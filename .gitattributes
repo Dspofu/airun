@@ -1,0 +1,10 @@
+# Git for Windows ships core.autocrlf=true in its system config, which would
+# check every source file out as CRLF while the tree on disk is LF today. Pinning
+# it here makes line endings a property of the repository instead of a property
+# of whichever machine cloned it.
+* text=auto eol=lf
+
+# Binary, so never touched by the conversion above.
+*.gguf binary
+*.png binary
+*.lib binary

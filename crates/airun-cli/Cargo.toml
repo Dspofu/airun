@@ -1,0 +1,25 @@
+[package]
+name = "airun-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "airun command line interface"
+
+[[bin]]
+name = "airun"
+path = "src/main.rs"
+
+[dependencies]
+airun-gguf.workspace = true
+airun-cuda.workspace = true
+airun-core.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+half.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true

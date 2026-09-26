@@ -1,0 +1,15 @@
+[package]
+name = "airun-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CUDA device management and hand-written kernels for airun"
+links = "airun_kernels"
+
+[dependencies]
+thiserror.workspace = true
+half.workspace = true
+
+[build-dependencies]
+cc = "1"

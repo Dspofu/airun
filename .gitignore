@@ -1,0 +1,11 @@
+# Build output. Around 700 MB, and none of it is worth carrying: build.rs
+# recompiles kernels/*.cu into the CUDA static library on every build, so a
+# checked-in copy would go stale against the .cu sources it came from.
+/target
+
+# Editor and OS scratch.
+.vs/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

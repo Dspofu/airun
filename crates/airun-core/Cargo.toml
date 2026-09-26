@@ -1,0 +1,16 @@
+[package]
+name = "airun-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model configuration, memory planning and the transformer runtime for airun"
+
+[dependencies]
+airun-gguf.workspace = true
+airun-cuda.workspace = true
+
+thiserror.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true

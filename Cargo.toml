@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/airun-gguf",
+    "crates/airun-cuda",
+    "crates/airun-core",
+    "crates/airun-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+airun-gguf = { path = "crates/airun-gguf" }
+airun-cuda = { path = "crates/airun-cuda" }
+airun-core = { path = "crates/airun-core" }
+
+anyhow = "1"
+thiserror = "2"
+memmap2 = "0.9"
+clap = { version = "4", features = ["derive", "wrap_help", "env"] }
+half = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+axum = "0.8"
+tokio-stream = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+lto = "thin"
+codegen-units = 16
