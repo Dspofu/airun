@@ -100,15 +100,25 @@ __device__ __forceinline__ void load_32b_align16(const void* p, uint32_t* w) {
     w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
 }
 
-/// Same 32 bytes when only 2-byte alignment is guaranteed: 16 halfword loads
-/// instead of 32 byte loads. This is what ggml's `get_int_b2` does, and for the
-/// same reason -- a 34-byte block is never reliably 4-byte aligned.
+/// Same 32 bytes when only 2-byte alignment is guaranteed (a 34-byte block is
+/// never reliably 4-byte aligned). Eight aligned words from the 4-byte boundary
+/// at or below `p`, the trailing halfword when `p` is off by 2, and a funnel
+/// shift to realign: nine loads instead of sixteen halfword ones, which kept
+/// the decode matvec at 87% of DRAM bandwidth where llama.cpp's reaches 94%.
+/// The shift is an operand, not a branch -- neighbouring Q8_0 groups alternate
+/// alignment, so a branch would diverge every warp. Every byte read lies in
+/// [p - 2, p + 32): the two below belong to the same or the previous block, and
+/// the allocation itself is 4-byte aligned, so nothing precedes it.
 __device__ __forceinline__ void load_32b_align2(const void* p, uint32_t* w) {
-    const uint16_t* h = (const uint16_t*)p;
+    const uintptr_t a = (uintptr_t)p;
+    const uint32_t* base = (const uint32_t*)(a & ~(uintptr_t)3);
+    const uint32_t sh = (uint32_t)(a & 3) * 8;   // 0 or 16
+    uint32_t v[9];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        w[i] = (uint32_t)h[2 * i] | ((uint32_t)h[2 * i + 1] << 16);
-    }
+    for (int i = 0; i < 8; ++i) v[i] = base[i];
+    v[8] = sh ? (uint32_t)*(const uint16_t*)(base + 8) : 0u;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) w[i] = __funnelshift_r(v[i], v[i + 1], sh);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,20 +230,42 @@ __device__ __forceinline__ void dq_bf16(const void* p, int sub, float* out) {
     }
 }
 
-__device__ __forceinline__ void dq_q8_0(const void* p, int sub, float* out) {
-    const block_q8_0* b = (const block_q8_0*)p + sub;
-    const float d = __half2float(b->d);
+// A Q8_0 block as loaded, before any arithmetic: the loads and the decode are
+// separate steps so a caller can issue several blocks' loads before it spends
+// any of them (see matvec_rows). load_32b_align2's words, unshifted.
+struct q8_0_raw {
+    uint32_t v[9];
+    uint32_t sh;
+    unsigned short d;
+};
 
-    uint32_t w[8];
-    load_32b_align2(b->qs, w); // 34-byte block: 2-byte alignment only
+__device__ __forceinline__ void q8_0_load(const void* p, int sub, q8_0_raw& r) {
+    const block_q8_0* b = (const block_q8_0*)p + sub;
+    r.d = __half_as_ushort(b->d);
+    const uintptr_t a = (uintptr_t)b->qs;   // 34-byte block: 2-byte alignment only
+    const uint32_t* base = (const uint32_t*)(a & ~(uintptr_t)3);
+    r.sh = (uint32_t)(a & 3) * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) r.v[i] = base[i];
+    r.v[8] = r.sh ? (uint32_t)*(const uint16_t*)(base + 8) : 0u;
+}
+
+__device__ __forceinline__ void q8_0_decode(const q8_0_raw& r, float* out) {
+    const float d = __half2float(__ushort_as_half(r.d));
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const uint32_t v = w[i];
+        const uint32_t v = __funnelshift_r(r.v[i], r.v[i + 1], r.sh);
         out[4 * i + 0] = d * (float)(int8_t)(v      );
         out[4 * i + 1] = d * (float)(int8_t)(v >>  8);
         out[4 * i + 2] = d * (float)(int8_t)(v >> 16);
         out[4 * i + 3] = d * (float)(int8_t)(v >> 24);
     }
+}
+
+__device__ __forceinline__ void dq_q8_0(const void* p, int sub, float* out) {
+    q8_0_raw r;
+    q8_0_load(p, sub, r);
+    q8_0_decode(r, out);
 }
 
 __device__ __forceinline__ void dq_q4_0(const void* p, int sub, float* out) {

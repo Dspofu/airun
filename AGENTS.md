@@ -30,7 +30,7 @@ streams e lançar *nossos* kernels.
 | 12 quantizadores (escrita) | round-trip testado |
 | Escrita GGUF | round-trip testado |
 | Leitura safetensors (multi-shard) | funciona |
-| Kernels CUDA (matvec f32/dp4a/tensor-core, attention, rope, rmsnorm, swiglu, embed, kv) | 78/78 no selftest |
+| Kernels CUDA (matvec f32/dp4a/tensor-core, attention, rope, rmsnorm, swiglu, embed, kv) | 226/226 no selftest |
 | Runtime Qwen3 denso | gera texto coerente |
 | Multi-GPU (split por camada) | validado com 2 placas |
 | Planner de VRAM | testado, com fallback automático |
@@ -39,10 +39,10 @@ streams e lançar *nossos* kernels.
 | Conversão HF → GGUF | Qwen3-8B convertido e executado |
 | Benchmark | funciona |
 
-**Arquiteturas suportadas hoje:** `qwen3`, `qwen2`, `llama` (decoders densos).
+**Arquiteturas suportadas hoje:** `qwen3`, `qwen2`, `llama` (decoders densos),
+`qwen35` / `qwen35moe` (híbridos SSM/atenção + MoE — veja a seção 7).
 
 **Não suportado ainda** (o loader recusa com mensagem clara):
-- `qwen35` / `qwen35moe` — camadas híbridas SSM/atenção + MoE. Veja a seção 7.
 - `clip` (mmproj) — encoder de visão.
 
 ---
@@ -138,10 +138,55 @@ sm_75/80/86/89/120 e leva vários minutos, mas é o que dá suporte a RTX 20 at�
 O decode (n=1) roda no kernel f32 exato — geração é bit-idêntica à referência
 CPU. Lotes de 2–63 tokens usam dp4a sobre ativações quantizadas (block_q8a em
 `vecdotq.cuh`, espelho em `quantize_q8a_mirror` no selftest — mudou um, mude o
-outro). Lotes de 64+ vão para tensor cores fp16 (`matvec_wmma_kernel`), que
-serve todos os 17 tipos via os mesmos `decode_group`. Cada caminho tem seus
-casos no selftest com limite de erro backward; `AIRUN_MATVEC_F32=1` força o
-exato em tudo, `AIRUN_NO_WMMA=1` desliga só o tensor-core.
+outro). Lotes de 64+ vão para **tensor cores int8** (MMQ, `mmq.cuh`) em sm_80+
+para Q8_0/Q4_K/Q5_K/Q6_K — os pesos viram os mesmos códigos inteiros do dp4a;
+Q8_0/Q4_K/Q5_K usam a versão com `cp.async` (`matvec_mmq_async_kernel`).
+Outros tipos e GPUs mais antigas vão para tensor cores fp16
+(`matvec_wmma_kernel`). Cada caminho tem seus casos no selftest com limite de
+erro backward; `AIRUN_MATVEC_F32=1` força o exato em tudo, `AIRUN_NO_MMQ=1`,
+`AIRUN_NO_MMQ_ASYNC=1` e `AIRUN_NO_WMMA=1` desligam cada um.
+
+O MMQ assíncrono usa **stream-K** quando as tiles não fecham ondas inteiras de
+SMs (`MmqStreamK` em `mmq.cuh`): as ondas cheias rodam tiles inteiras e as
+tiles que sobram são divididas em fatias de K iguais entre uma onda de blocos.
+O bloco que tem o começo de uma tile ("head") espera as flags dos blocos
+seguintes ("tails") e soma os parciais na ordem dos blocos — determinístico.
+As esperas só apontam para blocos de índice maior e o host limita o stream-K a
+uma onda residente, então não trava. Gate+up+SwiGLU do prefill são um
+lançamento só (`GLU=true`), inclusive no stream-K (os slots levam as somas
+cruas de gate e up; o SwiGLU roda no head). Não capture MMQ num CUDA graph: o
+`epoch` das flags congelaria (`mmq_streamk_plan` recusa em stream capturando).
+
+No decode, o Q8_0 carrega os bytes de todas as linhas do warp antes de usar
+qualquer uma (`q8_0_load`/`q8_0_decode` em `dequant.cuh`). Com um `break` ou
+decodificação intercalada, o compilador segurava as cargas da linha seguinte
+atrás da aritmética da anterior — uma linha em voo por warp. O resultado segue
+bit-idêntico.
+
+A decodificação gulosa é um pipeline (`ChainGraph` em `runtime.rs`): o grafo
+lê token e posição da GPU, o argmax escreve o próximo token lá e avança a
+posição, e o host enfileira o passo i+1 antes de ler o token do passo i. Um
+passo especulativo que o fim da geração descarta não é confirmado (`n_past` e
+`history` não andam). Por isso não roda em híbridos: o estado recorrente não
+tem como desfazer um passo.
+
+A atenção também tem caminhos por tamanho: prefill de 16+ tokens usa flash
+attention em tensor core fp16 (`AIRUN_NO_FLASH=1` desliga), e o decode usa um
+kernel por (head de KV, split) que lê o cache uma vez para todo o grupo GQA
+(`AIRUN_NO_GQA_DECODE=1` volta ao antigo). `crates/airun-core/tests/prefill.rs`
+(ignorado; `AIRUN_TEST_DENSE_GGUF`/`AIRUN_TEST_MOE_GGUF`) confere que um
+prefill em lote chega aos mesmos logits que alimentar token a token — é o
+único teste que roda esses kernels com pesos reais.
+
+**Três armadilhas de kernel que custaram horas em 2026-09-26:**
+- Um array de registradores (`acc[h]`) indexado num laço com limite de tempo
+  de execução vai inteiro para a memória local. Use `#pragma unroll` com o
+  limite constante e `if (h >= G) continue`. Confira `STACK:` em
+  `cuobjdump --dump-resource-usage` — deve ser 0.
+- `(const half2*)&raw` sobre uma variável de registrador também a manda para
+  a memória local. Extraia com operações de bits.
+- Sem contadores de desempenho (exigem admin no Windows), meça com `clock64()`
+  dentro do kernel e `printf` de um bloco — foi o que achou os três gargalos.
 
 **Ao ajustar tiles dos kernels: os tamanhos aparecem no template E na conta do
 grid.** Varrer um sem o outro computa fração da saída e parece um ganho enorme
@@ -208,83 +253,108 @@ rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
 
 ---
 
-## 7. Híbridos SSM/MoE — estado e o que falta
+## 7. Híbridos SSM/MoE — corrigidos em 2026-09-26
 
-**Implementado e rodando, mas a saída ainda não está correta.** Leia isto antes
-de mexer.
+**A saída está correta agora.** Dois bugs se mascaravam um ao outro:
 
-O que já funciona:
-- Config, carga de pesos, planner e split multi-GPU para `qwen35` e `qwen35moe`
-- Todos os kernels novos validados no `selftest` (delta rule, conv1d causal,
-  l2norm, gates, rmsnorm gated, router MoE, FFN de experts)
-- Qwen3.5-9B carrega e gera; Qwen3.6-35B-A3B carrega e divide entre as 2 GPUs
-- Recuperação de longo alcance funciona (71,3% de acerto em texto repetido,
-  contra 77,0% do 1.7B denso)
+1. **Associação V-head → K-head no delta rule.** O GGUF repete o eixo inteiro
+   de K-heads para chegar ao número de V-heads (`kh = vh % n_k_heads`, padrão
+   `0,1,0,1…`), como o `ggml_repeat` do llama.cpp. O kernel usava pares
+   adjacentes (`kh = vh / grupos`, padrão `0,0,1,1…`), que é o
+   `repeat_interleave` do HuggingFace — mas o conversor reordena as V-heads
+   justamente para que o tile funcione. `ssm.cu`, dois kernels.
+2. **Ordem do gate no `rmsnorm_gated`.** É norma → peso → gate (SiLU), como o
+   `RMSNormGated` do Qwen3-Next e o `build_norm_gated` do llama.cpp. O projeto
+   tinha escolhido "gate antes" porque, **com o bug 1 presente**, essa ordem
+   pontuava melhor (4.40 contra 4.89). Com o bug 1 corrigido, a ordem certa vai
+   a 1.43 e a antiga fica em 5.12.
 
-O que não funciona — **a semântica**, com a gramática intacta:
-`"The capital of Japan is"` → `" a Japanese TV show"`. Em número:
-
-| Modelo | Perda | Top-1 |
+| Qwen3.8-35B-A3B Q4_K_M | Perda | Top-1 |
 |---|---|---|
-| Qwen3-8B Q4_K (denso, controle) | 2.20 | 50.9% |
-| Qwen3.5-9B (híbrido) | 4.40 | 20.1% |
-| Qwen3.6-35B-A3B (híbrido + MoE) | 11.86 | 1.9% |
+| antes | 7.02 | 8.8% |
+| só a correção 1 | 5.12 | 14.5% |
+| correções 1 + 2 | **1.43** | **57.2%** |
+| Qwen3-4B Q8_0 (denso, controle) | 2.67 | 53.5% |
 
-O 35B está quase no chute uniforme (`ln(248320) = 12.4`), então há um segundo
-defeito no caminho MoE além do que os dois compartilham.
+A varredura de `docs/FLAGS.md` foi **refeita sobre a base corrigida** e todas
+as 15 alternativas pontuam pior (tabela em `benchmarks/2026-09-26/sweep2.txt`).
 
-Bugs reais já encontrados e corrigidos (não os reintroduza):
-1. O planner alocava `block_count` camadas, mas a última é MTP e não é
-   carregada → índice fora dos limites. Use sempre `cfg.n_run_layers()`.
-2. Os buffers `q/k/v` eram dimensionados só pela atenção. As camadas SSM
-   precisam de `group_count * state_size`, que no 9B é o dobro do
-   `n_head_kv * head_dim`. Escrita fora dos limites em prompts > 256 tokens.
-3. **`ssm_a` já vem como `-exp(A_log)`**, não como `A_log`. Aplicar `-exp()` de
-   novo multiplica o decaimento por ~13x e o estado esquece tudo a cada token.
-   `load_delta_decay_coeff` normaliza pelo sinal.
-4. **O gate do `rmsnorm_gated` vem antes da normalização**, não depois — é o
-   que o `RMSNormGated` do Mamba-2 faz, e faz a normalização dividir a escala
-   do próprio gate de volta. Vale 4.89 → 4.40 de perda.
+**Lição que vale para o projeto inteiro:** uma decisão A/B tomada com outro bug
+presente não é confiável. Ao corrigir um layout, refaça as decisões de layout
+anteriores. O selftest não pega isso (armadilha 8): os dois lados codificavam a
+mesma suposição.
 
-**Todas as ambiguidades de layout já foram varridas e medidas** — ordem de
-`[q][k][v]`, agrupamento por k-head, `alpha`/`beta`, metade do gate em
-`attn_q`, ordem dos taps da conv, pareamento do RoPE, RoPE parcial vs total,
-l2norm, escala de q, SiLU da conv, SiLU vs sigmoid no gate, interpretação do
-`ssm_a`. A tabela com os números de cada uma está em `tasks.md` §3; a lista das
-variáveis de ambiente está em `docs/FLAGS.md`. **Não refaça essa varredura.**
+Bugs anteriores, ainda válidos (não reintroduza):
+1. O planner deve alocar `cfg.n_run_layers()`; a última camada é MTP e não é
+   carregada.
+2. Os buffers `q/k/v` precisam de `group_count * state_size` nas camadas SSM.
+3. **`ssm_a` já vem como `-exp(A_log)`**; `load_delta_decay_coeff` normaliza
+   pelo sinal.
 
-Também já descartados: tokenizador, prefill em lote, camada MTP, decodificador
-Q5_K, mRoPE (com texto puro reduz exatamente ao RoPE padrão), offset DC no
-residual e a semântica do `post_attention_norm`.
+### Offload de experts (`--expert-cache N`)
 
-A pista mais forte que sobrou: **o híbrido quase não usa posição.** Desligar o
-RoPE inteiro (`AIRUN_ROPE_OFF=1`) custa +2.75 nats no 8B denso e **+0.04** no
-9B híbrido. Por isso todos os testes de RoPE deram empate — não há sinal
-posicional chegando à saída para eles mexerem. Os números completos e a
-ressalva (o delta-net carrega posição implícita, então parte disso pode ser
-legítimo) estão em `tasks.md` §3.
+Mantém N experts por camada na VRAM (LRU) e lê os que faltam do GGUF, sem
+requantizar — o teste `crates/airun-core/tests/offload.rs` (ignorado; rode com
+`AIRUN_TEST_MOE_GGUF=<35B>`) exige logits **idênticos** ao modelo residente.
 
-O resto está no mesmo lugar: o caminho MoE (isolado pelo 35B), e uma referência
-CPU de uma *camada* delta-net inteira com os pesos reais, que é o oráculo que
-falta (`dequant.rs` é o oráculo dos kernels; não existe um para composição).
+Os misses são lidos com leituras posicionais paralelas (`upload_experts` em
+`runtime.rs`, um handle de arquivo por thread). Pelo mmap eles chegavam um
+page fault de cada vez, à velocidade de fila-1 do SSD, e isso era quase todo o
+tempo de decode.
 
+**Meça com texto natural.** `airun bench` usa um token repetido em modelos
+densos, mas num MoE isso roteia sempre para os mesmos experts e o cache parece
+perfeito (99,8% de acerto, 54 t/s) quando com texto real acerta ~88% (3 t/s
+antes do leitor paralelo). O bench agora usa uma passagem em inglês para MoE e
+mostra a taxa de acerto; use também `--temp 0.7`, porque o greedy entra em
+laço e flatteria o cache da mesma forma.
+
+### KV cache quantizado (`--kv-type f16|q8_0|q4_0`)
+
+Blocos Q8_0/Q4_0 do GGUF por linha de head, decodificados pelos mesmos
+`dequant`. O encoder GPU espelha `encode_q8_0`/`encode_q4_0` de `quantize.rs`
+**bit a bit** (selftest compara os bytes); os intrinsics `__f*_rn` existem
+porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
 ## 8. Outras frentes
 
-1. **Decode que não cai com o contexto.** Esta é agora a maior perda medida.
-   A atenção lança `n_tokens * n_heads` blocos, o que no decode dá 16 blocos
-   numa placa de 70 SMs. O custo por posição de KV é de *latência*, não de
-   banda: a 3072 tokens o kernel gasta ~12x o que a leitura do cache justifica.
-   Já foi feito o que dava dentro de um bloco — 32 warps no decode contra 8 no
-   prefill (`ATTN_WARPS_DECODE`/`ATTN_WARPS_PREFILL` em `ops.cu`), que dobrou a
-   taxa a 3072. O passo que falta é dividir o intervalo de KV entre blocos
-   (`gridDim.z`) e combinar os parciais `(max, sum, acc)` num segundo kernel,
-   como o `flash_attn_ext` do llama.cpp. Precisa de um buffer de scratch de
-   `n_tokens * n_heads * n_splits * (head_dim + 2)` floats — ~133 KB no decode.
+1. **Decode que não cai com o contexto — feito.** No decode a atenção divide o
+   intervalo de KV entre blocos (`gridDim.z`, `attention_splits(ctx)` blocos) e
+   combina os parciais `(max, sum, acc)` num segundo kernel, como o
+   `flash_attn_ext` do llama.cpp. Qwen3-4B Q8_0 numa RTX 3060: 38,9 → 53,4 t/s a
+   3072 tokens (llama.cpp: 49,0). `AIRUN_NO_SPLIT_ATTN=1` volta ao kernel de um
+   bloco por head. O selftest cobre até a posição 212991.
 
-   Use `airun bench --decode-at 16,512,1024,2048,3072` para medir. **O bench sem
-   `--decode-at` mede só com o contexto vazio e é cego para isso** — foi assim
-   que a regressão passou despercebida até um usuário notar na conversa.
+   Depois, em 2026-09-26/27: MMQ int8 com `cp.async`, flash attention com
+   `mma.sync`, stream-K, fusões (QKV, gate/up/SwiGLU, prólogo da atenção,
+   soma+norm), argmax na GPU e o pipeline do decode. Placar intercalado contra
+   o llama.cpp, Qwen3-4B Q8_0, RTX 3060, melhor de 3 rodadas
+   (`benchmarks/2026-09-26/scoreboard.ps1`):
 
+   | Teste | airun | llama.cpp | razão |
+   |---|---|---|---|
+   | prefill 128 | 3535 t/s | 3118 t/s | 1,13x |
+   | prefill 512 | 3979 t/s | 3829 t/s | 1,04x |
+   | decode @16 | 70,3 t/s | 69,1 t/s | 1,02x |
+   | decode @3072 | 63,7 t/s | 62,9 t/s | 1,01x |
+
+   O decode está no limite da memória: os matvecs rodam a 88–96% da banda real
+   (a 3060 fica em P2 durante compute, memória a 7301 MHz em vez de 7501). O
+   que ainda sobra: atenção de decode em contexto curto (~16 µs por camada
+   contra ~10 do llama.cpp, limitada por latência com 8 warps na GPU inteira)
+   e ~4 µs de rampa+cauda por matvec pequeno (o e QKV a 88%).
+
+   **Tentado e descartado (medido, não repita sem motivo novo):** prefetch
+   para o L2 num segundo stream durante os kernels pequenos (1–2% mais lento: os
+   ramos extras do grafo custam mais do que o L2 poupa); prioridade de GPU do
+   processo via `D3DKMTSetProcessSchedulingPriorityClass` (nenhum efeito, nem
+   com outra carga CUDA na placa); 1 ou 2 linhas por warp no GLU do decode (1
+   cai para 85% da banda, 2 empata com 4); buffer duplo K/V na atenção de decode
+   (66 contra 52 µs a 3072).
+
+   **Medir exige alternar.** Nesta máquina outro programa que desenha na GPU
+   (navegador, o próprio app de chat) estica um kernel em ~300 µs a cada ~4 ms —
+   ~8% do decode — e some quando o programa para. Os dois motores sofrem igual;
+   só execuções intercaladas na mesma janela de tempo são comparáveis.
 2. **Multi-modal.** `mmproj-f16.gguf` é um ViT de 27 blocos (patch 16, embd
    1152, ffn 4304) com projetor `qwen3vl_merger`, merge espacial 2x2 e camadas
    deepstack. Estrutura já mapeada via `inspect --tensors`. Depende do item

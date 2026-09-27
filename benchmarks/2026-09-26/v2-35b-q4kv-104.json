@@ -1,0 +1,67 @@
+{
+  "architecture": "qwen35moe",
+  "batch": 512,
+  "ctx": 212992,
+  "decode_method": "greedy_generate",
+  "expert_cache_slots": 104,
+  "expert_cache_stats": [
+    15313515,
+    31125
+  ],
+  "fallbacks": [],
+  "gpus": [
+    0
+  ],
+  "kv_cache": "f16",
+  "kv_type": "q4_0",
+  "load_ms": 1113.407,
+  "model": "E:\\models\\LLMs\\qwen3.8\\Qwen3.8-35B-A3B-Q4_K_M.gguf",
+  "parameters_summary": "Ours (qwen35moe) - 41 layers, 2048 embd, 16 heads (2 kv, GQA 8x), head_dim 256, ffn 512, vocab 248320, q/k norm, 1 MTP layer(s) skipped\n  hybrid: 30 linear-attention + 10 attention layers; delta-net 32 v-heads x 16 k-heads, state 128x128, conv 4\n  MoE: 256 experts, 8 active, expert ffn 512, shared expert ffn 512\n  gated attention output",
+  "results": [
+    {
+      "label": "prefill 512",
+      "max_tps": 181.90194973310153,
+      "median_tps": 181.90194973310153,
+      "min_tps": 179.01679153029602,
+      "samples_ms": [
+        2860.0669000000003,
+        2814.7032
+      ],
+      "tokens": 512
+    },
+    {
+      "label": "decode 64 @ 16",
+      "max_tps": 53.67183713750649,
+      "median_tps": 53.67183713750649,
+      "min_tps": 53.465205262112335,
+      "samples_ms": [
+        1192.4317,
+        1197.0402
+      ],
+      "tokens": 64
+    },
+    {
+      "label": "decode 64 @ 512",
+      "max_tps": 51.41844199549831,
+      "median_tps": 51.41844199549831,
+      "min_tps": 51.37655037771799,
+      "samples_ms": [
+        1245.7045,
+        1244.6896000000002
+      ],
+      "tokens": 64
+    },
+    {
+      "label": "decode 64 @ 4096",
+      "max_tps": 44.582340099167844,
+      "median_tps": 44.582340099167844,
+      "min_tps": 44.57869752608429,
+      "samples_ms": [
+        1435.6633,
+        1435.546
+      ],
+      "tokens": 64
+    }
+  ],
+  "weight_bytes": 9570918400
+}

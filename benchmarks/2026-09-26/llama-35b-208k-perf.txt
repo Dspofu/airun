@@ -1,0 +1,39 @@
+
+
+Loading model... 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b11056-e613ef2c8
+model      : E:\models\LLMs\qwen3.8\Qwen3.8-35B-A3B-Q4_K_M.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> The capital of France is
+
+[Start thinking]
+
+The user is asking a simple factual question: "The capital of France is". The answer is Paris. This is straightforward and doesn't require any complex reasoning.
+[End thinking]
+
+The capital of France is **Paris**.
+
+[ Prompt: 2.7 t/s | Generation: 5.8 t/s ]
+
+
+Exiting...

@@ -1,0 +1,17 @@
+
+uploading weights: 32/43   
+uploading weights: 43/43   
+building tokenizer: 0/1   
+Ours (qwen35moe) - 41 layers, 2048 embd, 16 heads (2 kv, GQA 8x), head_dim 256, ffn 512, vocab 248320, q/k norm, 1 MTP layer(s) skipped
+  hybrid: 30 linear-attention + 10 attention layers; delta-net 32 v-heads x 16 k-heads, state 128x128, conv 4
+  MoE: 256 experts, 8 active, expert ffn 512, shared expert ffn 512
+  gated attention output
+loaded 4.94 GiB of weights in 2.2s
+memory plan (context 212992 tokens):
+  GPU 0 NVIDIA GeForce RTX 3060    layers 0..39 (40)       +embed +output
+      weights   4.94 GiB  kv   4.12 GiB  scratch  32.03 MiB  =    9.10 GiB of  10.60 GiB budget
+  note: whole model fits on GPU 0 (NVIDIA GeForce RTX 3060), keeping it on one device to avoid cross-GPU transfers
+  note: MoE expert cache: 48 slots per layer; exact packed weights streamed from mmap on misses; KV cache f16
+prompt: 5 tokens
+
+5 prompt tokens in 8204 ms (0.6 tok/s)  |  26 generated in 9526 ms (2.7 tok/s)

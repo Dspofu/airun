@@ -1,0 +1,9 @@
+Ours (qwen35moe) - 41 layers, 2048 embd, 16 heads (2 kv, GQA 8x), head_dim 256, ffn 512, vocab 248320, q/k norm, 1 MTP layer(s) skipped
+  hybrid: 30 linear-attention + 10 attention layers; delta-net 32 v-heads x 16 k-heads, state 128x128, conv 4
+  MoE: 256 experts, 8 active, expert ffn 512, shared expert ffn 512
+  gated attention output
+
+159 tokens scored
+  mean loss   7.0206 nats/token
+  perplexity  1119.47
+  top-1       8.8% (14/159)

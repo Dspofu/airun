@@ -1,0 +1,16 @@
+﻿airun selftest on GPU 0 - NVIDIA GeForce RTX 3060 (sm_86, Ampere)
+
+== block decoders (GPU vs CPU reference) ==
+
+== matvec ==
+
+== elementwise and norms ==
+
+== attention ==
+
+== gated delta net (hybrid layers) ==
+
+== mixture of experts ==
+
+205 passed, 0 failed
+all kernels agree with the CPU reference

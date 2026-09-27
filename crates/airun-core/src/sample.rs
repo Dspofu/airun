@@ -116,6 +116,16 @@ impl Sampler {
         &self.params
     }
 
+    /// True when [`sample`] reduces to the argmax of the raw logits: no
+    /// temperature, no biases, no penalty that could move the maximum. The
+    /// runtime then computes the argmax on the GPU instead of copying logits.
+    pub fn is_pure_greedy(&self) -> bool {
+        let p = &self.params;
+        let penalizing = (p.repeat_penalty != 1.0 || p.presence_penalty != 0.0
+            || p.frequency_penalty != 0.0) && p.repeat_last_n > 0;
+        p.temperature <= 0.0 && p.logit_bias.is_empty() && !penalizing
+    }
+
     /// Picks the next token. `logits` is modified in place.
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
         for &(token, bias) in &self.params.logit_bias {

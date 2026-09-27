@@ -165,6 +165,10 @@ pub struct Config {
     pub attn_output_gate: bool,
     /// The FFN pre-norm is named `post_attention_norm` rather than `ffn_norm`.
     pub ffn_norm_name: &'static str,
+
+    /// Storage format of the KV cache. A runtime choice, not a file property:
+    /// from_gguf leaves it at f16 and the loader applies the user's option.
+    pub kv_type: airun_cuda::ops::KvType,
 }
 
 impl Config {
@@ -363,6 +367,7 @@ impl Config {
             full_attention_interval,
             attn_output_gate,
             ffn_norm_name,
+            kv_type: Default::default(),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -463,9 +468,9 @@ impl Config {
         self.n_head_kv * self.head_dim
     }
 
-    /// Bytes of KV cache for one layer at `ctx` tokens, both K and V, f16.
+    /// Bytes of KV cache for one layer at `ctx` tokens, both K and V.
     pub fn kv_bytes_per_layer(&self, ctx: usize) -> u64 {
-        2 * (self.n_head_kv * ctx * self.head_dim) as u64 * 2
+        2 * (self.n_head_kv * ctx) as u64 * self.kv_type.row_bytes(self.head_dim) as u64
     }
 
     /// KV cache across the whole model.
@@ -573,6 +578,7 @@ mod tests {
             full_attention_interval: 0,
             attn_output_gate: false,
             ffn_norm_name: "ffn_norm",
+            kv_type: Default::default(),
         }
     }
 
@@ -590,6 +596,7 @@ mod tests {
             full_attention_interval: 4,
             attn_output_gate: true,
             ffn_norm_name: "post_attention_norm",
+            kv_type: Default::default(),
             ssm: Some(SsmConfig {
                 conv_kernel: 4,
                 inner_size: 4096,

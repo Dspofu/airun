@@ -1,0 +1,20 @@
+Ours (qwen35moe) - 41 layers, 2048 embd, 16 heads (2 kv, GQA 8x), head_dim 256, ffn 512, vocab 248320, q/k norm, 1 MTP layer(s) skipped
+  hybrid: 30 linear-attention + 10 attention layers; delta-net 32 v-heads x 16 k-heads, state 128x128, conv 4
+  MoE: 256 experts, 8 active, expert ffn 512, shared expert ffn 512
+  gated attention output
+weights 8.91 GiB loaded in 1.2s
+memory plan (context 212992 tokens):
+  GPU 0 NVIDIA GeForce RTX 3060    layers 0..39 (40)       +embed +output
+      weights   8.92 GiB  kv   1.20 GiB  scratch 117.03 MiB  =   10.24 GiB of  10.60 GiB budget
+  note: whole model fits on GPU 0 (NVIDIA GeForce RTX 3060), keeping it on one device to avoid cross-GPU transfers
+  note: MoE expert cache: 104 slots per layer; exact packed weights streamed from mmap on misses
+  note: KV cache q4_0
+
+test                   median          min          max expert hit
+-------------------------------------------------------------------
+prefill 512            7.1 t/s       6.5 t/s       7.1 t/s      88.7%
+decode 64 @ 16        21.3 t/s       6.1 t/s      21.3 t/s      85.0%
+decode 64 @ 512        3.0 t/s       2.9 t/s       3.0 t/s      88.5%
+decode 64 @ 4096       3.2 t/s       2.9 t/s       3.2 t/s      88.4%
+
+2 run(s) per test after 1 warm-up run(s); median reported

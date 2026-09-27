@@ -8,6 +8,8 @@
 
 use airun_cuda::{DeviceBuffer, Stream};
 use airun_gguf::{GgufFile, TensorInfo};
+use std::{cell::RefCell, sync::Arc};
+use crate::expert_cache::ExpertSlots;
 
 use crate::config::{Config, LayerKind};
 use crate::error::{CoreError, Result};
@@ -16,6 +18,7 @@ use crate::plan::Placement;
 /// A weight matrix on a device, kept in its on-disk layout.
 pub struct GpuTensor {
     pub data: DeviceBuffer<u8>,
+    pub host_experts: Option<HostExperts>,
     pub ty: airun_gguf::GgmlType,
     /// Row length: the matmul's inner dimension.
     pub k: usize,
@@ -28,7 +31,48 @@ pub struct GpuTensor {
     pub device: i32,
 }
 
+pub struct HostExperts {
+    file: Arc<GgufFile>,
+    info: TensorInfo,
+    slots: RefCell<ExpertSlots>,
+}
+
 impl GpuTensor {
+    /// Assigns a device slot to every id, returning the slots and the
+    /// `(slot, expert)` pairs that must be uploaded before the kernels run. The
+    /// caller synchronizes before evicting slots a previous token still reads,
+    /// and calls `invalidate_experts` if the uploads then fail.
+    pub fn select_experts(&self, ids: &[i32]) -> Result<(Vec<i32>, Vec<(usize, usize)>)> {
+        let Some(host) = &self.host_experts else { return Ok((ids.to_vec(), Vec::new())); };
+        host.slots.borrow_mut().select(ids, self.n_experts)
+    }
+
+    pub fn invalidate_experts(&self) {
+        if let Some(host) = &self.host_experts { host.slots.borrow_mut().invalidate(); }
+    }
+
+    /// Absolute file offset of one expert's packed weights.
+    pub fn expert_file_offset(&self, expert: usize) -> Option<u64> {
+        let host = self.host_experts.as_ref()?;
+        Some(host.file.data_offset() + host.info.offset + (expert * self.expert_stride) as u64)
+    }
+
+    /// The GGUF the experts are streamed from.
+    pub fn expert_file_path(&self) -> Option<&std::path::Path> {
+        self.host_experts.as_ref().map(|h| h.file.path())
+    }
+
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.host_experts.as_ref().map_or((0, 0), |h| {
+            let c = h.slots.borrow();
+            (c.hits, c.misses)
+        })
+    }
+
+    pub fn cache_capacity(&self) -> usize {
+        if self.host_experts.is_some() { self.data.len() / self.expert_stride } else { self.n_experts }
+    }
+
     pub fn kernel_type(&self) -> airun_cuda::ops::KernelType {
         airun_cuda::ops::KernelType(self.ty.id() as i32)
     }
@@ -125,10 +169,11 @@ impl Model {
     /// `progress` is called with (layers done, total) so the caller can show
     /// something during the multi-second upload of a large model.
     pub fn load(
-        gguf: &GgufFile,
+        gguf: &Arc<GgufFile>,
         config: Config,
         placement: Placement,
         streams: &[(i32, Stream)],
+        expert_cache: Option<usize>,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Self> {
         let stream_for = |dev: i32| -> Result<&Stream> {
@@ -163,6 +208,7 @@ impl Model {
             if out_dev == embed_dev {
                 GpuTensor {
                     data: DeviceBuffer::<u8>::new(out_dev, 0)?,
+                    host_experts: None,
                     ty: token_embd.ty,
                     k: token_embd.k,
                     rows: token_embd.rows,
@@ -227,9 +273,9 @@ impl Model {
                 };
                 FfnWeights::Moe {
                     router: load_packed(gguf, &name("ffn_gate_inp.weight"), dev, stream, &config)?,
-                    gate_exps: load_packed(gguf, &name("ffn_gate_exps.weight"), dev, stream, &config)?,
-                    up_exps: load_packed(gguf, &name("ffn_up_exps.weight"), dev, stream, &config)?,
-                    down_exps: load_packed(gguf, &name("ffn_down_exps.weight"), dev, stream, &config)?,
+                    gate_exps: load_cached(gguf, &name("ffn_gate_exps.weight"), dev, stream, &config, expert_cache)?,
+                    up_exps: load_cached(gguf, &name("ffn_up_exps.weight"), dev, stream, &config, expert_cache)?,
+                    down_exps: load_cached(gguf, &name("ffn_down_exps.weight"), dev, stream, &config, expert_cache)?,
                     shared,
                 }
             } else {
@@ -323,11 +369,18 @@ fn tensor_info<'a>(gguf: &'a GgufFile, name: &str, arch: &str) -> Result<&'a Ten
 /// A three-dimensional tensor is an expert stack: the trailing axis indexes
 /// experts, and `rows` becomes the per-expert row count.
 fn load_packed(
-    gguf: &GgufFile,
+    gguf: &Arc<GgufFile>,
     name: &str,
     device: i32,
     stream: &Stream,
     config: &Config,
+) -> Result<GpuTensor> {
+    load_cached(gguf, name, device, stream, config, None)
+}
+
+fn load_cached(
+    gguf: &Arc<GgufFile>, name: &str, device: i32, stream: &Stream,
+    config: &Config, slots: Option<usize>,
 ) -> Result<GpuTensor> {
     let info = tensor_info(gguf, name, &config.arch_name)?;
 
@@ -356,11 +409,17 @@ fn load_packed(
     };
     let expert_stride = if n_experts > 1 { rows * row_bytes } else { 0 };
 
-    let bytes = gguf.tensor_bytes(info)?;
-    let data = DeviceBuffer::<u8>::from_slice(device, bytes, stream)?;
+    let (data, host_experts) = if let Some(slots) = slots.filter(|&s| s < n_experts) {
+        (DeviceBuffer::new(device, slots * expert_stride)?, Some(HostExperts {
+            file: Arc::clone(gguf), info: info.clone(), slots: RefCell::new(ExpertSlots::new(slots)),
+        }))
+    } else {
+        (DeviceBuffer::<u8>::from_slice(device, gguf.tensor_bytes(info)?, stream)?, None)
+    };
 
     Ok(GpuTensor {
         data,
+        host_experts,
         ty: info.ty,
         k,
         rows,

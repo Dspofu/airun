@@ -48,6 +48,18 @@ pub struct ServeArgs {
     #[arg(short = 'c', long, default_value_t = 4096)]
     pub ctx_size: usize,
 
+    /// Resident experts per layer; stream cache misses from the GGUF without re-quantizing.
+    #[arg(long)]
+    pub expert_cache: Option<usize>,
+
+    /// KV cache format: f16, q8_0 or q4_0.
+    #[arg(long, default_value = "f16", value_parser = crate::run::parse_kv_type)]
+    pub kv_type: airun_cuda::ops::KvType,
+
+    /// Fail instead of silently shrinking the requested context or batch.
+    #[arg(long)]
+    pub no_fallback: bool,
+
     /// Tokens per forward pass during prompt ingestion.
     #[arg(short = 'b', long, default_value_t = 512)]
     pub batch_size: usize,
@@ -93,6 +105,51 @@ struct AppState {
     /// startup so `/props` never has to touch the runtime mutex, which a
     /// generation in flight would otherwise hold for the whole response.
     props: serde_json::Value,
+    /// How the GGUF's chat template handles reasoning.
+    thinking: Thinking,
+}
+
+/// Reasoning support read from the chat template, which airun does not
+/// evaluate but whose `<think>` conventions it has to reproduce.
+#[derive(Clone, Copy, Default)]
+struct Thinking {
+    /// The template knows `<think>` blocks, so `enable_thinking` means something.
+    supported: bool,
+    /// The generation prompt already opens the block (Qwen3.5 and later), so the
+    /// model never emits `<think>` itself and the server has to send it.
+    prompt_opens_block: bool,
+}
+
+impl Thinking {
+    fn from_template(template: &str) -> Self {
+        Self {
+            supported: template.contains("<think>"),
+            prompt_opens_block: template.contains("'<think>\\n'"),
+        }
+    }
+
+    /// Text appended after `<|im_start|>assistant\n`, and the part of it the
+    /// client must see as the start of the reply.
+    fn generation_prefix(self, enabled: bool) -> (&'static str, &'static str) {
+        match (self.supported, enabled) {
+            (false, _) => ("", ""),
+            (true, false) => ("<think>\n\n</think>\n\n", ""),
+            (true, true) if self.prompt_opens_block => ("<think>\n", "<think>\n"),
+            (true, true) => ("", ""),
+        }
+    }
+}
+
+/// The answer part of an assistant turn. Qwen's templates drop earlier turns'
+/// reasoning from the prompt, so replaying it would both waste context and
+/// show the model a transcript shape it was not trained on.
+fn strip_reasoning(text: &str) -> &str {
+    match text.rfind("</think>") {
+        Some(end) => text[end + "</think>".len()..].trim_start(),
+        // A reply stopped mid-thought has no answer at all.
+        None if text.trim_start().starts_with("<think>") => "",
+        None => text,
+    }
 }
 
 /// One line per request, so a slow first token can be attributed instead of
@@ -174,6 +231,9 @@ fn finish_reason(stop: airun_core::StopReason) -> &'static str {
 pub fn run(args: ServeArgs) -> Result<()> {
     let mut run_args = RunArgs::bench_defaults(args.model.clone());
     run_args.ctx_size = args.ctx_size;
+    run_args.expert_cache = args.expert_cache;
+    run_args.kv_type = args.kv_type;
+    run_args.no_fallback = args.no_fallback;
     run_args.batch_size = args.batch_size;
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();
@@ -201,18 +261,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let ctx = runtime.ctx();
     let cfg = &report.config;
 
-    // A hybrid loads and generates fluent text while answering the wrong
-    // question, so the UI has to say so out loud -- otherwise the first thing a
-    // new user sees is a confident wrong answer with nothing marking it.
-    let note = match cfg.architecture {
-        airun_core::Architecture::Qwen3NextHybrid => Some(
-            "Hybrid SSM/attention architecture: this model loads and produces \
-             grammatical text, but its output is known to be semantically wrong \
-             (perplexity ~16x a dense model of the same size). Do not judge \
-             quality from it yet.",
-        ),
-        _ => None,
-    };
+    let template = airun_gguf::GgufFile::open(&args.model)
+        .ok()
+        .and_then(|g| g.get("tokenizer.chat_template").and_then(|v| v.as_str()).map(str::to_owned))
+        .unwrap_or_default();
+    let thinking = Thinking::from_template(&template);
 
     let props = json!({
         "model": model_name,
@@ -223,7 +276,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         "ctx": ctx,
         "gpus": report.placement.devices(),
         "auth_required": args.api_key.is_some(),
-        "note": note,
+        "thinking": thinking.supported,
     });
 
     let state = Arc::new(AppState {
@@ -234,6 +287,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         repeat_penalty: args.repeat_penalty,
         repeat_last_n: args.repeat_last_n,
         props,
+        thinking,
     });
 
     let app = Router::new()
@@ -340,6 +394,13 @@ struct ChatRequest {
     stream: bool,
     #[serde(default)]
     stop: Option<serde_json::Value>,
+    /// Whether a reasoning model thinks before answering. Defaults to on.
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+    /// llama.cpp and vLLM pass template switches here; `enable_thinking` is
+    /// the only one airun understands.
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -501,7 +562,8 @@ async fn chat_completions(
             "system" if system.is_none() && transcript.is_empty() => system = Some(m.text()),
             "assistant" => {
                 transcript.push_str("<|im_start|>assistant\n");
-                transcript.push_str(&m.text());
+                let text = m.text();
+                transcript.push_str(if state.thinking.supported { strip_reasoning(&text) } else { &text });
                 transcript.push_str("<|im_end|>\n");
             }
             _ => {
@@ -519,6 +581,15 @@ async fn chat_completions(
     }
     prompt.push_str(&transcript);
     prompt.push_str("<|im_start|>assistant\n");
+    let enable_thinking = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|k| k.get("enable_thinking"))
+        .and_then(|v| v.as_bool())
+        .or(req.enable_thinking)
+        .unwrap_or(true);
+    let (prefix, echoed) = state.thinking.generation_prefix(enable_thinking);
+    prompt.push_str(prefix);
 
     let params = SamplingParams {
         temperature: req.temperature.unwrap_or(0.8),
@@ -546,9 +617,9 @@ async fn chat_completions(
     let model = req.model.clone().unwrap_or_else(|| state.model_name.clone());
 
     if req.stream {
-        stream_response(state, prompt, params, max_tokens, stops, model, true).await
+        stream_response(state, prompt, echoed, params, max_tokens, stops, model, true).await
     } else {
-        blocking_response(state, prompt, params, max_tokens, stops, model, true).await
+        blocking_response(state, prompt, echoed, params, max_tokens, stops, model, true).await
     }
 }
 
@@ -598,16 +669,19 @@ async fn completions(
     let model = req.model.clone().unwrap_or_else(|| state.model_name.clone());
 
     if req.stream {
-        stream_response(state, prompt, params, max_tokens, stops, model, false).await
+        stream_response(state, prompt, "", params, max_tokens, stops, model, false).await
     } else {
-        blocking_response(state, prompt, params, max_tokens, stops, model, false).await
+        blocking_response(state, prompt, "", params, max_tokens, stops, model, false).await
     }
 }
 
 /// Generates on a blocking thread and returns one JSON body.
+/// `echoed` is prompt text that belongs to the reply (an opened `<think>`) and
+/// is sent to the client ahead of the generated text.
 async fn blocking_response(
     state: Arc<AppState>,
     prompt: String,
+    echoed: &'static str,
     params: SamplingParams,
     max_tokens: usize,
     stops: Vec<String>,
@@ -623,7 +697,7 @@ async fn blocking_response(
         // turn. Resetting here would throw that away every message.
         let tokens = rt.tokenizer.encode(&prompt, true);
         let mut sampler = Sampler::new(params);
-        let mut text = String::new();
+        let mut text = echoed.to_string();
 
         let stats = rt.generate(&tokens, max_tokens, &mut sampler, |_, piece| {
             text.push_str(piece);
@@ -692,6 +766,7 @@ async fn blocking_response(
 async fn stream_response(
     state: Arc<AppState>,
     prompt: String,
+    echoed: &'static str,
     params: SamplingParams,
     max_tokens: usize,
     stops: Vec<String>,
@@ -722,7 +797,7 @@ async fn stream_response(
             let _ = tx.send(Ok(Event::default().data(first.to_string())));
         }
 
-        let mut accumulated = String::new();
+        let mut accumulated = echoed.to_string();
         // How much of `accumulated` the client already has. Text is released
         // from here rather than forwarded token by token, because a stop
         // sequence can straddle two tokens and an SSE chunk cannot be unsent.
@@ -867,6 +942,36 @@ mod tests {
 
         assert!(logit_bias_from(&None).is_empty());
         assert!(logit_bias_from(&Some(serde_json::json!([1, 2]))).is_empty());
+    }
+
+    #[test]
+    fn earlier_reasoning_is_dropped_from_the_transcript() {
+        assert_eq!(strip_reasoning("<think>\nhmm\n</think>\n\nParis."), "Paris.");
+        // Qwen3.5+ opens the block in the prompt, so replies lack <think>.
+        assert_eq!(strip_reasoning("hmm\n</think>\n\nParis."), "Paris.");
+        assert_eq!(strip_reasoning("Paris."), "Paris.");
+        assert_eq!(strip_reasoning("<think>\nstill going"), "");
+    }
+
+    #[test]
+    fn thinking_prefix_follows_the_template() {
+        // Qwen3.8's template, abridged: the prompt itself opens the block.
+        let opens = Thinking::from_template(
+            "{%- if enable_thinking is defined and enable_thinking is false %}\
+             {{- '<think>\\n\\n</think>\\n\\n' }}{%- else %}{{- '<think>\\n' }}{%- endif %}");
+        assert_eq!(opens.generation_prefix(true), ("<think>\n", "<think>\n"));
+        assert_eq!(opens.generation_prefix(false), ("<think>\n\n</think>\n\n", ""));
+
+        // Qwen3's: only the disabled case writes anything.
+        let qwen3 = Thinking::from_template(
+            "{%- if enable_thinking is defined and enable_thinking is false %}\
+             {{- '<think>\\n\\n</think>\\n\\n' }}{%- endif %}");
+        assert_eq!(qwen3.generation_prefix(true), ("", ""));
+        assert_eq!(qwen3.generation_prefix(false), ("<think>\n\n</think>\n\n", ""));
+
+        // A model without reasoning is left alone either way.
+        let plain = Thinking::from_template("{{ messages }}");
+        assert_eq!(plain.generation_prefix(false), ("", ""));
     }
 
     /// A stream that ended on the model's own end-of-generation token used to

@@ -2,6 +2,8 @@
 
 pub mod config;
 pub mod error;
+mod expert_cache;
+mod expert_reader;
 pub mod loader;
 pub mod model;
 pub mod plan;

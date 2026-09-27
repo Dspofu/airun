@@ -1,4 +1,4 @@
-﻿//! VRAM planning: deciding what goes on which GPU before anything is allocated.
+//! VRAM planning: deciding what goes on which GPU before anything is allocated.
 //!
 //! The plan is computed from exact tensor sizes read out of the GGUF header, not
 //! from an estimate, so a plan that says it fits does fit. Everything the planner
@@ -267,6 +267,8 @@ pub fn scratch_bytes(cfg: &Config, batch: usize, hosts_output: bool) -> u64 {
         total += cfg.vocab_size as u64 * f32_size;
     }
     total += b * 4; // position ids
+    // Bound split-attention scratch at its maximum, including long contexts.
+    total += (cfg.n_head * 128 * (cfg.head_dim + 2) * 4) as u64;
 
     total + total / 4
 }
@@ -624,6 +626,7 @@ mod tests {
             full_attention_interval: 0,
             attn_output_gate: false,
             ffn_norm_name: "ffn_norm",
+            kv_type: Default::default(),
         }
     }
 

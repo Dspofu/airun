@@ -145,6 +145,20 @@ impl<T: Copy> DeviceBuffer<T> {
         })
     }
 
+    /// Queues a bounded upload into a subrange. Keep the source alive and
+    /// unchanged until stream completion, as with `copy_from_host`.
+    pub fn copy_from_host_at(&self, offset: usize, data: &[T], stream: &Stream) -> Result<()> {
+        if offset > self.len || data.len() > self.len - offset {
+            return Err(CudaError::Runtime { code: -1, name: "AIRUN_COPY_TOO_LARGE".into(),
+                message: "upload exceeds buffer bounds; reduce the upload or enlarge the buffer".into() });
+        }
+        if data.is_empty() { return Ok(()); }
+        // SAFETY: destination range is checked above; caller retains the source
+        // through stream completion, matching the other asynchronous copies.
+        ffi::check(unsafe { ffi::airun_memcpy_h2d(self.offset_ptr(offset),
+            data.as_ptr().cast(), std::mem::size_of_val(data) as u64, stream.raw()) })
+    }
+
     /// Copies the whole buffer back to the host, synchronizing before returning.
     pub fn to_vec(&self, stream: &Stream) -> Result<Vec<T>>
     where

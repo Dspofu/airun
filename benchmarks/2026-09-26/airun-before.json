@@ -1,0 +1,84 @@
+{
+  "architecture": "qwen3",
+  "ctx": 4096,
+  "gpus": [
+    0
+  ],
+  "model": "E:\\models\\imagem\\Qwen3-4B-Q8_0.gguf",
+  "parameters_summary": "Qwen3-4B (qwen3) - 36 layers, 2560 embd, 32 heads (8 kv, GQA 4x), head_dim 128, ffn 9728, vocab 151936, tied embeddings, q/k norm",
+  "results": [
+    {
+      "label": "prefill 128",
+      "max_tps": 511.766225188334,
+      "median_tps": 509.5904525043783,
+      "min_tps": 506.18794995857564,
+      "samples_ms": [
+        252.8705,
+        250.1142,
+        251.18210000000002
+      ],
+      "tokens": 128
+    },
+    {
+      "label": "prefill 512",
+      "max_tps": 664.9276384705313,
+      "median_tps": 663.8199336569023,
+      "min_tps": 662.0815793128472,
+      "samples_ms": [
+        773.3186,
+        770.0086,
+        771.2935
+      ],
+      "tokens": 512
+    },
+    {
+      "label": "decode 128 @ 16",
+      "max_tps": 53.54399325077965,
+      "median_tps": 53.37451622047378,
+      "min_tps": 53.188083326279674,
+      "samples_ms": [
+        2390.5576,
+        2398.1482,
+        2406.5541000000003
+      ],
+      "tokens": 128
+    },
+    {
+      "label": "decode 128 @ 512",
+      "max_tps": 50.81996020638304,
+      "median_tps": 50.64612386023964,
+      "min_tps": 50.59735914199212,
+      "samples_ms": [
+        2518.6954,
+        2529.7763,
+        2527.3405000000002
+      ],
+      "tokens": 128
+    },
+    {
+      "label": "decode 128 @ 2048",
+      "max_tps": 43.42416503896725,
+      "median_tps": 43.35275435120249,
+      "min_tps": 42.32149956975897,
+      "samples_ms": [
+        3024.4675,
+        2947.6675,
+        2952.5229
+      ],
+      "tokens": 128
+    },
+    {
+      "label": "decode 128 @ 3072",
+      "max_tps": 39.266035581715734,
+      "median_tps": 38.88770824861459,
+      "min_tps": 38.233333253680556,
+      "samples_ms": [
+        3259.8147000000004,
+        3347.864,
+        3291.5285
+      ],
+      "tokens": 128
+    }
+  ],
+  "weight_bytes": 4273664000
+}

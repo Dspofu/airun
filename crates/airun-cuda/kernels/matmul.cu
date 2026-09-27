@@ -1,4 +1,4 @@
-﻿// Quantized matrix-vector / matrix-matrix products.
+// Quantized matrix-vector / matrix-matrix products.
 //
 // Decode (one token) is memory bound: the weights are read once and every byte
 // fetched is used exactly once, so the win comes from reading the packed form
@@ -17,8 +17,10 @@
 // outputs. Change the defines, never the instantiations, and hold perplexity
 // constant across any kernel experiment.
 
+#include <cmath>
 #include "dequant.cuh"
 #include "vecdotq.cuh"
+#include "mmq.cuh"
 
 #define ROWS_PER_BLOCK 4
 
@@ -52,17 +54,17 @@
 //
 // Each row still accumulates its groups in the same order as before, so the
 // result is bit-identical to the one-row-per-warp version.
+// ROWS_PER_WARP rows starting at row0 of one matrix, for one token: the body of
+// the decode kernels below.
 template <int TYPE>
-__global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_kernel(
+__device__ __forceinline__ void matvec_rows(
     const uint8_t* __restrict__ w,
     const float* __restrict__ x,
     float* __restrict__ y,
     const int K,
+    const int row0,
     const int n_rows,
     const size_t row_bytes) {
-
-    const int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.y) * ROWS_PER_WARP;
-    if (row0 >= n_rows) return;
 
     // Warp-uniform: derived from blockIdx and threadIdx.y only, so the loops
     // below exit together and warp_reduce_sum always sees a full warp.
@@ -74,6 +76,16 @@ __global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_kernel(
     for (int r = 0; r < ROWS_PER_WARP; ++r) acc[r] = 0.0f;
 
     for (int g = threadIdx.x; g < groups; g += 32) {
+        // Q8_0: every row's bytes are requested before any is used; left to
+        // itself the compiler held rows 2 and 3 back until rows 0 and 1 were
+        // done.
+        q8_0_raw raw[ROWS_PER_WARP];
+        if constexpr (TYPE == AIRUN_TYPE_Q8_0) {
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_WARP; ++r) {
+                q8_0_load(w + (size_t)(row0 + min(r, n_row - 1)) * row_bytes, g, raw[r]);
+            }
+        }
         // 32 floats == 8 float4 loads; x is 16-byte aligned at every group.
         float xv[32];
         const float4* xg = (const float4*)x + g * 8;
@@ -86,11 +98,19 @@ __global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_kernel(
             xv[i * 4 + 3] = v.w;
         }
 
+        // No early exit for a short last warp: rows past the end re-read the
+        // last row and their sums are dropped below. A `break` here made every
+        // row's loads wait for the previous row's arithmetic -- one row in
+        // flight per warp, and ncu put nearly all stall samples on the first
+        // use of each load. Branch-free, the loads of all rows go out together.
 #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
-            if (r >= n_row) break;
             float vals[32];
-            decode_group<TYPE>(w + (size_t)(row0 + r) * row_bytes, g, vals);
+            if constexpr (TYPE == AIRUN_TYPE_Q8_0) {
+                q8_0_decode(raw[r], vals);
+            } else {
+                decode_group<TYPE>(w + (size_t)(row0 + min(r, n_row - 1)) * row_bytes, g, vals);
+            }
 #pragma unroll
             for (int i = 0; i < 32; ++i) acc[r] = fmaf(vals[i], xv[i], acc[r]);
         }
@@ -106,6 +126,115 @@ __global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_kernel(
     }
 }
 
+template <int TYPE>
+__global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const size_t row_bytes) {
+
+    const int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.y) * ROWS_PER_WARP;
+    if (row0 >= n_rows) return;
+    matvec_rows<TYPE>(w, x, y, K, row0, n_rows, row_bytes);
+}
+
+// Decode FFN: gate and up rows against the same x, SwiGLU applied on the way
+// out -- y = silu(gate x) * (up x) -- in one launch, as llama.cpp's fused
+// mul_mat_vec_q does. Each warp carries the same R rows of both matrices, so
+// every x slice it loads serves 2R rows. Measured on Qwen3-4B: 178 us for gate
+// and up as two launches, against 163 us in llama.cpp's; Q8_0's explicit
+// load-then-decode (below) took it from 128 registers to 80 and from 170 to
+// 161 us, llama.cpp's 159.
+template <int TYPE, int R>
+__global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_glu_kernel(
+    const uint8_t* __restrict__ wg,
+    const uint8_t* __restrict__ wu,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const size_t row_bytes) {
+
+    const int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.y) * R;
+    if (row0 >= n_rows) return;
+    const int n_row = min(R, n_rows - row0);
+    const int groups = K / 32;
+
+    float ag[R], au[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) ag[r] = au[r] = 0.0f;
+
+    for (int g = threadIdx.x; g < groups; g += 32) {
+        q8_0_raw rg[R], ru[R];
+        if constexpr (TYPE == AIRUN_TYPE_Q8_0) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const size_t off = (size_t)(row0 + min(r, n_row - 1)) * row_bytes;
+                q8_0_load(wg + off, g, rg[r]);
+                q8_0_load(wu + off, g, ru[r]);
+            }
+        }
+        float xv[32];
+        const float4* xg = (const float4*)x + g * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float4 v = xg[i];
+            xv[i * 4 + 0] = v.x;
+            xv[i * 4 + 1] = v.y;
+            xv[i * 4 + 2] = v.z;
+            xv[i * 4 + 3] = v.w;
+        }
+        // Branch-free for the reason in matvec_rows.
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const size_t off = (size_t)(row0 + min(r, n_row - 1)) * row_bytes;
+            float vals[32];
+            if constexpr (TYPE == AIRUN_TYPE_Q8_0) q8_0_decode(rg[r], vals);
+            else decode_group<TYPE>(wg + off, g, vals);
+#pragma unroll
+            for (int i = 0; i < 32; ++i) ag[r] = fmaf(vals[i], xv[i], ag[r]);
+            if constexpr (TYPE == AIRUN_TYPE_Q8_0) q8_0_decode(ru[r], vals);
+            else decode_group<TYPE>(wu + off, g, vals);
+#pragma unroll
+            for (int i = 0; i < 32; ++i) au[r] = fmaf(vals[i], xv[i], au[r]);
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (r >= n_row) break;
+        const float g = warp_reduce_sum(ag[r]);
+        const float u = warp_reduce_sum(au[r]);
+        // Same accumulation order as matvec_kernel and the same SwiGLU as
+        // swiglu_kernel, so decode stays bit-identical to the unfused path.
+        if (threadIdx.x == 0) y[row0 + r] = (g / (1.0f + __expf(-g))) * u;
+    }
+}
+// Three matrices against the same x in one launch: the q, k and v projections
+// of a decode step. On their own k and v (1024 rows on Qwen3-4B) are 64-block
+// grids that kept DRAM at half its bandwidth -- 15.6 us each where the bytes
+// justify 8 -- and q at 71%. As one 6144-row grid they stream like the big FFN
+// matrices. Each warp's rows lie in one matrix: the boundaries are multiples of
+// ROWS_PER_WARP, which dispatch checks.
+template <int TYPE>
+__global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec3_kernel(
+    const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1, const uint8_t* __restrict__ w2,
+    const float* __restrict__ x,
+    float* __restrict__ y0, float* __restrict__ y1, float* __restrict__ y2,
+    const int K, const int n0, const int n1, const int n2,
+    const size_t row_bytes) {
+
+    int row = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.y) * ROWS_PER_WARP;
+    if (row < n0) {
+        matvec_rows<TYPE>(w0, x, y0, K, row, n0, row_bytes);
+    } else if ((row -= n0) < n1) {
+        matvec_rows<TYPE>(w1, x, y1, K, row, n1, row_bytes);
+    } else if ((row -= n1) < n2) {
+        matvec_rows<TYPE>(w2, x, y2, K, row, n2, row_bytes);
+    }
+}
 // One block per output row, for decode against matrices too narrow to fill
 // the GPU with row parallelism. The 9B's 32-row alpha/beta projections ran on
 // a 2-block grid through the warp-per-rows kernel -- 36us each at essentially
@@ -403,45 +532,35 @@ __global__ __launch_bounds__(32 * TR / 16) void matvec_wmma_kernel(
 
 // f32 -> block_q8a, one thread per 32-element group. Memory bound and tiny
 // next to any matvec that consumes it.
+// One warp per group, a lane per element: loads and stores are coalesced and
+// the max and sum are shuffles. A thread per group (the previous form) had the
+// lanes of a warp 128 bytes apart and took 26 ms of a 512-token Qwen3-4B
+// prefill for ~1.3 GB of traffic. Same arithmetic as before, so the CPU mirror
+// in selftest is unchanged.
 __global__ void quantize_q8a_kernel(
     const float* __restrict__ x,
     block_q8a* __restrict__ out,
     const int64_t n_groups) {
 
-    const int64_t g = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (g >= n_groups) return;
+    const int64_t g = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (g >= n_groups) return;   // g is warp-uniform
 
-    float v[32];
-    const float4* xg = (const float4*)x + g * 8;
+    const float v = x[g * 32 + lane];
+    float amax = fabsf(v);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const float4 f = xg[i];
-        v[i * 4 + 0] = f.x;
-        v[i * 4 + 1] = f.y;
-        v[i * 4 + 2] = f.z;
-        v[i * 4 + 3] = f.w;
-    }
-
-    float amax = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(v[i]));
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
 
     const float d  = amax / 127.0f;
     const float id = d > 0.0f ? 1.0f / d : 0.0f;
-
-    int sum = 0;
-    int8_t q[32];
+    // Round-to-nearest-even, mirrored by round_ties_even in the CPU check.
+    const int qi = __float2int_rn(v * id);
+    int sum = qi;
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        // Round-to-nearest-even, mirrored by round_ties_even in the CPU check.
-        const int qi = __float2int_rn(v[i] * id);
-        q[i] = (int8_t)qi;
-        sum += qi;
-    }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
 
-#pragma unroll
-    for (int i = 0; i < 32; ++i) out[g].qs[i] = q[i];
-    out[g].ds = __floats2half2_rn(d, d * (float)sum);
+    out[g].qs[lane] = (int8_t)qi;
+    if (lane == 0) out[g].ds = __floats2half2_rn(d, d * (float)sum);
 }
 
 // Decode: same warp layout as matvec_kernel, integer dots instead of FMAs.
@@ -595,10 +714,342 @@ static bool airun_force_no_wmma() {
     return cached == 1;
 }
 
-extern "C" {
+// Smallest batch the integer tensor-core kernel takes; below it the dp4a tiles
+// win because an MMQ tile of 64 tokens would be mostly padding.
+#define MMQ_MIN_TOKENS 32
 
-// cudaErrorInvalidValue, returned for a type this build has no kernel for.
-#define AIRUN_ERR_BAD_TYPE 1
+// 1 when the current device runs matvec_mmq_kernel: m16n8k32 integer MMA is
+// sm_80+. AIRUN_NO_MMQ=1 turns it off to measure it against the fp16 path.
+extern "C" int32_t airun_mmq_supported() {
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char* v = getenv("AIRUN_NO_MMQ");
+        disabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (disabled) return 0;
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return 0;
+    return major >= 8 ? 1 : 0;
+}
+
+// AIRUN_NO_MMQ_ASYNC=1 keeps every type on the synchronous MMQ kernel.
+static bool mmq_async_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_MMQ_ASYNC");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// The cp.async kernel needs whole, aligned chunks; anything else (Q6_K's
+// 210-byte blocks, a K that is not a multiple of 128) takes the synchronous one.
+// Split-K: how many K slices to cut the grid into, from how well the plain grid
+// fills the GPU. `per_sm` blocks fit an SM at once, so the grid runs in waves of
+// SMs * per_sm; a 16-block grid on 28 SMs leaves 12 idle, and 40 blocks run as
+// a full wave plus a 12-block one. Splitting multiplies the blocks; each extra
+// split costs a partial write and a read in the reduction, priced here at 10%.
+// AIRUN_NO_MMQ_SPLIT=1 turns it off.
+// A 128-token Qwen3-4B prefill measured 46 ms of MMQ without this, llama.cpp's
+// stream-k 30 ms.
+// SMs of the current device; per device, as the two cards of a split differ.
+static int mmq_sm_count() {
+    static int sms[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) dev = 0;
+    if (sms[dev] == 0) {
+        int n = 0;
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        sms[dev] = n > 0 ? n : 1;
+    }
+    return sms[dev];
+}
+
+static int mmq_splits(int blocks, int per_sm, int chunks) {
+    const int sms = mmq_sm_count();
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char* v = getenv("AIRUN_NO_MMQ_SPLIT");
+        disabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    const double slots = (double)sms * per_sm;
+    const double waves1 = blocks / slots;
+    // Splitting every grid measured slower: a split halves each block's K
+    // loop (more pipeline fill per MAC) and adds the reduction. Only grids
+    // that fill the GPU badly are worth it.
+    // 0.80: the 64-block k/v grids of a Qwen3-4B 512-token prefill (76%) do
+    // split; at 0.75 they did not and ran 34% behind llama.cpp's stream-k.
+    if (disabled || waves1 / std::ceil(waves1) >= 0.80) return 1;
+    int best = 1;
+    double best_score = 0.0;
+    for (int s = 1; s <= 4 && chunks / s >= 2; ++s) {
+        const double waves = blocks * s / slots;
+        const double eff = waves / std::ceil(waves) - 0.10 * (s - 1);
+        if (eff > best_score + 1e-9) { best_score = eff; best = s; }
+    }
+    return best;
+}
+
+// Per-device scratch for the split partials, grown on demand. Prefill is never
+// captured into a CUDA graph (decode is), so allocating here is allowed.
+static float* mmq_scratch(size_t floats) {
+    static float* buf[16] = {};
+    static size_t cap[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return nullptr;
+    if (cap[dev] < floats) {
+        if (buf[dev]) cudaFree(buf[dev]);
+        buf[dev] = nullptr;
+        cap[dev] = 0;
+        if (cudaMalloc(&buf[dev], floats * sizeof(float)) != cudaSuccess) return nullptr;
+        cap[dev] = floats;
+    }
+    return buf[dev];
+}
+
+// AIRUN_NO_MMQ_STREAMK=1 leaves the asynchronous kernel on whole-tile grids
+// (with split-K where they fill the GPU badly).
+static bool mmq_streamk_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_MMQ_STREAMK");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Plans a stream-K launch of `kernel` over `tiles` tiles (see MmqStreamK):
+// whole waves as whole tiles, the leftover tiles shared by one wave of blocks.
+// False when the tiles already make whole waves, or the launch cannot use it:
+// a stream being captured into a graph would freeze the flag epoch into it.
+static bool mmq_streamk_plan(const void* kernel, size_t smem, int tiles, int tok_tiles,
+                             size_t slot_floats, cudaStream_t stream, MmqStreamK& sk) {
+    if (mmq_streamk_disabled()) return false;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return false;
+    int per_sm = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, 256, smem) != cudaSuccess ||
+        per_sm < 1) {
+        return false;
+    }
+    // At most one resident wave of stream-K blocks: a head spins until the
+    // tails after it have run, so they must be able to be on the GPU at once.
+    const int wave = mmq_sm_count() * per_sm;
+    const int rest = tiles % wave;
+    if (rest == 0) return false;
+
+    static float* slots[16] = {};
+    static size_t slots_cap[16] = {};
+    static unsigned* flags[16] = {};
+    static int flags_cap[16] = {};
+    static unsigned epoch[16] = {};
+    const size_t need = (size_t)wave * slot_floats;
+    if (slots_cap[dev] < need) {
+        if (slots[dev]) cudaFree(slots[dev]);
+        slots[dev] = nullptr;
+        slots_cap[dev] = 0;
+        if (cudaMalloc(&slots[dev], need * sizeof(float)) != cudaSuccess) return false;
+        slots_cap[dev] = need;
+    }
+    if (flags_cap[dev] < wave) {
+        if (flags[dev]) cudaFree(flags[dev]);
+        flags[dev] = nullptr;
+        flags_cap[dev] = 0;
+        if (cudaMalloc(&flags[dev], wave * sizeof(unsigned)) != cudaSuccess) return false;
+        // Synchronous, so no launch sees the buffer before it is zeroed.
+        if (cudaMemset(flags[dev], 0, wave * sizeof(unsigned)) != cudaSuccess) return false;
+        flags_cap[dev] = wave;
+    }
+    if (++epoch[dev] == 0) epoch[dev] = 1;   // 0 is what a fresh flag holds
+    sk.tiles = tiles;
+    sk.dp = tiles - rest;
+    sk.sk = wave;
+    sk.tok_tiles = tok_tiles;
+    sk.epoch = epoch[dev];
+    sk.slots = slots[dev];
+    sk.flags = flags[dev];
+    return true;
+}
+
+// The cp.async kernel needs whole, aligned chunks; anything else (Q6_K's
+// 210-byte blocks, a K that is not a multiple of 128) takes the synchronous one.
+template <int TYPE, int TC>
+static void launch_mmq_tc(const void* w, const void* xq, void* y, int k, int n_rows,
+                          int n_tokens, uint64_t row_bytes, cudaStream_t stream) {
+    bool async = false;
+    if constexpr (mmq_async<TYPE>::OK) {
+        async = row_bytes % 16 == 0 && (uintptr_t)w % 16 == 0 && (uintptr_t)xq % 16 == 0 &&
+                (k / 32) % mmq_async<TYPE>::GROUP_MULTIPLE == 0 && !mmq_async_disabled();
+    }
+    const int tok_tiles = (n_tokens + TC - 1) / TC;
+    const int tiles = tok_tiles * ((n_rows + MMQ_TR - 1) / MMQ_TR);
+    const int chunks = (k / 32 + MMQ_KG - 1) / MMQ_KG;
+    if constexpr (mmq_async<TYPE>::OK) {
+        if (async) {
+            constexpr size_t smem = mmq_async_smem<TYPE, TC>();
+            const void* kernel = (const void*)matvec_mmq_async_kernel<TYPE, TC>;
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            MmqStreamK sk = {};
+            if (mmq_streamk_plan(kernel, smem, tiles, tok_tiles, (size_t)MMQ_TR * TC, stream, sk)) {
+                matvec_mmq_async_kernel<TYPE, TC><<<sk.dp + sk.sk, 256, smem, stream>>>(
+                    (const uint8_t*)w, nullptr, (const block_q8a*)xq, (float*)y, nullptr, k,
+                    n_rows, n_tokens, (size_t)row_bytes, sk);
+                return;
+            }
+        }
+    }
+    int splits = mmq_splits(tiles, async ? 1 : 2, chunks);
+    float* partial = nullptr;
+    if (splits > 1) {
+        partial = mmq_scratch((size_t)splits * n_rows * n_tokens);
+        if (!partial) splits = 1;
+    }
+    const dim3 grid(tok_tiles, (n_rows + MMQ_TR - 1) / MMQ_TR, splits);
+    if constexpr (mmq_async<TYPE>::OK) {
+        if (async) {
+            constexpr size_t smem = mmq_async_smem<TYPE, TC>();
+            matvec_mmq_async_kernel<TYPE, TC><<<grid, 256, smem, stream>>>(
+                (const uint8_t*)w, nullptr, (const block_q8a*)xq, (float*)y, partial, k, n_rows,
+                n_tokens, (size_t)row_bytes, MmqStreamK{});
+        }
+    }
+    if (!async) {
+        constexpr int smem = mmq_sync_smem<TC>();
+        cudaFuncSetAttribute(matvec_mmq_kernel<TYPE, TC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        matvec_mmq_kernel<TYPE, TC><<<grid, 256, smem, stream>>>(
+            (const uint8_t*)w, (const block_q8a*)xq, (float*)y, partial, k, n_rows, n_tokens,
+            (size_t)row_bytes);
+    }
+    if (splits > 1) {
+        const int64_t n = (int64_t)n_rows * n_tokens;
+        mmq_reduce_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>((float*)y, partial, n,
+                                                                             splits);
+    }
+}
+// 128-token tiles from 128 tokens up: a wider tile does twice the MMAs per
+// staged weight and per barrier; below that it is mostly padding. AIRUN_MMQ_TC=64 or =128 forces one.
+static int mmq_forced_tc() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_MMQ_TC");
+        cached = v ? atoi(v) : 0;
+    }
+    return cached;
+}
+template <int TYPE>
+static void launch_mmq(const void* w, const void* xq, void* y, int k, int n_rows,
+                       int n_tokens, uint64_t row_bytes, cudaStream_t stream) {
+    // 99 KiB is the per-block opt-in on sm_86/89/120. Q5_K's 176-byte
+    // superblocks make the 128-token asynchronous tile 106 KiB: it stays at 64.
+    constexpr bool wide_fits = !mmq_async<TYPE>::OK || mmq_async_smem<TYPE, 128>() <= 99 * 1024;
+    const int forced = mmq_forced_tc();
+    // Measured on Qwen3-4B (best of 3): at 128 tokens the wide tile wins 13%
+    // even as a single token tile (split-K fills the grid), ties at 192 and
+    // loses 25% at 64.
+    const bool wide = forced ? forced == 128 : n_tokens >= 128;
+    if (wide_fits && wide) {
+        launch_mmq_tc<TYPE, 128>(w, xq, y, k, n_rows, n_tokens, row_bytes, stream);
+    } else {
+        launch_mmq_tc<TYPE, 64>(w, xq, y, k, n_rows, n_tokens, row_bytes, stream);
+    }
+}
+#ifndef AIRUN_ERR_BAD_TYPE
+#define AIRUN_ERR_BAD_TYPE 1   // cudaErrorInvalidValue
+#endif
+
+// Gate and up projections plus SwiGLU in one launch (see matvec_mmq_async_kernel):
+// y = silu(w_gate x) * (w_up x). Only where the asynchronous MMQ kernel runs;
+// airun_mmq_glu_supported says whether this call qualifies, and the caller
+// keeps the separate path otherwise.
+template <int TYPE, int TC>
+static void launch_mmq_glu_tc(const void* wg, const void* wu, const void* xq, void* y, int k,
+                              int n_rows, int n_tokens, uint64_t row_bytes, cudaStream_t stream) {
+    const int tok_tiles = (n_tokens + TC - 1) / TC;
+    const int row_tiles = (n_rows + MMQ_TR / 2 - 1) / (MMQ_TR / 2);
+    constexpr size_t smem = mmq_async_smem<TYPE, TC>();
+    const void* kernel = (const void*)matvec_mmq_async_kernel<TYPE, TC, true>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    // SwiGLU is not linear, so gate/up cannot split K into partial outputs; the
+    // stream-K slots carry the raw gate and up sums, and the epilogue runs once
+    // the head block has all of them.
+    MmqStreamK sk = {};
+    const bool streamk = mmq_streamk_plan(kernel, smem, tok_tiles * row_tiles, tok_tiles,
+                                          (size_t)MMQ_TR * TC, stream, sk);
+    const dim3 grid = streamk ? dim3(sk.dp + sk.sk) : dim3(tok_tiles, row_tiles);
+    matvec_mmq_async_kernel<TYPE, TC, true><<<grid, 256, smem, stream>>>(
+        (const uint8_t*)wg, (const uint8_t*)wu, (const block_q8a*)xq, (float*)y, nullptr, k,
+        n_rows, n_tokens, (size_t)row_bytes, sk);
+}
+
+template <int TYPE>
+static bool mmq_glu_ok(const void* wg, const void* wu, const void* xq, int k, uint64_t row_bytes,
+                       int n_tokens) {
+    if constexpr (!mmq_async<TYPE>::OK) {
+        return false;
+    } else {
+        return n_tokens >= MMQ_MIN_TOKENS && airun_mmq_supported() && !mmq_async_disabled() &&
+               row_bytes % 16 == 0 && (uintptr_t)wg % 16 == 0 && (uintptr_t)wu % 16 == 0 &&
+               (uintptr_t)xq % 16 == 0 && (k / 32) % mmq_async<TYPE>::GROUP_MULTIPLE == 0;
+    }
+}
+
+// AIRUN_NO_MMQ_GLU=1 keeps gate, up and SwiGLU as three launches.
+static bool mmq_glu_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_MMQ_GLU");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+extern "C" int32_t airun_mmq_glu_supported(int32_t type_id, const void* wg, const void* wu,
+                                           const void* xq, int32_t k, uint64_t row_bytes,
+                                           int32_t n_tokens) {
+    if (mmq_glu_disabled() || k % 32 != 0) return 0;
+    switch (type_id) {
+#define GLU_CASE(TYPE) case TYPE: return mmq_glu_ok<TYPE>(wg, wu, xq, k, row_bytes, n_tokens) ? 1 : 0;
+        AIRUN_FOR_EACH_Q8_TYPE(GLU_CASE)
+#undef GLU_CASE
+        default: return 0;
+    }
+}
+
+extern "C" airun_status airun_matvec_q8_glu(
+    int32_t type_id, const void* wg, const void* wu, const void* xq, void* y,
+    int32_t k, int32_t n_rows, int32_t n_tokens, uint64_t row_bytes, cudaStream_t stream) {
+    if (!airun_mmq_glu_supported(type_id, wg, wu, xq, k, row_bytes, n_tokens)) return AIRUN_ERR_BAD_TYPE;
+    const int forced = mmq_forced_tc();
+    const bool wide = forced ? forced == 128 : n_tokens >= 128;
+    switch (type_id) {
+#define GLU_LAUNCH(TYPE)                                                                         \
+    case TYPE: {                                                                                 \
+        constexpr bool fits = mmq_async<TYPE>::OK && mmq_async_smem<TYPE, 128>() <= 99 * 1024;  \
+        if (fits && wide) launch_mmq_glu_tc<TYPE, 128>(wg, wu, xq, y, k, n_rows, n_tokens, row_bytes, stream); \
+        else launch_mmq_glu_tc<TYPE, 64>(wg, wu, xq, y, k, n_rows, n_tokens, row_bytes, stream); \
+        break;                                                                                   \
+    }
+        GLU_LAUNCH(AIRUN_TYPE_Q8_0)
+        GLU_LAUNCH(AIRUN_TYPE_Q4_K)
+        GLU_LAUNCH(AIRUN_TYPE_Q5_K)
+#undef GLU_LAUNCH
+        default: return AIRUN_ERR_BAD_TYPE;
+    }
+    AIRUN_CHECK_LAUNCH();
+}
+extern "C" {
+// cudaErrorInvalidValue, returned for a type this build has no kernel for;
+// defined above, where the gate/up entry point first needs it.
 
 airun_status airun_matvec(
     int32_t type_id,
@@ -704,6 +1155,62 @@ airun_status airun_matvec(
     AIRUN_CHECK_LAUNCH();
 }
 
+// Decode (one token): y = silu(w_gate x) * (w_up x). Same type and shape.
+airun_status airun_matvec_glu(
+    int32_t type_id, const void* wg, const void* wu, const void* x, void* y,
+    int32_t k, int32_t n_rows, uint64_t row_bytes, cudaStream_t stream) {
+
+    if (k % 32 != 0) return AIRUN_ERR_BAD_TYPE;
+    if (n_rows <= 0) return AIRUN_OK;
+    // Rows per warp: 2 and 4 measured the same on Qwen3-4B (93% of DRAM peak
+    // under ncu); 1 fell to 85%, the x loads no longer amortized.
+    constexpr int R = ROWS_PER_WARP;
+    const dim3 block(32, ROWS_PER_BLOCK);
+    const int warps = (n_rows + R - 1) / R;
+    const dim3 grid((warps + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+
+#define LAUNCH(TYPE)                                                             \
+    matvec_glu_kernel<TYPE, R><<<grid, block, 0, stream>>>(                      \
+        (const uint8_t*)wg, (const uint8_t*)wu, (const float*)x, (float*)y,     \
+        k, n_rows, (size_t)row_bytes);
+
+    switch (type_id) {
+        AIRUN_FOR_EACH_TYPE(AIRUN_CASE)
+        default: return AIRUN_ERR_BAD_TYPE;
+    }
+#undef LAUNCH
+    AIRUN_CHECK_LAUNCH();
+}
+// Decode (one token) against three matrices sharing K, type and row size.
+airun_status airun_matvec3(
+    int32_t type_id,
+    const void* w0, const void* w1, const void* w2,
+    const void* x,
+    void* y0, void* y1, void* y2,
+    int32_t k, int32_t n0, int32_t n1, int32_t n2,
+    uint64_t row_bytes,
+    cudaStream_t stream) {
+
+    if (k % 32 != 0 || n0 % ROWS_PER_WARP != 0 || n1 % ROWS_PER_WARP != 0) return AIRUN_ERR_BAD_TYPE;
+    const int rows = n0 + n1 + n2;
+    if (rows <= 0) return AIRUN_OK;
+    const dim3 block(32, ROWS_PER_BLOCK);
+    const int warps = (rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+    const dim3 grid((warps + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+
+#define LAUNCH(TYPE)                                                             \
+    matvec3_kernel<TYPE><<<grid, block, 0, stream>>>(                            \
+        (const uint8_t*)w0, (const uint8_t*)w1, (const uint8_t*)w2,             \
+        (const float*)x, (float*)y0, (float*)y1, (float*)y2, k, n0, n1, n2,     \
+        (size_t)row_bytes);
+
+    switch (type_id) {
+        AIRUN_FOR_EACH_TYPE(AIRUN_CASE)
+        default: return AIRUN_ERR_BAD_TYPE;
+    }
+#undef LAUNCH
+    AIRUN_CHECK_LAUNCH();
+}
 // 1 when airun_matvec_q8 has a kernel for this type. The host uses this to
 // decide whether to quantize the activation at all.
 int32_t airun_matvec_has_q8(int32_t type_id) {
@@ -728,7 +1235,7 @@ airun_status airun_quantize_act(
     if (n_groups == 0) return AIRUN_OK;
 
     const int threads = 256;
-    const int64_t blocks = (n_groups + threads - 1) / threads;
+    const int64_t blocks = (n_groups * 32 + threads - 1) / threads;
     quantize_q8a_kernel<<<(unsigned)blocks, threads, 0, stream>>>(
         (const float*)x, (block_q8a*)out, n_groups);
 
@@ -751,7 +1258,15 @@ airun_status airun_matvec_q8(
 
     const dim3 block(32, ROWS_PER_BLOCK);
 
-    if (n_tokens == 1) {
+    if (n_tokens >= MMQ_MIN_TOKENS && airun_mmq_supported()) {
+#define LAUNCH(TYPE) launch_mmq<TYPE>(w, xq, y, k, n_rows, n_tokens, row_bytes, stream);
+
+        switch (type_id) {
+            AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)
+            default: return AIRUN_ERR_BAD_TYPE;
+        }
+#undef LAUNCH
+    } else if (n_tokens == 1) {
         const int warps = (n_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
         const dim3 grid((warps + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, 1);
 

@@ -39,6 +39,18 @@ pub struct BenchArgs {
     #[arg(short = 'c', long, default_value_t = 4096)]
     pub ctx_size: usize,
 
+    /// Resident experts per layer; stream cache misses from the GGUF without re-quantizing.
+    #[arg(long)]
+    pub expert_cache: Option<usize>,
+
+    /// KV cache format: f16, q8_0 or q4_0.
+    #[arg(long, default_value = "f16", value_parser = crate::run::parse_kv_type)]
+    pub kv_type: airun_cuda::ops::KvType,
+
+    /// Time exactly N forwards with fixed tokens, excluding sampling and EOS stops.
+    #[arg(long)]
+    pub forward_only: bool,
+
     /// Tokens per forward pass during prefill.
     #[arg(short = 'b', long, default_value_t = 512)]
     pub batch_size: usize,
@@ -51,6 +63,17 @@ pub struct BenchArgs {
     #[arg(long, value_delimiter = ',')]
     pub tensor_split: Vec<f32>,
 
+    /// Build prompts from this text instead of a repeated token. MoE models use
+    /// a built-in English passage by default: a repeated token routes to the
+    /// same few experts every step, which makes an expert cache look perfect.
+    #[arg(long)]
+    pub text_file: Option<PathBuf>,
+
+    /// Sampling temperature for the decode tests; 0 is greedy. Greedy decoding
+    /// tends to loop, which again flatters an expert cache.
+    #[arg(long, default_value_t = 0.0)]
+    pub temp: f32,
+
     /// Emit machine-readable JSON.
     #[arg(long)]
     pub json: bool,
@@ -60,6 +83,8 @@ struct Measurement {
     label: String,
     tokens: usize,
     samples: Vec<f64>,
+    /// Expert-cache hit rate over the timed and warm-up runs, on offloaded MoE.
+    hit_rate: Option<f64>,
 }
 
 impl Measurement {
@@ -91,8 +116,14 @@ impl Measurement {
 }
 
 pub fn run(args: BenchArgs) -> Result<()> {
+    anyhow::ensure!(args.runs > 0 && args.batch_size > 0 && args.ctx_size > 0 && args.decode > 0,
+        "runs, batch-size, ctx-size and decode must be positive; pass values greater than zero");
     let mut run_args = RunArgs::bench_defaults(args.model.clone());
     run_args.ctx_size = args.ctx_size;
+    run_args.expert_cache = args.expert_cache;
+    run_args.kv_type = args.kv_type;
+    // A benchmark at a silently reduced context is not the requested test.
+    run_args.no_fallback = true;
     run_args.batch_size = args.batch_size;
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();
@@ -112,12 +143,28 @@ pub fn run(args: BenchArgs) -> Result<()> {
     }
 
     // A fixed repeated token keeps tokenization out of the measurement and makes
-    // every run identical in shape.
+    // every run identical in shape -- fine for dense models, but not for MoE.
     let filler = runtime
         .tokenizer
         .id_of("the")
         .or_else(|| runtime.tokenizer.id_of(" the"))
         .unwrap_or(1);
+    let text = match &args.text_file {
+        Some(p) => Some(std::fs::read_to_string(p)
+            .with_context(|| format!("failed to read {}; check the --text-file path", p.display()))?),
+        None if report.config.moe.is_some() => Some(crate::perplexity::DEFAULT_TEXT.to_string()),
+        None => None,
+    };
+    let source = match &text {
+        Some(t) => runtime.tokenizer.encode(t, false),
+        None => vec![filler],
+    };
+    anyhow::ensure!(!source.is_empty(), "the benchmark text produced no tokens; pass a non-empty --text-file");
+    let prompt_of = |n: usize| -> Vec<u32> { source.iter().copied().cycle().take(n).collect() };
+    let hit_rate = |before: (u64, u64), after: (u64, u64)| -> Option<f64> {
+        let (h, m) = (after.0 - before.0, after.1 - before.1);
+        (h + m > 0).then(|| h as f64 / (h + m) as f64)
+    };
 
     let mut results = Vec::new();
 
@@ -126,8 +173,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
             eprintln!("skipping prefill {n}: it does not fit the {} context", runtime.ctx());
             continue;
         }
-        let prompt = vec![filler; n];
+        let prompt = prompt_of(n);
         let mut samples = Vec::new();
+        let before = runtime.expert_cache_stats();
 
         for i in 0..(args.warmup + args.runs) {
             runtime.reset();
@@ -147,6 +195,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             label: format!("prefill {n}"),
             tokens: n,
             samples,
+            hit_rate: hit_rate(before, runtime.expert_cache_stats()),
         });
     }
 
@@ -162,11 +211,22 @@ pub fn run(args: BenchArgs) -> Result<()> {
             );
             continue;
         }
-        let prompt = vec![filler; depth.max(1)];
+        let prompt = prompt_of(depth.max(1));
         let mut samples = Vec::new();
+        let before = runtime.expert_cache_stats();
         for i in 0..(args.warmup + args.runs) {
             runtime.reset();
-            let mut sampler = Sampler::new(SamplingParams::greedy());
+            if args.forward_only {
+                for chunk in prompt.chunks(args.batch_size) { runtime.forward(chunk)?; }
+                let start = std::time::Instant::now();
+                for _ in 0..args.decode { runtime.forward(&[filler])?; }
+                if i >= args.warmup { samples.push(start.elapsed().as_secs_f64() * 1000.0); }
+                continue;
+            }
+            let mut params = SamplingParams::greedy();
+            params.temperature = args.temp;
+            params.seed = 1 + i as u64;
+            let mut sampler = Sampler::new(params);
             let stats = runtime.generate(&prompt, args.decode, &mut sampler, |_, _| true)?;
             if i >= args.warmup && stats.generated_tokens > 0 {
                 // Normalize to the tokens actually produced; an early stop would
@@ -178,6 +238,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             label: format!("decode {} @ {depth}", args.decode),
             tokens: args.decode,
             samples,
+            hit_rate: hit_rate(before, runtime.expert_cache_stats()),
         });
     }
 
@@ -192,6 +253,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     "min_tps": m.min_tps(),
                     "max_tps": m.max_tps(),
                     "samples_ms": m.samples,
+                    "expert_hit_rate": m.hit_rate,
                 })
             })
             .collect();
@@ -202,6 +264,19 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 "architecture": report.config.arch_name,
                 "parameters_summary": report.config.summary(),
                 "weight_bytes": report.weight_bytes,
+                "load_ms": report.load_ms,
+                "batch": args.batch_size,
+                "expert_cache_slots": args.expert_cache,
+                "kv_type": args.kv_type.name(),
+                "expert_cache_stats": runtime.expert_cache_stats(),
+                "decode_method": if args.forward_only { "fixed_forward" } else if args.temp > 0.0 { "sampled_generate" } else { "greedy_generate" },
+                "temperature": args.temp,
+                "prompt_source": match (&args.text_file, text.is_some()) {
+                    (Some(p), _) => p.display().to_string(),
+                    (None, true) => "built-in passage".to_string(),
+                    (None, false) => "repeated token".to_string(),
+                },
+                "fallbacks": report.fallbacks,
                 "ctx": runtime.ctx(),
                 "gpus": report.placement.devices(),
                 "results": rows,
@@ -210,15 +285,16 @@ pub fn run(args: BenchArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<16} {:>12} {:>12} {:>12}", "test", "median", "min", "max");
-    println!("{:-<56}", "");
+    println!("{:<16} {:>12} {:>12} {:>12} {:>10}", "test", "median", "min", "max", "expert hit");
+    println!("{:-<67}", "");
     for m in &results {
         println!(
-            "{:<16} {:>9.1} t/s {:>9.1} t/s {:>9.1} t/s",
+            "{:<16} {:>9.1} t/s {:>9.1} t/s {:>9.1} t/s {:>10}",
             m.label,
             m.median_tps(),
             m.min_tps(),
-            m.max_tps()
+            m.max_tps(),
+            m.hit_rate.map_or(String::new(), |r| format!("{:.1}%", r * 100.0))
         );
     }
     println!(

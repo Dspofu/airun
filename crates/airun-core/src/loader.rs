@@ -26,6 +26,11 @@ pub struct LoadOptions {
     pub gpus: Vec<i32>,
     pub split: SplitMode,
     pub gpu_layers: Option<usize>,
+    /// Resident slots per MoE tensor; absent keeps all experts on the GPU.
+    pub expert_cache: Option<usize>,
+    /// KV cache storage; quantized formats trade a little accuracy for
+    /// 2x (q8_0) or 3.6x (q4_0) more context per byte.
+    pub kv_type: airun_cuda::ops::KvType,
     pub reserve_bytes: u64,
     /// Allow the loader to shrink context/batch to make the model fit.
     pub allow_fallback: bool,
@@ -39,6 +44,8 @@ impl Default for LoadOptions {
             gpus: Vec::new(),
             split: SplitMode::Auto,
             gpu_layers: None,
+            expert_cache: None,
+            kv_type: Default::default(),
             reserve_bytes: 384 << 20,
             allow_fallback: true,
         }
@@ -63,8 +70,9 @@ pub fn load(
 ) -> Result<(Runtime, LoadReport)> {
     let start = std::time::Instant::now();
 
-    let gguf = GgufFile::open(path)?;
-    let config = Config::from_gguf(&gguf)?;
+    let gguf = std::sync::Arc::new(GgufFile::open(path)?);
+    let mut config = Config::from_gguf(&gguf)?;
+    config.kv_type = opts.kv_type;
 
     if let Architecture::Unsupported(reason) = config.architecture {
         return Err(CoreError::UnsupportedArchitecture {
@@ -74,7 +82,23 @@ pub fn load(
     }
 
     let devices = select_devices(&opts.gpus)?;
-    let sizes = WeightSizes::from_gguf(&gguf, config.n_layers);
+    let mut sizes = WeightSizes::from_gguf(&gguf, config.n_layers);
+    if let Some(slots) = opts.expert_cache {
+        let moe = config.moe.as_ref().ok_or_else(|| CoreError::Other(
+            "--expert-cache requires a MoE model; omit it for dense models".into()))?;
+        if slots < moe.n_experts_used || slots > moe.n_experts {
+            return Err(CoreError::Other(format!(
+                "--expert-cache must be between {} and {}; choose enough slots for every active expert",
+                moe.n_experts_used, moe.n_experts)));
+        }
+        for l in 0..config.n_run_layers() {
+            for kind in ["gate", "up", "down"] {
+                if let Some(t) = gguf.tensor(&format!("blk.{l}.ffn_{kind}_exps.weight")) {
+                    sizes.per_layer[l] -= t.nbytes - t.nbytes / moe.n_experts as u64 * slots as u64;
+                }
+            }
+        }
+    }
 
     // Ladder of retries. Each rung halves the memory the run needs; the first
     // that both plans and allocates wins.
@@ -93,7 +117,7 @@ pub fn load(
             allow_ctx_shrink: opts.allow_fallback,
         };
 
-        let placement = match plan(&config, &sizes, &devices, &req) {
+        let mut placement = match plan(&config, &sizes, &devices, &req) {
             Ok(p) => p,
             Err(e) if opts.allow_fallback && e.is_capacity_error() => {
                 match next_rung(&mut ctx, &mut batch, &mut reserve) {
@@ -106,6 +130,13 @@ pub fn load(
             }
             Err(e) => return Err(e),
         };
+
+        if let Some(slots) = opts.expert_cache {
+            placement.notes.push(format!("MoE expert cache: {slots} slots per layer; misses read from the GGUF, weights unchanged"));
+        }
+        if opts.kv_type != airun_cuda::ops::KvType::F16 {
+            placement.notes.push(format!("KV cache {}", opts.kv_type.name()));
+        }
 
         if placement.ctx != ctx {
             fallbacks.push(format!(
@@ -123,7 +154,7 @@ pub fn load(
             streams.push((shard.device, Stream::new(shard.device)?));
         }
 
-        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, |d, t| {
+        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, opts.expert_cache, |d, t| {
             progress("uploading weights", d, t)
         });
 

@@ -1,0 +1,12 @@
+loading E:\models\imagem\Qwen3-4B-Q8_0.gguf
+building tokenizer: 0/1   Qwen3-4B (qwen3) - 36 layers, 2560 embd, 32 heads (8 kv, GQA 4x), head_dim 128, ffn 9728, vocab 151936, tied embeddings, q/k norm
+memory plan (context 4096 tokens):
+  GPU 0 NVIDIA GeForce RTX 3060    layers 0..35 (36)       +embed +output
+      weights   3.98 GiB  kv 576.00 MiB  scratch  94.52 MiB  =    4.64 GiB of  10.60 GiB budget
+  note: whole model fits on GPU 0 (NVIDIA GeForce RTX 3060), keeping it on one device to avoid cross-GPU transfers
+
+airun serving Qwen3-4B-Q8_0 on http://127.0.0.1:8765
+  web ui:         http://127.0.0.1:8765/
+  authentication: disabled (no --api-key)
+  endpoints: /v1/chat/completions  /v1/completions  /v1/models  /props  /health
+  prompt 20 tok (0 cached, 20 new)  prefill 113 ms (176.8 tok/s)  decode 40 tok in 613 ms (65.2 tok/s)

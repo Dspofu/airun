@@ -194,9 +194,12 @@ Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, NVFP4.
 **Quantizações — escrita:** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K,
 Q5_K, Q6_K, NVFP4.
 
-**Ainda não:** modelos híbridos SSM/atenção (`qwen35`, `qwen35moe`), MoE,
-multi-modal (`mmproj`). O loader recusa com mensagem explícita em vez de gerar
-lixo. Detalhes e roteiro em [AGENTS.md](AGENTS.md).
+**Híbridos SSM/atenção + MoE** (`qwen35`, `qwen35moe`): suportados. MoE maior
+que a VRAM roda com `--expert-cache N` (experts lidos do GGUF sob demanda) e o
+KV cache pode ser `--kv-type q8_0|q4_0`.
+
+**Ainda não:** multi-modal (`mmproj`). O loader recusa com mensagem explícita em
+vez de gerar lixo. Detalhes e roteiro em [AGENTS.md](AGENTS.md).
 
 ---
 

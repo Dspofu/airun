@@ -177,7 +177,9 @@ __global__ void delta_rule_par_kernel(
     const int vh = blockIdx.x;
     const int dv = threadIdx.x;          // 0..head_v_dim
     const int j  = threadIdx.y;          // 0..DELTA_DK_PAR
-    const int kh = vh / (n_v_heads / n_k_heads);
+    // GGUF repeats the complete K-head axis to reach the V-head count.
+    // Grouping adjacent V heads instead silently selects different Q/K rows.
+    const int kh = vh % n_k_heads;
 
     const int slice = head_k_dim / DELTA_DK_PAR;
     const int dk0 = j * slice;
@@ -266,7 +268,7 @@ __global__ void delta_rule_kernel(
     if (vh >= n_v_heads) return;
 
     // Value heads outnumber key heads; several v-heads share one k/q vector.
-    const int kh = vh / (n_v_heads / n_k_heads);
+    const int kh = vh % n_k_heads;
     const int dv = threadIdx.x;
     if (dv >= head_v_dim) return;
 

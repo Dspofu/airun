@@ -20,7 +20,7 @@ use crate::run::RunArgs;
 
 /// Ordinary English, no rare words and no formatting: a model that predicts this
 /// badly is broken, not merely unfamiliar with the domain.
-const DEFAULT_TEXT: &str = "\
+pub(crate) const DEFAULT_TEXT: &str = "\
 The capital of France is Paris, and the capital of Italy is Rome. Water freezes \
 at zero degrees Celsius and boils at one hundred. The sun rises in the east and \
 sets in the west. A year has twelve months, and most of them have thirty or \
@@ -57,6 +57,14 @@ pub struct PerplexityArgs {
     #[arg(short = 'c', long, default_value_t = 4096)]
     pub ctx_size: usize,
 
+    /// Resident experts per layer; stream cache misses from the GGUF without re-quantizing.
+    #[arg(long)]
+    pub expert_cache: Option<usize>,
+
+    /// KV cache format: f16, q8_0 or q4_0.
+    #[arg(long, default_value = "f16", value_parser = crate::run::parse_kv_type)]
+    pub kv_type: airun_cuda::ops::KvType,
+
     /// CUDA ordinals to use.
     #[arg(long, value_delimiter = ',')]
     pub gpus: Vec<i32>,
@@ -81,6 +89,8 @@ pub fn run(args: PerplexityArgs) -> Result<()> {
 
     let mut run_args = RunArgs::bench_defaults(args.model.clone());
     run_args.ctx_size = args.ctx_size;
+    run_args.expert_cache = args.expert_cache;
+    run_args.kv_type = args.kv_type;
     run_args.batch_size = 1;
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();

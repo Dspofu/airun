@@ -1,0 +1,102 @@
+{
+  "architecture": "qwen3",
+  "batch": 512,
+  "ctx": 4096,
+  "decode_method": "greedy_generate",
+  "expert_cache_slots": null,
+  "expert_cache_stats": [
+    0,
+    0
+  ],
+  "fallbacks": [],
+  "gpus": [
+    0
+  ],
+  "kv_type": "f16",
+  "load_ms": 5927.0369,
+  "model": "E:\\models\\imagem\\Qwen3-4B-Q8_0.gguf",
+  "parameters_summary": "Qwen3-4B (qwen3) - 36 layers, 2560 embd, 32 heads (8 kv, GQA 4x), head_dim 128, ffn 9728, vocab 151936, tied embeddings, q/k norm",
+  "prompt_source": "repeated token",
+  "results": [
+    {
+      "expert_hit_rate": null,
+      "label": "prefill 128",
+      "max_tps": 603.0496408792275,
+      "median_tps": 602.8959731259121,
+      "min_tps": 602.0670655674552,
+      "samples_ms": [
+        212.6009,
+        212.2545,
+        212.30859999999998
+      ],
+      "tokens": 128
+    },
+    {
+      "expert_hit_rate": null,
+      "label": "prefill 512",
+      "max_tps": 799.2417194187015,
+      "median_tps": 799.1096170813425,
+      "min_tps": 797.9829733500181,
+      "samples_ms": [
+        640.6072,
+        640.7131,
+        641.6177
+      ],
+      "tokens": 512
+    },
+    {
+      "expert_hit_rate": null,
+      "label": "decode 128 @ 16",
+      "max_tps": 65.59319978899488,
+      "median_tps": 65.54219808972144,
+      "min_tps": 65.49698936436349,
+      "samples_ms": [
+        1951.4217999999998,
+        1952.9402999999998,
+        1954.2883
+      ],
+      "tokens": 128
+    },
+    {
+      "expert_hit_rate": null,
+      "label": "decode 128 @ 512",
+      "max_tps": 63.19547109656387,
+      "median_tps": 63.170034188806945,
+      "min_tps": 63.1671225391841,
+      "samples_ms": [
+        2025.4615999999999,
+        2026.3706,
+        2026.2772
+      ],
+      "tokens": 128
+    },
+    {
+      "expert_hit_rate": null,
+      "label": "decode 128 @ 2048",
+      "max_tps": 56.977307540893236,
+      "median_tps": 56.970523851533216,
+      "min_tps": 56.95666225415692,
+      "samples_ms": [
+        2246.5084,
+        2246.7758999999996,
+        2247.3226999999997
+      ],
+      "tokens": 128
+    },
+    {
+      "expert_hit_rate": null,
+      "label": "decode 128 @ 3072",
+      "max_tps": 53.38600752742707,
+      "median_tps": 53.374669791142004,
+      "min_tps": 53.35095693277346,
+      "samples_ms": [
+        2398.1413,
+        2399.2072000000003,
+        2397.6319999999996
+      ],
+      "tokens": 128
+    }
+  ],
+  "temperature": 0.0,
+  "weight_bytes": 4273664000
+}

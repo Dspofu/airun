@@ -1,0 +1,13 @@
+user
+The capital of France is
+assistant
+<think>
+The user is asking a simple factual question: "The capital of France is". The answer is Paris. This is straightforward and doesn't require any complex reasoning.
+</think>
+
+The capital of France is **Paris**.
+
+> EOF by user
+
+
+

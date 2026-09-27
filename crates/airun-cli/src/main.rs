@@ -1,4 +1,4 @@
-﻿//! airun -- multi-modal LLM runtime for NVIDIA GPUs.
+//! airun -- multi-modal LLM runtime for NVIDIA GPUs.
 
 mod bench;
 mod convert;

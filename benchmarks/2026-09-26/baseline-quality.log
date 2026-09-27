@@ -1,0 +1,6 @@
+Qwen3-4B (qwen3) - 36 layers, 2560 embd, 32 heads (8 kv, GQA 4x), head_dim 128, ffn 9728, vocab 151936, tied embeddings, q/k norm
+
+159 tokens scored
+  mean loss   2.6688 nats/token
+  perplexity  14.42
+  top-1       53.5% (85/159)

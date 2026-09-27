@@ -131,6 +131,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     println!("\n== matvec ==");
     test_matvec(args.device, &stream, &mut report)?;
     test_matvec_q8(args.device, &stream, &mut report)?;
+    test_mmq_glu(args.device, &stream, &mut report)?;
     test_matvec_batch(args.device, &stream, &mut report)?;
 
     println!("\n== elementwise and norms ==");
@@ -146,6 +147,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_l2norm(args.device, &stream, &mut report)?;
     test_delta_gates(args.device, &stream, &mut report)?;
     test_delta_rule(args.device, &stream, &mut report)?;
+    test_delta_head_broadcast(args.device, &stream, &mut report)?;
     test_rmsnorm_gated(args.device, &stream, &mut report)?;
     test_split_head_gate(args.device, &stream, &mut report)?;
 
@@ -503,10 +505,15 @@ fn quantize_q8a_mirror(x: &[f32]) -> Vec<f32> {
 /// backward-error bound proves the GPU integer path computes the same product
 /// the mirrored quantization defines.
 fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
-    const K: usize = 512;
+    // 3 tokens take the dp4a tiles; 100 take the integer tensor-core kernel on
+    // sm_80+. Neither 96 rows nor 100 tokens fill its 128 x 64 tile, and 544
+    // is 17 groups where it stages 4 at a time, so every edge path runs.
     const N_ROWS: usize = 96;
-    const N_TOKENS: usize = 3;
-
+    // (tokens, odd K): 100 tokens with K = 512 take the cp.async MMQ kernel for
+    // Q8_0/Q4_K/Q5_K; K = 544 (Q8_0 only) is 17 groups, which it cannot chunk,
+    // so the synchronous one runs.
+    // 300 tokens take the 128-token tile, with a partial last tile.
+    for (n_tokens, odd_k) in [(3usize, false), (100, false), (100, true), (300, false)] {
     for &ty in TYPES {
         let kty = ops::KernelType(ty.id() as i32);
         if !ops::matvec_supports_q8(kty) {
@@ -514,6 +521,11 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
         }
         let layout = ty.layout().unwrap();
         let elems = layout.elements as usize;
+        if odd_k && elems != 32 {
+            continue;
+        }
+        let K: usize = if odd_k { 544 } else { 512 };
+        let N_TOKENS = n_tokens;
         let blocks_per_row = K / elems;
         let row_bytes = blocks_per_row * layout.bytes as usize;
 
@@ -582,17 +594,72 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
             }
         }
 
+        let path = if n_tokens >= 32 && ops::mmq_supported() { "mmq" } else { "dp4a" };
         report.case(
-            &format!("matvec_q8 {ty}"),
+            &format!("matvec_q8 {ty}, {n_tokens} tokens, K {K} ({path})"),
             format!(
                 "max_abs {worst_abs:.3e}  error/bound {worst_ulps:.2}x  (activation quantized both sides)"
             ),
             worst_ulps <= 1.0,
         );
     }
+    }
     Ok(())
 }
 
+/// The fused gate/up/SwiGLU MMQ launch against the unfused one: gate and up
+/// through matvec_q8 (itself checked above against the CPU), SwiGLU applied on
+/// the CPU. Same integer products and scaling, so they agree to rounding.
+fn test_mmq_glu(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const K: usize = 512;
+    const N_ROWS: usize = 96; // one full 64-row gate/up tile and a partial one
+    for n_tokens in [100usize, 300] {
+        for &ty in TYPES {
+            let kty = ops::KernelType(ty.id() as i32);
+            if !ops::matvec_supports_q8(kty) {
+                continue;
+            }
+            let layout = ty.layout().unwrap();
+            let row_bytes = K / layout.elements as usize * layout.bytes as usize;
+            let mut rng = Rng::new(0x61_1000 + ty.id() as u64 + n_tokens as u64);
+            let mut gate = Vec::new();
+            let mut up = Vec::new();
+            for _ in 0..N_ROWS {
+                gate.extend_from_slice(&random_blocks(&mut rng, ty, K / layout.elements as usize));
+                up.extend_from_slice(&random_blocks(&mut rng, ty, K / layout.elements as usize));
+            }
+            let x = rng.floats(n_tokens * K);
+            let d_g = DeviceBuffer::<u8>::from_slice(device, &gate, stream)?;
+            let d_u = DeviceBuffer::<u8>::from_slice(device, &up, stream)?;
+            let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+            let d_xq = DeviceBuffer::<u8>::new(device, n_tokens * K / 32 * 36)?;
+            ops::quantize_act(d_x.as_ptr(), d_xq.as_mut_ptr(), n_tokens * K, stream)?;
+            if !ops::mmq_glu_supported(kty, d_g.as_ptr(), d_u.as_ptr(), d_xq.as_ptr(), K, row_bytes, n_tokens) {
+                continue;
+            }
+            let d_yg = DeviceBuffer::<f32>::new(device, n_tokens * N_ROWS)?;
+            let d_yu = DeviceBuffer::<f32>::new(device, n_tokens * N_ROWS)?;
+            let d_y = DeviceBuffer::<f32>::new(device, n_tokens * N_ROWS)?;
+            ops::matvec_q8(kty, d_g.as_ptr(), d_xq.as_ptr(), d_yg.as_mut_ptr(), K, N_ROWS, n_tokens, row_bytes, stream)?;
+            ops::matvec_q8(kty, d_u.as_ptr(), d_xq.as_ptr(), d_yu.as_mut_ptr(), K, N_ROWS, n_tokens, row_bytes, stream)?;
+            ops::matvec_q8_glu(kty, d_g.as_ptr(), d_u.as_ptr(), d_xq.as_ptr(), d_y.as_mut_ptr(), K, N_ROWS, n_tokens, row_bytes, stream)?;
+            let (g, u, y) = (d_yg.to_vec(stream)?, d_yu.to_vec(stream)?, d_y.to_vec(stream)?);
+            // The unfused reference may split K on a grid this small (the fused
+            // launch never does), which sums the groups in another order; with
+            // random weights the dot products cancel heavily, so the error is
+            // measured against the scale of the products, not entry by entry.
+            let scale = g.iter().zip(&u).map(|(a, b)| f64::from((a * b).abs())).fold(1.0, f64::max);
+            let mut worst = 0f64;
+            for i in 0..y.len() {
+                let want = (g[i] / (1.0 + (-g[i]).exp())) * u[i];
+                worst = worst.max(f64::from((y[i] - want).abs()) / scale);
+            }
+            report.case(&format!("mmq gate/up/SwiGLU fused {ty}, {n_tokens} tokens"),
+                format!("max error {worst:.2e} of max |gate*up|, against unfused"), worst <= 1e-5);
+        }
+    }
+    Ok(())
+}
 fn test_rmsnorm(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
     const N: usize = 2048;
     const ROWS: usize = 5;
@@ -871,6 +938,25 @@ fn test_delta_gates(device: i32, stream: &Stream, report: &mut Report) -> Result
     Ok(())
 }
 
+fn test_delta_head_broadcast(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    let mut q = vec![0.0f32; 64]; q[0] = 1.0; q[32] = 2.0;
+    let mut k = vec![0.0f32; 64]; k[0] = 1.0; k[32] = 1.0;
+    let q = DeviceBuffer::from_slice(device, &q, stream)?;
+    let k = DeviceBuffer::from_slice(device, &k, stream)?;
+    let v = DeviceBuffer::from_slice(device, &vec![1.0f32; 128], stream)?;
+    let coeff = DeviceBuffer::from_slice(device, &[1.0f32; 4], stream)?;
+    let state = DeviceBuffer::<f32>::zeroed(device, 4 * 32 * 32, stream)?;
+    let out = DeviceBuffer::<f32>::new(device, 128)?;
+    airun_cuda::hybrid::delta_rule(state.as_mut_ptr(), q.as_ptr(), k.as_ptr(), v.as_ptr(),
+        coeff.as_ptr(), coeff.as_ptr(), out.as_mut_ptr(), 1, 2, 4, 32, 32, stream)?;
+    let got = out.to_vec(stream)?;
+    let expected = [1.0f32, 2.0, 1.0, 2.0];
+    report.case("delta-net GGUF head broadcast [0,1,0,1]",
+        format!("first values {:?}", [got[0], got[32], got[64], got[96]]),
+        got.chunks(32).zip(expected).all(|(row, e)| row.iter().all(|&x| (x-e).abs() < 1e-6)));
+    Ok(())
+}
+
 fn test_delta_rule(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
     const N_TOKENS: usize = 9;
     const N_K_HEADS: usize = 4;
@@ -893,10 +979,10 @@ fn test_delta_rule(device: i32, stream: &Stream, report: &mut Report) -> Result<
     // CPU reference, transcribed from torch_recurrent_gated_delta_rule.
     let mut state = vec![0f64; N_V_HEADS * HEAD_K * HEAD_V];
     let mut cpu = vec![0f32; N_TOKENS * N_V_HEADS * HEAD_V];
-    let groups = N_V_HEADS / N_K_HEADS;
+    // GGUF broadcasts the complete K-head axis (0,1,0,1), not adjacent pairs.
     for t in 0..N_TOKENS {
         for vh in 0..N_V_HEADS {
-            let kh = vh / groups;
+            let kh = vh % N_K_HEADS;
             let s = &mut state[vh * HEAD_K * HEAD_V..(vh + 1) * HEAD_K * HEAD_V];
             let d = f64::from(decay[t * N_V_HEADS + vh]);
             let b = f64::from(beta[t * N_V_HEADS + vh]);
@@ -1327,9 +1413,274 @@ fn test_attention(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     // Cover the shapes real models actually use. head_dim 256 with GQA 4x is
     // Qwen3.5's attention layer and sits exactly at the kernel's per-lane limit,
     // which is where an off-by-one in the register blocking would show up.
-    attention_case(device, stream, report, 8, 2, 64, "head_dim 64, GQA 4x")?;
-    attention_case(device, stream, report, 16, 4, 256, "head_dim 256, GQA 4x")?;
-    attention_case(device, stream, report, 16, 2, 128, "head_dim 128, GQA 8x")?;
+    let few = [40, 55, 70];
+    attention_case(device, stream, report, 8, 2, 64, "head_dim 64, GQA 4x", &few)?;
+    attention_case(device, stream, report, 16, 4, 256, "head_dim 256, GQA 4x", &few)?;
+    attention_case(device, stream, report, 16, 2, 128, "head_dim 128, GQA 8x", &few)?;
+    // 50 contiguous positions, as a prefill chunk arrives: the tensor-core
+    // (flash) kernel on sm_80+, with a partial last query tile.
+    let chunk: Vec<i32> = (20..70).collect();
+    attention_case(device, stream, report, 8, 2, 64, "head_dim 64, 50-token prefill", &chunk)?;
+    attention_case(device, stream, report, 16, 2, 128, "head_dim 128, 50-token prefill", &chunk)?;
+    attention_case(device, stream, report, 16, 4, 256, "head_dim 256, 50-token prefill", &chunk)?;
+    test_split_attention_long(device, stream, report)?;
+    test_fused_prologue(device, stream, report)?;
+    test_argmax(device, stream, report)?;
+    for kv in [ops::KvType::Q8_0, ops::KvType::Q4_0] {
+        test_kv_quant(device, stream, report, kv)?;
+    }
+    Ok(())
+}
+
+/// GPU argmax against the sampler's rule: first maximum wins, NaN never does,
+/// and index 0 when nothing beats -inf.
+fn test_argmax(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    let cpu = |v: &[f32]| -> i32 {
+        let (mut best, mut val) = (0i32, f32::NEG_INFINITY);
+        for (i, &x) in v.iter().enumerate() {
+            if x > val { val = x; best = i as i32; }
+        }
+        best
+    };
+    let mut rng = Rng::new(0xA7_6000);
+    let mut cases: Vec<Vec<f32>> = Vec::new();
+    cases.push(rng.floats(151_936));
+    let mut tie = rng.floats(100_000);
+    tie[777] = 5.0; tie[50_001] = 5.0; tie[99_999] = 5.0;   // first of equal maxima
+    cases.push(tie);
+    let mut nan = rng.floats(4097);
+    nan[10] = f32::NAN; nan[11] = 3.0;
+    cases.push(nan);
+    cases.push(vec![f32::NEG_INFINITY; 300]);
+    cases.push(vec![-1.0]);
+    // Maxima in the last element and in the first, where the two passes split.
+    let mut last = rng.floats(151_936);
+    last[151_935] = 9.0;
+    cases.push(last);
+    let mut first = rng.floats(70_000);
+    first[0] = 9.0;
+    cases.push(first);
+    let out = DeviceBuffer::<i32>::new(device, 1)?;
+    let scratch = DeviceBuffer::<i32>::new(device, ops::ARGMAX_SCRATCH)?;
+    let mut bad = 0;
+    for c in &cases {
+        let d = DeviceBuffer::from_slice(device, c, stream)?;
+        ops::argmax(d.as_ptr(), c.len(), out.as_mut_ptr(), scratch.as_mut_ptr(), std::ptr::null_mut(), stream)?;
+        if out.to_vec(stream)?[0] != cpu(c) { bad += 1; }
+    }
+    report.case("argmax on the GPU matches the sampler", format!("{bad} of {} cases differ", cases.len()), bad == 0);
+
+    // The chained decode graph's position bump: +1 per call, after the pick.
+    let bump = DeviceBuffer::<i32>::from_slice(device, &[41], stream)?;
+    let d = DeviceBuffer::from_slice(device, &cases[0], stream)?;
+    ops::argmax(d.as_ptr(), cases[0].len(), out.as_mut_ptr(), scratch.as_mut_ptr(), bump.as_mut_ptr(), stream)?;
+    let bumped = bump.to_vec(stream)?[0];
+    report.case("argmax position bump", format!("41 -> {bumped}"), bumped == 42 && out.to_vec(stream)?[0] == cpu(&cases[0]));
+    Ok(())
+}
+/// The fused attention prologue must reproduce rmsnorm, rope and kv_store run
+/// one after another, bit for bit: same q, same cache bytes.
+fn test_fused_prologue(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const HEADS: usize = 8;
+    const KV_HEADS: usize = 2;
+    const DIM: usize = 128;
+    const MAX_SEQ: usize = 64;
+    const TOKENS: usize = 5;
+    let mut rng = Rng::new(0x9E_0000);
+    let q = rng.floats(TOKENS * HEADS * DIM);
+    let k = rng.floats(TOKENS * KV_HEADS * DIM);
+    let v = rng.floats(TOKENS * KV_HEADS * DIM);
+    let qn: Vec<f32> = (0..DIM).map(|_| 1.0 + rng.unit() * 0.5).collect();
+    let kn: Vec<f32> = (0..DIM).map(|_| 1.0 + rng.unit() * 0.5).collect();
+    let pos: Vec<i32> = vec![3, 17, 40, 41, 63];
+    let d_qn = DeviceBuffer::from_slice(device, &qn, stream)?;
+    let d_kn = DeviceBuffer::from_slice(device, &kn, stream)?;
+    let d_pos = DeviceBuffer::from_slice(device, &pos, stream)?;
+    // (rope_dim, interleaved): full NeoX, partial (the hybrids' 64 of 128), GPT-J.
+    for kv in [ops::KvType::F16, ops::KvType::Q8_0, ops::KvType::Q4_0] {
+        for (rope_dim, inter) in [(DIM, false), (64, false), (DIM, true)] {
+            let row = kv.row_bytes(DIM);
+            let run = |fused: bool| -> Result<(Vec<f32>, Vec<u8>, Vec<u8>)> {
+                let d_q = DeviceBuffer::from_slice(device, &q, stream)?;
+                let d_k = DeviceBuffer::from_slice(device, &k, stream)?;
+                let d_v = DeviceBuffer::from_slice(device, &v, stream)?;
+                let kc = DeviceBuffer::<u8>::zeroed(device, KV_HEADS * MAX_SEQ * row, stream)?;
+                let vc = DeviceBuffer::<u8>::zeroed(device, KV_HEADS * MAX_SEQ * row, stream)?;
+                let rope = Some((rope_dim, 1_000_000.0f32, 1.0f32, inter));
+                if fused {
+                    ops::qk_norm_rope_store(d_q.as_mut_ptr(), d_k.as_ptr(), d_v.as_ptr(),
+                        d_qn.as_ptr(), d_kn.as_ptr(), kc.as_mut_ptr(), vc.as_mut_ptr(), d_pos.as_ptr(),
+                        TOKENS, HEADS, KV_HEADS, DIM, MAX_SEQ, 1e-6, rope, kv, stream)?;
+                } else {
+                    ops::rmsnorm(d_q.as_mut_ptr(), d_q.as_ptr(), d_qn.as_ptr(), DIM, TOKENS * HEADS, 1e-6, stream)?;
+                    ops::rmsnorm(d_k.as_mut_ptr(), d_k.as_ptr(), d_kn.as_ptr(), DIM, TOKENS * KV_HEADS, 1e-6, stream)?;
+                    ops::rope(d_q.as_mut_ptr(), d_pos.as_ptr(), TOKENS, HEADS, DIM, rope_dim, 1_000_000.0, 1.0, inter, stream)?;
+                    ops::rope(d_k.as_mut_ptr(), d_pos.as_ptr(), TOKENS, KV_HEADS, DIM, rope_dim, 1_000_000.0, 1.0, inter, stream)?;
+                    ops::kv_store(kc.as_mut_ptr(), vc.as_mut_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_pos.as_ptr(),
+                        TOKENS, KV_HEADS, DIM, MAX_SEQ, kv, stream)?;
+                }
+                Ok((d_q.to_vec(stream)?, kc.to_vec(stream)?, vc.to_vec(stream)?))
+            };
+            let (qa, ka, va) = run(false)?;
+            let (qb, kb, vb) = run(true)?;
+            let q_diff = qa.iter().zip(&qb).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let c_diff = ka.iter().zip(&kb).filter(|(a, b)| a != b).count()
+                + va.iter().zip(&vb).filter(|(a, b)| a != b).count();
+            report.case(&format!("fused q/k norm+rope+kv store ({}, rope {rope_dim}{})", kv.name(),
+                    if inter { ", interleaved" } else { "" }),
+                format!("{q_diff} q values and {c_diff} cache bytes differ"), q_diff == 0 && c_diff == 0);
+        }
+    }
+    Ok(())
+}
+/// A quantized KV cache is only as good as two mirrors: the GPU encoder must
+/// write the bytes quantize.rs writes, and attention must read them the way
+/// dequant.rs decodes them. The second check starts from CPU-encoded caches so
+/// a bug in one side cannot be cancelled by the same bug in the other.
+fn test_kv_quant(device: i32, stream: &Stream, report: &mut Report, kv: ops::KvType) -> Result<()> {
+    const N_HEADS: usize = 8;
+    const N_KV: usize = 2;
+    const DIM: usize = 128;
+    const MAX_SEQ: usize = 96;
+    let ty = match kv { ops::KvType::Q8_0 => GgmlType::Q8_0, _ => GgmlType::Q4_0 };
+    let row = kv.row_bytes(DIM);
+    let mut rng = Rng::new(0x4B56_0000 + row as u64);
+
+    // Encoder: three tokens, including an all-zero block, a negative extreme
+    // and a tie in magnitude, which is where the Q4_0 scale choice can differ.
+    let positions = [5i32, 40, 95];
+    let mut k_new = rng.floats(3 * N_KV * DIM);
+    let v_new = rng.floats(3 * N_KV * DIM);
+    k_new[..32].fill(0.0);
+    k_new[32] = -3.0;
+    k_new[64] = 2.0;
+    k_new[70] = -2.0;
+    let d_kn = DeviceBuffer::from_slice(device, &k_new, stream)?;
+    let d_vn = DeviceBuffer::from_slice(device, &v_new, stream)?;
+    let d_pos = DeviceBuffer::from_slice(device, &positions, stream)?;
+    let d_kc = DeviceBuffer::<u8>::zeroed(device, N_KV * MAX_SEQ * row, stream)?;
+    let d_vc = DeviceBuffer::<u8>::zeroed(device, N_KV * MAX_SEQ * row, stream)?;
+    ops::kv_store(d_kc.as_mut_ptr(), d_vc.as_mut_ptr(), d_kn.as_ptr(), d_vn.as_ptr(),
+        d_pos.as_ptr(), 3, N_KV, DIM, MAX_SEQ, kv, stream)?;
+    let (kc, vc) = (d_kc.to_vec(stream)?, d_vc.to_vec(stream)?);
+    let mut mismatched = 0usize;
+    for (t, &pos) in positions.iter().enumerate() {
+        for h in 0..N_KV {
+            for (src, cache) in [(&k_new, &kc), (&v_new, &vc)] {
+                let mut want = Vec::new();
+                airun_gguf::quantize(ty, &src[(t * N_KV + h) * DIM..][..DIM], DIM, &mut want)?;
+                let got = &cache[(h * MAX_SEQ + pos as usize) * row..][..row];
+                mismatched += want.iter().zip(got).filter(|(a, b)| a != b).count();
+            }
+        }
+    }
+    report.case(&format!("kv_store {} matches quantize.rs", kv.name()),
+        format!("{mismatched} mismatched bytes"), mismatched == 0);
+
+    // Attention: caches encoded on the CPU, reference decoded by dequant.rs.
+    let k_raw = rng.floats(N_KV * MAX_SEQ * DIM);
+    let v_raw = rng.floats(N_KV * MAX_SEQ * DIM);
+    let (mut kq, mut vq) = (Vec::new(), Vec::new());
+    airun_gguf::quantize(ty, &k_raw, DIM, &mut kq)?;
+    airun_gguf::quantize(ty, &v_raw, DIM, &mut vq)?;
+    let (mut k, mut v) = (vec![0f32; k_raw.len()], vec![0f32; v_raw.len()]);
+    dequant::dequantize(ty, &kq, k.len(), &mut k)?;
+    dequant::dequantize(ty, &vq, v.len(), &mut v)?;
+
+    let q = rng.floats(N_HEADS * DIM);
+    let pos = 77usize;
+    let scale = 1.0 / (DIM as f32).sqrt();
+    let mut cpu = vec![0f32; N_HEADS * DIM];
+    for h in 0..N_HEADS {
+        let kvh = h / (N_HEADS / N_KV);
+        let qv = &q[h * DIM..][..DIM];
+        let scores: Vec<f32> = (0..=pos).map(|j| {
+            qv.iter().zip(&k[(kvh * MAX_SEQ + j) * DIM..][..DIM]).map(|(a, b)| a * b).sum::<f32>() * scale
+        }).collect();
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for (j, e) in exps.iter().enumerate() {
+            for d in 0..DIM {
+                cpu[h * DIM + d] += e / sum * v[(kvh * MAX_SEQ + j) * DIM + d];
+            }
+        }
+    }
+
+    let d_q = DeviceBuffer::from_slice(device, &q, stream)?;
+    let d_k = DeviceBuffer::from_slice(device, &kq, stream)?;
+    let d_v = DeviceBuffer::from_slice(device, &vq, stream)?;
+    let d_p = DeviceBuffer::from_slice(device, &[pos as i32], stream)?;
+    let d_o = DeviceBuffer::<f32>::new(device, N_HEADS * DIM)?;
+    ops::attention(d_o.as_mut_ptr(), d_q.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_p.as_ptr(),
+        1, N_HEADS, N_KV, DIM, MAX_SEQ, scale, 0, kv, stream)?;
+    let (abs, _) = compare(&cpu, &d_o.to_vec(stream)?);
+    let partial = DeviceBuffer::<f32>::new(device, N_HEADS * 16 * (DIM + 2))?;
+    ops::attention_split(d_o.as_mut_ptr(), &partial, d_q.as_ptr(), d_k.as_ptr(), d_v.as_ptr(),
+        d_p.as_ptr(), N_HEADS, N_KV, DIM, MAX_SEQ, scale, 0, 16, kv, stream)?;
+    let (split_abs, _) = compare(&cpu, &d_o.to_vec(stream)?);
+    report.case(&format!("attention over {} cache vs dequant.rs", kv.name()),
+        format!("max_abs {abs:.3e}  split {split_abs:.3e}"), abs <= 1e-3 && split_abs <= 1e-3);
+
+    // A 20-token prefill chunk over the same cache: the flash kernel's path.
+    const CHUNK: usize = 20;
+    let qc = rng.floats(CHUNK * N_HEADS * DIM);
+    let pos_c: Vec<i32> = (58..58 + CHUNK as i32).collect();
+    let mut want = vec![0f32; CHUNK * N_HEADS * DIM];
+    for (t, &p) in pos_c.iter().enumerate() {
+        for h in 0..N_HEADS {
+            let kvh = h / (N_HEADS / N_KV);
+            let qv = &qc[(t * N_HEADS + h) * DIM..][..DIM];
+            let scores: Vec<f32> = (0..=p as usize).map(|j| {
+                qv.iter().zip(&k[(kvh * MAX_SEQ + j) * DIM..][..DIM]).map(|(a, b)| a * b).sum::<f32>() * scale
+            }).collect();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (j, e) in exps.iter().enumerate() {
+                for d in 0..DIM {
+                    want[(t * N_HEADS + h) * DIM + d] += e / sum * v[(kvh * MAX_SEQ + j) * DIM + d];
+                }
+            }
+        }
+    }
+    let d_qc = DeviceBuffer::from_slice(device, &qc, stream)?;
+    let d_pc = DeviceBuffer::from_slice(device, &pos_c, stream)?;
+    let d_oc = DeviceBuffer::<f32>::new(device, CHUNK * N_HEADS * DIM)?;
+    ops::attention(d_oc.as_mut_ptr(), d_qc.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_pc.as_ptr(),
+        CHUNK, N_HEADS, N_KV, DIM, MAX_SEQ, scale, 0, kv, stream)?;
+    let (chunk_abs, _) = compare(&want, &d_oc.to_vec(stream)?);
+    report.case(&format!("{CHUNK}-token prefill attention over {} cache", kv.name()),
+        format!("max_abs {chunk_abs:.3e}"), chunk_abs <= 3e-3);
+    Ok(())
+}
+
+fn test_split_attention_long(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    // Zero queries give uniform attention: the answer is an exact arithmetic
+    // mean, independently of both implementations of the softmax reduction.
+    let ctx = 212_992usize;
+    let dim = 128;
+    let q = DeviceBuffer::from_slice(device, &vec![0.0f32; 2 * dim], stream)?;
+    let k = DeviceBuffer::<half::f16>::zeroed(device, ctx * dim, stream)?;
+    let values: Vec<half::f16> = (0..ctx * dim).map(|i|
+        half::f16::from_f32(((i / dim) % 17) as f32 - 8.0)).collect();
+    let v = DeviceBuffer::from_slice(device, &values, stream)?;
+    let scratch = DeviceBuffer::new(device, 2 * 128 * (dim + 2))?;
+    let out = DeviceBuffer::<f32>::new(device, 2 * dim)?;
+    let mut worst = 0.0f32;
+    for pos in [0usize, 1, 17, 3072, ctx - 1] {
+        let p = DeviceBuffer::from_slice(device, &[pos as i32], stream)?;
+        for window in [0usize, 1, 37] {
+            ops::attention_split(out.as_mut_ptr(), &scratch, q.as_ptr(), k.as_ptr(), v.as_ptr(),
+                p.as_ptr(), 2, 1, dim, ctx, 1.0, window, 128, ops::KvType::F16, stream)?;
+            let begin = if window == 0 { 0 } else { (pos + 1).saturating_sub(window) };
+            let expected = (begin..=pos).map(|j| (j % 17) as f64 - 8.0).sum::<f64>()
+                / (pos + 1 - begin) as f64;
+            for x in out.to_vec(stream)? { worst = worst.max((x - expected as f32).abs()); }
+        }
+    }
+    report.case("split attention 212992 context, empty splits and sliding windows",
+        format!("max_abs {worst:.3e}"), worst.is_finite() && worst < 1e-4);
     Ok(())
 }
 
@@ -1341,14 +1692,17 @@ fn attention_case(
     n_kv_heads: usize,
     head_dim: usize,
     label: &str,
+    positions: &[i32],
 ) -> Result<()> {
     let (N_HEADS, N_KV_HEADS, HEAD_DIM) = (n_heads, n_kv_heads, head_dim);
     const MAX_SEQ: usize = 96;
-    const N_TOKENS: usize = 3;
+    let N_TOKENS = positions.len();
+    // The flash kernel rounds Q and the probabilities to fp16.
+    let tolerance = if N_TOKENS >= 16 { 3e-3 } else { 1e-3 };
 
     let mut rng = Rng::new(0xF6_6000);
     let q = rng.floats(N_TOKENS * N_HEADS * HEAD_DIM);
-    let positions: Vec<i32> = vec![40, 55, 70];
+    let positions = positions.to_vec();
     let n_kv = *positions.iter().max().unwrap() as usize + 1;
 
     // The cache is f16 on device, so the reference must round-trip through f16
@@ -1407,6 +1761,7 @@ fn attention_case(
         MAX_SEQ,
         scale,
         0,
+        ops::KvType::F16,
         stream,
     )?;
     let gpu = d_o.to_vec(stream)?;
@@ -1416,7 +1771,7 @@ fn attention_case(
     report.case(
         &format!("attention {label}"),
         format!("max_abs {abs:.3e}  max_rel {rel:.3e}  peak {peak:.3e}  ({n_kv} keys)"),
-        abs <= 1e-3 && peak > 1e-4,
+        abs <= tolerance && peak > 1e-4,
     );
 
     // A window of 1 must reduce to attending only to the query's own position.
@@ -1434,6 +1789,7 @@ fn attention_case(
         MAX_SEQ,
         scale,
         1,
+        ops::KvType::F16,
         stream,
     )?;
     let windowed = d_o2.to_vec(stream)?;
@@ -1451,6 +1807,26 @@ fn attention_case(
         format!("max_abs {wabs:.3e}  max_rel {wrel:.3e}"),
         wabs <= 1e-4,
     );
+
+    let partial = DeviceBuffer::<f32>::new(device, N_HEADS * 128 * (HEAD_DIM + 2))?;
+    for splits in [4, 16, 128] {
+        for t in 0..N_TOKENS.min(3) {
+            for window in [0, 1] {
+                ops::attention_split(d_o.as_mut_ptr(), &partial,
+                    d_q.offset_ptr(t * N_HEADS * HEAD_DIM), d_k.as_ptr(), d_v.as_ptr(),
+                    d_p.offset_ptr(t), N_HEADS, N_KV_HEADS, HEAD_DIM, MAX_SEQ,
+                    scale, window, splits, ops::KvType::F16, stream)?;
+                let mut actual = vec![0.0f32; N_HEADS * HEAD_DIM];
+                d_o.copy_to_host(&mut actual, stream)?;
+                stream.synchronize()?;
+                let reference = if window == 0 { &cpu } else { &expect };
+                let reference = &reference[t * N_HEADS * HEAD_DIM..(t + 1) * N_HEADS * HEAD_DIM];
+                let (error, _) = compare(reference, &actual);
+                report.case(&format!("split attention {label}, splits={splits}, token={t}, window={window}"),
+                    format!("max_abs {error:.3e}"), error <= 1e-3 && actual.iter().all(|x| x.is_finite()));
+            }
+        }
+    }
 
     Ok(())
 }

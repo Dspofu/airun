@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use airun_cuda::ops::KvType;
 use airun_core::{LoadOptions, Sampler, SamplingParams, SplitMode, apply_chat_template, loader};
 use anyhow::{Context, Result};
 use clap::Args;
@@ -33,6 +34,15 @@ pub struct RunArgs {
     /// Context length in tokens.
     #[arg(short = 'c', long, default_value_t = 4096)]
     pub ctx_size: usize,
+
+    /// Resident experts per layer; stream cache misses from the GGUF without re-quantizing.
+    #[arg(long)]
+    pub expert_cache: Option<usize>,
+
+    /// KV cache format: f16, q8_0 or q4_0. The quantized formats fit 2x and
+    /// 3.6x more context in the same VRAM, at a small cost in accuracy.
+    #[arg(long, default_value = "f16", value_parser = parse_kv_type)]
+    pub kv_type: KvType,
 
     /// Tokens processed per forward pass during prompt ingestion.
     #[arg(short = 'b', long, default_value_t = 512)]
@@ -129,6 +139,8 @@ impl RunArgs {
             gpus: Vec::new(),
             tensor_split: Vec::new(),
             single_gpu: None,
+            expert_cache: None,
+            kv_type: KvType::F16,
             vram_reserve: 384,
             no_fallback: false,
             temp: 0.0,
@@ -147,6 +159,13 @@ impl RunArgs {
         }
     }
 
+}
+
+pub fn parse_kv_type(s: &str) -> Result<KvType, String> {
+    KvType::parse(s).ok_or_else(|| format!("unknown KV cache type '{s}'; use f16, q8_0 or q4_0"))
+}
+
+impl RunArgs {
     pub fn load_options(&self) -> LoadOptions {
         let split = if let Some(g) = self.single_gpu {
             SplitMode::Single(g)
@@ -162,6 +181,8 @@ impl RunArgs {
             gpus: self.gpus.clone(),
             split,
             gpu_layers: None,
+            expert_cache: self.expert_cache,
+            kv_type: self.kv_type,
             reserve_bytes: self.vram_reserve << 20,
             allow_fallback: !self.no_fallback,
         }
@@ -262,6 +283,15 @@ pub fn run(args: RunArgs) -> Result<()> {
             stats.decode_ms,
             stats.decode_tps(),
         );
+        let (hits, misses) = runtime.expert_cache_stats();
+        if hits + misses > 0 {
+            eprintln!(
+                "expert cache: {:.1}% hits ({hits} hits, {misses} misses)",
+                100.0 * hits as f64 / (hits + misses) as f64
+            );
+            let (wait, read) = runtime.expert_stream_timing();
+            eprintln!("expert streaming: {wait:.0} ms waiting on the GPU for routing, {read:.0} ms reading misses");
+        }
     }
     Ok(())
 }

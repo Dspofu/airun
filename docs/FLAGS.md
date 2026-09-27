@@ -30,6 +30,8 @@ Estas são as flags que decidem **o que vai para qual GPU**.
 | `--single-gpu <ordinal>` | — | Força o modelo inteiro numa placa. Conflita com `--tensor-split`. |
 | `--vram-reserve <MiB>` | `384` | VRAM deixada livre em cada GPU. O Windows/WDDM não entrega os últimos megabytes; reduza só se souber o que está fazendo. |
 | `--no-fallback` | desligado | Falha em vez de reduzir contexto/batch automaticamente para caber. Útil em CI, onde uma redução silenciosa mascara uma regressão. |
+| `--kv-type <tipo>` | `f16` | Formato do KV cache: `f16`, `q8_0` ou `q4_0`. Os quantizados cabem 2x e 3,6x mais contexto na mesma VRAM; no 35B custam +0,001 (q8_0) e +0,02 (q4_0) nats de perda. Vale também para `perplexity`. |
+| `--expert-cache <N>` | todos | Só MoE: mantém N experts por camada na VRAM e lê os demais do GGUF sob demanda, sem requantizar. Resultado idêntico ao modelo residente; a velocidade depende da taxa de acerto e do disco. Vale também para `perplexity`. |
 
 ### Como a alocação automática decide
 
@@ -274,7 +276,14 @@ política de mistura por tensor, não um formato de bloco.
 | `--decode-at <lista>` | `16` | Profundidades de contexto onde medir o decode, ex.: `--decode-at 16,1024,3072`. O prompt é ingerido antes e só a geração é cronometrada. |
 | `--runs <N>` | `3` | Execuções medidas por configuração. |
 | `--warmup <N>` | `1` | Execuções descartadas (JIT de kernel, subida de clock). |
+| `--text-file <arquivo>` | — | Monta os prompts a partir deste texto em vez de um token repetido. Modelos MoE usam uma passagem embutida por padrão. |
+| `--temp <T>` | `0` | Temperatura da amostragem no decode; 0 é greedy. |
 | `--json` | — | Saída legível por máquina. |
+
+**Em MoE com `--expert-cache`, meça com texto natural e `--temp 0.7`.** Um
+token repetido roteia sempre para os mesmos experts, e o greedy entra em laço;
+os dois fazem o cache parecer perfeito. A coluna *expert hit* mostra a taxa de
+acerto de cada teste.
 
 Reporta a **mediana**, não a média: uma única interrupção de escalonamento
 distorce demais a média de três execuções.
@@ -348,17 +357,21 @@ kernel.**
 Existem porque várias ambiguidades de layout produzem tensores da **mesma
 forma**: nenhuma validação as distingue, só a saída do modelo. Cada uma liga a
 interpretação alternativa; meça a diferença com `airun perplexity`, não olhando
-o texto gerado. Todas as escolhas atuais já foram medidas e são as melhores —
+o texto gerado. Todas as escolhas atuais foram medidas de novo depois da correção de 2026-09-26 e são as melhores —
 veja a tabela em `tasks.md`.
 
 | Variável | Interpretação alternativa que liga |
 |---|---|
-| `AIRUN_MATVEC_F32=1` | Todos os matvecs no caminho f32 exato (o de referência). Sem ela, o decode já é exato; lotes de 2–63 tokens usam dp4a sobre ativações Q8 e 64+ usam tensor cores fp16 — ambos validados no selftest por limite de erro backward e fim-a-fim por perplexidade. Use quando "idêntico à referência" importa mais que velocidade. |
+| `AIRUN_MATVEC_F32=1` | Todos os matvecs no caminho f32 exato (o de referência). Sem ela, o decode já é exato; lotes pequenos usam dp4a sobre ativações Q8 e lotes grandes usam tensor cores int8 (MMQ) — ambos validados no selftest por limite de erro backward e fim-a-fim por perplexidade. Use quando "idêntico à referência" importa mais que velocidade. |
 | `AIRUN_NO_WMMA=1` | Mantém lotes grandes nos kernels de registrador (mede o caminho tensor-core contra eles sem rebuild). |
+| `AIRUN_NO_MMQ=1` | Lotes de 64+ tokens saem dos tensor cores int8 (MMQ) e voltam para o fp16 (WMMA). |
+| `AIRUN_NO_MMQ_ASYNC=1` | Mantém o MMQ, mas na versão síncrona (sem `cp.async`). |
+| `AIRUN_NO_FLASH=1` | O prefill usa o kernel de atenção antigo (um bloco por query) em vez da flash attention. |
+| `AIRUN_NO_GQA_DECODE=1` | O decode usa o kernel de atenção por head de query em vez do agrupado por head de KV. |
 | `AIRUN_ABLATE=ssm,attn,ffn` | Zera a contribuição desses blocos ao residual. Um bloco correto sempre pontua melhor que bloco nenhum. Sanidade: `ffn` no 8B denso leva a perda de 2.20 para 25.96 — se ela **não** se mexer, a flag não está ligada naquele caminho. |
 | `AIRUN_TRACE_LAYERS=1` | Imprime rms/média de cada bloco e do residual, camada a camada. |
 | `AIRUN_TRACE_SSM=<camada>` | Imprime as faixas de q, k, v, z, decay, beta, estado e saída dessa camada delta-net. |
-| `AIRUN_SSM_GATE_AFTER_NORM=1` | Aplica o gate depois da normalização, não antes. |
+| `AIRUN_SSM_GATE_BEFORE_NORM=1` | Aplica o gate antes da normalização (a ordem antiga, errada). |
 | `AIRUN_SSM_GATE_SIGMOID=1` | Sigmoid em vez de SiLU no gate. |
 | `AIRUN_SSM_QKV_ORDER=<perm>` | Ordem dos três blocos em `attn_qkv`, ex.: `kqv`. Padrão `qkv`. |
 | `AIRUN_SSM_QKV_GROUPED=1` | `attn_qkv` agrupado por k-head em vez de blocos contíguos. |
@@ -375,3 +388,26 @@ veja a tabela em `tasks.md`.
 | `AIRUN_ROPE_INTERLEAVED=1` | Pareamento GPT-J `(2i, 2i+1)` em vez de NeoX `(i, i + dim/2)`. |
 | `AIRUN_ROPE_OFF=1` | Sem RoPE nenhum. O custo disso mede quanto o modelo usa posição: no 8B denso vale +2.75 nats, no 9B híbrido +0.04. |
 | `AIRUN_ATTN_WINDOW=<n>` | Força uma janela deslizante. Com `1` cada query só se vê; o custo mede quanto a atenção tira do histórico. |
+
+### Variáveis de desempenho
+
+Cada uma desliga (ou força) uma otimização, para medir o ganho dela sem
+recompilar. Nenhuma muda o resultado além de arredondamento — as que mexem na
+ordem das somas estão cobertas pelo selftest e pela perplexidade. Meça sempre
+alternando as execuções (veja `benchmarks/2026-09-26/scoreboard.ps1`): nesta
+máquina, outro programa desenhando na GPU atrasa kernels em ~300 µs a cada 4 ms,
+e duas sessões separadas variam ~15%.
+
+| Variável | Efeito |
+|---|---|
+| `AIRUN_NO_MMQ_STREAMK=1` | O MMQ assíncrono volta à grade de tiles inteiros (com split-K onde ela ocupa mal a GPU). Com stream-K as últimas tiles são divididas em fatias de K iguais entre todos os SMs: prefill de 128 tokens no Qwen3-4B de 2767 para 3269 t/s. |
+| `AIRUN_NO_MMQ_SPLIT=1` | Sem split-K no MMQ (onde o stream-K não roda: kernel síncrono, Q6_K). |
+| `AIRUN_MMQ_TC=64` ou `=128` | Força a largura da tile de tokens do MMQ. Padrão: 128 a partir de 128 tokens. |
+| `AIRUN_NO_MMQ_GLU=1` | Gate, up e SwiGLU do prefill em três lançamentos em vez de um. |
+| `AIRUN_NO_FLASH2=1` | O prefill usa a flash attention WMMA antiga em vez da de `mma.sync` (head_dim 64/128). |
+| `AIRUN_NO_SPLIT_ATTN=1` | O decode usa o kernel de atenção de um bloco por head, sem dividir o contexto. |
+| `AIRUN_NO_FUSED_PROLOGUE=1` | q/k norm, RoPE e escrita no cache em lançamentos separados. |
+| `AIRUN_NO_FUSED_NORMS=1` | Soma residual e RMSNorm seguinte em dois lançamentos. |
+| `AIRUN_NO_GRAPH=1` | O decode lança os kernels um a um em vez de repetir um CUDA graph capturado. |
+| `AIRUN_NO_GPU_ARGMAX=1` | Decodificação gulosa copia os logits para o host e escolhe lá. |
+| `AIRUN_NO_DECODE_PIPELINE=1` | Decodificação gulosa espera cada token antes de enfileirar o passo seguinte. Com o pipeline o passo i+1 lê o token do passo i direto da GPU; o texto gerado é idêntico. Não roda em híbridos (o estado recorrente absorveria o passo especulativo). |

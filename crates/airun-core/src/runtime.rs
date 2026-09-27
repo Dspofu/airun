@@ -6,7 +6,6 @@
 //! KV cache that grows with context, or a recurrent state that does not.
 
 use airun_cuda::{DeviceBuffer, Stream, device, hybrid, ops};
-use half::f16;
 
 use crate::config::{Config, LayerKind};
 use crate::error::{CoreError, Result};
@@ -19,8 +18,9 @@ use crate::tokenizer::Tokenizer;
 enum LayerState {
     /// Softmax attention: keys and values for every position so far.
     Kv {
-        k: DeviceBuffer<f16>,
-        v: DeviceBuffer<f16>,
+        // Raw rows in cfg.kv_type's format.
+        k: DeviceBuffer<u8>,
+        v: DeviceBuffer<u8>,
     },
     /// Linear attention: a fixed-size recurrent matrix plus the convolution's
     /// short history. Neither grows with sequence length.
@@ -51,6 +51,14 @@ struct MoeScratch {
     weights: DeviceBuffer<f32>,
     h: DeviceBuffer<f32>,
     shared_logit: DeviceBuffer<f32>,
+    upload: Option<std::cell::RefCell<airun_cuda::PinnedBuffer<u8>>>,
+    cached_ids: DeviceBuffer<i32>,
+    cached_host_ids: std::cell::RefCell<airun_cuda::PinnedBuffer<i32>>,
+    cache_group: usize,
+    /// Present only when experts are streamed.
+    reader: Option<ExpertReader>,
+    /// Milliseconds spent waiting for routing results and reading misses.
+    timing: std::cell::Cell<(f64, f64)>,
 }
 
 /// The activation-quantization scratch and its freshness flag.
@@ -75,6 +83,7 @@ struct DeviceState {
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
     attn: DeviceBuffer<f32>,
+    attn_partial: DeviceBuffer<f32>,
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
     positions: DeviceBuffer<i32>,
@@ -88,6 +97,7 @@ struct DeviceState {
 
     hybrid: Option<HybridScratch>,
     moe: Option<MoeScratch>,
+
 
     /// One entry per layer on this device, in the same order as `layers`.
     states: Vec<LayerState>,
@@ -121,6 +131,38 @@ pub struct Runtime {
     history: Vec<u32>,
     /// Captured decode step; built on the first single-token forward.
     decode_graph: Option<DecodeGraph>,
+    /// Greedy decoding's pick on the device, its pinned landing slot and the
+    /// argmax scratch.
+    pick: Option<(DeviceBuffer<i32>, airun_cuda::PinnedBuffer<i32>, DeviceBuffer<i32>)>,
+    /// The pipelined greedy decode step; built on first use.
+    chain: Option<ChainGraph>,
+    /// Pinned landing buffer for the logits a sampler reads, reused per token.
+    logits_host: Option<airun_cuda::PinnedBuffer<f32>>,
+}
+
+/// Greedy decode as a chain of graph launches (see [`Runtime::generate`]): the
+/// step reads its token and position from the device, and its argmax writes
+/// the next token there and advances the position, so step i+1 can be queued
+/// before the host has read step i's pick. Between steps the GPU used to idle
+/// 170-340 us while the host copied the pick back, synchronized and relaunched
+/// -- 1-2% of a Qwen3-4B decode step.
+struct ChainGraph {
+    graph: Option<airun_cuda::Graph>,
+    scratch: DeviceBuffer<i32>,
+    /// Each step's pick lands here, alternating between the two slots: the
+    /// host reads one while the step after it fills the other.
+    slots: airun_cuda::PinnedBuffer<i32>,
+    ready: [airun_cuda::Event; 2],
+    /// Token and position a chain starts from.
+    seed: airun_cuda::PinnedBuffer<i32>,
+    launches: usize,
+}
+
+/// AIRUN_NO_DECODE_PIPELINE=1 waits for every greedy pick before queuing the
+/// next step.
+fn decode_pipeline_disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("AIRUN_NO_DECODE_PIPELINE").is_ok_and(|v| v.trim() != "0"))
 }
 
 impl Runtime {
@@ -164,8 +206,8 @@ impl Runtime {
             for &l in &shard.layers {
                 layer_states.push(match cfg.layer_kind(l) {
                     LayerKind::Attention => LayerState::Kv {
-                        k: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.head_dim, &stream)?,
-                        v: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.head_dim, &stream)?,
+                        k: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim), &stream)?,
+                        v: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim), &stream)?,
                     },
                     LayerKind::LinearAttention => {
                         let ssm = cfg.ssm.as_ref().ok_or_else(|| {
@@ -201,6 +243,32 @@ impl Runtime {
                     weights: DeviceBuffer::new(dev, b * moe.n_experts_used)?,
                     h: DeviceBuffer::new(dev, b * moe.n_experts_used * moe.expert_ff)?,
                     shared_logit: DeviceBuffer::new(dev, b)?,
+                    upload: {
+                        let staging_bytes = model.layers.iter().filter_map(|l| match &l.ffn {
+                            FfnWeights::Moe { gate_exps, up_exps, down_exps, .. }
+                                if gate_exps.host_experts.is_some() => Some(
+                                    gate_exps.expert_stride.max(up_exps.expert_stride).max(down_exps.expert_stride)
+                                    * gate_exps.cache_capacity().min(b * moe.n_experts_used)),
+                            _ => None,
+                        }).max().unwrap_or(0);
+                        if staging_bytes == 0 { None } else {
+                            Some(std::cell::RefCell::new(airun_cuda::PinnedBuffer::new(3 * staging_bytes)?))
+                        }
+                    },
+                    cached_ids: DeviceBuffer::new(dev, b * moe.n_experts_used)?,
+                    cached_host_ids: std::cell::RefCell::new(airun_cuda::PinnedBuffer::new(b * moe.n_experts_used)?),
+                    reader: model.layers.iter().find_map(|l| match &l.ffn {
+                        FfnWeights::Moe { gate_exps, .. } => gate_exps.expert_file_path(),
+                        _ => None,
+                    }).map(|path| ExpertReader::new(path, EXPERT_READERS))
+                    .transpose()
+                    .map_err(|e| CoreError::Other(format!(
+                        "cannot reopen the model to stream experts ({e}); check the file is still readable")))?,
+                    timing: std::cell::Cell::new((0.0, 0.0)),
+                    cache_group: model.layers.iter().filter_map(|l| match &l.ffn {
+                        FfnWeights::Moe { gate_exps, .. } if gate_exps.host_experts.is_some() =>
+                            Some(gate_exps.cache_capacity() / moe.n_experts_used), _ => None,
+                    }).min().unwrap_or(1).max(1),
                 }),
                 None => None,
             };
@@ -215,6 +283,7 @@ impl Runtime {
                 k: DeviceBuffer::new(dev, b * k_width)?,
                 v: DeviceBuffer::new(dev, b * v_width)?,
                 attn: DeviceBuffer::new(dev, b * attn_width)?,
+                attn_partial: DeviceBuffer::new(dev, cfg.n_head * ops::attention_splits(ctx) * (cfg.head_dim + 2))?,
                 gate: DeviceBuffer::new(dev, b * ffn_width.max(1))?,
                 up: DeviceBuffer::new(dev, b * ffn_width.max(1))?,
                 positions: DeviceBuffer::new(dev, b)?,
@@ -235,6 +304,7 @@ impl Runtime {
                 },
                 hybrid: hybrid_scratch,
                 moe: moe_scratch,
+
                 states: layer_states,
                 layers: shard.layers.clone(),
             });
@@ -249,11 +319,32 @@ impl Runtime {
             n_past: 0,
             history: Vec::new(),
             decode_graph: None,
+            pick: None,
+            chain: None,
+            logits_host: None,
         })
     }
 
     pub fn ctx(&self) -> usize {
         self.ctx
+    }
+
+    /// Tensor-cache hits/misses, including prefill and warm-up.
+    /// Milliseconds spent (waiting on the GPU for routing, reading expert
+    /// misses) since load; the first includes all GPU work queued before it.
+    pub fn expert_stream_timing(&self) -> (f64, f64) {
+        self.states.iter().filter_map(|s| s.moe.as_ref())
+            .fold((0.0, 0.0), |(w, r), m| { let (a, b) = m.timing.get(); (w + a, r + b) })
+    }
+
+    pub fn expert_cache_stats(&self) -> (u64, u64) {
+        self.model.layers.iter().fold((0, 0), |(hits, misses), layer| {
+            if let FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } = &layer.ffn {
+                [gate_exps, up_exps, down_exps].iter().fold((hits, misses), |(h, m), w| {
+                    let (wh, wm) = w.cache_stats(); (h + wh, m + wm)
+                })
+            } else { (hits, misses) }
+        })
     }
 
     pub fn n_past(&self) -> usize {
@@ -285,6 +376,154 @@ impl Runtime {
 
     /// Runs `tokens` through the model and returns the logits for the last one.
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.step(tokens)?;
+        let st = &self.states[self.states.len() - 1];
+        device::set_device(st.device)?;
+        let logits = st
+            .logits
+            .as_ref()
+            .ok_or_else(|| CoreError::Other("output shard has no logits buffer".into()))?;
+        Ok(logits.to_vec(&st.stream)?)
+    }
+
+    /// [`forward`], with the logits landing in a reused pinned buffer rather
+    /// than a fresh vector: a pageable copy of a 152k vocabulary goes through a
+    /// driver staging buffer every token.
+    fn forward_pinned(&mut self, tokens: &[u32]) -> Result<&mut [f32]> {
+        self.step(tokens)?;
+        let st = &self.states[self.states.len() - 1];
+        device::set_device(st.device)?;
+        let logits = st
+            .logits
+            .as_ref()
+            .ok_or_else(|| CoreError::Other("output shard has no logits buffer".into()))?;
+        if self.logits_host.as_ref().is_none_or(|h| h.len() != logits.len()) {
+            self.logits_host = Some(airun_cuda::PinnedBuffer::new(logits.len())?);
+        }
+        let host = self.logits_host.as_mut().expect("allocated above");
+        logits.copy_to_host(host.as_mut_slice(), &st.stream)?;
+        st.stream.synchronize()?;
+        Ok(host.as_mut_slice())
+    }
+
+    /// [`forward`] for greedy decoding: the argmax of the logits, computed on
+    /// the GPU, so four bytes cross the bus instead of the whole vocabulary.
+    /// Picks the same token as [`crate::Sampler`] with temperature 0.
+    fn forward_argmax(&mut self, tokens: &[u32]) -> Result<u32> {
+        self.step(tokens)?;
+        let last = self.states.len() - 1;
+        let st = &self.states[last];
+        device::set_device(st.device)?;
+        let logits = st
+            .logits
+            .as_ref()
+            .ok_or_else(|| CoreError::Other("output shard has no logits buffer".into()))?;
+        if self.pick.is_none() {
+            self.pick = Some((
+                DeviceBuffer::new(st.device, 1)?,
+                airun_cuda::PinnedBuffer::new(1)?,
+                DeviceBuffer::new(st.device, ops::ARGMAX_SCRATCH)?,
+            ));
+        }
+        let (dev, host, scratch) = self.pick.as_mut().expect("allocated above");
+        ops::argmax(logits.as_ptr(), logits.len(), dev.as_mut_ptr(), scratch.as_mut_ptr(),
+                    std::ptr::null_mut(), &st.stream)?;
+        dev.copy_to_host(host.as_mut_slice(), &st.stream)?;
+        st.stream.synchronize()?;
+        Ok(host.as_slice()[0] as u32)
+    }
+
+    /// Whether greedy decode can run as a [`ChainGraph`]: where the graphed
+    /// step runs, and not on a hybrid, whose recurrent state would absorb a
+    /// speculative step that the end of a generation then throws away.
+    fn chain_eligible(&self) -> bool {
+        self.states.len() == 1
+            && !graphs_disabled()
+            && !decode_pipeline_disabled()
+            && !self.model.config.is_hybrid()
+            && !self.states[0].moe.as_ref().is_some_and(|m| m.upload.is_some())
+    }
+
+    /// Puts `token` and the current position where the chained step reads them.
+    fn chain_seed(&mut self, token: u32) -> Result<()> {
+        let mut ch = match self.chain.take() {
+            Some(ch) => ch,
+            None => {
+                let dev = self.states[0].device;
+                ChainGraph {
+                    graph: None,
+                    scratch: DeviceBuffer::new(dev, ops::ARGMAX_SCRATCH)?,
+                    slots: airun_cuda::PinnedBuffer::new(2)?,
+                    ready: [airun_cuda::Event::new()?, airun_cuda::Event::new()?],
+                    seed: airun_cuda::PinnedBuffer::new(2)?,
+                    launches: 0,
+                }
+            }
+        };
+        // The previous chain's seed copies finished before its first pick was
+        // read, so the staging is free to overwrite.
+        ch.seed.as_mut_slice()[0] = token as i32;
+        ch.seed.as_mut_slice()[1] = self.n_past as i32;
+        let st = &mut self.states[0];
+        device::set_device(st.device)?;
+        let queued = st.tokens.copy_from_host(&ch.seed.as_slice()[..1], &st.stream)
+            .and_then(|_| st.positions.copy_from_host(&ch.seed.as_slice()[1..], &st.stream));
+        self.chain = Some(ch);
+        Ok(queued?)
+    }
+
+    /// Queues one chained step; returns the slot its pick lands in.
+    fn chain_launch(&mut self) -> Result<usize> {
+        let mut ch = self.chain.take().ok_or_else(|| {
+            CoreError::Other("chained decode launched before it was seeded; this is a bug".into())
+        })?;
+        device::set_device(self.states[0].device)?;
+        if ch.graph.is_none() {
+            // SAFETY of the capture: everything queued lives in `self` or in
+            // `ch`, both of which outlive the graph.
+            airun_cuda::Graph::begin_capture(&self.states[0].stream)?;
+            let queued = self.queue_forward_with(&[0], &[0], false).and_then(|_| {
+                let st = &self.states[0];
+                let logits = st.logits.as_ref().ok_or_else(|| {
+                    CoreError::Other("output shard has no logits buffer".into())
+                })?;
+                ops::argmax(logits.as_ptr(), logits.len(), st.tokens.as_mut_ptr(),
+                            ch.scratch.as_mut_ptr(), st.positions.as_mut_ptr(), &st.stream)?;
+                Ok(())
+            });
+            let ended = airun_cuda::Graph::end_capture(&self.states[0].stream);
+            let built = queued.and_then(|_| Ok(ended?));
+            match built {
+                Ok(graph) => ch.graph = Some(graph),
+                Err(e) => {
+                    self.chain = Some(ch);
+                    return Err(e);
+                }
+            }
+        }
+        let st = &self.states[0];
+        let slot = ch.launches % 2;
+        let queued = ch.graph.as_ref().expect("graph was just built").launch(&st.stream)
+            .and_then(|_| st.tokens.copy_to_host(&mut ch.slots.as_mut_slice()[slot..slot + 1], &st.stream))
+            .and_then(|_| ch.ready[slot].record(&st.stream));
+        ch.launches += 1;
+        self.chain = Some(ch);
+        queued?;
+        Ok(slot)
+    }
+
+    /// Waits for the chained step that fills `slot` and returns its pick.
+    fn chain_read(&self, slot: usize) -> Result<u32> {
+        let ch = self.chain.as_ref().ok_or_else(|| {
+            CoreError::Other("chained decode read before it was seeded; this is a bug".into())
+        })?;
+        ch.ready[slot].synchronize()?;
+        Ok(ch.slots.as_slice()[slot] as u32)
+    }
+
+    /// Runs `tokens` through the model, leaving the last one's logits on the
+    /// device.
+    fn step(&mut self, tokens: &[u32]) -> Result<()> {
         if tokens.is_empty() {
             return Err(CoreError::Other("forward called with no tokens".into()));
         }
@@ -308,7 +547,8 @@ impl Runtime {
         // Decode goes through a captured CUDA graph where possible: a step is
         // hundreds of tiny launches, and issuing them one by one measured
         // ~40% of a decode step as GPU idle time on a 1.7B.
-        if tokens.len() == 1 && self.states.len() == 1 && !graphs_disabled() {
+        if tokens.len() == 1 && self.states.len() == 1 && !graphs_disabled()
+            && !self.states[0].moe.as_ref().is_some_and(|m| m.upload.is_some()) {
             return self.forward_decode_graphed(tokens[0]);
         }
 
@@ -316,17 +556,9 @@ impl Runtime {
         let positions: Vec<i32> = (0..n).map(|i| (self.n_past + i) as i32).collect();
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         self.queue_forward(&token_ids, &positions)?;
-
-        let st = &self.states[self.states.len() - 1];
-        device::set_device(st.device)?;
-        let logits = st
-            .logits
-            .as_ref()
-            .ok_or_else(|| CoreError::Other("output shard has no logits buffer".into()))?;
-        let out = logits.to_vec(&st.stream)?;
         self.n_past += n;
         self.history.extend_from_slice(tokens);
-        Ok(out)
+        Ok(())
     }
 
     /// One decode step through a captured graph.
@@ -336,7 +568,7 @@ impl Runtime {
     /// the pinned staging values and replay it. The capture stores pointers,
     /// which is why the token and position live in pinned buffers owned by
     /// the runtime: their addresses must outlive every replay.
-    fn forward_decode_graphed(&mut self, token: u32) -> Result<Vec<f32>> {
+    fn forward_decode_graphed(&mut self, token: u32) -> Result<()> {
         let mut dg = match self.decode_graph.take() {
             Some(dg) => dg,
             None => DecodeGraph {
@@ -363,16 +595,10 @@ impl Runtime {
             .expect("graph was just built")
             .launch(&self.states[0].stream)?;
 
-        let st = &self.states[0];
-        let logits = st
-            .logits
-            .as_ref()
-            .ok_or_else(|| CoreError::Other("output shard has no logits buffer".into()))?;
-        let out = logits.to_vec(&st.stream)?;
         self.decode_graph = Some(dg);
         self.n_past += 1;
         self.history.push(token);
-        Ok(out)
+        Ok(())
     }
 
     /// Queues the whole forward pass for `token_ids` at `positions` on the
@@ -380,6 +606,12 @@ impl Runtime {
     /// the caller reads the logits back. Factored out of [`Self::forward`] so
     /// the decode path can record exactly this work into a CUDA graph.
     fn queue_forward(&mut self, token_ids: &[i32], positions: &[i32]) -> Result<()> {
+        self.queue_forward_with(token_ids, positions, true)
+    }
+
+    /// [`Self::queue_forward`]; with `upload` false the tokens and positions are
+    /// already in the device buffers, and the slices only give their count.
+    fn queue_forward_with(&mut self, token_ids: &[i32], positions: &[i32], upload: bool) -> Result<()> {
         let cfg = self.model.config.clone();
         let n = token_ids.len();
 
@@ -387,8 +619,10 @@ impl Runtime {
         {
             let st = &mut self.states[0];
             device::set_device(st.device)?;
-            st.tokens.copy_from_host(&token_ids, &st.stream)?;
-            st.positions.copy_from_host(&positions, &st.stream)?;
+            if upload {
+                st.tokens.copy_from_host(&token_ids, &st.stream)?;
+                st.positions.copy_from_host(&positions, &st.stream)?;
+            }
 
             let embd = &self.model.token_embd;
             ops::embed(
@@ -425,6 +659,7 @@ impl Runtime {
                 let layer = self.states[si].layers[local];
                 self.run_layer(si, local, layer, n, &cfg)?;
             }
+
         }
 
         // --- final norm and projection, last token only ---
@@ -432,15 +667,18 @@ impl Runtime {
         let st = &self.states[last];
         device::set_device(st.device)?;
 
-        ops::rmsnorm(
-            st.xb.as_mut_ptr(),
-            st.x.as_ptr(),
-            self.model.output_norm.as_ptr(),
-            cfg.n_embd,
-            n,
-            cfg.rms_eps,
-            &st.stream,
-        )?;
+        // The last layer's residual add already left this norm in xb.
+        if fused_norms_disabled() || st.layers.is_empty() {
+            ops::rmsnorm(
+                st.xb.as_mut_ptr(),
+                st.x.as_ptr(),
+                self.model.output_norm.as_ptr(),
+                cfg.n_embd,
+                n,
+                cfg.rms_eps,
+                &st.stream,
+            )?;
+        }
 
         let out_w = self.model.output_tensor();
         let logits = st
@@ -463,6 +701,7 @@ impl Runtime {
             out_w.row_bytes,
             &st.stream,
         )?;
+
 
         Ok(())
     }
@@ -524,15 +763,19 @@ impl Runtime {
         let stream = &st.stream;
 
         // --- token mixing ---
-        ops::rmsnorm(
-            st.xb.as_mut_ptr(),
-            st.x.as_ptr(),
-            w.attn_norm.as_ptr(),
-            cfg.n_embd,
-            n,
-            cfg.rms_eps,
-            stream,
-        )?;
+        // The previous layer on this device already left this norm in xb (see
+        // the end of this function).
+        if !(local > 0 && !fused_norms_disabled()) {
+            ops::rmsnorm(
+                st.xb.as_mut_ptr(),
+                st.x.as_ptr(),
+                w.attn_norm.as_ptr(),
+                cfg.n_embd,
+                n,
+                cfg.rms_eps,
+                stream,
+            )?;
+        }
 
         let kind = match &w.block {
             Block::Attention(_) => "attn",
@@ -547,27 +790,51 @@ impl Runtime {
             }
         }
         trace_block(st, layer, kind, n, cfg)?;
-        ops::add(st.x.as_mut_ptr(), st.xb2.as_ptr(), n * cfg.n_embd, stream)?;
 
         // --- feed-forward ---
-        ops::rmsnorm(
-            st.xb.as_mut_ptr(),
-            st.x.as_ptr(),
-            w.ffn_norm.as_ptr(),
-            cfg.n_embd,
-            n,
-            cfg.rms_eps,
-            stream,
-        )?;
+
+        if fused_norms_disabled() {
+            ops::add(st.x.as_mut_ptr(), st.xb2.as_ptr(), n * cfg.n_embd, stream)?;
+            ops::rmsnorm(
+                st.xb.as_mut_ptr(),
+                st.x.as_ptr(),
+                w.ffn_norm.as_ptr(),
+                cfg.n_embd,
+                n,
+                cfg.rms_eps,
+                stream,
+            )?;
+        } else {
+            ops::add_rmsnorm(st.xb.as_mut_ptr(), st.x.as_mut_ptr(), st.xb2.as_ptr(),
+                w.ffn_norm.as_ptr(), cfg.n_embd, n, cfg.rms_eps, stream)?;
+        }
 
         if ablated("ffn") {
             st.xb2.fill_zero(stream)?;
         } else {
             match &w.ffn {
                 FfnWeights::Dense { gate, up, down } => {
-                    matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
-                    matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
-                    ops::swiglu(st.gate.as_mut_ptr(), st.up.as_ptr(), n * cfg.ffn_len, stream)?;
+                    // Prefill takes gate, up and SwiGLU as one integer tensor-core
+                    // launch where it can (see matvec_mmq_async_kernel's GLU).
+                    let glu = n > 1 && !matvec_f32_forced() && same_shape(&[gate, up])
+                        && ops::matvec_supports_q8(gate.kernel_type())
+                        && ops::mmq_glu_supported(gate.kernel_type(), gate.data.as_ptr(),
+                            up.data.as_ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
+                    if n == 1 && same_shape(&[gate, up]) {
+                        // Decode: gate, up and SwiGLU in one launch, bit-identical.
+                        ops::matvec_glu(gate.kernel_type(), gate.data.as_ptr(), up.data.as_ptr(),
+                            st.xb.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, gate.row_bytes,
+                            stream)?;
+                    } else if glu {
+                        ops::quantize_act(st.xb.as_ptr(), st.q8act.buf.as_mut_ptr(), n * gate.k, stream)?;
+                        ops::matvec_q8_glu(gate.kernel_type(), gate.data.as_ptr(), up.data.as_ptr(),
+                            st.q8act.buf.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, n,
+                            gate.row_bytes, stream)?;
+                    } else {
+                        matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
+                        matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
+                        ops::swiglu(st.gate.as_mut_ptr(), st.up.as_ptr(), n * cfg.ffn_len, stream)?;
+                    }
                     matvec(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
                 }
                 FfnWeights::Moe {
@@ -581,9 +848,30 @@ impl Runtime {
             }
         }
         trace_block(st, layer, "ffn", n, cfg)?;
-        ops::add(st.x.as_mut_ptr(), st.xb2.as_ptr(), n * cfg.n_embd, stream)?;
+        // The residual add, fused with whichever norm reads x next: the next
+        // layer's on this device, or the output norm after the last layer.
+        // Across devices x moves first, so the add stays plain.
+        match self.next_norm(si, local) {
+            Some(norm) if !fused_norms_disabled() => ops::add_rmsnorm(st.xb.as_mut_ptr(),
+                st.x.as_mut_ptr(), st.xb2.as_ptr(), norm, cfg.n_embd, n, cfg.rms_eps, stream)?,
+            _ => ops::add(st.x.as_mut_ptr(), st.xb2.as_ptr(), n * cfg.n_embd, stream)?,
+        }
 
         Ok(())
+    }
+
+    /// The norm applied to x right after layer `local` of shard `si`, when it
+    /// runs on the same device: the next layer's attention norm, or the output
+    /// norm after the model's last layer.
+    fn next_norm(&self, si: usize, local: usize) -> Option<*const std::ffi::c_void> {
+        let layers = &self.states[si].layers;
+        if local + 1 < layers.len() {
+            Some(self.model.layers[layers[local + 1]].attn_norm.as_ptr())
+        } else if si + 1 == self.states.len() {
+            Some(self.model.output_norm.as_ptr())
+        } else {
+            None
+        }
     }
 
     /// Softmax attention, optionally with a per-head sigmoid output gate.
@@ -598,6 +886,8 @@ impl Runtime {
         let st = &self.states[si];
         let stream = &st.stream;
 
+        // Decode runs q, k and v as one launch (same f32 kernel, same result).
+        let fused_qkv = n == 1 && !cfg.attn_output_gate && same_shape(&[&a.q, &a.k, &a.v]);
         if cfg.attn_output_gate {
             // The q projection packs a gate next to each head's queries; they
             // interleave per head rather than sitting in two blocks.
@@ -627,36 +917,27 @@ impl Runtime {
                 interleaved,
                 stream,
             )?;
+        } else if fused_qkv {
+            // Decode: q, k and v in one launch. k and v alone are grids too
+            // small to keep DRAM busy (see matvec3_kernel).
+            ops::matvec3(
+                a.q.kernel_type(),
+                [a.q.data.as_ptr(), a.k.data.as_ptr(), a.v.data.as_ptr()],
+                st.xb.as_ptr(),
+                [st.q.as_mut_ptr(), st.k.as_mut_ptr(), st.v.as_mut_ptr()],
+                a.q.k,
+                [a.q.rows, a.k.rows, a.v.rows],
+                a.q.row_bytes,
+                stream,
+            )?;
         } else {
             matvec(&a.q, &st.xb, &st.q, n, &st.q8act, stream)?;
         }
-        matvec_reuse(&a.k, &st.xb, &st.k, n, &st.q8act, stream)?;
-        matvec_reuse(&a.v, &st.xb, &st.v, n, &st.q8act, stream)?;
+        if !fused_qkv {
+            matvec_reuse(&a.k, &st.xb, &st.k, n, &st.q8act, stream)?;
+            matvec_reuse(&a.v, &st.xb, &st.v, n, &st.q8act, stream)?;
+        }
 
-        // Per-head RMSNorm before RoPE. Rows are contiguous head_dim slices, so
-        // this is one call over n * heads rows.
-        if let Some(qn) = &a.q_norm {
-            ops::rmsnorm(
-                st.q.as_mut_ptr(),
-                st.q.as_ptr(),
-                qn.as_ptr(),
-                cfg.head_dim,
-                n * cfg.n_head,
-                cfg.rms_eps,
-                stream,
-            )?;
-        }
-        if let Some(kn) = &a.k_norm {
-            ops::rmsnorm(
-                st.k.as_mut_ptr(),
-                st.k.as_ptr(),
-                kn.as_ptr(),
-                cfg.head_dim,
-                n * cfg.n_head_kv,
-                cfg.rms_eps,
-                stream,
-            )?;
-        }
 
         // Partial rotary: `rope_dim` may be a fraction of `head_dim`, leaving the
         // tail of each head unrotated. AIRUN_ROPE_FULL=1 rotates the whole head
@@ -673,75 +954,105 @@ impl Runtime {
         // notices is not attending the way it was trained to.
         let rope_off = std::env::var("AIRUN_ROPE_OFF").is_ok();
 
-        if !rope_off {
-            ops::rope(
-                st.q.as_mut_ptr(),
-                st.positions.as_ptr(),
-                n,
-                cfg.n_head,
-                cfg.head_dim,
-                rope_dim,
-                cfg.rope_base,
-                cfg.rope_scale,
-                rope_interleaved,
-                stream,
-            )?;
-            ops::rope(
-                st.k.as_mut_ptr(),
-                st.positions.as_ptr(),
-                n,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                rope_dim,
-                cfg.rope_base,
-                cfg.rope_scale,
-                rope_interleaved,
-                stream,
-            )?;
-        }
-
         let LayerState::Kv { k: kc, v: vc } = &st.states[local] else {
             return Err(CoreError::Other(
                 "an attention layer was given a recurrent state".into(),
             ));
         };
 
-        ops::kv_store(
-            kc.as_mut_ptr(),
-            vc.as_mut_ptr(),
-            st.k.as_ptr(),
-            st.v.as_ptr(),
-            st.positions.as_ptr(),
-            n,
-            cfg.n_head_kv,
-            cfg.head_dim,
-            self.ctx,
-            stream,
-        )?;
+        if !fused_prologue_disabled() {
+            // q/k norms, RoPE and the cache write in one launch (see
+            // qk_norm_rope_store_kernel); the same arithmetic as the steps below.
+            let null = std::ptr::null::<std::ffi::c_void>();
+            ops::qk_norm_rope_store(
+                st.q.as_mut_ptr(), st.k.as_ptr(), st.v.as_ptr(),
+                a.q_norm.as_ref().map_or(null, |w| w.as_ptr()),
+                a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
+                kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.as_ptr(),
+                n, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
+                (!rope_off).then_some((rope_dim, cfg.rope_base, cfg.rope_scale, rope_interleaved)),
+                cfg.kv_type, stream,
+            )?;
+        } else {
+            // Per-head RMSNorm before RoPE. Rows are contiguous head_dim slices, so
+            // this is one call over n * heads rows.
+            if let Some(qn) = &a.q_norm {
+                ops::rmsnorm(
+                    st.q.as_mut_ptr(),
+                    st.q.as_ptr(),
+                    qn.as_ptr(),
+                    cfg.head_dim,
+                    n * cfg.n_head,
+                    cfg.rms_eps,
+                    stream,
+                )?;
+            }
+            if let Some(kn) = &a.k_norm {
+                ops::rmsnorm(
+                    st.k.as_mut_ptr(),
+                    st.k.as_ptr(),
+                    kn.as_ptr(),
+                    cfg.head_dim,
+                    n * cfg.n_head_kv,
+                    cfg.rms_eps,
+                    stream,
+                )?;
+            }
 
-        ops::attention(
-            st.attn.as_mut_ptr(),
-            st.q.as_ptr(),
-            kc.as_ptr(),
-            vc.as_ptr(),
-            st.positions.as_ptr(),
-            n,
-            cfg.n_head,
-            cfg.n_head_kv,
-            cfg.head_dim,
-            self.ctx,
-            cfg.attn_scale(),
-            // AIRUN_ATTN_WINDOW=<n> forces a sliding window. Setting it to 1
-            // leaves each query able to see only its own position, so the cost
-            // of doing that measures how much the softmax layers draw from
-            // history at all.
-            match std::env::var("AIRUN_ATTN_WINDOW") {
-                Ok(v) => v.parse().unwrap_or(cfg.sliding_window),
-                Err(_) => cfg.sliding_window,
-            },
-            stream,
-        )?;
+            if !rope_off {
+                ops::rope(
+                    st.q.as_mut_ptr(),
+                    st.positions.as_ptr(),
+                    n,
+                    cfg.n_head,
+                    cfg.head_dim,
+                    rope_dim,
+                    cfg.rope_base,
+                    cfg.rope_scale,
+                    rope_interleaved,
+                    stream,
+                )?;
+                ops::rope(
+                    st.k.as_mut_ptr(),
+                    st.positions.as_ptr(),
+                    n,
+                    cfg.n_head_kv,
+                    cfg.head_dim,
+                    rope_dim,
+                    cfg.rope_base,
+                    cfg.rope_scale,
+                    rope_interleaved,
+                    stream,
+                )?;
+            }
 
+            ops::kv_store(
+                kc.as_mut_ptr(),
+                vc.as_mut_ptr(),
+                st.k.as_ptr(),
+                st.v.as_ptr(),
+                st.positions.as_ptr(),
+                n,
+                cfg.n_head_kv,
+                cfg.head_dim,
+                self.ctx,
+                cfg.kv_type,
+                stream,
+            )?;
+        }
+
+        let window = std::env::var("AIRUN_ATTN_WINDOW").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
+        if n == 1 && std::env::var("AIRUN_NO_SPLIT_ATTN").is_err() {
+            ops::attention_split(st.attn.as_mut_ptr(), &st.attn_partial,
+                st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(), st.positions.as_ptr(),
+                cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
+                window, ops::attention_splits(self.ctx), cfg.kv_type, stream)?;
+        } else {
+            ops::attention(st.attn.as_mut_ptr(), st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
+                st.positions.as_ptr(), n, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
+                self.ctx, cfg.attn_scale(), window, cfg.kv_type, stream)?;
+        }
         // AIRUN_ATTN_NO_GATE=1 drops the gate entirely, which says whether the
         // gate is the thing going wrong or merely riding along.
         if cfg.attn_output_gate && std::env::var("AIRUN_ATTN_NO_GATE").is_err() {
@@ -910,18 +1221,16 @@ impl Runtime {
             stream,
         )?;
 
-        // Gate per value head, then normalize, then scale by the learned weight.
+        // Normalize, scale by the learned weight, then gate -- the order of
+        // Qwen3-Next's RMSNormGated and of llama.cpp's build_norm_gated.
         //
-        // Mamba-2's fused RMSNormGated -- which Qwen3-Next's is derived from --
-        // gates before it measures the row, so the normalization divides the
-        // gate's own scale back out instead of leaving it in the output. Worth
-        // knowing that the short smoke test prefers the other order: it
-        // continues "...the lazy" with " dog" when the gate comes last and with
-        // nonsense when it comes first. Scored over a passage the ranking
-        // reverses and stays reversed on a second passage (4.40 against 4.89
-        // nats, then 5.08 against 5.75), which is the ordering kept here.
+        // The gate-first order once scored better (4.40 against 4.89 nats), but
+        // only while the delta rule paired V heads with the wrong K heads. With
+        // the K-head broadcast fixed the 35B scores 1.43 gate-last against 5.12
+        // gate-first. Two layout bugs can hide each other: re-measure old A/B
+        // decisions after fixing one.
         //
-        // AIRUN_SSM_GATE_AFTER_NORM=1 restores the other one.
+        // AIRUN_SSM_GATE_BEFORE_NORM=1 restores the other order.
         hybrid::rmsnorm_gated(
             st.attn.as_mut_ptr(),
             l.norm.as_ptr(),
@@ -929,7 +1238,7 @@ impl Runtime {
             ssm.head_v_dim(),
             n * ssm.n_v_heads,
             cfg.rms_eps,
-            std::env::var("AIRUN_SSM_GATE_AFTER_NORM").is_err(),
+            std::env::var("AIRUN_SSM_GATE_BEFORE_NORM").is_ok(),
             std::env::var("AIRUN_SSM_GATE_SIGMOID").is_ok(),
             stream,
         )?;
@@ -1012,6 +1321,63 @@ impl Runtime {
             st.xb2.fill_zero(stream)?;
         }
 
+        if let Some(upload) = &m.upload {
+            let mut ids = vec![0i32; n * moe.n_experts_used];
+            let waited = std::time::Instant::now();
+            m.ids.copy_to_host(&mut ids, stream)?;
+            stream.synchronize()?;
+            let wait_ms = waited.elapsed().as_secs_f64() * 1000.0;
+            let mut staging = upload.borrow_mut();
+            let mut host_ids = m.cached_host_ids.borrow_mut();
+            let tensors = [gate_exps, up_exps, down_exps];
+            for t in (0..n).step_by(m.cache_group) {
+                // The next token may evict a slot, and pinned staging cannot be
+                // rewritten while the DMA engine is still reading it.
+                if t > 0 { stream.synchronize()?; }
+                let count = m.cache_group.min(n - t);
+                let selected = &ids[t * moe.n_experts_used..(t + count) * moe.n_experts_used];
+                let mut picks = Vec::with_capacity(3);
+                for w in tensors {
+                    match w.select_experts(selected) {
+                        Ok(p) => picks.push(p),
+                        Err(e) => { tensors.iter().for_each(|w| w.invalidate_experts()); return Err(e); }
+                    }
+                }
+                if picks[0].0 != picks[1].0 || picks[0].0 != picks[2].0 {
+                    tensors.iter().for_each(|w| w.invalidate_experts());
+                    return Err(CoreError::Other("expert caches disagree; reload the model and run airun selftest".into()));
+                }
+                let reader = m.reader.as_ref().ok_or_else(|| CoreError::Other(
+                    "streamed experts without a reader; reload the model".into()))?;
+                let read = std::time::Instant::now();
+                let uploaded = upload_experts(&tensors, &picks, staging.as_mut_slice(), reader, stream);
+                let (w, r) = m.timing.get();
+                m.timing.set((w + if t == 0 { wait_ms } else { 0.0 }, r + read.elapsed().as_secs_f64() * 1000.0));
+                if let Err(e) = uploaded {
+                    tensors.iter().for_each(|w| w.invalidate_experts());
+                    return Err(e);
+                }
+                let gate_ids = &picks[0].0;
+                host_ids.as_mut_slice()[..gate_ids.len()].copy_from_slice(gate_ids);
+                m.cached_ids.copy_from_host_at(0, &host_ids.as_slice()[..gate_ids.len()], stream)?;
+                hybrid::moe_gate_up(
+                    gate_exps.kernel_type(), gate_exps.data.as_ptr(), up_exps.data.as_ptr(),
+                    st.xb.offset_ptr(t * cfg.n_embd), m.cached_ids.as_ptr(), m.h.as_mut_ptr(),
+                    cfg.n_embd, moe.expert_ff, count, moe.n_experts_used,
+                    gate_exps.row_bytes, gate_exps.expert_stride, stream,
+                )?;
+                hybrid::moe_down(
+                    down_exps.kernel_type(), down_exps.data.as_ptr(), m.h.as_ptr(),
+                    m.cached_ids.as_ptr(), m.weights.offset_ptr(t * moe.n_experts_used),
+                    st.xb2.offset_ptr(t * cfg.n_embd), moe.expert_ff, cfg.n_embd,
+                    count, moe.n_experts_used, down_exps.row_bytes, down_exps.expert_stride, stream,
+                )?;
+                // Both staging arrays belong to the runtime. The next routing
+                // read synchronizes before either is reused by another layer.
+            }
+            return Ok(());
+        }
+
         hybrid::moe_gate_up(
             gate_exps.kernel_type(),
             gate_exps.data.as_ptr(),
@@ -1067,12 +1433,22 @@ impl Runtime {
         let cached = self.reusable_prefix(prompt);
         self.rewind_to(cached);
 
-        let mut logits = Vec::new();
+        // Greedy decoding picks each token on the GPU (see forward_argmax);
+        // anything else samples from logits copied to pinned host memory.
+        let greedy = sampler.is_pure_greedy() && !gpu_argmax_disabled();
+        let mut next: Option<u32> = None;
         let mut prompt_done = cached;
         while prompt_done < prompt.len() {
             let take = (prompt.len() - prompt_done).min(self.max_batch);
-            logits = self.forward(&prompt[prompt_done..prompt_done + take])?;
+            let chunk = &prompt[prompt_done..prompt_done + take];
             prompt_done += take;
+            if prompt_done < prompt.len() {
+                self.step(chunk)?;
+            } else if greedy {
+                next = Some(self.forward_argmax(chunk)?);
+            } else {
+                self.forward_pinned(chunk)?;
+            }
         }
         let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1084,9 +1460,22 @@ impl Runtime {
         let mut decoder = self.tokenizer.stream_decoder();
         let mut last_token = 0u32;
 
+        // Chained greedy steps queued and not yet read, oldest first: the slot
+        // each one's pick lands in. At most two -- the step for the token just
+        // accepted, and the one after it.
+        let chain = greedy && self.chain_eligible();
+        let mut inflight: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+
         let mut stop = StopReason::MaxTokens;
         for _ in 0..max_tokens {
-            let token = sampler.sample(&mut logits, &history);
+            let token = match next.take() {
+                Some(t) => t,
+                None => {
+                    let logits = self.logits_host.as_mut().ok_or_else(|| CoreError::Other(
+                        "generate has no logits to sample; the prompt must not be empty".into()))?;
+                    sampler.sample(logits.as_mut_slice(), &history)
+                }
+            };
             if self.tokenizer.is_eog(token) {
                 stop = StopReason::EndOfGeneration;
                 break;
@@ -1103,7 +1492,37 @@ impl Runtime {
                 stop = StopReason::ContextFull;
                 break;
             }
-            logits = self.forward(&[token])?;
+            if chain {
+                if inflight.is_empty() {
+                    self.chain_seed(token)?;
+                    inflight.push_back(self.chain_launch()?);
+                }
+                // That step (queued now or one iteration ago) is `token`'s.
+                self.n_past += 1;
+                self.history.push(token);
+                // The next step's input is this step's pick, which the GPU
+                // already holds: queue it before reading the pick back, so the
+                // GPU is not idle while the host waits, copies and hands the
+                // token out. If the pick ends generation, that step is never
+                // committed: the position stays put and its cache row is
+                // overwritten by whatever comes next.
+                if generated < max_tokens && self.n_past < self.ctx {
+                    inflight.push_back(self.chain_launch()?);
+                }
+                let slot = inflight.pop_front().expect("a chained step is in flight");
+                next = Some(self.chain_read(slot)?);
+            } else if greedy {
+                next = Some(self.forward_argmax(&[token])?);
+            } else {
+                self.forward_pinned(&[token])?;
+            }
+        }
+        if !inflight.is_empty() {
+            // A speculative step outlived the loop; let it finish before its
+            // pinned staging can be reused.
+            let st = &self.states[0];
+            device::set_device(st.device)?;
+            st.stream.synchronize()?;
         }
 
         // A generation that stops mid-character leaves bytes behind; emit them
@@ -1313,6 +1732,92 @@ fn matvec_f32_forced() -> bool {
     *FORCED.get_or_init(|| std::env::var("AIRUN_MATVEC_F32").is_ok_and(|v| v.trim() != "0"))
 }
 
+/// Concurrent reads when streaming experts. An NVMe drive only reaches its
+/// bandwidth with several requests in flight.
+const EXPERT_READERS: usize = 8;
+
+use crate::expert_reader::ExpertReader;
+
+/// Reads every expert miss of one MoE step from the GGUF into pinned staging,
+/// then queues the uploads.
+///
+/// The misses are a few dozen ~0.6 MiB pieces scattered over a 20 GB file. Read
+/// through the mmap they arrived one page fault at a time, the SSD's queue-depth-1
+/// speed of ~220 MB/s, and that was nearly all of decode. Parallel positional
+/// reads (see ExpertReader) keep the drive's queue full.
+fn upload_experts(
+    tensors: &[&GpuTensor; 3],
+    picks: &[(Vec<i32>, Vec<(usize, usize)>)],
+    staging: &mut [u8],
+    reader: &ExpertReader,
+    stream: &Stream,
+) -> Result<()> {
+    // (tensor, slot, file offset, staging range)
+    let mut jobs = Vec::new();
+    let mut used = 0usize;
+    for (w, (_, uploads)) in tensors.iter().zip(picks) {
+        for &(slot, expert) in uploads {
+            let offset = w.expert_file_offset(expert).ok_or_else(|| CoreError::Other(
+                "an expert miss on a tensor that is not streamed; reload the model".into()))?;
+            let end = used + w.expert_stride;
+            if end > staging.len() {
+                return Err(CoreError::Other(
+                    "expert uploads exceed the staging buffer; lower --batch-size".into()));
+            }
+            jobs.push((*w, slot, offset, used..end));
+            used = end;
+        }
+    }
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    let mut rest = &mut staging[..used];
+    let mut reads = Vec::with_capacity(jobs.len());
+    for (w, _, offset, _) in &jobs {
+        let (head, tail) = rest.split_at_mut(w.expert_stride);
+        reads.push((*offset, head));
+        rest = tail;
+    }
+    reader.read_all(reads).map_err(|e| CoreError::Other(format!(
+        "reading experts from the model file failed ({e}); check the drive and that the file is unchanged")))?;
+    for (w, slot, _, range) in jobs {
+        w.data.copy_from_host_at(slot * w.expert_stride, &staging[range], stream)?;
+    }
+    Ok(())
+}
+
+/// AIRUN_NO_GPU_ARGMAX=1 copies the logits to the host for greedy decoding too.
+fn gpu_argmax_disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("AIRUN_NO_GPU_ARGMAX").is_ok_and(|v| v.trim() != "0"))
+}
+
+/// AIRUN_NO_FUSED_NORMS=1 keeps each residual add and the norm after it as two
+/// launches, to compare against add_rmsnorm.
+fn fused_norms_disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("AIRUN_NO_FUSED_NORMS").is_ok_and(|v| v.trim() != "0"))
+}
+
+/// AIRUN_NO_FUSED_PROLOGUE=1 runs the q/k norms, RoPE and the cache write as
+/// separate launches, to compare against the fused kernel.
+fn fused_prologue_disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("AIRUN_NO_FUSED_PROLOGUE").is_ok_and(|v| v.trim() != "0"))
+}
+
+/// Weights that one fused decode launch can serve together: same kernel type,
+/// inner size and row size, with row counts the fused kernel can partition.
+fn same_shape(ws: &[&GpuTensor]) -> bool {
+    let first = ws[0];
+    ws.iter().all(|w| {
+        w.ty == first.ty && w.k == first.k && w.row_bytes == first.row_bytes
+            && w.rows % 4 == 0 && w.n_experts <= 1
+    })
+}
+
+
 /// `out = w @ x` for `n` tokens.
 ///
 /// Quantizes `x` into `q8` and takes the integer kernel when the weight type
@@ -1351,9 +1856,11 @@ fn matvec_reuse(
     //              launches measured faster (148 vs 133 tok/s, Q8_0 1.7B).
     //              This also keeps generation bit-identical to the reference.
     //   2..63      dp4a on quantized activations, when the type has a kernel.
-    //   64+        handled inside ops::matvec, which sends large batches to
-    //              the fp16 tensor-core kernel for every weight type.
-    if n > 1 && n < 64 && !matvec_f32_forced() && ops::matvec_supports_q8(w.kernel_type()) {
+    //   64+        int8 tensor cores (MMQ) on sm_80+ for the same types.
+    //              Other types and older GPUs go to ops::matvec's fp16
+    //              tensor-core kernel.
+    let batch_q8 = n < 64 || ops::mmq_supported();
+    if n > 1 && batch_q8 && !matvec_f32_forced() && ops::matvec_supports_q8(w.kernel_type()) {
         if !q8.valid.get() {
             ops::quantize_act(x.as_ptr(), q8.buf.as_mut_ptr(), n * w.k, stream)?;
             q8.valid.set(true);
