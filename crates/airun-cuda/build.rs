@@ -76,10 +76,38 @@ fn main() {
         })
         .unwrap_or_else(|| DEFAULT_ARCHS.iter().map(|s| s.to_string()).collect());
 
-    let mut cmd = Command::new(&nvcc);
+    // Flags, include path, host compiler and its environment, shared by both
+    // libraries below.
+    let base = || {
+        let mut cmd = Command::new(&nvcc);
+        cmd.args([
+            "-O3",
+            "--use_fast_math",
+            "-std=c++17",
+            "--extended-lambda",
+            "-Xcompiler",
+            "/EHsc",
+            // MSVC releases move faster than CUDA's supported-compiler table; the
+            // C++ we generate is plain enough that the check is not worth a hard stop.
+            "-allow-unsupported-compiler",
+            "-diag-suppress=177", // unused function: kernels are selected per type
+        ]);
+        cmd.arg("-I").arg(&kernels_dir);
+        if let Some(ccbin) = host_compiler_dir() {
+            cmd.arg("-ccbin").arg(&ccbin);
+        }
+        // The MSVC environment (INCLUDE/LIB) has to reach the host compiler nvcc spawns.
+        if let Some(tool) = cc::windows_registry::find_tool(&target(), "cl.exe") {
+            for (k, v) in tool.env() {
+                cmd.env(k, v);
+            }
+        }
+        cmd
+    };
+
+    let mut cmd = base();
     cmd.arg("-lib");
     cmd.arg("-o").arg(out_dir.join("airun_kernels.lib"));
-
     for arch in &archs {
         cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
     }
@@ -87,53 +115,31 @@ fn main() {
     if let Some(newest) = archs.last() {
         cmd.arg(format!("-gencode=arch=compute_{newest},code=compute_{newest}"));
     }
-
-    cmd.args([
-        "-O3",
-        "--use_fast_math",
-        "-std=c++17",
-        "--extended-lambda",
-        "-Xcompiler",
-        "/EHsc",
-        // MSVC releases move faster than CUDA's supported-compiler table; the
-        // C++ we generate is plain enough that the check is not worth a hard stop.
-        "-allow-unsupported-compiler",
-        "-diag-suppress=177", // unused function: kernels are selected per type
-    ]);
-    cmd.arg("-I").arg(&kernels_dir);
-
-    if let Some(ccbin) = host_compiler_dir() {
-        cmd.arg("-ccbin").arg(&ccbin);
-    }
     for src in &sources {
         cmd.arg(src);
     }
+    run_nvcc(cmd, &nvcc);
 
-    // The MSVC environment (INCLUDE/LIB) has to reach the host compiler nvcc spawns.
-    if let Some(tool) = cc::windows_registry::find_tool(&target(), "cl.exe") {
-        for (k, v) in tool.env() {
-            cmd.env(k, v);
-        }
+    // Blackwell's FP4 tensor-core instructions exist only in the arch-specific
+    // target, so their unit is built for compute_120a alone. Without sm_120 in
+    // the list it is built empty and reports itself unsupported.
+    let mut fp4 = base();
+    fp4.arg("-lib");
+    fp4.arg("-o").arg(out_dir.join("airun_fp4.lib"));
+    if archs.iter().any(|a| a == "120") {
+        fp4.arg("-gencode=arch=compute_120a,code=sm_120a");
+        fp4.arg("-DAIRUN_FP4_BUILT=1");
+    } else {
+        let a = &archs[0];
+        fp4.arg(format!("-gencode=arch=compute_{a},code=sm_{a}"));
+        fp4.arg("-DAIRUN_FP4_BUILT=0");
     }
-
-    let output = cmd.output().unwrap_or_else(|e| {
-        panic!("failed to run nvcc at {}: {e}", nvcc.display());
-    });
-
-    if !output.status.success() {
-        // nvcc diagnostics are the single most useful thing when a kernel breaks,
-        // so surface them verbatim rather than a one-line "build failed".
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            println!("cargo:warning=nvcc: {line}");
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            println!("cargo:warning=nvcc: {line}");
-        }
-        panic!("nvcc failed with status {}", output.status);
-    }
+    fp4.arg(kernels_dir.join("sm120a").join("fp4mma.cu"));
+    run_nvcc(fp4, &nvcc);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=airun_kernels");
+    println!("cargo:rustc-link-lib=static=airun_fp4");
 
     let lib_dir = cuda.join("lib").join("x64");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -214,4 +220,21 @@ fn find_cuda() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Runs nvcc, surfacing its diagnostics verbatim when it fails: they are the
+/// single most useful thing when a kernel breaks, more than "build failed".
+fn run_nvcc(mut cmd: Command, nvcc: &Path) {
+    let output = cmd.output().unwrap_or_else(|e| {
+        panic!("failed to run nvcc at {}: {e}", nvcc.display());
+    });
+    if !output.status.success() {
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            println!("cargo:warning=nvcc: {line}");
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            println!("cargo:warning=nvcc: {line}");
+        }
+        panic!("nvcc failed with status {}", output.status);
+    }
 }

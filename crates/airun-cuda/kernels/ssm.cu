@@ -1,4 +1,4 @@
-// Gated DeltaNet: the linear-attention layers of Qwen3-Next style hybrids.
+﻿// Gated DeltaNet: the linear-attention layers of Qwen3-Next style hybrids.
 //
 // These layers replace softmax attention with a recurrent state of shape
 // [head_k_dim, head_v_dim] per head. The state is a fixed size regardless of
@@ -34,7 +34,8 @@ __global__ void causal_conv1d_kernel(
     const int channels,
     const int kernel,
     const int apply_silu,
-    const int reverse) {
+    const int reverse,
+    const int keep_state) {
 
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
@@ -70,7 +71,58 @@ __global__ void causal_conv1d_kernel(
         if (hist > 0) window[hist - 1] = cur;
     }
 
-    for (int i = 0; i < hist; ++i) st[i] = window[i];
+    // A speculative verify reads the history but leaves it; the accepted
+    // tokens are pushed afterwards by a call that keeps it.
+    if (keep_state) {
+        for (int i = 0; i < hist; ++i) st[i] = window[i];
+    }
+}
+
+// causal_conv1d_kernel's arithmetic, out of place and parallel over tokens as
+// well as channels: each thread does CONV_T tokens of one channel, reading the
+// inputs (and, before the first token, the history) without writing them. The
+// in-place kernel walked all tokens of a channel in one thread -- 40 blocks for
+// a 512-token prefill of a 10240-channel layer, 7% of the prefill.
+#define CONV_T 8
+__global__ void causal_conv1d_oop_kernel(
+    const float* __restrict__ x, float* __restrict__ out, const float* __restrict__ weight,
+    const float* __restrict__ state, const int n_tokens, const int channels, const int kernel,
+    const int apply_silu, const int reverse) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int hist = kernel - 1;
+    const float* w = weight + (size_t)c * kernel;
+    const float* st = state + (size_t)c * hist;
+    const int cur_tap = reverse ? 0 : hist;
+    const int t0 = blockIdx.y * CONV_T;
+    for (int t = t0; t < min(t0 + CONV_T, n_tokens); ++t) {
+        float acc = 0.0f;
+        for (int i = 0; i < hist; ++i) {
+            const int src = t - hist + i;   // window[i], oldest first
+            const float v = src >= 0 ? x[(size_t)src * channels + c] : st[hist + src];
+            acc = fmaf(w[reverse ? (hist - i) : i], v, acc);
+        }
+        acc = fmaf(w[cur_tap], x[(size_t)t * channels + c], acc);
+        if (apply_silu) acc = acc / (1.0f + __expf(-acc));
+        out[(size_t)t * channels + c] = acc;
+    }
+}
+
+// The history after the last token: the last `kernel - 1` inputs, reaching
+// into the old history when fewer tokens than that arrived.
+__global__ void conv_state_push_kernel(
+    const float* __restrict__ x, float* __restrict__ state, const int n_tokens, const int channels,
+    const int kernel) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int hist = kernel - 1;
+    float* st = state + (size_t)c * hist;
+    float next[8];
+    for (int i = 0; i < hist; ++i) {
+        const int src = n_tokens - hist + i;
+        next[i] = src >= 0 ? x[(size_t)src * channels + c] : st[hist + src];
+    }
+    for (int i = 0; i < hist; ++i) st[i] = next[i];
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +211,8 @@ __global__ void delta_gates_kernel(
 // shared-memory tree reductions. The reduction changes the summation order, so
 // this path is validated by the selftest bound rather than bit equality.
 #define DELTA_DK_PAR 8
+// Value columns per block of the register kernel (see delta_rule_reg_kernel).
+#define DELTA_COLS 32
 
 __global__ void delta_rule_par_kernel(
     float* __restrict__ state,          // [n_v_heads][head_k_dim][head_v_dim]
@@ -247,6 +301,106 @@ __global__ void delta_rule_par_kernel(
             out[((size_t)t * n_v_heads + vh) * head_v_dim + dv] = o;
         }
         __syncthreads();
+    }
+}
+
+// delta_rule_par_kernel with each thread's dk slice of the state held in
+// registers for the whole call: the state is read once and written once (or,
+// with keep_state 0, not at all -- a speculative verify that must leave the
+// state as it was). The arithmetic is the in-place kernel's, operation for
+// operation, so the results are bit-identical to it.
+// Blocks reach 128 x 8 = 1024 threads, so registers must stay at 64 per thread.
+template <int SLICE>
+__global__ __launch_bounds__(256) void delta_rule_reg_kernel(
+    float* __restrict__ state,          // [n_v_heads][head_k_dim][head_v_dim]
+    const float* __restrict__ q,        // [n_tokens][n_k_heads][head_k_dim]
+    const float* __restrict__ k,        // [n_tokens][n_k_heads][head_k_dim]
+    const float* __restrict__ v,        // [n_tokens][n_v_heads][head_v_dim]
+    const float* __restrict__ decay,    // [n_tokens][n_v_heads]
+    const float* __restrict__ beta,     // [n_tokens][n_v_heads]
+    float* __restrict__ out,            // [n_tokens][n_v_heads][head_v_dim]
+    const int n_tokens,
+    const int n_k_heads,
+    const int n_v_heads,
+    const int head_k_dim,
+    const int head_v_dim,
+    const int keep_state) {
+
+    // Value columns of the state never interact (each has its own memory
+    // read, correction and output), so a head's columns split across
+    // blockIdx.y: one block per head left 22 of a 70-SM card idle.
+    const int vh = blockIdx.x;
+    const int cols = blockDim.x;
+    const int dv = blockIdx.y * cols + threadIdx.x;
+    const int lc = threadIdx.x;
+    const int j  = threadIdx.y;
+    const int kh = vh % n_k_heads;
+    const int dk0 = j * SLICE;
+
+    float* S = state + (size_t)vh * head_k_dim * head_v_dim;
+
+    extern __shared__ float smem[];
+    float* k_sh = smem;
+    float* q_sh = k_sh + head_k_dim;
+    float* red  = q_sh + head_k_dim;
+    float* d_sh = red + DELTA_DK_PAR * cols;
+
+    const int tid = j * cols + lc;
+    const int nthreads = cols * DELTA_DK_PAR;
+
+    float s[SLICE];
+#pragma unroll
+    for (int i = 0; i < SLICE; ++i) s[i] = S[(size_t)(dk0 + i) * head_v_dim + dv];
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float d = decay[(size_t)t * n_v_heads + vh];
+        const float b = beta[(size_t)t * n_v_heads + vh];
+
+        for (int i = tid; i < head_k_dim; i += nthreads) {
+            k_sh[i] = k[((size_t)t * n_k_heads + kh) * head_k_dim + i];
+            q_sh[i] = q[((size_t)t * n_k_heads + kh) * head_k_dim + i];
+        }
+        __syncthreads();
+
+        float pm = 0.0f;
+#pragma unroll
+        for (int i = 0; i < SLICE; ++i) {
+            s[i] = s[i] * d;
+            pm = fmaf(s[i], k_sh[dk0 + i], pm);
+        }
+        red[j * cols + lc] = pm;
+        __syncthreads();
+
+        if (j == 0) {
+            float mem = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < DELTA_DK_PAR; ++jj) mem += red[jj * cols + lc];
+            d_sh[lc] = (v[((size_t)t * n_v_heads + vh) * head_v_dim + dv] - mem) * b;
+        }
+        __syncthreads();
+
+        const float delta = d_sh[lc];
+        float po = 0.0f;
+#pragma unroll
+        for (int i = 0; i < SLICE; ++i) {
+            s[i] = fmaf(k_sh[dk0 + i], delta, s[i]);
+            po = fmaf(s[i], q_sh[dk0 + i], po);
+        }
+        red[j * cols + lc] = po;
+        __syncthreads();
+
+        if (j == 0) {
+            float o = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < DELTA_DK_PAR; ++jj) o += red[jj * cols + lc];
+            out[((size_t)t * n_v_heads + vh) * head_v_dim + dv] = o;
+        }
+        __syncthreads();
+    }
+
+    if (keep_state) {
+#pragma unroll
+        for (int i = 0; i < SLICE; ++i) S[(size_t)(dk0 + i) * head_v_dim + dv] = s[i];
     }
 }
 
@@ -492,7 +646,7 @@ extern "C" {
 airun_status airun_causal_conv1d(
     void* x, const void* weight, void* state,
     int32_t n_tokens, int32_t channels, int32_t kernel, int32_t apply_silu,
-    int32_t reverse, cudaStream_t stream) {
+    int32_t reverse, int32_t keep_state, cudaStream_t stream) {
 
     if (n_tokens <= 0 || channels <= 0) return AIRUN_OK;
     if (kernel < 1 || kernel > 8) return AIRUN_ERR_BAD_ARG;
@@ -501,7 +655,26 @@ airun_status airun_causal_conv1d(
     const int blocks = (channels + threads - 1) / threads;
     causal_conv1d_kernel<<<blocks, threads, 0, stream>>>(
         (float*)x, (const float*)weight, (float*)state,
+        n_tokens, channels, kernel, apply_silu, reverse, keep_state);
+    AIRUN_CHECK_LAUNCH();
+}
+
+airun_status airun_causal_conv1d_oop(
+    const void* x, void* out, const void* weight, void* state,
+    int32_t n_tokens, int32_t channels, int32_t kernel, int32_t apply_silu,
+    int32_t reverse, int32_t keep_state, cudaStream_t stream) {
+
+    if (n_tokens <= 0 || channels <= 0) return AIRUN_OK;
+    if (kernel < 1 || kernel > 8) return AIRUN_ERR_BAD_ARG;
+    const int threads = 128;
+    const dim3 grid((channels + threads - 1) / threads, (n_tokens + CONV_T - 1) / CONV_T);
+    causal_conv1d_oop_kernel<<<grid, threads, 0, stream>>>(
+        (const float*)x, (float*)out, (const float*)weight, (const float*)state,
         n_tokens, channels, kernel, apply_silu, reverse);
+    if (keep_state) {
+        conv_state_push_kernel<<<(channels + 255) / 256, 256, 0, stream>>>(
+            (const float*)x, (float*)state, n_tokens, channels, kernel);
+    }
     AIRUN_CHECK_LAUNCH();
 }
 
@@ -533,7 +706,7 @@ airun_status airun_delta_rule(
     void* state, const void* q, const void* k, const void* v,
     const void* decay, const void* beta, void* out,
     int32_t n_tokens, int32_t n_k_heads, int32_t n_v_heads,
-    int32_t head_k_dim, int32_t head_v_dim, cudaStream_t stream) {
+    int32_t head_k_dim, int32_t head_v_dim, int32_t keep_state, cudaStream_t stream) {
 
     if (n_tokens <= 0) return AIRUN_OK;
     if (n_k_heads <= 0 || n_v_heads <= 0 || n_v_heads % n_k_heads != 0) return AIRUN_ERR_BAD_ARG;
@@ -541,6 +714,20 @@ airun_status airun_delta_rule(
 
     // The dk-parallel form needs the key dim to split evenly and the thread
     // block to fit; anything else takes the one-warp-column original.
+    if (head_k_dim == 16 * DELTA_DK_PAR && head_v_dim % DELTA_COLS == 0) {
+        const dim3 threads(DELTA_COLS, DELTA_DK_PAR);
+        const dim3 grid(n_v_heads, head_v_dim / DELTA_COLS);
+        const size_t shared =
+            (2 * (size_t)head_k_dim +
+             (size_t)(DELTA_DK_PAR + 1) * DELTA_COLS) * sizeof(float);
+        delta_rule_reg_kernel<16><<<grid, threads, shared, stream>>>(
+            (float*)state, (const float*)q, (const float*)k, (const float*)v,
+            (const float*)decay, (const float*)beta, (float*)out,
+            n_tokens, n_k_heads, n_v_heads, head_k_dim, head_v_dim, keep_state);
+        AIRUN_CHECK_LAUNCH();
+    }
+    // The in-place kernels below always write the state back.
+    if (!keep_state) return AIRUN_ERR_BAD_ARG;
     if (head_k_dim % DELTA_DK_PAR == 0 &&
         head_v_dim * DELTA_DK_PAR <= 1024) {
         const dim3 threads(head_v_dim, DELTA_DK_PAR);

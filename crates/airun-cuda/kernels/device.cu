@@ -155,15 +155,24 @@ airun_status airun_free(int32_t ordinal, void* ptr) {
 
 // Page-locked host memory. Worth the allocation cost for the weight-upload path
 // and for multi-GPU staging, where pageable memory would halve throughput.
+// Mapped too, so a kernel can read a table that stays in RAM (the token
+// embedding) a few rows at a time over PCIe.
 airun_status airun_host_alloc(uint64_t bytes, void** out) {
     void* ptr = nullptr;
-    cudaError_t e = cudaHostAlloc(&ptr, (size_t)bytes, cudaHostAllocPortable);
+    cudaError_t e = cudaHostAlloc(&ptr, (size_t)bytes, cudaHostAllocPortable | cudaHostAllocMapped);
     if (e != cudaSuccess) {
         *out = nullptr;
         return (airun_status)e;
     }
     *out = ptr;
     return AIRUN_OK;
+}
+
+// The address kernels on `ordinal` use for a mapped host allocation; the host
+// pointer itself under unified addressing.
+airun_status airun_host_device_ptr(int32_t ordinal, void* host, void** out) {
+    AIRUN_TRY(cudaSetDevice((int)ordinal));
+    return (airun_status)cudaHostGetDevicePointer(out, host, 0);
 }
 
 airun_status airun_host_free(void* ptr) {
@@ -181,6 +190,13 @@ airun_status airun_memcpy_d2h(void* dst, const void* src, uint64_t bytes, cudaSt
 
 airun_status airun_memcpy_d2d(void* dst, const void* src, uint64_t bytes, cudaStream_t stream) {
     return (airun_status)cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyDeviceToDevice, stream);
+}
+
+// `rows` runs of `width` bytes, `spitch` apart in src and `dpitch` apart in dst.
+airun_status airun_memcpy2d_d2d(void* dst, uint64_t dpitch, const void* src, uint64_t spitch,
+                                uint64_t width, uint64_t rows, cudaStream_t stream) {
+    return (airun_status)cudaMemcpy2DAsync(dst, (size_t)dpitch, src, (size_t)spitch, (size_t)width,
+                                           (size_t)rows, cudaMemcpyDeviceToDevice, stream);
 }
 
 // Cross-device copy. Falls back to a staged copy through host memory when the

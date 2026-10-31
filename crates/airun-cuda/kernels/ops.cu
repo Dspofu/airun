@@ -160,8 +160,7 @@ __global__ void rope_kernel(
     const int n_heads,
     const int head_dim,
     const int rope_dim,
-    const float freq_base,
-    const float freq_scale,
+    const airun_rope_params rp,
     const int interleaved) {
 
     const int token = blockIdx.x;
@@ -171,12 +170,8 @@ __global__ void rope_kernel(
     const int i = blockIdx.z * blockDim.x + threadIdx.x;
     if (i >= half) return;
 
-    const float pos = (float)positions[token] * freq_scale;
-    const float inv_freq = __powf(freq_base, -2.0f * (float)i / (float)rope_dim);
-    const float theta = pos * inv_freq;
-
     float sin_t, cos_t;
-    __sincosf(theta, &sin_t, &cos_t);
+    rope_cos_sin(rp, i, rope_dim, positions[token], &cos_t, &sin_t);
 
     float* base = x + ((size_t)token * n_heads + head) * head_dim;
     const int lo = interleaved ? (2 * i) : i;
@@ -391,7 +386,7 @@ __global__ void qk_norm_rope_store_kernel(
     uint8_t* __restrict__ k_cache, uint8_t* __restrict__ v_cache,
     const int32_t* __restrict__ positions,
     const int n_heads, const int n_kv_heads, const int head_dim, const int max_seq,
-    const float eps, const int rope_dim, const float freq_base, const float freq_scale,
+    const float eps, const int rope_dim, const airun_rope_params rp,
     const int interleaved, const int rope_on) {
 
     extern __shared__ float qk_smem[];   // [head_dim] row, then the reduce scratch
@@ -446,11 +441,8 @@ __global__ void qk_norm_rope_store_kernel(
             other = first ? i + half_ : i - half_;
         }
         if (pair >= 0) {
-            const float p = (float)pos * freq_scale;
-            const float inv_freq = __powf(freq_base, -2.0f * (float)pair / (float)rope_dim);
-            const float theta = p * inv_freq;
             float sin_t, cos_t;
-            __sincosf(theta, &sin_t, &cos_t);
+            rope_cos_sin(rp, pair, rope_dim, pos, &cos_t, &sin_t);
             const float x0 = first ? row[i] : row[other];
             const float x1 = first ? row[other] : row[i];
             x = first ? x0 * cos_t - x1 * sin_t : x0 * sin_t + x1 * cos_t;
@@ -1165,8 +1157,12 @@ static cudaError_t launch_flash(int kv_type, float* out, const float* q, const u
 
 template <int D>
 struct F2Shape {
+    // Keys per tile. At head_dim 256 a warp already holds Q (64 registers) and
+    // O (128); 64-key tiles left no room for the scores and needed 135 KiB of
+    // shared memory, so the widest heads (Qwen3.5/3.8) take 32.
+    static constexpr int KT = D >= 256 ? 32 : F2_KT;
     static constexpr int LD = D + 8;                           // halves; 16B-aligned rows, conflict-free ldmatrix
-    static constexpr size_t TILE = (size_t)F2_KT * LD * 2;     // one K or V tile
+    static constexpr size_t TILE = (size_t)KT * LD * 2;        // one K or V tile
     static constexpr size_t SMEM = 4 * TILE;                   // K and V, two stages
 };
 
@@ -1219,7 +1215,7 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
 
     using S = F2Shape<D>;
     constexpr int LD = S::LD;
-    constexpr int NJ = F2_KT / 8;       // key n8 tiles per KV tile
+    constexpr int NJ = S::KT / 8;       // key n8 tiles per KV tile
     constexpr int ND = D / 8;           // head-dim n8 tiles
     extern __shared__ __align__(16) unsigned char f2_smem[];
     half* kbuf = (half*)f2_smem;                              // [2][KT][LD]
@@ -1257,7 +1253,7 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
 #pragma unroll
     for (int w = 0; w < F2_WARPS; ++w) { hi = max(hi, warp_hi[w]); lo = min(lo, warp_lo[w]); }
     if (hi < 0) return;
-    const int k_begin = (lo / F2_KT) * F2_KT;
+    const int k_begin = (lo / S::KT) * S::KT;
 
     // Q as A fragments, pre-scaled by scale * log2(e) so the softmax is exp2.
     const float qs = scale * 1.4426950408889634f;
@@ -1287,10 +1283,10 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
 
     // Stage the KV tile starting at key k0 into buffer `st`.
     auto stage = [&](int k0, int st) {
-        half* kd = kbuf + st * F2_KT * LD;
-        half* vd = vbuf + st * F2_KT * LD;
+        half* kd = kbuf + st * S::KT * LD;
+        half* vd = vbuf + st * S::KT * LD;
         constexpr int PIECES = D / 8;                 // 16-byte pieces per row
-        for (int i = tid; i < F2_KT * PIECES; i += 32 * F2_WARPS) {
+        for (int i = tid; i < S::KT * PIECES; i += 32 * F2_WARPS) {
             const int r = i / PIECES, c = i % PIECES;
             const int key = k0 + r;
             const bool ok = key <= hi && key < max_seq;
@@ -1317,18 +1313,18 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
 
     stage(k_begin, 0);
     int st = 0;
-    for (int k0 = k_begin; k0 <= hi; k0 += F2_KT, st ^= 1) {
-        if (k0 + F2_KT <= hi) {
-            stage(k0 + F2_KT, st ^ 1);
+    for (int k0 = k_begin; k0 <= hi; k0 += S::KT, st ^= 1) {
+        if (k0 + S::KT <= hi) {
+            stage(k0 + S::KT, st ^ 1);
             asm volatile("cp.async.wait_group 1;\n" ::);
         } else {
             asm volatile("cp.async.wait_group 0;\n" ::);
         }
         __syncthreads();
 
-        if (k0 <= whi && k0 + F2_KT > wlo) {
-            const half* kt = kbuf + st * F2_KT * LD;
-            const half* vt = vbuf + st * F2_KT * LD;
+        if (k0 <= whi && k0 + S::KT > wlo) {
+            const half* kt = kbuf + st * S::KT * LD;
+            const half* vt = vbuf + st * S::KT * LD;
 
             // S = Q K^T for 16 queries x 64 keys.
             float s[NJ][4];
@@ -1389,7 +1385,7 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
 
             // O += P V. Two adjacent S tiles are one k16 A fragment of P.
 #pragma unroll
-            for (int kk = 0; kk < F2_KT / 16; ++kk) {
+            for (int kk = 0; kk < S::KT / 16; ++kk) {
                 const uint32_t pa[4] = {
                     f2_pack(s[2 * kk][0], s[2 * kk][1]), f2_pack(s[2 * kk][2], s[2 * kk][3]),
                     f2_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]), f2_pack(s[2 * kk + 1][2], s[2 * kk + 1][3])};
@@ -1565,7 +1561,7 @@ airun_status airun_argmax(const void* x, int32_t n, void* out, void* scratch, vo
 airun_status airun_rope(
     void* x, const void* positions,
     int32_t n_tokens, int32_t n_heads, int32_t head_dim, int32_t rope_dim,
-    float freq_base, float freq_scale, int32_t interleaved, cudaStream_t stream) {
+    airun_rope_params rp, int32_t interleaved, cudaStream_t stream) {
 
     if (n_tokens <= 0 || n_heads <= 0) return AIRUN_OK;
     if (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) return AIRUN_ERR_BAD_ARG;
@@ -1575,7 +1571,7 @@ airun_status airun_rope(
     const dim3 grid(n_tokens, n_heads, (half + threads - 1) / threads);
     rope_kernel<<<grid, threads, 0, stream>>>(
         (float*)x, (const int32_t*)positions,
-        n_heads, head_dim, rope_dim, freq_base, freq_scale, interleaved);
+        n_heads, head_dim, rope_dim, rp, interleaved);
     AIRUN_CHECK_LAUNCH();
 }
 
@@ -1666,7 +1662,7 @@ airun_status airun_qk_norm_rope_store(
     void* q, const void* k, const void* v, const void* q_norm, const void* k_norm,
     void* k_cache, void* v_cache, const void* positions,
     int32_t n_tokens, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim, int32_t max_seq,
-    float eps, int32_t rope_dim, float freq_base, float freq_scale, int32_t interleaved,
+    float eps, int32_t rope_dim, airun_rope_params rp, int32_t interleaved,
     int32_t rope_on, int32_t kv_type, cudaStream_t stream) {
 
     if (n_tokens <= 0) return AIRUN_OK;
@@ -1677,7 +1673,7 @@ airun_status airun_qk_norm_rope_store(
 #define QK_LAUNCH(KVT) qk_norm_rope_store_kernel<KVT><<<grid, head_dim, shared, stream>>>(        \
         (float*)q, (const float*)k, (const float*)v, (const float*)q_norm, (const float*)k_norm, \
         (uint8_t*)k_cache, (uint8_t*)v_cache, (const int32_t*)positions, n_heads, n_kv_heads,     \
-        head_dim, max_seq, eps, rope_dim, freq_base, freq_scale, interleaved, rope_on)
+        head_dim, max_seq, eps, rope_dim, rp, interleaved, rope_on)
     switch (kv_type) {
         case KV_Q8_0: QK_LAUNCH(KV_Q8_0); break;
         case KV_Q4_0: QK_LAUNCH(KV_Q4_0); break;
@@ -1715,7 +1711,8 @@ airun_status airun_attention(
                                          : launch_flash<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream);
             else if (head_dim == 128) e = f2 ? launch_flash2<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream)
                                          : launch_flash<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream);
-            else                      e = launch_flash<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream);
+            else                      e = f2 ? launch_flash2<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream)
+                                         : launch_flash<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream);
             AIRUN_TRY(e);
             return AIRUN_OK;
         }

@@ -17,8 +17,17 @@ pub struct TokenizeArgs {
     pub model: PathBuf,
 
     /// Text to tokenize.
-    #[arg(short, long)]
-    pub text: String,
+    #[arg(short, long, required_unless_present = "file")]
+    pub text: Option<String>,
+
+    /// Read the text from a file instead.
+    #[arg(short, long, conflicts_with = "text")]
+    pub file: Option<PathBuf>,
+
+    /// Print only the ids, as `[a, b, ...]` like `llama-tokenize --ids`, so the
+    /// two tokenizers can be diffed.
+    #[arg(long)]
+    pub ids: bool,
 
     /// Apply the chat template before tokenizing.
     #[arg(long)]
@@ -29,6 +38,17 @@ pub fn run(args: TokenizeArgs) -> Result<()> {
     let gguf = GgufFile::open(&args.model)
         .with_context(|| format!("failed to open {}", args.model.display()))?;
     let tok = Tokenizer::from_gguf(&gguf)?;
+    let input = match (&args.text, &args.file) {
+        (Some(t), _) => t.clone(),
+        (None, Some(p)) => std::fs::read_to_string(p).with_context(|| format!("failed to read {}", p.display()))?,
+        (None, None) => anyhow::bail!("pass --text or --file"),
+    };
+    if args.ids {
+        let ids = tok.encode(&input, true);
+        let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        println!("[{}]", list.join(", "));
+        return Ok(());
+    }
 
     println!(
         "tokenizer: model {:?}, pre {:?}, vocab {}",
@@ -43,9 +63,9 @@ pub fn run(args: TokenizeArgs) -> Result<()> {
     println!("  end-of-generation ids: {:?}", tok.eog);
 
     let text = if args.chat {
-        airun_core::apply_chat_template(None, &args.text, None)
+        airun_core::apply_chat_template(None, &input, None)
     } else {
-        args.text.clone()
+        input
     };
 
     let ids = tok.encode(&text, true);

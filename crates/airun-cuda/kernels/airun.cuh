@@ -102,3 +102,40 @@ __device__ __forceinline__ float block_reduce_max(float v, float* shared) {
 }
 
 __device__ __forceinline__ int ceil_div(int a, int b) { return (a + b - 1) / b; }
+
+// ---------------------------------------------------------------------------
+// RoPE frequencies
+// ---------------------------------------------------------------------------
+// Plain RoPE scales the position by freq_scale (1/factor under linear
+// scaling). YaRN (ext_factor != 0) keeps the fast dimensions extrapolated, the
+// slow ones interpolated, ramps between them over [corr_lo, corr_hi], and
+// scales cos/sin by mscale, as llama.cpp's rope_yarn. Mirrored by
+// `RopeParams::cos_sin` in airun-cuda/src/ops.rs.
+typedef struct {
+    float base;
+    float freq_scale;
+    float ext_factor;
+    float mscale;
+    float corr_lo;
+    float corr_hi;
+} airun_rope_params;
+
+// The accurate sincosf, not __sincosf: at a million positions the angle of the
+// fastest pair reaches 1e6 rad, where the intrinsic's range reduction fails.
+__device__ __forceinline__ void rope_cos_sin(const airun_rope_params& p, int pair, int rope_dim,
+                                             int pos, float* c, float* s) {
+    const float inv_freq = powf(p.base, -2.0f * (float)pair / (float)rope_dim);
+    float theta;
+    if (p.ext_factor == 0.0f) {
+        theta = ((float)pos * p.freq_scale) * inv_freq;
+    } else {
+        const float extrap = (float)pos * inv_freq;
+        const float interp = p.freq_scale * extrap;
+        const float y = ((float)pair - p.corr_lo) / fmaxf(0.001f, p.corr_hi - p.corr_lo);
+        const float ramp = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * p.ext_factor;
+        theta = interp * (1.0f - ramp) + extrap * ramp;
+    }
+    sincosf(theta, s, c);
+    *c *= p.mscale;
+    *s *= p.mscale;
+}

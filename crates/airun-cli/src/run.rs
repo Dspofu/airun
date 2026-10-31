@@ -48,6 +48,12 @@ pub struct RunArgs {
     #[arg(short = 'b', long, default_value_t = 512)]
     pub batch_size: usize,
 
+    /// Speculative decoding with the model's own MTP head: tokens drafted per
+    /// step (0 turns it off). Greedy decoding only (--temp 0); the output is the
+    /// same text plain decoding writes. Ignored for files without an MTP head.
+    #[arg(long, default_value_t = 3)]
+    pub draft: usize,
+
     /// CUDA ordinals to use, comma separated. Defaults to every supported GPU.
     #[arg(long, value_delimiter = ',')]
     pub gpus: Vec<i32>,
@@ -136,6 +142,7 @@ impl RunArgs {
             predict: 128,
             ctx_size: 4096,
             batch_size: 512,
+            draft: 0,
             gpus: Vec::new(),
             tensor_split: Vec::new(),
             single_gpu: None,
@@ -185,6 +192,7 @@ impl RunArgs {
             kv_type: self.kv_type,
             reserve_bytes: self.vram_reserve << 20,
             allow_fallback: !self.no_fallback,
+            draft: self.draft,
         }
     }
 
@@ -283,6 +291,10 @@ pub fn run(args: RunArgs) -> Result<()> {
             stats.decode_ms,
             stats.decode_tps(),
         );
+        if stats.drafted > 0 {
+            eprintln!("speculation: {} of {} drafted tokens accepted ({:.0}%)", stats.accepted, stats.drafted,
+                100.0 * stats.accepted as f64 / stats.drafted as f64);
+        }
         let (hits, misses) = runtime.expert_cache_stats();
         if hits + misses > 0 {
             eprintln!(

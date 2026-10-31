@@ -1,4 +1,4 @@
-//! `airun selftest` -- check every GPU kernel against the CPU reference.
+﻿//! `airun selftest` -- check every GPU kernel against the CPU reference.
 //!
 //! The CPU decoders in airun-gguf are the oracle. A quantization layout that is
 //! subtly wrong produces text that looks almost right, which is far worse than a
@@ -132,6 +132,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_matvec(args.device, &stream, &mut report)?;
     test_matvec_q8(args.device, &stream, &mut report)?;
     test_mmq_glu(args.device, &stream, &mut report)?;
+    test_matmul_fp4(args.device, &stream, &mut report)?;
     test_matvec_batch(args.device, &stream, &mut report)?;
 
     println!("\n== elementwise and norms ==");
@@ -147,6 +148,8 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_l2norm(args.device, &stream, &mut report)?;
     test_delta_gates(args.device, &stream, &mut report)?;
     test_delta_rule(args.device, &stream, &mut report)?;
+    test_delta_defer(args.device, &stream, &mut report)?;
+    test_conv_oop(args.device, &stream, &mut report)?;
     test_delta_head_broadcast(args.device, &stream, &mut report)?;
     test_rmsnorm_gated(args.device, &stream, &mut report)?;
     test_split_head_gate(args.device, &stream, &mut report)?;
@@ -513,7 +516,7 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     // Q8_0/Q4_K/Q5_K; K = 544 (Q8_0 only) is 17 groups, which it cannot chunk,
     // so the synchronous one runs.
     // 300 tokens take the 128-token tile, with a partial last tile.
-    for (n_tokens, odd_k) in [(3usize, false), (100, false), (100, true), (300, false)] {
+    for (n_tokens, odd_k) in [(1usize, false), (3, false), (8, false), (12, false), (100, false), (100, true), (300, false)] {
     for &ty in TYPES {
         let kty = ops::KernelType(ty.id() as i32);
         if !ops::matvec_supports_q8(kty) {
@@ -603,6 +606,81 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
             worst_ulps <= 1.0,
         );
     }
+    }
+    Ok(())
+}
+
+/// NVFP4 x NVFP4 on the FP4 tensor cores (Blackwell only). The activation is
+/// quantized on the GPU and read back, so the reference multiplies exactly the
+/// values the MMA saw, in f64; the quantization itself is checked separately
+/// against its rounding bound. Rows and tokens that do not fill a 128 x 128
+/// tile, and 0x7F run scales (ggml's zero, the hardware's NaN), included.
+fn test_matmul_fp4(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    if !ops::fp4_supported() {
+        return Ok(());
+    }
+    const ROWS: usize = 200;
+    const K: usize = 512;
+    for n_tokens in [100usize, 300] {
+        let ty = GgmlType::NVFP4;
+        let row_bytes = K / 64 * 36;
+        let mut rng = Rng::new(0xF4F4_0000 + n_tokens as u64);
+        let mut packed = Vec::with_capacity(ROWS * row_bytes);
+        for _ in 0..ROWS {
+            packed.extend_from_slice(&random_blocks(&mut rng, ty, K / 64));
+        }
+        let x = rng.floats(n_tokens * K);
+
+        let d_w = DeviceBuffer::<u8>::from_slice(device, &packed, stream)?;
+        ops::nvfp4_sanitize(d_w.as_mut_ptr(), ROWS * K / 64, stream)?;
+        let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+        let d_xq = DeviceBuffer::<u8>::new(device, ops::nvfp4_act_bytes(n_tokens, K))?;
+        let d_y = DeviceBuffer::<f32>::new(device, n_tokens * ROWS)?;
+        ops::quantize_act_nvfp4(d_x.as_ptr(), d_xq.as_mut_ptr(), n_tokens, K, stream)?;
+        ops::matmul_nvfp4(d_w.as_ptr(), row_bytes, d_xq.as_ptr(), d_y.as_mut_ptr(), K, ROWS, n_tokens, stream)?;
+        let gpu = d_y.to_vec(stream)?;
+        let xq = d_xq.to_vec(stream)?;
+
+        // The activation as the MMA reads it: NVFP4 blocks times the row scale.
+        let blocks = n_tokens * K / 64 * 36;
+        let mut xd = vec![0f32; n_tokens * K];
+        let mut q_over = 0usize;
+        for t in 0..n_tokens {
+            let s = f32::from_le_bytes(xq[blocks + 4 * t..blocks + 4 * t + 4].try_into().unwrap());
+            dequant::dequantize(ty, &xq[t * K / 64 * 36..(t + 1) * K / 64 * 36], K, &mut xd[t * K..(t + 1) * K])?;
+            for (i, v) in xd[t * K..(t + 1) * K].iter_mut().enumerate() {
+                *v *= s;
+                // Rounding to E2M1 under a UE4M3 run scale is off by at most a
+                // quarter of the run's peak (the gap between 4 and 6, relative to 6,
+                // plus the scale's own rounding).
+                let run = &x[t * K + i / 16 * 16..t * K + i / 16 * 16 + 16];
+                let peak = run.iter().fold(0f32, |m, v| m.max(v.abs()));
+                if (x[t * K + i] - *v).abs() > 0.25 * peak + 1e-6 {
+                    q_over += 1;
+                }
+            }
+        }
+        let mut row = vec![0f32; K];
+        let (mut worst, mut worst_abs) = (0f64, 0f64);
+        for r in 0..ROWS {
+            dequant::dequantize(ty, &packed[r * row_bytes..(r + 1) * row_bytes], K, &mut row)?;
+            for t in 0..n_tokens {
+                let (mut acc, mut mag) = (0f64, 0f64);
+                for (w, v) in row.iter().zip(&xd[t * K..(t + 1) * K]) {
+                    let term = f64::from(*w) * f64::from(*v);
+                    acc += term;
+                    mag += term.abs();
+                }
+                let diff = (f64::from(gpu[t * ROWS + r]) - acc).abs();
+                worst_abs = worst_abs.max(diff);
+                if mag > 0.0 {
+                    worst = worst.max(diff / (mag * 1.192_092_9e-7 * (K as f64).sqrt() * 4.0));
+                }
+            }
+        }
+        report.case(&format!("matmul NVFP4 x NVFP4 (FP4 tensor cores), {n_tokens} tokens"),
+            format!("max_abs {worst_abs:.3e}  error/bound {worst:.2}x  {q_over} activations past the rounding bound"),
+            worst <= 1.0 && q_over == 0);
     }
     Ok(())
 }
@@ -731,57 +809,64 @@ fn test_swiglu(device: i32, stream: &Stream, report: &mut Report) -> Result<()> 
 }
 
 fn test_rope(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
-    const N_TOKENS: usize = 4;
     const N_HEADS: usize = 6;
     const HEAD_DIM: usize = 128;
-    const ROPE_DIM: usize = 128;
-    const BASE: f32 = 1_000_000.0;
 
-    let mut rng = Rng::new(0xE5_5000);
-    let x = rng.floats(N_TOKENS * N_HEADS * HEAD_DIM);
-    let positions: Vec<i32> = (0..N_TOKENS as i32).map(|i| i * 7 + 3).collect();
+    // (name, rope_dim, params, positions). The YaRN case is Qwen3.8-27B's
+    // 1M-context file: 64 of 256 dims rotated, base 1e7, factor 4 over 262144.
+    let cases = [
+        ("rope (neox)", 128, ops::RopeParams::plain(1_000_000.0, 1.0), vec![3, 10, 17, 24]),
+        ("rope (neox, linear x4)", 128, ops::RopeParams::plain(1_000_000.0, 0.25), vec![3, 900, 70_001, 262_143]),
+        ("rope (yarn x4, partial 64)", 64, ops::RopeParams::yarn(1e7, 4.0, 64, 262_144, 32.0, 1.0, 1.0),
+            vec![3, 1000, 300_007, 1_048_575]),
+    ];
+    for (name, rope_dim, p, positions) in cases {
+        let n_tokens = positions.len();
+        let mut rng = Rng::new(0xE5_5000);
+        let x = rng.floats(n_tokens * N_HEADS * HEAD_DIM);
 
-    let mut cpu = x.clone();
-    let half = ROPE_DIM / 2;
-    for (t, &pos) in positions.iter().enumerate() {
-        for h in 0..N_HEADS {
-            let base = (t * N_HEADS + h) * HEAD_DIM;
-            for i in 0..half {
-                let inv_freq = BASE.powf(-2.0 * i as f32 / ROPE_DIM as f32);
-                let theta = pos as f32 * inv_freq;
-                let (sin_t, cos_t) = theta.sin_cos();
-                let x0 = x[base + i];
-                let x1 = x[base + i + half];
-                cpu[base + i] = x0 * cos_t - x1 * sin_t;
-                cpu[base + i + half] = x0 * sin_t + x1 * cos_t;
+        // The angle in f64 from the formulas themselves (llama.cpp's rope_yarn),
+        // not from RopeParams::cos_sin, so the kernel and its Rust mirror cannot
+        // agree on a shared mistake. f32 rounds the angle to ~|theta| * eps, so
+        // that is what each element is allowed to be off by, plus a floor.
+        let mut cpu = x.clone();
+        let mut allowed = vec![5e-5f32; x.len()];
+        let half = rope_dim / 2;
+        for (t, &pos) in positions.iter().enumerate() {
+            for h in 0..N_HEADS {
+                let base = (t * N_HEADS + h) * HEAD_DIM;
+                for i in 0..half {
+                    let inv_freq = (p.base as f64).powf(-2.0 * i as f64 / rope_dim as f64);
+                    let extrap = pos as f64 * inv_freq;
+                    let interp = p.freq_scale as f64 * extrap;
+                    let (theta, m) = if p.ext_factor == 0.0 {
+                        (interp, 1.0)
+                    } else {
+                        let y = (i as f64 - p.corr_lo as f64) / (p.corr_hi as f64 - p.corr_lo as f64).max(0.001);
+                        let ramp = (1.0 - y.clamp(0.0, 1.0)) * p.ext_factor as f64;
+                        (interp * (1.0 - ramp) + extrap * ramp, p.mscale as f64)
+                    };
+                    let (sin_t, cos_t) = theta.sin_cos();
+                    let x0 = x[base + i] as f64;
+                    let x1 = x[base + i + half] as f64;
+                    cpu[base + i] = (m * (x0 * cos_t - x1 * sin_t)) as f32;
+                    cpu[base + i + half] = (m * (x0 * sin_t + x1 * cos_t)) as f32;
+                    let tol = 5e-5 + 8.0 * f32::EPSILON as f64 * theta.abs() * (x0.abs() + x1.abs()) * m;
+                    allowed[base + i] = tol as f32;
+                    allowed[base + i + half] = tol as f32;
+                }
             }
         }
+
+        let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+        let d_p = DeviceBuffer::<i32>::from_slice(device, &positions, stream)?;
+        ops::rope(d_x.as_mut_ptr(), d_p.as_ptr(), n_tokens, N_HEADS, HEAD_DIM, rope_dim, p, false, stream)?;
+        let gpu = d_x.to_vec(stream)?;
+
+        let (abs, rel) = compare(&cpu, &gpu);
+        let over = cpu.iter().zip(&gpu).zip(&allowed).filter(|((c, g), a)| (*c - *g).abs() > **a).count();
+        report.case(name, format!("max_abs {abs:.3e}  max_rel {rel:.3e}  {over} over the angle bound"), over == 0);
     }
-
-    let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
-    let d_p = DeviceBuffer::<i32>::from_slice(device, &positions, stream)?;
-    ops::rope(
-        d_x.as_mut_ptr(),
-        d_p.as_ptr(),
-        N_TOKENS,
-        N_HEADS,
-        HEAD_DIM,
-        ROPE_DIM,
-        BASE,
-        1.0,
-        false,
-        stream,
-    )?;
-    let gpu = d_x.to_vec(stream)?;
-
-    let (abs, rel) = compare(&cpu, &gpu);
-    // __sincosf trades accuracy for speed; at position ~24 the angle is small
-    // and the error stays in the 1e-5 range.
-    report.case(
-        "rope (neox)",
-        format!("max_abs {abs:.3e}  max_rel {rel:.3e}"),
-        abs <= 5e-4,
-    );
     Ok(())
 }
 
@@ -954,6 +1039,98 @@ fn test_delta_head_broadcast(device: i32, stream: &Stream, report: &mut Report) 
     report.case("delta-net GGUF head broadcast [0,1,0,1]",
         format!("first values {:?}", [got[0], got[32], got[64], got[96]]),
         got.chunks(32).zip(expected).all(|(row, e)| row.iter().all(|&x| (x-e).abs() < 1e-6)));
+    Ok(())
+}
+
+/// The batch convolution (out of place, parallel over tokens) against the
+/// in-place one: same outputs and same history, bit for bit, including runs
+/// shorter than the history.
+fn test_conv_oop(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const CH: usize = 300;
+    const KER: usize = 4;
+    let mut rng = Rng::new(0xC0_0E00);
+    let w = rng.floats(CH * KER);
+    let hist = rng.floats(CH * (KER - 1));
+    let d_w = DeviceBuffer::<f32>::from_slice(device, &w, stream)?;
+    let mut bad = 0usize;
+    for n in [1usize, 2, 3, 9, 37] {
+        let x = rng.floats(n * CH);
+        let (xa, ha) = (DeviceBuffer::from_slice(device, &x, stream)?, DeviceBuffer::from_slice(device, &hist, stream)?);
+        airun_cuda::hybrid::causal_conv1d(xa.as_mut_ptr(), d_w.as_ptr(), ha.as_mut_ptr(), n, CH, KER, true, false, stream)?;
+        let (xb, hb) = (DeviceBuffer::from_slice(device, &x, stream)?, DeviceBuffer::from_slice(device, &hist, stream)?);
+        let out = DeviceBuffer::<f32>::new(device, n * CH)?;
+        airun_cuda::hybrid::causal_conv1d_oop(xb.as_ptr(), out.as_mut_ptr(), d_w.as_ptr(), hb.as_mut_ptr(), n, CH,
+            KER, true, false, true, stream)?;
+        let (a, b) = (xa.to_vec(stream)?, out.to_vec(stream)?);
+        bad += a.iter().zip(&b).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+        bad += ha.to_vec(stream)?.iter().zip(&hb.to_vec(stream)?).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+    }
+    report.case("causal conv1d, batch (out of place) vs in place", format!("{bad} values differ"), bad == 0);
+    Ok(())
+}
+
+/// Speculative decoding's undo for delta-net layers (see airun-core spec.rs):
+/// a verify over n tokens with keep_state off must leave state and conv
+/// history untouched, and pushing the first m tokens afterwards must reach
+/// the state, history and outputs of running only those m -- bit for bit,
+/// since an accepted draft is meant to be indistinguishable from plain decode.
+/// Head width 128 takes the register kernel the Qwen hybrids use.
+fn test_delta_defer(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const N: usize = 4;
+    const M: usize = 2;
+    const NK: usize = 2;
+    const NV: usize = 4;
+    const DK: usize = 128;
+    const DV: usize = 128;
+    const CH: usize = 96;
+    const KER: usize = 4;
+    let mut rng = Rng::new(0x5BEC_0001);
+    let q = rng.floats(N * NK * DK);
+    let k = rng.floats(N * NK * DK);
+    let v = rng.floats(N * NV * DV);
+    let decay: Vec<f32> = (0..N * NV).map(|_| 0.5 + rng.unit().abs() * 0.49).collect();
+    let beta: Vec<f32> = (0..N * NV).map(|_| rng.unit().abs().max(0.01)).collect();
+    let state0: Vec<f32> = rng.floats(NV * DK * DV).iter().map(|x| x * 0.1).collect();
+    let raw = rng.floats(N * CH);
+    let w = rng.floats(CH * KER);
+    let hist0 = rng.floats(CH * (KER - 1));
+
+    let up = |x: &[f32]| DeviceBuffer::<f32>::from_slice(device, x, stream);
+    let (d_q, d_k, d_v, d_dec, d_beta) = (up(&q)?, up(&k)?, up(&v)?, up(&decay)?, up(&beta)?);
+    let d_w = up(&w)?;
+    let delta = |state: &DeviceBuffer<f32>, out: &DeviceBuffer<f32>, n: usize, keep: bool| {
+        airun_cuda::hybrid::delta_rule_ex(state.as_mut_ptr(), d_q.as_ptr(), d_k.as_ptr(), d_v.as_ptr(),
+            d_dec.as_ptr(), d_beta.as_ptr(), out.as_mut_ptr(), n, NK, NV, DK, DV, keep, stream)
+    };
+    let conv = |x: &DeviceBuffer<f32>, hist: &DeviceBuffer<f32>, n: usize, keep: bool| {
+        airun_cuda::hybrid::causal_conv1d_ex(x.as_mut_ptr(), d_w.as_ptr(), hist.as_mut_ptr(), n, CH, KER,
+            true, false, keep, stream)
+    };
+
+    // Reference: only the first M tokens, state kept.
+    let (s_ref, o_ref) = (up(&state0)?, DeviceBuffer::<f32>::new(device, N * NV * DV)?);
+    delta(&s_ref, &o_ref, M, true)?;
+    let (x_ref, h_ref) = (up(&raw)?, up(&hist0)?);
+    conv(&x_ref, &h_ref, M, true)?;
+
+    // Verify over N without keeping, then commit M.
+    let (s, o) = (up(&state0)?, DeviceBuffer::<f32>::new(device, N * NV * DV)?);
+    delta(&s, &o, N, false)?;
+    let untouched = s.to_vec(stream)? == state0;
+    let (x, h) = (up(&raw)?, up(&hist0)?);
+    conv(&x, &h, N, false)?;
+    let hist_untouched = h.to_vec(stream)? == hist0;
+    let same_out = o.to_vec(stream)?[..M * NV * DV] == o_ref.to_vec(stream)?[..M * NV * DV]
+        && x.to_vec(stream)?[..M * CH] == x_ref.to_vec(stream)?[..M * CH];
+    let scratch = DeviceBuffer::<f32>::new(device, N * NV * DV)?;
+    delta(&s, &scratch, M, true)?;
+    let x2 = up(&raw)?;
+    conv(&x2, &h, M, true)?;
+    let same_state = s.to_vec(stream)? == s_ref.to_vec(stream)? && h.to_vec(stream)? == h_ref.to_vec(stream)?;
+
+    report.case("delta rule + conv: verify leaves state, commit replays it",
+        format!("state untouched {untouched}, history untouched {hist_untouched}, outputs equal {same_out},                  committed state equal {same_state}"),
+        untouched && hist_untouched && same_out && same_state);
     Ok(())
 }
 
@@ -1506,7 +1683,7 @@ fn test_fused_prologue(device: i32, stream: &Stream, report: &mut Report) -> Res
                 let d_v = DeviceBuffer::from_slice(device, &v, stream)?;
                 let kc = DeviceBuffer::<u8>::zeroed(device, KV_HEADS * MAX_SEQ * row, stream)?;
                 let vc = DeviceBuffer::<u8>::zeroed(device, KV_HEADS * MAX_SEQ * row, stream)?;
-                let rope = Some((rope_dim, 1_000_000.0f32, 1.0f32, inter));
+                let rope = Some((rope_dim, ops::RopeParams::plain(1_000_000.0, 1.0), inter));
                 if fused {
                     ops::qk_norm_rope_store(d_q.as_mut_ptr(), d_k.as_ptr(), d_v.as_ptr(),
                         d_qn.as_ptr(), d_kn.as_ptr(), kc.as_mut_ptr(), vc.as_mut_ptr(), d_pos.as_ptr(),
@@ -1514,8 +1691,8 @@ fn test_fused_prologue(device: i32, stream: &Stream, report: &mut Report) -> Res
                 } else {
                     ops::rmsnorm(d_q.as_mut_ptr(), d_q.as_ptr(), d_qn.as_ptr(), DIM, TOKENS * HEADS, 1e-6, stream)?;
                     ops::rmsnorm(d_k.as_mut_ptr(), d_k.as_ptr(), d_kn.as_ptr(), DIM, TOKENS * KV_HEADS, 1e-6, stream)?;
-                    ops::rope(d_q.as_mut_ptr(), d_pos.as_ptr(), TOKENS, HEADS, DIM, rope_dim, 1_000_000.0, 1.0, inter, stream)?;
-                    ops::rope(d_k.as_mut_ptr(), d_pos.as_ptr(), TOKENS, KV_HEADS, DIM, rope_dim, 1_000_000.0, 1.0, inter, stream)?;
+                    ops::rope(d_q.as_mut_ptr(), d_pos.as_ptr(), TOKENS, HEADS, DIM, rope_dim, ops::RopeParams::plain(1_000_000.0, 1.0), inter, stream)?;
+                    ops::rope(d_k.as_mut_ptr(), d_pos.as_ptr(), TOKENS, KV_HEADS, DIM, rope_dim, ops::RopeParams::plain(1_000_000.0, 1.0), inter, stream)?;
                     ops::kv_store(kc.as_mut_ptr(), vc.as_mut_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_pos.as_ptr(),
                         TOKENS, KV_HEADS, DIM, MAX_SEQ, kv, stream)?;
                 }

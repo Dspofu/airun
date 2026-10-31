@@ -32,6 +32,7 @@ Estas são as flags que decidem **o que vai para qual GPU**.
 | `--no-fallback` | desligado | Falha em vez de reduzir contexto/batch automaticamente para caber. Útil em CI, onde uma redução silenciosa mascara uma regressão. |
 | `--kv-type <tipo>` | `f16` | Formato do KV cache: `f16`, `q8_0` ou `q4_0`. Os quantizados cabem 2x e 3,6x mais contexto na mesma VRAM; no 35B custam +0,001 (q8_0) e +0,02 (q4_0) nats de perda. Vale também para `perplexity`. |
 | `--expert-cache <N>` | todos | Só MoE: mantém N experts por camada na VRAM e lê os demais do GGUF sob demanda, sem requantizar. Resultado idêntico ao modelo residente; a velocidade depende da taxa de acerto e do disco. Vale também para `perplexity`. |
+| `--draft <N>` | `3` | Decodificação especulativa com a cabeça MTP do próprio modelo (Qwen3.5/3.8 densos): N tokens rascunhados por passo, verificados de uma vez. Só com amostragem gulosa pura (`--temp 0 --repeat-penalty 1`); o texto é idêntico ao do decode normal. `0` desliga e não carrega a cabeça (~240 MB a menos). Ignorada em arquivos sem MTP. |
 
 ### Como a alocação automática decide
 
@@ -309,6 +310,8 @@ fluente enquanto responde a outra pergunta.
 | `-f`, `--file <ARQUIVO>` | — | Lê o texto de um arquivo. Conflita com `--text`. |
 | `-n`, `--limit <N>` | `0` (tudo) | Para depois de N tokens. |
 | `--worst <N>` | `0` | Lista os N tokens pior previstos, do pior para o melhor. |
+| `--batched` | desligado | Com `--chunk`: cada bloco numa passada só, pelos kernels de prefill (como o `llama-perplexity`), em vez de token a token. Mede o custo de qualidade do caminho de prefill (ex.: ativações FP4). |
+| `--chunk <N>` | `0` | Pontua como o `llama-perplexity -c N`: blocos de N tokens, contexto reiniciado em cada um, só a segunda metade conta. Mesmo texto e N dão números comparáveis entre os dois (normalize CRLF→LF antes: o llama.cpp lê `-f` em modo texto no Windows). |
 | `-c`, `--ctx-size <N>` | `4096` | Tamanho do contexto. |
 | `--gpus`, `--tensor-split`, `--single-gpu` | | Iguais às de `run`. |
 
@@ -362,6 +365,13 @@ veja a tabela em `tasks.md`.
 
 | Variável | Interpretação alternativa que liga |
 |---|---|
+| `AIRUN_ROPE_SCALING=none\|linear\|yarn` | Ignora o `rope.scaling.type` do arquivo, como o `--rope-scaling` do llama.cpp. Para A/B. |
+| `AIRUN_ROPE_MSCALE=<f>` | Substitui o fator de magnitude do YaRN (padrão `1 + 0.1 ln fator`). Para A/B. |
+| `AIRUN_EMBED_ON_GPU=1` | Mantém a tabela de embeddings na VRAM. Por padrão ela fica em RAM pinned (como no llama.cpp) quando não é amarrada à cabeça de saída: ~0,8 GiB a menos num vocabulário de 250k. |
+| `AIRUN_NO_FP4=1` | Prefill NVFP4 no MMQ int8 (ativações de 8 bits) em vez dos tensor cores FP4 do Blackwell (ativações de 4 bits). Mais lento, um pouco mais exato. |
+| `AIRUN_NO_Q8_WIDE=1` | Decode e verify NVFP4 voltam aos kernels de um warp por quatro linhas. |
+| `AIRUN_NO_Q8_MULTI=1` | Lotes de 2–8 tokens voltam ao kernel tiled em vez do que decodifica cada grupo uma vez para todos os tokens. |
+| `AIRUN_SPEC_TIMING=1` | Imprime o tempo médio de verify, commit e rascunho por passo especulativo. |
 | `AIRUN_MATVEC_F32=1` | Todos os matvecs no caminho f32 exato (o de referência). Sem ela, o decode já é exato; lotes pequenos usam dp4a sobre ativações Q8 e lotes grandes usam tensor cores int8 (MMQ) — ambos validados no selftest por limite de erro backward e fim-a-fim por perplexidade. Use quando "idêntico à referência" importa mais que velocidade. |
 | `AIRUN_NO_WMMA=1` | Mantém lotes grandes nos kernels de registrador (mede o caminho tensor-core contra eles sem rebuild). |
 | `AIRUN_NO_MMQ=1` | Lotes de 64+ tokens saem dos tensor cores int8 (MMQ) e voltam para o fp16 (WMMA). |

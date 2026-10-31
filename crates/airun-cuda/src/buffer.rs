@@ -289,6 +289,16 @@ impl<T: Copy + Default> PinnedBuffer<T> {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// The address a kernel on `device` reads this buffer through (it is
+    /// allocated mapped). Every access crosses PCIe, so this suits data read
+    /// sparsely, not streamed.
+    pub fn device_ptr(&self, device: i32) -> Result<*const c_void> {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `self.ptr` is a live airun_host_alloc allocation; `out` is a valid out-parameter.
+        ffi::check(unsafe { ffi::airun_host_device_ptr(device, self.ptr, &mut out) })?;
+        Ok(out)
+    }
 }
 
 impl<T> Drop for PinnedBuffer<T> {

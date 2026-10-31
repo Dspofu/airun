@@ -34,6 +34,9 @@ pub struct LoadOptions {
     pub reserve_bytes: u64,
     /// Allow the loader to shrink context/batch to make the model fit.
     pub allow_fallback: bool,
+    /// Speculative decoding: tokens the model's MTP head drafts per step. 0
+    /// leaves the head unloaded; ignored on files without one.
+    pub draft: usize,
 }
 
 impl Default for LoadOptions {
@@ -48,6 +51,7 @@ impl Default for LoadOptions {
             kv_type: Default::default(),
             reserve_bytes: 384 << 20,
             allow_fallback: true,
+            draft: 0,
         }
     }
 }
@@ -83,6 +87,15 @@ pub fn load(
 
     let devices = select_devices(&opts.gpus)?;
     let mut sizes = WeightSizes::from_gguf(&gguf, config.n_layers);
+    if crate::model::embeds_on_host(&config) {
+        sizes.embedding = 0;
+    }
+    let load_mtp = opts.draft > 0 && crate::model::mtp_supported(&config);
+    if load_mtp {
+        // The head and its own KV cache sit with the output projection.
+        sizes.output += sizes.per_layer.get(config.n_run_layers()).copied().unwrap_or(0)
+            + config.kv_bytes_per_layer(opts.ctx);
+    }
     if let Some(slots) = opts.expert_cache {
         let moe = config.moe.as_ref().ok_or_else(|| CoreError::Other(
             "--expert-cache requires a MoE model; omit it for dense models".into()))?;
@@ -118,7 +131,10 @@ pub fn load(
         };
 
         let mut placement = match plan(&config, &sizes, &devices, &req) {
-            Ok(p) => p,
+            Ok(p) => {
+                batch = p.batch;
+                p
+            }
             Err(e) if opts.allow_fallback && e.is_capacity_error() => {
                 match next_rung(&mut ctx, &mut batch, &mut reserve) {
                     Some(note) => {
@@ -154,7 +170,7 @@ pub fn load(
             streams.push((shard.device, Stream::new(shard.device)?));
         }
 
-        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, opts.expert_cache, |d, t| {
+        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, opts.expert_cache, load_mtp, |d, t| {
             progress("uploading weights", d, t)
         });
 
@@ -181,7 +197,8 @@ pub fn load(
 
         let weight_bytes = model.total_bytes;
         let placement_out = model.placement.clone();
-        let runtime = Runtime::new(model, tokenizer, streams, batch)?;
+        let mut runtime = Runtime::new(model, tokenizer, streams, batch)?;
+        runtime.set_draft(opts.draft);
 
         return Ok((
             runtime,

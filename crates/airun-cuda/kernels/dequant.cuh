@@ -504,6 +504,34 @@ __device__ __forceinline__ void dq_mxfp4(const void* p, int sub, float* out) {
     }
 }
 
+// kvalues_mxfp4 as int8 lanes of four words, for __byte_perm lookups. The
+// __constant__ table above, indexed by a different nibble in every lane,
+// serializes up to 16 ways -- it held the 27B NVFP4 decode at 5 tok/s. A byte
+// permute looks up four codes in one instruction, from registers.
+#define FP4_POS_LO 0x03020100u   // codes 0..3:   0  1  2  3
+#define FP4_POS_HI 0x0C080604u   // codes 4..7:   4  6  8 12
+#define FP4_NEG_LO 0xFDFEFF00u   // codes 8..11:  0 -1 -2 -3
+#define FP4_NEG_HI 0xF4F8FAFCu   // codes 12..15: -4 -6 -8 -12
+
+// The int8 codes of the eight FP4 nibbles of `w`, where byte j holds element j
+// in its low nibble and element j + 8 in its high one (NVFP4's run layout):
+// `lo` gets elements 0..3, `hi` elements 8..11. __byte_perm reads only the low
+// three bits of each selector nibble, so the magnitude picks the byte and the
+// sign bit then chooses the positive or the negative table.
+__device__ __forceinline__ void fp4_codes8(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    const uint32_t sign_sel = 0x32103210u | ((w & 0x88888888u) >> 1);
+    uint32_t t[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t s = w >> (16 * i);
+        const uint32_t pos = __byte_perm(FP4_POS_LO, FP4_POS_HI, s);
+        const uint32_t neg = __byte_perm(FP4_NEG_LO, FP4_NEG_HI, s);
+        t[i] = __byte_perm(pos, neg, sign_sel >> (16 * i));   // [e0 e8 e1 e9], [e2 e10 e3 e11]
+    }
+    lo = __byte_perm(t[0], t[1], 0x6420);
+    hi = __byte_perm(t[0], t[1], 0x7531);
+}
+
 // NVFP4 packs 64 elements as four independently scaled runs of 16, so one
 // 32-element group spans two of them. The block is 36 bytes and therefore
 // 4-byte aligned, which is exactly wide enough to pull each run's payload in
@@ -517,18 +545,14 @@ __device__ __forceinline__ void dq_nvfp4(const void* p, int sub, float* out) {
         const float d = ue4m3_to_f32(b->d[run]);
 
         const uint32_t* q = (const uint32_t*)(b->qs + run * 8);
-        const uint32_t w0 = q[0];
-        const uint32_t w1 = q[1];
+        uint32_t c[4];   // elements 0..3, 4..7, 8..11, 12..15
+        fp4_codes8(q[0], c[0], c[2]);
+        fp4_codes8(q[1], c[1], c[3]);
 
         float* o = out + half * 16;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const uint32_t byte0 = (w0 >> (8 * i)) & 0xFF;
-            const uint32_t byte1 = (w1 >> (8 * i)) & 0xFF;
-            o[i]         = d * (float)kvalues_mxfp4[byte0 & 0x0F];
-            o[i + 8]     = d * (float)kvalues_mxfp4[byte0 >> 4];
-            o[i + 4]     = d * (float)kvalues_mxfp4[byte1 & 0x0F];
-            o[i + 12]    = d * (float)kvalues_mxfp4[byte1 >> 4];
+        for (int i = 0; i < 16; ++i) {
+            o[i] = d * (float)(int8_t)(c[i / 4] >> (8 * (i % 4)));
         }
     }
 }

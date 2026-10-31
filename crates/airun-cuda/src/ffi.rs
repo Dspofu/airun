@@ -64,10 +64,13 @@ unsafe extern "C" {
     pub fn airun_free(ordinal: i32, ptr: *mut c_void) -> Status;
     pub fn airun_host_alloc(bytes: u64, out: *mut *mut c_void) -> Status;
     pub fn airun_host_free(ptr: *mut c_void) -> Status;
+    pub fn airun_host_device_ptr(ordinal: i32, host: *mut c_void, out: *mut *mut c_void) -> Status;
 
     pub fn airun_memcpy_h2d(dst: *mut c_void, src: *const c_void, bytes: u64, stream: Stream) -> Status;
     pub fn airun_memcpy_d2h(dst: *mut c_void, src: *const c_void, bytes: u64, stream: Stream) -> Status;
     pub fn airun_memcpy_d2d(dst: *mut c_void, src: *const c_void, bytes: u64, stream: Stream) -> Status;
+    pub fn airun_memcpy2d_d2d(dst: *mut c_void, dpitch: u64, src: *const c_void, spitch: u64,
+        width: u64, rows: u64, stream: Stream) -> Status;
     pub fn airun_memcpy_peer(
         dst: *mut c_void,
         dst_dev: i32,
@@ -131,6 +134,7 @@ mod stub {
         fn airun_free(a: i32, b: *mut c_void) -> Status = NO_CUDA;
         fn airun_host_alloc(a: u64, b: *mut *mut c_void) -> Status = NO_CUDA;
         fn airun_host_free(a: *mut c_void) -> Status = NO_CUDA;
+        fn airun_host_device_ptr(a: i32, b: *mut c_void, c: *mut *mut c_void) -> Status = NO_CUDA;
         fn airun_memset(a: *mut c_void, b: i32, c: u64, d: Stream) -> Status = NO_CUDA;
         fn airun_capture_begin(a: Stream) -> Status = NO_CUDA;
         fn airun_capture_end(a: Stream, b: *mut *mut c_void) -> Status = NO_CUDA;
@@ -154,6 +158,8 @@ mod stub {
     pub unsafe extern "C" fn airun_memcpy_d2h(_: *mut c_void, _: *const c_void, _: u64, _: Stream) -> Status { NO_CUDA }
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn airun_memcpy_d2d(_: *mut c_void, _: *const c_void, _: u64, _: Stream) -> Status { NO_CUDA }
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn airun_memcpy2d_d2d(_: *mut c_void, _: u64, _: *const c_void, _: u64, _: u64, _: u64, _: Stream) -> Status { NO_CUDA }
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn airun_memcpy_peer(_: *mut c_void, _: i32, _: *const c_void, _: i32, _: u64, _: Stream) -> Status { NO_CUDA }
     #[unsafe(no_mangle)]

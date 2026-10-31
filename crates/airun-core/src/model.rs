@@ -150,16 +150,36 @@ pub struct LayerWeights {
     pub ffn: FfnWeights,
 }
 
+/// The multi-token-prediction head stored after the main layers
+/// (`blk.{n_run}`): a draft model for speculative decoding. It reads the main
+/// model's final hidden state and the next token, and predicts the token after.
+pub struct MtpWeights {
+    /// A full-attention block with a dense feed-forward, in the main layers' form.
+    pub layer: LayerWeights,
+    /// Projects `[enorm(embedding) | hnorm(hidden)]` back to the model width.
+    pub eh_proj: GpuTensor,
+    pub enorm: DeviceBuffer<f32>,
+    pub hnorm: DeviceBuffer<f32>,
+    /// The norm before the shared output head; its output is also the hidden
+    /// the next draft step starts from.
+    pub head_norm: DeviceBuffer<f32>,
+}
+
 /// The loaded model.
 pub struct Model {
     pub config: Config,
     pub placement: Placement,
     pub layers: Vec<LayerWeights>,
+    /// Shape and type of the embedding table. Its bytes are in `data`, or in
+    /// `token_embd_host` when the table stays in RAM (see [`embeds_on_host`]).
     pub token_embd: GpuTensor,
+    pub token_embd_host: Option<airun_cuda::PinnedBuffer<u8>>,
     pub output_norm: DeviceBuffer<f32>,
     /// The output projection. When embeddings are tied this is a second copy of
     /// the embedding table on the output device.
     pub output: GpuTensor,
+    /// Loaded when the file has one and speculative decoding was asked for.
+    pub mtp: Option<MtpWeights>,
     pub total_bytes: u64,
 }
 
@@ -174,6 +194,7 @@ impl Model {
         placement: Placement,
         streams: &[(i32, Stream)],
         expert_cache: Option<usize>,
+        load_mtp: bool,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Self> {
         let stream_for = |dev: i32| -> Result<&Stream> {
@@ -192,8 +213,19 @@ impl Model {
         let embed_dev = placement.embedding_device();
         let out_dev = placement.output_device();
 
-        let token_embd = load_packed(gguf, "token_embd.weight", embed_dev, stream_for(embed_dev)?, &config)?;
-        total_bytes += token_embd.bytes() as u64;
+        let (token_embd, token_embd_host) = if embeds_on_host(&config) {
+            let info = tensor_info(gguf, "token_embd.weight", &config.arch_name)?;
+            let bytes = gguf.tensor_bytes(info)?;
+            let mut host = airun_cuda::PinnedBuffer::<u8>::new(bytes.len())?;
+            host.as_mut_slice().copy_from_slice(bytes);
+            let mut t = describe_packed(gguf, "token_embd.weight", embed_dev, &config)?;
+            t.data = DeviceBuffer::<u8>::new(embed_dev, 0)?;
+            (t, Some(host))
+        } else {
+            let t = load_packed(gguf, "token_embd.weight", embed_dev, stream_for(embed_dev)?, &config)?;
+            total_bytes += t.bytes() as u64;
+            (t, None)
+        };
         done += 1;
         progress(done, total_steps);
 
@@ -304,6 +336,14 @@ impl Model {
         // whose header and tensors disagree would otherwise produce garbage.
         validate_shapes(&config, &layers, &token_embd)?;
 
+        let mtp = if load_mtp && mtp_supported(&config) {
+            let m = load_mtp_weights(gguf, &config, out_dev, stream_for(out_dev)?)?;
+            total_bytes += layer_bytes(&m.layer) + m.eh_proj.bytes() as u64;
+            Some(m)
+        } else {
+            None
+        };
+
         for (_, s) in streams {
             s.synchronize()?;
         }
@@ -313,10 +353,20 @@ impl Model {
             placement,
             layers,
             token_embd,
+            token_embd_host,
             output_norm,
             output,
+            mtp,
             total_bytes,
         })
+    }
+
+    /// Where the embedding kernel on `device` reads the table.
+    pub fn embedding_ptr(&self, device: i32) -> Result<*const std::ffi::c_void> {
+        match &self.token_embd_host {
+            Some(host) => Ok(host.device_ptr(device)?),
+            None => Ok(self.token_embd.data.as_ptr()),
+        }
     }
 
     /// The tensor used for the final projection to logits.
@@ -368,6 +418,79 @@ fn tensor_info<'a>(gguf: &'a GgufFile, name: &str, arch: &str) -> Result<&'a Ten
 ///
 /// A three-dimensional tensor is an expert stack: the trailing axis indexes
 /// experts, and `rows` becomes the per-expert row count.
+/// Whether this file's MTP head is one the runtime can draft with: a single
+/// head whose block is attention with a dense feed-forward (Qwen3.5/3.8
+/// dense). The MoE heads of the A3B models are not wired up yet.
+pub fn mtp_supported(config: &Config) -> bool {
+    config.nextn_predict_layers == 1 && config.moe.is_none() && config.is_hybrid()
+}
+
+fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &Stream) -> Result<MtpWeights> {
+    let l = config.n_run_layers();
+    let name = |suffix: &str| format!("blk.{l}.{suffix}");
+    let layer = LayerWeights {
+        device: dev,
+        attn_norm: load_f32(gguf, &name("attn_norm.weight"), dev, stream)?,
+        block: Block::Attention(AttentionWeights {
+            q: load_packed(gguf, &name("attn_q.weight"), dev, stream, config)?,
+            k: load_packed(gguf, &name("attn_k.weight"), dev, stream, config)?,
+            v: load_packed(gguf, &name("attn_v.weight"), dev, stream, config)?,
+            output: load_packed(gguf, &name("attn_output.weight"), dev, stream, config)?,
+            q_norm: load_f32_optional(gguf, &name("attn_q_norm.weight"), dev, stream)?,
+            k_norm: load_f32_optional(gguf, &name("attn_k_norm.weight"), dev, stream)?,
+        }),
+        ffn_norm: load_f32(gguf, &name(&format!("{}.weight", config.ffn_norm_name)), dev, stream)?,
+        ffn: FfnWeights::Dense {
+            gate: load_packed(gguf, &name("ffn_gate.weight"), dev, stream, config)?,
+            up: load_packed(gguf, &name("ffn_up.weight"), dev, stream, config)?,
+            down: load_packed(gguf, &name("ffn_down.weight"), dev, stream, config)?,
+        },
+    };
+    let head_norm = if gguf.tensor(&name("nextn.shared_head_norm.weight")).is_some() {
+        load_f32(gguf, &name("nextn.shared_head_norm.weight"), dev, stream)?
+    } else {
+        load_f32(gguf, "output_norm.weight", dev, stream)?
+    };
+    Ok(MtpWeights {
+        layer,
+        eh_proj: load_packed(gguf, &name("nextn.eh_proj.weight"), dev, stream, config)?,
+        enorm: load_f32(gguf, &name("nextn.enorm.weight"), dev, stream)?,
+        hnorm: load_f32(gguf, &name("nextn.hnorm.weight"), dev, stream)?,
+        head_norm,
+    })
+}
+
+/// Whether the token embedding table stays in pinned RAM instead of VRAM, as
+/// llama.cpp keeps it. A decode step reads one row (3.5 KiB for a 5120-wide
+/// Q5_K table) over PCIe, while the table itself is ~0.8 GiB of VRAM on a
+/// 250k vocabulary -- enough to decide whether a 27B fits one 16 GB card. A
+/// tied table is also the output projection, which reads all of it every
+/// token, so that one stays on the GPU. AIRUN_EMBED_ON_GPU=1 keeps it there.
+pub fn embeds_on_host(config: &Config) -> bool {
+    !config.tied_embeddings && std::env::var("AIRUN_EMBED_ON_GPU").map_or(true, |v| v.trim() == "0")
+}
+
+/// A tensor's shape and type, with an empty device buffer.
+fn describe_packed(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Config) -> Result<GpuTensor> {
+    let info = tensor_info(gguf, name, &config.arch_name)?;
+    let k = info.row_size() as usize;
+    let layout = info.ty.layout().ok_or_else(|| CoreError::UnsupportedTensorType {
+        name: name.to_string(),
+        ty: info.ty.to_string(),
+    })?;
+    Ok(GpuTensor {
+        data: DeviceBuffer::<u8>::new(device, 0)?,
+        host_experts: None,
+        ty: info.ty,
+        k,
+        rows: info.n_rows() as usize,
+        row_bytes: (k / layout.elements as usize) * layout.bytes as usize,
+        expert_stride: 0,
+        n_experts: 1,
+        device,
+    })
+}
+
 fn load_packed(
     gguf: &Arc<GgufFile>,
     name: &str,
@@ -414,7 +537,13 @@ fn load_cached(
             file: Arc::clone(gguf), info: info.clone(), slots: RefCell::new(ExpertSlots::new(slots)),
         }))
     } else {
-        (DeviceBuffer::<u8>::from_slice(device, gguf.tensor_bytes(info)?, stream)?, None)
+        let data = DeviceBuffer::<u8>::from_slice(device, gguf.tensor_bytes(info)?, stream)?;
+        // ggml reads a 0x7F NVFP4 run scale as zero and the FP4 tensor cores as
+        // NaN; zeroing it keeps every path on ggml's reading.
+        if info.ty == airun_gguf::GgmlType::NVFP4 && airun_cuda::ops::fp4_supported() {
+            airun_cuda::ops::nvfp4_sanitize(data.as_mut_ptr(), data.len() / 36, stream)?;
+        }
+        (data, None)
     };
 
     Ok(GpuTensor {

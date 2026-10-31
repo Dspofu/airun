@@ -1,4 +1,4 @@
-//! The forward pass and the generation loop.
+﻿//! The forward pass and the generation loop.
 //!
 //! Handles both plain dense decoders and Qwen3-Next style hybrids, where most
 //! layers are gated delta-net linear attention and only every Nth is softmax
@@ -13,6 +13,9 @@ use crate::model::{Block, FfnWeights, GpuTensor, Model};
 use crate::plan::Placement;
 use crate::sample::Sampler;
 use crate::tokenizer::Tokenizer;
+
+#[path = "spec.rs"]
+mod spec;
 
 /// What a layer carries from one token to the next.
 enum LayerState {
@@ -33,6 +36,8 @@ enum LayerState {
 /// Scratch buffers only hybrid models need.
 struct HybridScratch {
     qkv: DeviceBuffer<f32>,
+    /// The convolved qkv of a batch (the batch convolution is out of place).
+    conv_out: DeviceBuffer<f32>,
     z: DeviceBuffer<f32>,
     core: DeviceBuffer<f32>,
     a: DeviceBuffer<f32>,
@@ -61,6 +66,18 @@ struct MoeScratch {
     timing: std::cell::Cell<(f64, f64)>,
 }
 
+/// What a delta-net layer saw during a speculative verify, so the accepted
+/// prefix can be pushed into its state afterwards: the pre-convolution rows,
+/// and the recurrence's inputs.
+struct DeltaStash {
+    raw: DeviceBuffer<f32>,
+    q: DeviceBuffer<f32>,
+    k: DeviceBuffer<f32>,
+    v: DeviceBuffer<f32>,
+    decay: DeviceBuffer<f32>,
+    beta: DeviceBuffer<f32>,
+}
+
 /// The activation-quantization scratch and its freshness flag.
 ///
 /// `valid` means: `buf` holds the quantization of the input the current group
@@ -69,6 +86,10 @@ struct MoeScratch {
 struct QAct {
     buf: DeviceBuffer<u8>,
     valid: std::cell::Cell<bool>,
+    /// The same input as NVFP4 blocks for the FP4 tensor cores, where the
+    /// device and the model have them; same freshness protocol.
+    fp4: Option<DeviceBuffer<u8>>,
+    fp4_valid: std::cell::Cell<bool>,
 }
 
 /// Everything that lives on one GPU.
@@ -102,6 +123,9 @@ struct DeviceState {
     /// One entry per layer on this device, in the same order as `layers`.
     states: Vec<LayerState>,
     layers: Vec<usize>,
+    /// Per layer, parallel to `states`; allocated for delta-net layers once
+    /// speculative decoding starts.
+    stash: Vec<Option<DeltaStash>>,
 }
 
 /// The captured decode step and the pinned staging its replays read.
@@ -138,6 +162,16 @@ pub struct Runtime {
     chain: Option<ChainGraph>,
     /// Pinned landing buffer for the logits a sampler reads, reused per token.
     logits_host: Option<airun_cuda::PinnedBuffer<f32>>,
+    /// Set during a speculative verify: delta-net layers stash their inputs
+    /// instead of advancing their state.
+    defer: bool,
+    /// Set when the caller projects the logits itself (a verify needs every
+    /// row, not just the last).
+    skip_logits: bool,
+    /// The MTP draft head's state, once speculative decoding has run.
+    spec: Option<spec::Spec>,
+    /// Drafts per speculative step (see `set_draft`); 0 decodes plainly.
+    draft: usize,
 }
 
 /// Greedy decode as a chain of graph launches (see [`Runtime::generate`]): the
@@ -196,6 +230,10 @@ impl Runtime {
         let v_width = cfg.kv_dim().max(ssm_v);
         let attn_width = cfg.q_dim().max(ssm_v);
 
+        let model_has_nvfp4 = model.layers.iter().any(|l| match &l.ffn {
+            FfnWeights::Dense { gate, .. } => gate.kernel_type().0 == 40,
+            FfnWeights::Moe { gate_exps, .. } => gate_exps.kernel_type().0 == 40,
+        });
         let mut states = Vec::new();
         for shard in &placement.shards {
             let dev = shard.device;
@@ -224,6 +262,7 @@ impl Runtime {
             let hybrid_scratch = match &cfg.ssm {
                 Some(ssm) => Some(HybridScratch {
                     qkv: DeviceBuffer::new(dev, b * ssm.qkv_dim())?,
+                    conv_out: DeviceBuffer::new(dev, b * ssm.qkv_dim())?,
                     z: DeviceBuffer::new(dev, b * ssm.inner_size)?,
                     core: DeviceBuffer::new(dev, b * ssm.v_dim())?,
                     a: DeviceBuffer::new(dev, b * ssm.n_v_heads)?,
@@ -301,12 +340,20 @@ impl Runtime {
                         b * cfg.n_embd.max(ffn_width).max(attn_width) / 32 * 36,
                     )?,
                     valid: std::cell::Cell::new(false),
+                    fp4: if model_has_nvfp4 && ops::fp4_supported() {
+                        Some(DeviceBuffer::new(dev, ops::nvfp4_act_bytes(b,
+                            cfg.n_embd.max(ffn_width).max(attn_width).next_multiple_of(64)))?)
+                    } else {
+                        None
+                    },
+                    fp4_valid: std::cell::Cell::new(false),
                 },
                 hybrid: hybrid_scratch,
                 moe: moe_scratch,
 
                 states: layer_states,
                 layers: shard.layers.clone(),
+                stash: Vec::new(),
             });
         }
 
@@ -322,6 +369,10 @@ impl Runtime {
             pick: None,
             chain: None,
             logits_host: None,
+            defer: false,
+            skip_logits: false,
+            spec: None,
+            draft: 0,
         })
     }
 
@@ -384,6 +435,48 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| CoreError::Other("output shard has no logits buffer".into()))?;
         Ok(logits.to_vec(&st.stream)?)
+    }
+
+    /// Runs `tokens` through the model in one pass, as a prefill does, and hands
+    /// every row's logits to `each(row, logits)` in order -- what a batched
+    /// perplexity scores. The head runs eight rows at a time, so the logits of a
+    /// whole chunk never sit in VRAM at once.
+    pub fn forward_all(&mut self, tokens: &[u32], mut each: impl FnMut(usize, &[f32])) -> Result<()> {
+        let n = tokens.len();
+        if n > self.max_batch || self.n_past + n > self.ctx {
+            return Err(CoreError::Other(format!(
+                "{n} tokens at position {} do not fit a batch of {} and a context of {};                  raise --batch-size or --ctx-size", self.n_past, self.max_batch, self.ctx)));
+        }
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let positions: Vec<i32> = (0..n).map(|i| (self.n_past + i) as i32).collect();
+        self.skip_logits = true;
+        let queued = self.queue_forward(&ids, &positions);
+        self.skip_logits = false;
+        queued?;
+        self.n_past += n;
+        self.history.extend_from_slice(tokens);
+
+        let cfg = &self.model.config;
+        let st = self.states.last().expect("a runtime has at least one device");
+        device::set_device(st.device)?;
+        let out_w = self.model.output_tensor();
+        const ROWS: usize = 8;
+        let buf = DeviceBuffer::<f32>::new(st.device, ROWS * cfg.vocab_size)?;
+        let mut host = vec![0f32; ROWS * cfg.vocab_size];
+        for r0 in (0..n).step_by(ROWS) {
+            let m = ROWS.min(n - r0);
+            ops::matvec(out_w.kernel_type(), out_w.data.as_ptr(), st.xb.offset_ptr(r0 * cfg.n_embd),
+                buf.as_mut_ptr(), cfg.n_embd, cfg.vocab_size, m, out_w.row_bytes, &st.stream)?;
+            buf.copy_to_host(&mut host[..m * cfg.vocab_size], &st.stream)?;
+            st.stream.synchronize()?;
+            for i in 0..m {
+                each(r0 + i, &host[i * cfg.vocab_size..(i + 1) * cfg.vocab_size]);
+            }
+        }
+        Ok(())
     }
 
     /// [`forward`], with the logits landing in a reused pinned buffer rather
@@ -544,6 +637,11 @@ impl Runtime {
             )));
         }
 
+        // The MTP head's cache does not follow a plain pass.
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+
         // Decode goes through a captured CUDA graph where possible: a step is
         // hundreds of tiny launches, and issuing them one by one measured
         // ~40% of a decode step as GPU idle time on a 1.7B.
@@ -628,7 +726,7 @@ impl Runtime {
             ops::embed(
                 embd.kernel_type(),
                 st.x.as_mut_ptr(),
-                embd.data.as_ptr(),
+                self.model.embedding_ptr(st.device)?,
                 st.tokens.as_ptr(),
                 n,
                 cfg.n_embd,
@@ -680,6 +778,9 @@ impl Runtime {
             )?;
         }
 
+        if self.skip_logits {
+            return Ok(());
+        }
         let out_w = self.model.output_tensor();
         let logits = st
             .logits
@@ -702,6 +803,16 @@ impl Runtime {
             &st.stream,
         )?;
 
+        if std::env::var("AIRUN_TRACE_LAYERS").is_ok_and(|v| v.trim() == "sum") {
+            let norm = st.xb.to_vec(&st.stream)?;
+            let norm = &norm[(n - 1) * cfg.n_embd..n * cfg.n_embd];
+            let l = logits.to_vec(&st.stream)?;
+            let l = &l[..cfg.vocab_size];
+            let best = (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap_or(0);
+            eprintln!("  result_norm sum {:>12.6}  result_output sum {:>14.4}  [{:.4}, {:.4}, {:.4}]  argmax {best} ({:.4})",
+                norm.iter().map(|&v| v as f64).sum::<f64>(), l.iter().map(|&v| v as f64).sum::<f64>(),
+                l[0], l[1], l[2], l[best]);
+        }
 
         Ok(())
     }
@@ -758,14 +869,36 @@ impl Runtime {
         n: usize,
         cfg: &Config,
     ) -> Result<()> {
-        let w = &self.model.layers[layer];
+        // The previous layer on this device already left this norm in xb (see
+        // the end of run_block).
+        let norm_first = !(local > 0 && !fused_norms_disabled());
+        let next = self.next_norm(si, local);
+        let stash = self.states[si].stash.get(local).and_then(|s| s.as_ref()).filter(|_| self.defer);
+        self.run_block(si, &self.model.layers[layer], &self.states[si].states[local], stash, layer,
+            n, cfg, norm_first, next)
+    }
+
+    /// One block: token mixing then feed-forward, each with its residual add.
+    /// `next` is the norm whose output the final residual add leaves in xb
+    /// (the following block's, or the output norm); `None` leaves only x.
+    #[allow(clippy::too_many_arguments)]
+    fn run_block(
+        &self,
+        si: usize,
+        w: &crate::model::LayerWeights,
+        state: &LayerState,
+        stash: Option<&DeltaStash>,
+        layer: usize,
+        n: usize,
+        cfg: &Config,
+        norm_first: bool,
+        next: Option<*const std::ffi::c_void>,
+    ) -> Result<()> {
         let st = &self.states[si];
         let stream = &st.stream;
 
         // --- token mixing ---
-        // The previous layer on this device already left this norm in xb (see
-        // the end of this function).
-        if !(local > 0 && !fused_norms_disabled()) {
+        if norm_first {
             ops::rmsnorm(
                 st.xb.as_mut_ptr(),
                 st.x.as_ptr(),
@@ -785,8 +918,8 @@ impl Runtime {
             st.xb2.fill_zero(stream)?;
         } else {
             match &w.block {
-                Block::Attention(a) => self.run_attention(si, local, a, n, cfg)?,
-                Block::Linear(l) => self.run_linear_attention(si, local, layer, l, n, cfg)?,
+                Block::Attention(a) => self.run_attention(si, state, a, n, cfg)?,
+                Block::Linear(l) => self.run_linear_attention(si, state, stash, layer, l, n, cfg)?,
             }
         }
         trace_block(st, layer, kind, n, cfg)?;
@@ -814,13 +947,15 @@ impl Runtime {
         } else {
             match &w.ffn {
                 FfnWeights::Dense { gate, up, down } => {
+                    let mut down_done = false;
                     // Prefill takes gate, up and SwiGLU as one integer tensor-core
                     // launch where it can (see matvec_mmq_async_kernel's GLU).
                     let glu = n > 1 && !matvec_f32_forced() && same_shape(&[gate, up])
+                        && !fp4_prefill(gate, n, &st.q8act)
                         && ops::matvec_supports_q8(gate.kernel_type())
                         && ops::mmq_glu_supported(gate.kernel_type(), gate.data.as_ptr(),
                             up.data.as_ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
-                    if n == 1 && same_shape(&[gate, up]) {
+                    if n == 1 && same_shape(&[gate, up]) && !q8_decode(gate) {
                         // Decode: gate, up and SwiGLU in one launch, bit-identical.
                         ops::matvec_glu(gate.kernel_type(), gate.data.as_ptr(), up.data.as_ptr(),
                             st.xb.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, gate.row_bytes,
@@ -830,12 +965,25 @@ impl Runtime {
                         ops::matvec_q8_glu(gate.kernel_type(), gate.data.as_ptr(), up.data.as_ptr(),
                             st.q8act.buf.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, n,
                             gate.row_bytes, stream)?;
+                    } else if fp4_prefill(gate, n, &st.q8act) && fp4_prefill(down, n, &st.q8act) {
+                        // The SwiGLU goes into the down projection's quantization.
+                        matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
+                        matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
+                        let buf = st.q8act.fp4.as_ref().expect("checked by fp4_prefill");
+                        ops::quantize_glu_nvfp4(st.gate.as_ptr(), st.up.as_ptr(), buf.as_mut_ptr(), n, down.k,
+                            stream)?;
+                        st.q8act.valid.set(false);
+                        st.q8act.fp4_valid.set(true);
+                        matvec_reuse(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
+                        down_done = true;
                     } else {
                         matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
                         matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
                         ops::swiglu(st.gate.as_mut_ptr(), st.up.as_ptr(), n * cfg.ffn_len, stream)?;
                     }
-                    matvec(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
+                    if !down_done {
+                        matvec(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
+                    }
                 }
                 FfnWeights::Moe {
                     router,
@@ -851,7 +999,7 @@ impl Runtime {
         // The residual add, fused with whichever norm reads x next: the next
         // layer's on this device, or the output norm after the last layer.
         // Across devices x moves first, so the add stays plain.
-        match self.next_norm(si, local) {
+        match next {
             Some(norm) if !fused_norms_disabled() => ops::add_rmsnorm(st.xb.as_mut_ptr(),
                 st.x.as_mut_ptr(), st.xb2.as_ptr(), norm, cfg.n_embd, n, cfg.rms_eps, stream)?,
             _ => ops::add(st.x.as_mut_ptr(), st.xb2.as_ptr(), n * cfg.n_embd, stream)?,
@@ -878,7 +1026,7 @@ impl Runtime {
     fn run_attention(
         &self,
         si: usize,
-        local: usize,
+        kv_state: &LayerState,
         a: &crate::model::AttentionWeights,
         n: usize,
         cfg: &Config,
@@ -887,7 +1035,8 @@ impl Runtime {
         let stream = &st.stream;
 
         // Decode runs q, k and v as one launch (same f32 kernel, same result).
-        let fused_qkv = n == 1 && !cfg.attn_output_gate && same_shape(&[&a.q, &a.k, &a.v]);
+        let fused_qkv = n == 1 && !cfg.attn_output_gate && same_shape(&[&a.q, &a.k, &a.v])
+            && !q8_decode(&a.q);
         if cfg.attn_output_gate {
             // The q projection packs a gate next to each head's queries; they
             // interleave per head rather than sitting in two blocks.
@@ -954,7 +1103,7 @@ impl Runtime {
         // notices is not attending the way it was trained to.
         let rope_off = std::env::var("AIRUN_ROPE_OFF").is_ok();
 
-        let LayerState::Kv { k: kc, v: vc } = &st.states[local] else {
+        let LayerState::Kv { k: kc, v: vc } = kv_state else {
             return Err(CoreError::Other(
                 "an attention layer was given a recurrent state".into(),
             ));
@@ -970,7 +1119,7 @@ impl Runtime {
                 a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
                 kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.as_ptr(),
                 n, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
-                (!rope_off).then_some((rope_dim, cfg.rope_base, cfg.rope_scale, rope_interleaved)),
+                (!rope_off).then_some((rope_dim, cfg.rope, rope_interleaved)),
                 cfg.kv_type, stream,
             )?;
         } else {
@@ -1007,8 +1156,7 @@ impl Runtime {
                     cfg.n_head,
                     cfg.head_dim,
                     rope_dim,
-                    cfg.rope_base,
-                    cfg.rope_scale,
+                    cfg.rope,
                     rope_interleaved,
                     stream,
                 )?;
@@ -1019,8 +1167,7 @@ impl Runtime {
                     cfg.n_head_kv,
                     cfg.head_dim,
                     rope_dim,
-                    cfg.rope_base,
-                    cfg.rope_scale,
+                    cfg.rope,
                     rope_interleaved,
                     stream,
                 )?;
@@ -1073,7 +1220,8 @@ impl Runtime {
     fn run_linear_attention(
         &self,
         si: usize,
-        local: usize,
+        delta_state: &LayerState,
+        stash: Option<&DeltaStash>,
         layer: usize,
         l: &crate::model::LinearAttentionWeights,
         n: usize,
@@ -1090,7 +1238,7 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| CoreError::Other("linear layer without hybrid scratch".into()))?;
 
-        let LayerState::Delta { state, conv } = &st.states[local] else {
+        let LayerState::Delta { state, conv } = delta_state else {
             return Err(CoreError::Other(
                 "a linear-attention layer was given a KV cache".into(),
             ));
@@ -1126,22 +1274,30 @@ impl Runtime {
 
         // Short causal convolution over the packed q/k/v, with SiLU.
         // AIRUN_SSM_CONV_REVERSE=1 flips the tap order.
-        hybrid::causal_conv1d(
-            h.qkv.as_mut_ptr(),
-            l.conv1d.as_ptr(),
-            conv.as_mut_ptr(),
-            n,
-            ssm.qkv_dim(),
-            ssm.conv_kernel,
-            std::env::var("AIRUN_SSM_NO_CONV_SILU").is_err(),
-            std::env::var("AIRUN_SSM_CONV_REVERSE").is_ok(),
-            stream,
-        )?;
+        // A speculative verify leaves the recurrent state as it was and keeps
+        // what it needs to advance it later by however many tokens are
+        // accepted (see spec.rs).
+        if let Some(sh) = stash {
+            copy_rows(&sh.raw, &h.qkv, n * ssm.qkv_dim(), stream)?;
+        }
+        // A batch convolves out of place, in parallel over its tokens, into
+        // conv_out; one token stays in place.
+        let silu = std::env::var("AIRUN_SSM_NO_CONV_SILU").is_err();
+        let reverse = std::env::var("AIRUN_SSM_CONV_REVERSE").is_ok();
+        let conv_rows = if n > 1 {
+            hybrid::causal_conv1d_oop(h.qkv.as_ptr(), h.conv_out.as_mut_ptr(), l.conv1d.as_ptr(),
+                conv.as_mut_ptr(), n, ssm.qkv_dim(), ssm.conv_kernel, silu, reverse, stash.is_none(), stream)?;
+            &h.conv_out
+        } else {
+            hybrid::causal_conv1d_ex(h.qkv.as_mut_ptr(), l.conv1d.as_ptr(), conv.as_mut_ptr(), n, ssm.qkv_dim(),
+                ssm.conv_kernel, silu, reverse, stash.is_none(), stream)?;
+            &h.qkv
+        };
 
         if trace_ssm(layer) {
             stat(
                 "qkv (post-conv, pre-split)",
-                &h.qkv,
+                conv_rows,
                 (n - 1) * ssm.qkv_dim(),
                 ssm.qkv_dim(),
                 stream,
@@ -1162,10 +1318,10 @@ impl Runtime {
         let k_dim = ssm.k_dim();
         if std::env::var("AIRUN_SSM_QKV_GROUPED").is_err() {
             let [q_at, k_at, v_at] = qkv_offsets(ssm)?;
-            hybrid::slice_columns(h.qkv.as_ptr(), st.q.as_mut_ptr(), n, ssm.qkv_dim(), q_at, k_dim, stream)?;
-            hybrid::slice_columns(h.qkv.as_ptr(), st.k.as_mut_ptr(), n, ssm.qkv_dim(), k_at, k_dim, stream)?;
+            hybrid::slice_columns(conv_rows.as_ptr(), st.q.as_mut_ptr(), n, ssm.qkv_dim(), q_at, k_dim, stream)?;
+            hybrid::slice_columns(conv_rows.as_ptr(), st.k.as_mut_ptr(), n, ssm.qkv_dim(), k_at, k_dim, stream)?;
             hybrid::slice_columns(
-                h.qkv.as_ptr(),
+                conv_rows.as_ptr(),
                 h.core.as_mut_ptr(),
                 n,
                 ssm.qkv_dim(),
@@ -1175,7 +1331,7 @@ impl Runtime {
             )?;
         } else {
             hybrid::split_qkv_grouped(
-                h.qkv.as_ptr(),
+                conv_rows.as_ptr(),
                 st.q.as_mut_ptr(),
                 st.k.as_mut_ptr(),
                 h.core.as_mut_ptr(),
@@ -1204,8 +1360,16 @@ impl Runtime {
             )?;
         }
 
+        if let Some(sh) = stash {
+            copy_rows(&sh.q, &st.q, n * k_dim, stream)?;
+            copy_rows(&sh.k, &st.k, n * k_dim, stream)?;
+            copy_rows(&sh.v, &h.core, n * ssm.v_dim(), stream)?;
+            copy_rows(&sh.decay, &h.decay, n * ssm.n_v_heads, stream)?;
+            copy_rows(&sh.beta, &h.beta, n * ssm.n_v_heads, stream)?;
+        }
+
         // The recurrence writes over the value slice, which is no longer needed.
-        hybrid::delta_rule(
+        hybrid::delta_rule_ex(
             state.as_mut_ptr(),
             st.q.as_ptr(),
             st.k.as_ptr(),
@@ -1218,6 +1382,7 @@ impl Runtime {
             ssm.n_v_heads,
             ssm.head_k_dim(),
             ssm.head_v_dim(),
+            stash.is_none(),
             stream,
         )?;
 
@@ -1424,6 +1589,9 @@ impl Runtime {
         sampler: &mut Sampler,
         mut on_token: impl FnMut(u32, &str) -> bool,
     ) -> Result<GenerationStats> {
+        if sampler.is_pure_greedy() && !gpu_argmax_disabled() && self.speculates() {
+            return self.generate_spec(prompt, max_tokens, &mut on_token);
+        }
         let start = std::time::Instant::now();
 
         // Prefill, skipping whatever the caches already hold. In a chat each
@@ -1540,6 +1708,8 @@ impl Runtime {
             prefill_ms,
             decode_ms,
             stop,
+            drafted: 0,
+            accepted: 0,
         })
     }
 }
@@ -1572,6 +1742,10 @@ pub struct GenerationStats {
     pub prefill_ms: f64,
     pub decode_ms: f64,
     pub stop: StopReason,
+    /// Speculative decoding: tokens the MTP head drafted, and how many of them
+    /// the main model accepted. Both 0 without speculation.
+    pub drafted: usize,
+    pub accepted: usize,
 }
 
 impl GenerationStats {
@@ -1719,7 +1893,40 @@ fn trace_block(st: &DeviceState, layer: usize, kind: &str, n: usize, cfg: &Confi
         "  layer {layer:>3} {kind:<4}  block rms {br:>9.4} mean {bm:>9.4}  \
          residual rms {xr:>9.4} mean {xm:>9.4}"
     );
+    // The block output's sum over every token and the last token's first
+    // values, in the form llama.cpp's eval-callback prints them (as
+    // linear_attn_out-N / attn_output-N / ffn_out-N), so the same prompt
+    // compares layer by layer.
+    if std::env::var("AIRUN_TRACE_LAYERS").is_ok_and(|v| v.trim() == "sum") {
+        let host = st.xb2.to_vec(&st.stream)?;
+        let row = &host[(n - 1) * cfg.n_embd..n * cfg.n_embd];
+        let sum: f64 = host[..n * cfg.n_embd].iter().map(|&v| v as f64).sum();
+        let last: f64 = row.iter().map(|&v| v as f64).sum();
+        eprintln!("    sum {sum:>12.6}  last {last:>12.6}  [{:.4}, {:.4}, {:.4}, ..., {:.4}, {:.4}, {:.4}]",
+            row[0], row[1], row[2], row[cfg.n_embd - 3], row[cfg.n_embd - 2], row[cfg.n_embd - 1]);
+    }
     Ok(())
+}
+
+/// Copies the first `len` floats of `src` into `dst`, on the stream.
+fn copy_rows(dst: &DeviceBuffer<f32>, src: &DeviceBuffer<f32>, len: usize, stream: &Stream) -> Result<()> {
+    let bytes = len * std::mem::size_of::<f32>();
+    Ok(ops::copy_2d(dst.as_mut_ptr(), bytes, src.as_ptr(), bytes, bytes, 1, stream)?)
+}
+
+/// Whether this matmul takes the FP4 tensor cores: an NVFP4 weight, a batch
+/// big enough to fill their 128-token tiles reasonably, and a device and
+/// build that have them (see ops::fp4_supported; AIRUN_NO_FP4=1 opts out).
+/// The activation is then 4-bit, as in llama.cpp's Blackwell path; decode and
+/// small batches keep 8-bit activations.
+fn fp4_prefill(w: &GpuTensor, n: usize, q8: &QAct) -> bool {
+    n >= 32 && q8.fp4.is_some() && w.kernel_type().0 == 40 && w.k % 256 == 0 && !matvec_f32_forced()
+}
+
+/// Decode on the integer kernel for this weight; see
+/// [`ops::KernelType::prefers_q8_decode`].
+fn q8_decode(w: &GpuTensor) -> bool {
+    !matvec_f32_forced() && w.kernel_type().prefers_q8_decode() && ops::matvec_supports_q8(w.kernel_type())
 }
 
 /// Whether AIRUN_MATVEC_F32=1 pinned the matvec to the exact f32 path.
@@ -1836,6 +2043,7 @@ fn matvec(
     // scratch; it is rebuilt lazily by the first call that can use it, so a
     // group whose weights are all float types never pays for quantization.
     q8.valid.set(false);
+    q8.fp4_valid.set(false);
     matvec_reuse(w, x, out, n, q8, stream)
 }
 
@@ -1855,12 +2063,24 @@ fn matvec_reuse(
     //              same bytes move either way, and skipping the quantize
     //              launches measured faster (148 vs 133 tok/s, Q8_0 1.7B).
     //              This also keeps generation bit-identical to the reference.
+    //              NVFP4 is the exception (prefers_q8_decode): at 4.5 bits the
+    //              f32 vector, not the weights, is what each warp reads most.
     //   2..63      dp4a on quantized activations, when the type has a kernel.
     //   64+        int8 tensor cores (MMQ) on sm_80+ for the same types.
     //              Other types and older GPUs go to ops::matvec's fp16
     //              tensor-core kernel.
+    if fp4_prefill(w, n, q8) {
+        let buf = q8.fp4.as_ref().expect("checked by fp4_prefill");
+        if !q8.fp4_valid.get() {
+            ops::quantize_act_nvfp4(x.as_ptr(), buf.as_mut_ptr(), n, w.k, stream)?;
+            q8.fp4_valid.set(true);
+        }
+        ops::matmul_nvfp4(w.data.as_ptr(), w.row_bytes, buf.as_ptr(), out.as_mut_ptr(), w.k, w.rows, n, stream)?;
+        return Ok(());
+    }
     let batch_q8 = n < 64 || ops::mmq_supported();
-    if n > 1 && batch_q8 && !matvec_f32_forced() && ops::matvec_supports_q8(w.kernel_type()) {
+    let wants_q8 = if n == 1 { q8_decode(w) } else { batch_q8 };
+    if wants_q8 && !matvec_f32_forced() && ops::matvec_supports_q8(w.kernel_type()) {
         if !q8.valid.get() {
             ops::quantize_act(x.as_ptr(), q8.buf.as_mut_ptr(), n * w.k, stream)?;
             q8.valid.set(true);

@@ -22,10 +22,15 @@ unsafe extern "C" {
         kernel: i32,
         apply_silu: i32,
         reverse: i32,
+        keep_state: i32,
         stream: ffi::Stream,
     ) -> Status;
 
     fn airun_l2norm(x: *mut c_void, rows: i32, head_dim: i32, eps: f32, stream: ffi::Stream) -> Status;
+
+    fn airun_causal_conv1d_oop(x: *const c_void, out: *mut c_void, weight: *const c_void,
+        state: *mut c_void, n_tokens: i32, channels: i32, kernel: i32, apply_silu: i32,
+        reverse: i32, keep_state: i32, stream: ffi::Stream) -> Status;
 
     fn airun_delta_gates(
         a: *const c_void,
@@ -52,6 +57,7 @@ unsafe extern "C" {
         n_v_heads: i32,
         head_k_dim: i32,
         head_v_dim: i32,
+        keep_state: i32,
         stream: ffi::Stream,
     ) -> Status;
 
@@ -191,6 +197,24 @@ pub fn causal_conv1d(
     reverse: bool,
     stream: &Stream,
 ) -> Result<()> {
+    causal_conv1d_ex(x, weight, state, n_tokens, channels, kernel, apply_silu, reverse, true, stream)
+}
+
+/// [`causal_conv1d`]; with `keep_state` false the history is read but not
+/// advanced, for a speculative verify whose tokens may be rejected.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_ex(
+    x: *mut c_void,
+    weight: *const c_void,
+    state: *mut c_void,
+    n_tokens: usize,
+    channels: usize,
+    kernel: usize,
+    apply_silu: bool,
+    reverse: bool,
+    keep_state: bool,
+    stream: &Stream,
+) -> Result<()> {
     if !(1..=8).contains(&kernel) {
         return Err(bad_arg(format!(
             "convolution kernel width {kernel} is outside the supported 1..=8"
@@ -209,11 +233,32 @@ pub fn causal_conv1d(
             kernel as i32,
             apply_silu as i32,
             reverse as i32,
+            keep_state as i32,
             stream.raw(),
         ))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(x, weight, state, n_tokens, channels, apply_silu, reverse, stream)
+    needs_cuda!(x, weight, state, n_tokens, channels, apply_silu, reverse, keep_state, stream)
+}
+
+/// [`causal_conv1d_ex`] out of place: `x` is read, `out` written, and the
+/// work is parallel over tokens too. Same arithmetic, same results.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_oop(x: *const c_void, out: *mut c_void, weight: *const c_void, state: *mut c_void,
+    n_tokens: usize, channels: usize, kernel: usize, apply_silu: bool, reverse: bool, keep_state: bool,
+    stream: &Stream) -> Result<()> {
+    if !(1..=8).contains(&kernel) {
+        return Err(bad_arg(format!("convolution kernel width {kernel} is outside the supported 1..=8")));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: x and out hold n_tokens * channels floats each and do not overlap;
+    // weight channels * kernel; state channels * (kernel - 1).
+    unsafe {
+        ffi::check(airun_causal_conv1d_oop(x, out, weight, state, n_tokens as i32, channels as i32,
+            kernel as i32, apply_silu as i32, reverse as i32, keep_state as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(x, out, weight, state, n_tokens, channels, apply_silu, reverse, keep_state, stream)
 }
 
 /// Normalizes each of `rows` vectors of `head_dim` to unit length.
@@ -280,6 +325,29 @@ pub fn delta_rule(
     head_v_dim: usize,
     stream: &Stream,
 ) -> Result<()> {
+    delta_rule_ex(state, q, k, v, decay, beta, out, n_tokens, n_k_heads, n_v_heads,
+        head_k_dim, head_v_dim, true, stream)
+}
+
+/// [`delta_rule`]; with `keep_state` false the state is read but left as it
+/// was (head_k_dim 128 only), for a speculative verify.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_rule_ex(
+    state: *mut c_void,
+    q: *const c_void,
+    k: *const c_void,
+    v: *const c_void,
+    decay: *const c_void,
+    beta: *const c_void,
+    out: *mut c_void,
+    n_tokens: usize,
+    n_k_heads: usize,
+    n_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    keep_state: bool,
+    stream: &Stream,
+) -> Result<()> {
     if n_k_heads == 0 || n_v_heads % n_k_heads != 0 {
         return Err(bad_arg(format!(
             "value head count {n_v_heads} must be a multiple of key head count {n_k_heads}"
@@ -307,11 +375,12 @@ pub fn delta_rule(
             n_v_heads as i32,
             head_k_dim as i32,
             head_v_dim as i32,
+            keep_state as i32,
             stream.raw(),
         ))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(state, q, k, v, decay, beta, out, n_tokens, stream)
+    needs_cuda!(state, q, k, v, decay, beta, out, n_tokens, keep_state, stream)
 }
 
 /// RMSNorm over the last axis, fused with a SiLU gate.

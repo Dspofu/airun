@@ -103,6 +103,9 @@ Sempre, nesta ordem:
 $env:RUSTUP_HOME="E:\rust\rustup"; $env:CARGO_HOME="E:\rust\cargo"
 $env:PATH="E:\rust\cargo\bin;$env:PATH"
 $env:AIRUN_CUDA_ARCHS="120"     # só a arch local: build rápido durante dev
+# CUDA_PATH do sistema aponta para o 12.0, que não conhece sm_120:
+$env:CUDA_PATH="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+$env:PATH="$env:CUDA_PATH\bin;$env:PATH"
 
 cargo test --release            # 60+ testes unitários
 cargo build --release
@@ -145,6 +148,31 @@ Outros tipos e GPUs mais antigas vão para tensor cores fp16
 (`matvec_wmma_kernel`). Cada caminho tem seus casos no selftest com limite de
 erro backward; `AIRUN_MATVEC_F32=1` força o exato em tudo, `AIRUN_NO_MMQ=1`,
 `AIRUN_NO_MMQ_ASYNC=1` e `AIRUN_NO_WMMA=1` desligam cada um.
+
+**NVFP4** (Qwen3.8-27B NVFP4) segue o caminho inteiro em todos os tamanhos,
+inclusive no decode (`KernelType::prefers_q8_decode`): a 4,5 bits o vetor f32
+que cada warp relê pesa mais que os pesos. Os nibbles FP4 viram int8 com
+`__byte_perm` (`fp4_codes8` em `dequant.cuh`) — a tabela `__constant__` antiga,
+indexada por um nibble diferente em cada lane, serializava e deixava o 27B em
+5 tok/s. Lotes de 2–8 tokens (o verify do MTP) usam `matvec_q8_multi_kernel`,
+que decodifica cada grupo uma vez (`mmq_decode`) e o gasta em todos os tokens.
+NVFP4 tem MMQ assíncrono e gate/up fundido (`mmq_async<NVFP4>`, blocos de 36
+bytes copiados como os do Q8_0). O decode NVFP4 usa `matvec_q8_wide_kernel`
+(128 threads cobrem o K de 2 linhas: com um warp por 4 linhas, uma linha de 5120
+era só 5 iterações por lane e a banda ficava em 73%); o verify do MTP usa a
+versão com vários tokens (`matvec_q8_wide_multi_kernel`).
+
+**Prefill NVFP4 no Blackwell (sm_120): tensor cores FP4.**
+`kernels/sm120a/fp4mma.cu`, compilado à parte para `compute_120a` (o
+`mma ... kind::mxf4nvf4` só existe no alvo específico; o `build.rs` gera
+`airun_fp4.lib`). Os pesos entram como estão: a palavra t de um bloco NVFP4 já
+é o registrador do fragmento A e a palavra de escalas `d[4]` é o registrador de
+escala; a ativação é quantizada para o mesmo layout de bloco, mais uma escala
+f32 por token. Ativação em 4 bits, como o llama.cpp faz: na perplexidade em lote
+do 27B (blocos de 128, texto LF) int8 2,0727, FP4 2,0838, llama.cpp GPU 2,0862.
+Lotes de 32+ tokens; `AIRUN_NO_FP4=1` volta ao MMQ int8. O SwiGLU vai dentro da
+quantização da entrada da `down` (`quantize_glu_nvfp4`). Escalas `0x7F` (zero
+para o ggml, NaN para o hardware) são zeradas no carregamento.
 
 O MMQ assíncrono usa **stream-K** quando as tiles não fecham ondas inteiras de
 SMs (`MmqStreamK` em `mmq.cuh`): as ondas cheias rodam tiles inteiras e as
@@ -252,6 +280,19 @@ rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
     a diferença vem daqui, não de um bug novo.
 
 ---
+
+12. **`llama-perplexity -f` no Windows lê o arquivo em modo texto** e troca
+    CRLF por LF; o `airun perplexity -f` lê os bytes como estão. Num arquivo com
+    CRLF os dois pontuam textos diferentes e o llama.cpp parece ~0,1 nat melhor.
+    Normalize para LF antes de comparar. Com o mesmo texto, `--chunk N` do airun
+    reproduz o `llama-perplexity -c N` bloco a bloco (27B NVFP4, blocos de 128:
+    airun 7,9356, llama.cpp CPU 7,9438). Uma referência f64 em numpy do forward
+    qwen35 (fora do repo) confirmou o airun camada a camada.
+
+13. **YaRN não é escala linear.** `rope.scaling.type = yarn` (o 27B "yarn1m")
+    só interpola as dimensões lentas e multiplica cos/sin por
+    `1 + 0.1 ln(fator)`; tratar o fator como escala linear muda o modelo mesmo
+    em contexto curto. `RopeParams` em `ops.rs`, espelho em `airun.cuh`.
 
 ## 7. Híbridos SSM/MoE — corrigidos em 2026-09-26
 
@@ -363,8 +404,17 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
 3. **KV cache paginado** para múltiplas sequências concorrentes. Hoje o
    servidor serializa requisições porque o cache é uma sequência só.
 
-4. **MTP.** As camadas `nextn.*` são carregadas? Não — são puladas. Servem para
-   decodificação especulativa, não para a saída principal.
+4. **MTP — feito para o qwen35 denso (2026-10-31).** `--draft N` (padrão 3)
+   carrega `blk.{n_run}` como cabeça de rascunho e decodifica especulativamente
+   quando a amostragem é gulosa pura (`--temp 0 --repeat-penalty 1`); a saída é
+   idêntica à do decode normal. `crates/airun-core/src/spec.rs`: o verify roda
+   as camadas delta-net sem gravar estado (guarda as entradas em `DeltaStash`) e
+   `commit` empurra só os tokens aceitos — `test_delta_defer` no selftest exige
+   igualdade bit a bit. A linha do KV do MTP na posição q é o par
+   (h_{q-1}, x_q), como no draft-mtp do llama.cpp. 27B NVFP4 numa 5070 Ti:
+   ~90–103 tok/s contra 49 sem MTP (llama.cpp com draft-mtp, mesmos prompts:
+   91–104).
+   Falta: cabeça MTP dos MoE (35B-A3B), amostragem não gulosa.
 
 5. **Template Jinja.** O GGUF traz `tokenizer.chat_template`, que hoje é
    armazenado mas não avaliado; usamos ChatML embutido.

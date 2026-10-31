@@ -147,6 +147,29 @@ __device__ __forceinline__ float vdot_q6_K(const uint8_t* wr, int g,
     return d * ds.x * ((float)sc[0] * (float)dot0 + (float)sc[1] * (float)dot1);
 }
 
+// w = d_run * code for each run of 16 (two runs per group), codes the doubled
+// E2M1 values; d_run already carries the half.
+__device__ __forceinline__ float vdot_nvfp4(const uint8_t* wr, int g,
+                                            const block_q8a* a) {
+    const block_nvfp4* b = (const block_nvfp4*)wr + g / 2;
+    const uint32_t* q = (const uint32_t*)(b->qs + (g & 1) * 16);
+    const int* aw = (const int*)a[g].qs;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint32_t lo0, hi0, lo1, hi1;
+        fp4_codes8(q[h * 2 + 0], lo0, hi0);
+        fp4_codes8(q[h * 2 + 1], lo1, hi1);
+        int dot = __dp4a((int)lo0, aw[h * 4 + 0], 0);
+        dot = __dp4a((int)lo1, aw[h * 4 + 1], dot);
+        dot = __dp4a((int)hi0, aw[h * 4 + 2], dot);
+        dot = __dp4a((int)hi1, aw[h * 4 + 3], dot);
+        sum = fmaf(ue4m3_to_f32(b->d[(g & 1) * 2 + h]), (float)dot, sum);
+    }
+    return sum * __low2float(a[g].ds);
+}
+
 // Types with an integer path. Everything else (floats, the rarer quants) stays
 // on the f32 kernels -- dispatch falls back per tensor, so a model mixing both
 // still runs whole.
@@ -154,7 +177,8 @@ __device__ __forceinline__ float vdot_q6_K(const uint8_t* wr, int g,
     X(AIRUN_TYPE_Q8_0)            \
     X(AIRUN_TYPE_Q4_K)            \
     X(AIRUN_TYPE_Q5_K)            \
-    X(AIRUN_TYPE_Q6_K)
+    X(AIRUN_TYPE_Q6_K)            \
+    X(AIRUN_TYPE_NVFP4)
 
 template <int TYPE> struct q8dot;
 #define AIRUN_DEFINE_Q8DOT(TYPE, FN)                                          \
@@ -169,3 +193,4 @@ AIRUN_DEFINE_Q8DOT(AIRUN_TYPE_Q8_0, vdot_q8_0);
 AIRUN_DEFINE_Q8DOT(AIRUN_TYPE_Q4_K, vdot_q4_K);
 AIRUN_DEFINE_Q8DOT(AIRUN_TYPE_Q5_K, vdot_q5_K);
 AIRUN_DEFINE_Q8DOT(AIRUN_TYPE_Q6_K, vdot_q6_K);
+AIRUN_DEFINE_Q8DOT(AIRUN_TYPE_NVFP4, vdot_nvfp4);

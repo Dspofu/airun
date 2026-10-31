@@ -152,6 +152,31 @@ template <> struct mmq_decode<AIRUN_TYPE_Q6_K> {
         m = 0.0f;
     }
 };
+// NVFP4: a group is two runs of 16 with their own UE4M3 scales, so it takes the
+// split k16 products like Q6_K. Codes as vdot_nvfp4 feeds dp4a.
+template <> struct mmq_decode<AIRUN_TYPE_NVFP4> {
+    static constexpr bool SPLIT = true, HAS_MIN = false;
+    struct Raw { uint32_t d, q[4]; };
+    __device__ static __forceinline__ void load(const uint8_t* wr, int g, Raw& r) {
+        const block_nvfp4* b = (const block_nvfp4*)wr + g / 2;
+        const uint32_t* q = (const uint32_t*)(b->qs + (g & 1) * 16);
+        r.d = *(const uint32_t*)b->d;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) r.q[i] = q[i];
+    }
+    __device__ static __forceinline__ void decode(const Raw& r, int g, uint32_t q[8],
+                                                  float& s0, float& s1, float& m) {
+        fp4_codes8(r.q[0], q[0], q[2]);
+        fp4_codes8(r.q[1], q[1], q[3]);
+        fp4_codes8(r.q[2], q[4], q[6]);
+        fp4_codes8(r.q[3], q[5], q[7]);
+        const uint32_t d = r.d >> (16 * (g & 1));
+        s0 = ue4m3_to_f32((uint8_t)(d & 0xFF));
+        s1 = ue4m3_to_f32((uint8_t)((d >> 8) & 0xFF));
+        m = 0.0f;
+    }
+};
+
 // Integer results leave the MMA already as floats: the accumulator starts at
 // the bit pattern of 1.5 * 2^23, whose ulp is 1, so adding an integer v to it
 // gives the float 1.5 * 2^23 + v exactly for |v| < 2^22 -- far above the 516129
@@ -507,6 +532,18 @@ template <> struct mmq_async<AIRUN_TYPE_Q5_K> {
     __device__ static __forceinline__ int base_group(int g0) { return (g0 / 8) * 8; }
     __device__ static __forceinline__ size_t offset(int g0) { return (size_t)(g0 / 8) * 176; }
     __device__ static __forceinline__ int skew(int) { return 0; }
+};
+
+// NVFP4: a chunk of four groups is two 36-byte blocks, starting 8-byte aligned
+// (72 bytes per chunk); five 16-byte copies from the boundary at or below
+// cover it, as for Q8_0. Rows of a multiple of 8 groups are 16-byte multiples,
+// so the copies of a row's last chunk (always the 8-aligned kind) end inside it.
+template <> struct mmq_async<AIRUN_TYPE_NVFP4> {
+    static constexpr bool OK = true;
+    static constexpr int BYTES = 80, STRIDE = 80, COPY = 16, GROUP_MULTIPLE = 8;
+    __device__ static __forceinline__ int base_group(int g0) { return g0; }
+    __device__ static __forceinline__ size_t offset(int g0) { return ((size_t)g0 / 2 * 36) & ~(size_t)15; }
+    __device__ static __forceinline__ int skew(int g0) { return (g0 / 2 * 36) & 15; }
 };
 
 template <int TYPE, int TC>

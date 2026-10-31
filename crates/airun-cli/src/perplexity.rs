@@ -49,6 +49,19 @@ pub struct PerplexityArgs {
     #[arg(short = 'n', long, default_value_t = 0)]
     pub limit: usize,
 
+    /// Score like llama-perplexity: split the text into chunks of this many
+    /// tokens, restart the context at each, and count only predictions in a
+    /// chunk's second half. The same text and size give the two engines the
+    /// same tokens to score with the same context, so the numbers compare.
+    #[arg(long, default_value_t = 0)]
+    pub chunk: usize,
+
+    /// With --chunk: feed each chunk in one batched pass (the prefill kernels,
+    /// as llama-perplexity does) instead of one token at a time (the decode
+    /// kernels). The two paths should agree to rounding.
+    #[arg(long, requires = "chunk")]
+    pub batched: bool,
+
     /// Print the per-token loss, highest first.
     #[arg(long, default_value_t = 0)]
     pub worst: usize,
@@ -91,7 +104,7 @@ pub fn run(args: PerplexityArgs) -> Result<()> {
     run_args.ctx_size = args.ctx_size;
     run_args.expert_cache = args.expert_cache;
     run_args.kv_type = args.kv_type;
-    run_args.batch_size = 1;
+    run_args.batch_size = if args.batched { args.chunk.max(1) } else { 1 };
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();
     run_args.single_gpu = args.single_gpu;
@@ -109,41 +122,70 @@ pub fn run(args: PerplexityArgs) -> Result<()> {
         0 => tokens.len(),
         n => n.min(tokens.len()),
     };
-    if scored + 1 >= runtime.ctx() {
+    // (start, end, first scored prediction) per pass over the context.
+    let passes: Vec<(usize, usize, usize)> = if args.chunk > 0 {
+        if args.chunk < 4 || args.chunk > scored {
+            anyhow::bail!("--chunk {} needs at least 4 tokens and at most the text's {scored}", args.chunk);
+        }
+        (0..scored / args.chunk).map(|c| (c * args.chunk, (c + 1) * args.chunk, args.chunk / 2)).collect()
+    } else {
+        vec![(0, scored, 0)]
+    };
+    let longest = passes.iter().map(|(a, b, _)| b - a).max().unwrap_or(0);
+    if longest + 1 >= runtime.ctx() {
         anyhow::bail!(
-            "the text is {scored} tokens but the context is {}; raise --ctx-size",
+            "a pass is {longest} tokens but the context is {}; raise --ctx-size",
             runtime.ctx()
         );
     }
 
-    runtime.reset();
-
-    let mut losses: Vec<(usize, u32, f32)> = Vec::with_capacity(scored - 1);
+    let mut losses: Vec<(usize, u32, f32)> = Vec::with_capacity(scored);
     let mut total = 0f64;
     let mut top1 = 0usize;
 
-    for i in 0..scored - 1 {
-        let logits = runtime.forward(&tokens[i..i + 1])?;
-        let target = tokens[i + 1] as usize;
-
-        // Log-softmax the stable way; a 250k-entry vocabulary makes the naive
-        // form overflow long before the answer is wrong.
+    // Log-softmax the stable way; a 250k-entry vocabulary makes the naive
+    // form overflow long before the answer is wrong.
+    let score = |logits: &[f32], target: usize| -> (f32, bool) {
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
         let nll = -((logits[target] - max) - sum.ln());
-
-        let best = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        if best == target {
-            top1 += 1;
+        let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
+        (nll, best == target)
+    };
+    for &(start, end, first) in &passes {
+        runtime.reset();
+        if args.batched {
+            let mut rows = Vec::new();
+            runtime.forward_all(&tokens[start..end], |r, logits| {
+                if r >= first && r + 1 < end - start {
+                    rows.push((r, score(logits, tokens[start + r + 1] as usize)));
+                }
+            })?;
+            for (r, (nll, hit)) in rows {
+                top1 += hit as usize;
+                total += nll as f64;
+                losses.push((start + r + 1, tokens[start + r + 1], nll));
+            }
+        } else {
+            for i in start..end - 1 {
+                let logits = runtime.forward(&tokens[i..i + 1])?;
+                if i - start < first {
+                    continue;
+                }
+                let target = tokens[i + 1] as usize;
+                let (nll, hit) = score(&logits, target);
+                top1 += hit as usize;
+                total += nll as f64;
+                losses.push((i + 1, tokens[i + 1], nll));
+            }
         }
-
-        total += nll as f64;
-        losses.push((i + 1, tokens[i + 1], nll));
+        // The running value after each chunk, in llama-perplexity's "[i]ppl" form.
+        if passes.len() > 1 {
+            eprint!("[{}]{:.4},", losses.len() / (end - start - 1 - first).max(1), (total / losses.len() as f64).exp());
+        }
+    }
+    if passes.len() > 1 {
+        eprintln!();
     }
 
     let n = losses.len() as f64;

@@ -1,4 +1,4 @@
-// Quantized matrix-vector / matrix-matrix products.
+﻿// Quantized matrix-vector / matrix-matrix products.
 //
 // Decode (one token) is memory bound: the weights are read once and every byte
 // fetched is used exactly once, so the win comes from reading the packed form
@@ -601,6 +601,211 @@ __global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_q8_kernel(
     }
 }
 
+// Decode for the 4-bit types: a block of 128 threads covers the whole K of R
+// rows, so every group of a short row is requested at once. With a warp per
+// four rows (matvec_q8_kernel) a 5120-wide row is five groups per lane, and
+// the loads of one iteration were too few bytes in flight to keep DRAM busy:
+// the 27B NVFP4 decode ran its matvecs at 73% of bandwidth.
+#define WIDE_THREADS 128
+template <int TYPE, int R>
+__global__ __launch_bounds__(WIDE_THREADS) void matvec_q8_wide_kernel(
+    const uint8_t* __restrict__ w,
+    const block_q8a* __restrict__ xq,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const size_t row_bytes) {
+
+    const int row0 = blockIdx.x * R;
+    const int groups = K / 32;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+
+    for (int g = threadIdx.x; g < groups; g += WIDE_THREADS) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            acc[r] += q8dot<TYPE>::dot(w + (size_t)min(row0 + r, n_rows - 1) * row_bytes, g, xq);
+        }
+    }
+
+    __shared__ float red[R][WIDE_THREADS / 32];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float s = warp_reduce_sum(acc[r]);
+        if (lane == 0) red[r][warp] = s;
+    }
+    __syncthreads();
+    if (threadIdx.x < R && row0 + threadIdx.x < n_rows) {
+        float s = 0.0f;
+#pragma unroll
+        for (int i = 0; i < WIDE_THREADS / 32; ++i) s += red[threadIdx.x][i];
+        y[row0 + threadIdx.x] = s;
+    }
+}
+
+// matvec_q8_wide_kernel for 2..NT tokens (the speculative verify): each group
+// is decoded once (mmq_decode) and spent against every token's activation.
+template <int TYPE, int R, int NT>
+__global__ __launch_bounds__(WIDE_THREADS) void matvec_q8_wide_multi_kernel(
+    const uint8_t* __restrict__ w,
+    const block_q8a* __restrict__ xq,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens,
+    const size_t row_bytes) {
+
+    using D = mmq_decode<TYPE>;
+    const int row0 = blockIdx.x * R;
+    const int groups = K / 32;
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[r][t] = 0.0f;
+
+    for (int g = threadIdx.x; g < groups; g += WIDE_THREADS) {
+        typename D::Raw raw[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) D::load(w + (size_t)min(row0 + r, n_rows - 1) * row_bytes, g, raw[r]);
+        uint32_t q[R][8];
+        float s0[R], s1[R], m[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) D::decode(raw[r], g, q[r], s0[r], s1[r], m[r]);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= n_tokens) continue;
+            const block_q8a* a = xq + (size_t)t * groups + g;
+            int aw[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) aw[i] = ((const int*)a->qs)[i];
+            const float2 ds = __half22float2(a->ds);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if constexpr (D::SPLIT) {
+                    int d0 = 0, d1 = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) d0 = __dp4a((int)q[r][i], aw[i], d0);
+#pragma unroll
+                    for (int i = 4; i < 8; ++i) d1 = __dp4a((int)q[r][i], aw[i], d1);
+                    acc[r][t] += (s0[r] * (float)d0 + s1[r] * (float)d1) * ds.x;
+                } else {
+                    int d = 0;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) d = __dp4a((int)q[r][i], aw[i], d);
+                    float v = s0[r] * ds.x * (float)d;
+                    if constexpr (D::HAS_MIN) v -= m[r] * ds.y;
+                    acc[r][t] += v;
+                }
+            }
+        }
+    }
+
+    __shared__ float red[R][NT][WIDE_THREADS / 32];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float s = warp_reduce_sum(acc[r][t]);
+            if (lane == 0) red[r][t][warp] = s;
+        }
+    __syncthreads();
+    if (threadIdx.x < R * NT) {
+        const int r = threadIdx.x / NT, t = threadIdx.x % NT;
+        if (row0 + r < n_rows && t < n_tokens) {
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < WIDE_THREADS / 32; ++i) s += red[r][t][i];
+            y[(size_t)t * n_rows + row0 + r] = s;
+        }
+    }
+}
+
+// A few tokens (speculative verify, 2..8): each weight group is loaded and
+// decoded to its integer codes once -- mmq_decode, the same codes and scales
+// the tensor-core kernel uses -- and spent against every token's activation.
+// The tiled kernel below re-decoded the group per token, and for NVFP4, whose
+// decode is all byte permutes, a 4-token verify cost twice a decode step.
+template <int TYPE, int NT>
+__global__ __launch_bounds__(32 * ROWS_PER_BLOCK) void matvec_q8_multi_kernel(
+    const uint8_t* __restrict__ w,
+    const block_q8a* __restrict__ xq,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens,
+    const size_t row_bytes) {
+
+    using D = mmq_decode<TYPE>;
+    const int row0 = (blockIdx.x * ROWS_PER_BLOCK + threadIdx.y) * ROWS_PER_WARP;
+    if (row0 >= n_rows) return;
+    const int n_row = min(ROWS_PER_WARP, n_rows - row0);
+    const int groups = K / 32;
+
+    float acc[ROWS_PER_WARP][NT];
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[r][t] = 0.0f;
+
+    for (int g = threadIdx.x; g < groups; g += 32) {
+        // All rows' bytes requested before any is decoded (see q8_0_load),
+        // then every row decoded before the tokens: each token's activation
+        // is loaded once and spent against all rows.
+        typename D::Raw raw[ROWS_PER_WARP];
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            D::load(w + (size_t)(row0 + min(r, n_row - 1)) * row_bytes, g, raw[r]);
+        }
+        uint32_t q[ROWS_PER_WARP][8];
+        float s0[ROWS_PER_WARP], s1[ROWS_PER_WARP], m[ROWS_PER_WARP];
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) D::decode(raw[r], g, q[r], s0[r], s1[r], m[r]);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= n_tokens) continue;
+            const block_q8a* a = xq + (size_t)t * groups + g;
+            // 36-byte blocks: 4-byte alignment only.
+            int aw[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) aw[i] = ((const int*)a->qs)[i];
+            const float2 ds = __half22float2(a->ds);
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_WARP; ++r) {
+                if constexpr (D::SPLIT) {
+                    int d0 = 0, d1 = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) d0 = __dp4a((int)q[r][i], aw[i], d0);
+#pragma unroll
+                    for (int i = 4; i < 8; ++i) d1 = __dp4a((int)q[r][i], aw[i], d1);
+                    acc[r][t] += (s0[r] * (float)d0 + s1[r] * (float)d1) * ds.x;
+                } else {
+                    int d = 0;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) d = __dp4a((int)q[r][i], aw[i], d);
+                    float v = s0[r] * ds.x * (float)d;
+                    if constexpr (D::HAS_MIN) v -= m[r] * ds.y;
+                    acc[r][t] += v;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        if (r >= n_row) break;
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= n_tokens) break;
+            const float s = warp_reduce_sum(acc[r][t]);
+            if (threadIdx.x == 0) y[(size_t)t * n_rows + row0 + r] = s;
+        }
+    }
+}
+
 // Prefill: token x row tile as in matvec_tiled_kernel. The integer dot both
 // shrinks the activation reads 4x and replaces 32 FMAs with 8 dp4a per group,
 // which is what an instruction-bound kernel wants.
@@ -709,6 +914,26 @@ static bool airun_force_no_wmma() {
     static int cached = -1;
     if (cached < 0) {
         const char* v = getenv("AIRUN_NO_WMMA");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// AIRUN_NO_Q8_WIDE=1 keeps NVFP4 decode on the warp-per-four-rows kernel.
+static bool q8_wide_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_Q8_WIDE");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// AIRUN_NO_Q8_MULTI=1 sends 2..8-token batches back to the tiled kernel.
+static bool q8_multi_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_Q8_MULTI");
         cached = (v && v[0] && v[0] != '0') ? 1 : 0;
     }
     return cached == 1;
@@ -1042,6 +1267,7 @@ extern "C" airun_status airun_matvec_q8_glu(
         GLU_LAUNCH(AIRUN_TYPE_Q8_0)
         GLU_LAUNCH(AIRUN_TYPE_Q4_K)
         GLU_LAUNCH(AIRUN_TYPE_Q5_K)
+        GLU_LAUNCH(AIRUN_TYPE_NVFP4)
 #undef GLU_LAUNCH
         default: return AIRUN_ERR_BAD_TYPE;
     }
@@ -1266,7 +1492,11 @@ airun_status airun_matvec_q8(
             default: return AIRUN_ERR_BAD_TYPE;
         }
 #undef LAUNCH
-    } else if (n_tokens == 1) {
+    } else if (n_tokens == 1 && type_id == AIRUN_TYPE_NVFP4 && !q8_wide_disabled()) {
+        constexpr int R = 2;
+        matvec_q8_wide_kernel<AIRUN_TYPE_NVFP4, R><<<(n_rows + R - 1) / R, WIDE_THREADS, 0, stream>>>(
+            (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, (size_t)row_bytes);
+    } else if (n_tokens == 1 && !getenv("AIRUN_Q8_DECODE_MULTI")) {
         const int warps = (n_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
         const dim3 grid((warps + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, 1);
 
@@ -1274,6 +1504,36 @@ airun_status airun_matvec_q8(
     matvec_q8_kernel<TYPE><<<grid, block, 0, stream>>>(                    \
         (const uint8_t*)w, (const block_q8a*)xq, (float*)y,                \
         k, n_rows, (size_t)row_bytes);
+
+        switch (type_id) {
+            AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)
+            default: return AIRUN_ERR_BAD_TYPE;
+        }
+#undef LAUNCH
+    } else if (n_tokens == 1 && getenv("AIRUN_Q8_DECODE_MULTI")) {
+        const int warps = (n_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+        const dim3 grid((warps + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, 1);
+#define LAUNCH(TYPE) matvec_q8_multi_kernel<TYPE, 1><<<grid, block, 0, stream>>>(                        (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);
+        switch (type_id) {
+            AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)
+            default: return AIRUN_ERR_BAD_TYPE;
+        }
+#undef LAUNCH
+    } else if (n_tokens <= 8 && type_id == AIRUN_TYPE_NVFP4 && !q8_wide_disabled()) {
+        constexpr int R = 2;
+        const int blocks = (n_rows + R - 1) / R;
+        if (n_tokens <= 4) {
+            matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 4><<<blocks, WIDE_THREADS, 0, stream>>>(
+                (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);
+        } else {
+            matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 8><<<blocks, WIDE_THREADS, 0, stream>>>(
+                (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);
+        }
+    } else if (n_tokens <= 8 && !q8_multi_disabled()) {
+        const int warps = (n_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+        const dim3 grid((warps + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, 1);
+
+#define LAUNCH(TYPE)                                                                        if (n_tokens <= 2) matvec_q8_multi_kernel<TYPE, 2><<<grid, block, 0, stream>>>(             (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);     else if (n_tokens <= 4) matvec_q8_multi_kernel<TYPE, 4><<<grid, block, 0, stream>>>(         (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);     else matvec_q8_multi_kernel<TYPE, 8><<<grid, block, 0, stream>>>(                           (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);
 
         switch (type_id) {
             AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)

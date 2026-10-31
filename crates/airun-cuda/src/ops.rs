@@ -1,4 +1,4 @@
-//! Safe wrappers over the kernels.
+﻿//! Safe wrappers over the kernels.
 //!
 //! Every entry point takes a [`Stream`] and returns as soon as the work is
 //! queued; nothing here synchronizes. Shape checks happen on the Rust side so a
@@ -16,6 +16,15 @@ use crate::stream::Stream;
 #[cfg(airun_cuda)]
 unsafe extern "C" {
     fn airun_mmq_supported() -> i32;
+    fn airun_fp4_supported() -> i32;
+    fn airun_nvfp4_act_bytes(n_tokens: i32, k: i32) -> u64;
+    fn airun_quantize_act_nvfp4(x: *const c_void, out: *mut c_void, n_tokens: i32, k: i32,
+        stream: ffi::Stream) -> Status;
+    fn airun_quantize_glu_nvfp4(gate: *const c_void, up: *const c_void, out: *mut c_void, n_tokens: i32,
+        k: i32, stream: ffi::Stream) -> Status;
+    fn airun_matmul_nvfp4(w: *const c_void, row_bytes: u64, xq: *const c_void, y: *mut c_void,
+        k: i32, n_rows: i32, n_tokens: i32, stream: ffi::Stream) -> Status;
+    fn airun_nvfp4_sanitize(w: *mut c_void, n_blocks: i64, stream: ffi::Stream) -> Status;
     fn airun_argmax(x: *const c_void, n: i32, out: *mut c_void, scratch: *mut c_void,
         bump: *mut c_void, stream: ffi::Stream) -> Status;    fn airun_add_rmsnorm(out: *mut c_void, x: *mut c_void, b: *const c_void, weight: *const c_void,
         n: i32, rows: i32, eps: f32, stream: ffi::Stream) -> Status;
@@ -23,7 +32,7 @@ unsafe extern "C" {
     fn airun_qk_norm_rope_store(q: *mut c_void, k: *const c_void, v: *const c_void,
         q_norm: *const c_void, k_norm: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void,
         positions: *const c_void, n_tokens: i32, n_heads: i32, n_kv_heads: i32, head_dim: i32,
-        max_seq: i32, eps: f32, rope_dim: i32, freq_base: f32, freq_scale: f32,
+        max_seq: i32, eps: f32, rope_dim: i32, rope: RopeParams,
         interleaved: i32, rope_on: i32, kv_type: i32, stream: ffi::Stream) -> Status;
     fn airun_attention_split(out: *mut c_void, partial: *mut c_void,
         q: *const c_void, k: *const c_void, v: *const c_void, positions: *const c_void,
@@ -106,8 +115,7 @@ unsafe extern "C" {
         n_heads: i32,
         head_dim: i32,
         rope_dim: i32,
-        freq_base: f32,
-        freq_scale: f32,
+        rope: RopeParams,
         interleaved: i32,
         stream: ffi::Stream,
     ) -> Status;
@@ -188,6 +196,15 @@ impl KernelType {
 
     pub fn is_supported(self) -> bool {
         Self::SUPPORTED.contains(&self.0)
+    }
+
+    /// Whether decode (one token) should take the integer dp4a kernel rather
+    /// than the exact f32 one. At 4.5 bits per weight the f32 vector each warp
+    /// re-reads is ~3.5x the bytes of the weights it is spent against, and the
+    /// quantized vector is a quarter of that; at Q8_0's 8.5 bits the weights
+    /// dominate and f32 measured faster (148 vs 133 tok/s, 1.7B).
+    pub fn prefers_q8_decode(self) -> bool {
+        self.0 == 40   // NVFP4
     }
 }
 
@@ -384,6 +401,105 @@ pub fn mmq_supported() -> bool {
     }
 }
 
+/// Whether this build and the current device run NVFP4 x NVFP4 on Blackwell's
+/// FP4 tensor cores (sm_120a; see kernels/sm120a/fp4mma.cu). Not on
+/// AIRUN_NO_FP4=1, which keeps NVFP4 prefill on the int8 MMQ path.
+pub fn fp4_supported() -> bool {
+    if std::env::var("AIRUN_NO_FP4").is_ok_and(|v| v.trim() != "0") {
+        return false;
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: reads the current device's compute capability and nothing else.
+    unsafe {
+        airun_fp4_supported() != 0
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        false
+    }
+}
+
+/// Bytes [`quantize_act_nvfp4`] writes for `n_tokens` rows of `k` values.
+pub fn nvfp4_act_bytes(n_tokens: usize, k: usize) -> usize {
+    n_tokens * (k / 64) * 36 + n_tokens * 4
+}
+
+/// f32 activations `[n_tokens][k]` into NVFP4 blocks plus one f32 scale per
+/// row, the activation side of [`matmul_nvfp4`]. `k` must be a multiple of 64.
+pub fn quantize_act_nvfp4(x: *const c_void, out: *mut c_void, n_tokens: usize, k: usize,
+    stream: &Stream) -> Result<()> {
+    if k % 64 != 0 {
+        return Err(bad_arg(format!("NVFP4 activations need K divisible by 64, got {k}")));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: x holds n_tokens * k floats; out holds nvfp4_act_bytes(n_tokens, k).
+    unsafe {
+        debug_assert_eq!(airun_nvfp4_act_bytes(n_tokens as i32, k as i32) as usize, nvfp4_act_bytes(n_tokens, k));
+        ffi::check(airun_quantize_act_nvfp4(x, out, n_tokens as i32, k as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (x, out, n_tokens, stream);
+        Err(CudaError::NotBuiltWithCuda)
+    }
+}
+
+/// [`quantize_act_nvfp4`] of `silu(gate) * up`: the SwiGLU fused into the
+/// down projection's input.
+pub fn quantize_glu_nvfp4(gate: *const c_void, up: *const c_void, out: *mut c_void, n_tokens: usize, k: usize,
+    stream: &Stream) -> Result<()> {
+    if k % 64 != 0 {
+        return Err(bad_arg(format!("NVFP4 activations need K divisible by 64, got {k}")));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: gate and up hold n_tokens * k floats; out nvfp4_act_bytes(n_tokens, k).
+    unsafe {
+        ffi::check(airun_quantize_glu_nvfp4(gate, up, out, n_tokens as i32, k as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (gate, up, out, n_tokens, stream);
+        Err(CudaError::NotBuiltWithCuda)
+    }
+}
+
+/// `y[t][row] = W[row] . x[t]` on the FP4 tensor cores, W NVFP4 as stored and x
+/// from [`quantize_act_nvfp4`]. Check [`fp4_supported`] first.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_nvfp4(w: *const c_void, row_bytes: usize, xq: *const c_void, y: *mut c_void, k: usize,
+    n_rows: usize, n_tokens: usize, stream: &Stream) -> Result<()> {
+    if k % 256 != 0 || row_bytes != k / 64 * 36 {
+        return Err(bad_arg(format!("NVFP4 matmul: K {k} must divide by 256 and rows be {} bytes", k / 64 * 36)));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: w holds n_rows rows of row_bytes; xq the quantized n_tokens rows;
+    // y n_tokens * n_rows floats.
+    unsafe {
+        ffi::check(airun_matmul_nvfp4(w, row_bytes as u64, xq, y, k as i32, n_rows as i32, n_tokens as i32,
+            stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (w, xq, y, n_rows, n_tokens, stream);
+        Err(CudaError::NotBuiltWithCuda)
+    }
+}
+
+/// Rewrites NVFP4 run scales of 0x7F -- ggml's "zero", the hardware's NaN --
+/// to 0, over `n_blocks` blocks in place. Same weights to the int8 decoders.
+pub fn nvfp4_sanitize(w: *mut c_void, n_blocks: usize, stream: &Stream) -> Result<()> {
+    #[cfg(airun_cuda)]
+    // SAFETY: w holds n_blocks 36-byte NVFP4 blocks.
+    unsafe {
+        ffi::check(airun_nvfp4_sanitize(w, n_blocks as i64, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (w, n_blocks, stream);
+        Err(CudaError::NotBuiltWithCuda)
+    }
+}
+
 /// Quantizes `n_elements` f32 activations into `block_q8a` groups of 32
 /// (36 bytes per group: the codes, then scale and folded sum as half2).
 pub fn quantize_act(
@@ -518,6 +634,86 @@ pub fn rmsnorm(
     }
 }
 
+/// Copies `rows` runs of `width` bytes from `src` (rows `spitch` bytes apart)
+/// to `dst` (rows `dpitch` apart) on one device: placing two row blocks side
+/// by side, or taking columns out of one.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_2d(dst: *mut c_void, dpitch: usize, src: *const c_void, spitch: usize, width: usize,
+    rows: usize, stream: &Stream) -> Result<()> {
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller guarantees both regions hold `rows` rows at their pitches.
+    ffi::check(unsafe {
+        ffi::airun_memcpy2d_d2d(dst, dpitch as u64, src, spitch as u64, width as u64, rows as u64, stream.raw())
+    })
+}
+
+/// RoPE frequency parameters, laid out as `airun_rope_params` in airun.cuh.
+///
+/// Plain RoPE multiplies the position by `freq_scale`. YaRN (`ext_factor` not
+/// zero) mixes interpolated and extrapolated frequencies per dimension pair
+/// and scales cos/sin by `mscale`; see [`RopeParams::yarn`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeParams {
+    pub base: f32,
+    pub freq_scale: f32,
+    pub ext_factor: f32,
+    pub mscale: f32,
+    pub corr_lo: f32,
+    pub corr_hi: f32,
+}
+
+impl RopeParams {
+    /// Unscaled RoPE, or linear position interpolation when `freq_scale < 1`.
+    pub fn plain(base: f32, freq_scale: f32) -> Self {
+        Self { base, freq_scale, ext_factor: 0.0, mscale: 1.0, corr_lo: 0.0, corr_hi: 0.0 }
+    }
+
+    /// YaRN over `rope_dim` rotary dimensions trained at `orig_ctx` positions.
+    ///
+    /// The correction range and the magnitude factor follow llama.cpp
+    /// (`ggml_rope_yarn_corr_dims`, and `llama_context`'s attn_factor, which
+    /// cancels its own get_mscale against the kernel's so that the net factor
+    /// is `attn_factor * (1 + 0.1 ln factor)`), which in turn match
+    /// HuggingFace's `_compute_yarn_parameters` with `truncate=True`.
+    pub fn yarn(base: f32, factor: f32, rope_dim: usize, orig_ctx: usize, beta_fast: f32,
+        beta_slow: f32, attn_factor: f32) -> Self {
+        let corr_dim = |n_rot: f32| {
+            rope_dim as f32 * (orig_ctx as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let lo = corr_dim(beta_fast).floor().max(0.0);
+        let hi = corr_dim(beta_slow).ceil().min(rope_dim as f32 - 1.0);
+        Self {
+            base,
+            freq_scale: 1.0 / factor,
+            ext_factor: 1.0,
+            mscale: attn_factor * (1.0 + 0.1 * factor.ln()),
+            corr_lo: lo,
+            corr_hi: hi,
+        }
+    }
+
+    /// The angle's (cos, sin) for one dimension pair, as `rope_cos_sin` in
+    /// airun.cuh computes it. The CPU oracle for the kernels.
+    pub fn cos_sin(&self, pair: usize, rope_dim: usize, pos: i32) -> (f32, f32) {
+        let inv_freq = self.base.powf(-2.0 * pair as f32 / rope_dim as f32);
+        let theta = if self.ext_factor == 0.0 {
+            (pos as f32 * self.freq_scale) * inv_freq
+        } else {
+            let extrap = pos as f32 * inv_freq;
+            let interp = self.freq_scale * extrap;
+            let y = (pair as f32 - self.corr_lo) / (self.corr_hi - self.corr_lo).max(0.001);
+            let ramp = (1.0 - y.clamp(0.0, 1.0)) * self.ext_factor;
+            interp * (1.0 - ramp) + extrap * ramp
+        };
+        let (s, c) = theta.sin_cos();
+        (c * self.mscale, s * self.mscale)
+    }
+}
+
 /// In-place rotary embedding over `[n_tokens][n_heads][head_dim]`.
 ///
 /// `rope_dim` may be smaller than `head_dim`, leaving the tail unrotated, which
@@ -532,8 +728,7 @@ pub fn rope(
     n_heads: usize,
     head_dim: usize,
     rope_dim: usize,
-    freq_base: f32,
-    freq_scale: f32,
+    params: RopeParams,
     interleaved: bool,
     stream: &Stream,
 ) -> Result<()> {
@@ -552,15 +747,14 @@ pub fn rope(
             n_heads as i32,
             head_dim as i32,
             rope_dim as i32,
-            freq_base,
-            freq_scale,
+            params,
             interleaved as i32,
             stream.raw(),
         ))
     }
     #[cfg(not(airun_cuda))]
     {
-        let _ = (x, positions, n_tokens, n_heads, freq_base, freq_scale, interleaved, stream);
+        let _ = (x, positions, n_tokens, n_heads, params, interleaved, stream);
         Err(CudaError::NotBuiltWithCuda)
     }
 }
@@ -750,17 +944,17 @@ pub fn add_rmsnorm(out: *mut c_void, x: *mut c_void, b: *const c_void, weight: *
 /// The attention prologue in one launch: per-head RMSNorm of q and k (skipped
 /// when the weight is null), RoPE on both (unless `rope`is None), and k and v
 /// into the cache. Identical to [`rmsnorm`], [`rope`] and [`kv_store`] in turn.
-/// `rope` is (rope_dim, freq_base, freq_scale, interleaved).
+/// `rope` is (rope_dim, params, interleaved).
 #[allow(clippy::too_many_arguments)]
 pub fn qk_norm_rope_store(q: *mut c_void, k: *const c_void, v: *const c_void,
     q_norm: *const c_void, k_norm: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void,
     positions: *const c_void, n_tokens: usize, n_heads: usize, n_kv_heads: usize,
-    head_dim: usize, max_seq: usize, eps: f32, rope: Option<(usize, f32, f32, bool)>,
+    head_dim: usize, max_seq: usize, eps: f32, rope: Option<(usize, RopeParams, bool)>,
     kv_type: KvType, stream: &Stream) -> Result<()> {
     if head_dim % 32 != 0 || head_dim > 1024 {
         return Err(bad_arg(format!("the fused attention prologue needs head_dim divisible by 32, got {head_dim}")));
     }
-    let (rope_dim, base, scale, interleaved) = rope.unwrap_or((2, 1.0, 1.0, false));
+    let (rope_dim, params, interleaved) = rope.unwrap_or((2, RopeParams::plain(1.0, 1.0), false));
     #[cfg(airun_cuda)]
     // SAFETY: q/k/v hold n_tokens rows of their head counts, the caches
     // n_kv_heads * max_seq rows in kv_type's format; positions outside
@@ -768,13 +962,13 @@ pub fn qk_norm_rope_store(q: *mut c_void, k: *const c_void, v: *const c_void,
     unsafe {
         ffi::check(airun_qk_norm_rope_store(q, k, v, q_norm, k_norm, k_cache, v_cache, positions,
             n_tokens as i32, n_heads as i32, n_kv_heads as i32, head_dim as i32, max_seq as i32,
-            eps, rope_dim as i32, base, scale, interleaved as i32, rope.is_some() as i32,
+            eps, rope_dim as i32, params, interleaved as i32, rope.is_some() as i32,
             kv_type.id(), stream.raw()))
     }
     #[cfg(not(airun_cuda))]
     {
         let _ = (q, k, v, q_norm, k_norm, k_cache, v_cache, positions, n_tokens, n_heads,
-            n_kv_heads, max_seq, eps, rope_dim, base, scale, interleaved, kv_type, stream);
+            n_kv_heads, max_seq, eps, rope_dim, params, interleaved, kv_type, stream);
         Err(CudaError::NotBuiltWithCuda)
     }
 }
@@ -904,5 +1098,34 @@ pub fn attention(
     {
         let _ = (out, q, k_cache, v_cache, positions, n_tokens, n_heads, max_seq, scale, sliding_window, kv_type, stream);
         Err(CudaError::NotBuiltWithCuda)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RopeParams;
+
+    /// Qwen3.8-27B's yarn1m file, worked by hand from llama.cpp's
+    /// ggml_rope_yarn_corr_dims: 64 * ln(262144 / (32 * 2pi)) / (2 ln 1e7) =
+    /// 14.24 and, for beta 1, 21.12; floor and ceil give [14, 22].
+    #[test]
+    fn yarn_matches_llama_cpp_for_qwen38_27b() {
+        let p = RopeParams::yarn(1e7, 4.0, 64, 262_144, 32.0, 1.0, 1.0);
+        assert_eq!((p.corr_lo, p.corr_hi), (14.0, 22.0));
+        assert_eq!(p.freq_scale, 0.25);
+        assert!((p.mscale - 1.138_629_4).abs() < 1e-6);
+        // Fast pairs are not interpolated, slow ones are fully interpolated.
+        let (c0, _) = p.cos_sin(0, 64, 1000);
+        assert!((c0 - (1000f32).cos() * p.mscale).abs() < 1e-4);
+        let slow = 1e7f32.powf(-2.0 * 30.0 / 64.0);
+        let (c30, _) = p.cos_sin(30, 64, 1000);
+        assert!((c30 - (1000.0 * slow * 0.25).cos() * p.mscale).abs() < 1e-5);
+    }
+
+    #[test]
+    fn plain_rope_is_unscaled() {
+        let p = RopeParams::plain(1e6, 1.0);
+        let (c, s) = p.cos_sin(0, 128, 5);
+        assert_eq!((c, s), (5f32.cos(), 5f32.sin()));
     }
 }

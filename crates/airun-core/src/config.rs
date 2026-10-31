@@ -137,8 +137,9 @@ pub struct Config {
     pub train_ctx: usize,
 
     pub rms_eps: f32,
-    pub rope_base: f32,
-    pub rope_scale: f32,
+    /// Frequency base and context scaling (linear or YaRN) of the rotary
+    /// embedding.
+    pub rope: airun_cuda::ops::RopeParams,
     /// Rotary dimensions; may be smaller than `head_dim` for partial rotary.
     pub rope_dim: usize,
 
@@ -226,13 +227,6 @@ impl Config {
         let rms_eps = Self::arch_key(gguf, &arch_name, "attention.layer_norm_rms_epsilon")
             .and_then(|v| v.as_f32())
             .unwrap_or(1e-6);
-        let rope_base = Self::arch_key(gguf, &arch_name, "rope.freq_base")
-            .and_then(|v| v.as_f32())
-            .unwrap_or(10_000.0);
-        let rope_scale = Self::arch_key(gguf, &arch_name, "rope.scaling.factor")
-            .and_then(|v| v.as_f32())
-            .map(|f| if f > 0.0 { 1.0 / f } else { 1.0 })
-            .unwrap_or(1.0);
         let rope_dim = Self::arch_key(gguf, &arch_name, "rope.dimension_count")
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim);
@@ -240,6 +234,8 @@ impl Config {
         let train_ctx = Self::arch_key(gguf, &arch_name, "context_length")
             .and_then(|v| v.as_usize())
             .unwrap_or(4096);
+
+        let rope = Self::rope_params(gguf, &arch_name, rope_dim)?;
 
         let sliding_window = Self::arch_key(gguf, &arch_name, "attention.sliding_window")
             .and_then(|v| v.as_usize())
@@ -355,8 +351,7 @@ impl Config {
             vocab_size,
             train_ctx,
             rms_eps,
-            rope_base,
-            rope_scale,
+            rope,
             rope_dim,
             sliding_window,
             tied_embeddings,
@@ -371,6 +366,53 @@ impl Config {
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// RoPE frequencies, including the context-extension scaling the file
+    /// declares. `rope.scaling.type` decides how `rope.scaling.factor` applies:
+    /// linear interpolation divides every frequency, YaRN only the slow ones
+    /// (and rescales attention), so the two are not interchangeable even at
+    /// short contexts.
+    fn rope_params(gguf: &GgufFile, arch: &str, rope_dim: usize) -> Result<airun_cuda::ops::RopeParams> {
+        use airun_cuda::ops::RopeParams;
+        let f32_key = |k: &str| Self::arch_key(gguf, arch, k).and_then(|v| v.as_f32());
+        let base = f32_key("rope.freq_base").unwrap_or(10_000.0);
+        let factor = f32_key("rope.scaling.factor").filter(|f| *f > 0.0).unwrap_or(1.0);
+        // AIRUN_ROPE_SCALING=none|linear|yarn overrides the file, like
+        // llama.cpp's --rope-scaling; for A/B checks against it.
+        let kind = std::env::var("AIRUN_ROPE_SCALING").ok()
+            .or_else(|| Self::arch_key(gguf, arch, "rope.scaling.type").and_then(|v| v.as_str().map(str::to_string)))
+            .unwrap_or_else(|| if factor == 1.0 { "none".into() } else { "linear".into() });
+        match kind.as_str() {
+            "none" => Ok(RopeParams::plain(base, 1.0)),
+            "linear" => Ok(RopeParams::plain(base, 1.0 / factor)),
+            "yarn" => {
+                let orig = Self::arch_key(gguf, arch, "rope.scaling.original_context_length")
+                    .and_then(|v| v.as_usize())
+                    .ok_or_else(|| CoreError::MissingConfig {
+                        key: format!("{arch}.rope.scaling.original_context_length"),
+                    })?;
+                if f32_key("rope.scaling.yarn_log_multiplier").is_some_and(|m| m != 0.0) {
+                    return Err(CoreError::Other(format!(
+                        "{arch}.rope.scaling.yarn_log_multiplier is set (DeepSeek-style YaRN), which airun does not                          implement; remove the key from the file only if the model card says plain YaRN"
+                    )));
+                }
+                let beta_fast = f32_key("rope.scaling.yarn_beta_fast").unwrap_or(32.0);
+                let beta_slow = f32_key("rope.scaling.yarn_beta_slow").unwrap_or(1.0);
+                let attn_factor = f32_key("rope.scaling.attn_factor").unwrap_or(1.0);
+                let mut p = RopeParams::yarn(base, factor, rope_dim, orig, beta_fast, beta_slow, attn_factor);
+                if let Some(ext) = f32_key("rope.scaling.yarn_ext_factor").filter(|e| *e >= 0.0) {
+                    p.ext_factor = ext;
+                }
+                if let Some(m) = std::env::var("AIRUN_ROPE_MSCALE").ok().and_then(|v| v.parse().ok()) {
+                    p.mscale = m;
+                }
+                Ok(p)
+            }
+            other => Err(CoreError::Other(format!(
+                "{arch}.rope.scaling.type is \"{other}\", which airun does not implement (it knows none, linear                  and yarn); this file needs a newer airun"
+            ))),
+        }
     }
 
     /// Layers the forward pass actually runs.
@@ -519,6 +561,16 @@ impl Config {
                 self.nextn_predict_layers
             ));
         }
+        let r = &self.rope;
+        if r.ext_factor != 0.0 {
+            s.push_str(&format!(
+                "\n  rope: {} of {} dims, base {}, YaRN x{} (dims {}..{} ramp, mscale {:.4})",
+                self.rope_dim, self.head_dim, r.base, 1.0 / r.freq_scale, r.corr_lo, r.corr_hi, r.mscale
+            ));
+        } else if r.freq_scale != 1.0 {
+            s.push_str(&format!("\n  rope: {} of {} dims, base {}, linear x{}",
+                self.rope_dim, self.head_dim, r.base, 1.0 / r.freq_scale));
+        }
         if let Some(ssm) = &self.ssm {
             s.push_str(&format!(
                 "\n  hybrid: {} linear-attention + {} attention layers; delta-net {} v-heads x \
@@ -566,8 +618,7 @@ mod tests {
             vocab_size: 151936,
             train_ctx: 40960,
             rms_eps: 1e-6,
-            rope_base: 1e6,
-            rope_scale: 1.0,
+            rope: airun_cuda::ops::RopeParams::plain(1e6, 1.0),
             rope_dim: 128,
             sliding_window: 0,
             tied_embeddings: true,

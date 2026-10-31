@@ -88,6 +88,8 @@ pub struct Placement {
     pub shards: Vec<Shard>,
     /// Context actually planned for, which may be below what was requested.
     pub ctx: usize,
+    /// Prefill batch planned for, which may be below what was requested.
+    pub batch: usize,
     pub notes: Vec<String>,
 }
 
@@ -243,7 +245,8 @@ pub fn scratch_bytes(cfg: &Config, batch: usize, hosts_output: bool) -> u64 {
     // Hybrids need room for the packed qkv projection, its gate, and the
     // delta-net intermediates, none of which the dense path allocates.
     if let Some(ssm) = &cfg.ssm {
-        let qkv = b * ssm.qkv_dim() as u64;
+        // The packed projection, and its convolved copy (batches convolve out of place).
+        let qkv = 2 * b * ssm.qkv_dim() as u64;
         let gate = b * ssm.inner_size as u64;
         let core = b * ssm.v_dim() as u64;
         let coeffs = 2 * b * ssm.n_v_heads as u64;
@@ -383,6 +386,7 @@ fn try_place(
         .collect();
     let fixed = sizes.embedding + sizes.output + sizes.other;
     let total_needed: u64 = layer_cost.iter().sum::<u64>() + fixed;
+    let mut batch = req.batch;
 
     // Which devices to use, and how many layers each takes.
     let assignment: Vec<(i32, usize)> = match &req.split {
@@ -421,10 +425,29 @@ fn try_place(
         SplitMode::Auto => {
             // One GPU is always better when the model fits: no activation ever
             // crosses PCIe, which matters most on consumer cards with no P2P.
-            let single = ordered.iter().find(|d| {
-                let scratch = scratch_bytes(cfg, req.batch, true);
-                budgets.get(&d.ordinal).copied().unwrap_or(0) >= total_needed + scratch
+            let fits = |d: &Device, b: usize| {
+                budgets.get(&d.ordinal).copied().unwrap_or(0) >= total_needed + scratch_bytes(cfg, b, true)
+            };
+            // The fastest card with a smaller prefill batch beats a slower one
+            // at the full batch: the batch only sets how many prompt tokens go
+            // through per pass, while the card sets every decode step.
+            let fastest = ordered.first().copied();
+            let shrunk = fastest.and_then(|d| {
+                let mut b = req.batch;
+                while b > 128 && !fits(d, b) {
+                    b = (b / 2).max(128);
+                }
+                (b < req.batch && fits(d, b)).then_some((d, b))
             });
+            let single = if fastest.is_some_and(|d| fits(d, req.batch)) {
+                fastest
+            } else if let Some((d, b)) = shrunk {
+                batch = b;
+                notes.push(format!("prefill batch reduced to {b} so the model stays on the fastest GPU"));
+                Some(d)
+            } else {
+                ordered.iter().copied().find(|d| fits(d, req.batch))
+            };
             if let Some(d) = single {
                 notes.push(format!(
                     "whole model fits on GPU {} ({}), keeping it on one device to avoid \
@@ -482,7 +505,7 @@ fn try_place(
             layers: layers.clone(),
             weight_bytes,
             kv_bytes: layers.iter().map(|&l| per_layer_state(l)).sum(),
-            scratch_bytes: scratch_bytes(cfg, req.batch, hosts_output),
+            scratch_bytes: scratch_bytes(cfg, batch, hosts_output),
             budget_bytes: budgets.get(ordinal).copied().unwrap_or(0),
             hosts_embedding,
             hosts_output,
@@ -528,7 +551,7 @@ fn try_place(
         ));
     }
 
-    Ok(Placement { shards, ctx, notes })
+    Ok(Placement { shards, ctx, batch, notes })
 }
 
 /// Splits `n_layers` into contiguous runs proportional to `weights`.
@@ -614,8 +637,7 @@ mod tests {
             vocab_size: 151936,
             train_ctx: 40960,
             rms_eps: 1e-6,
-            rope_base: 1e6,
-            rope_scale: 1.0,
+            rope: airun_cuda::ops::RopeParams::plain(1e6, 1.0),
             rope_dim: 128,
             sliding_window: 0,
             tied_embeddings: true,
