@@ -192,7 +192,7 @@ pub struct KernelType(pub i32);
 impl KernelType {
     /// Type ids the kernels have a compiled decoder for.
     pub const SUPPORTED: &'static [i32] =
-        &[0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 20, 23, 30, 39, 40];
+        &[0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 18, 20, 21, 22, 23, 30, 39, 40, 42];
 
     pub fn is_supported(self) -> bool {
         Self::SUPPORTED.contains(&self.0)

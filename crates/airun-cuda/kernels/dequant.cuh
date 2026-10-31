@@ -12,6 +12,7 @@
 #pragma once
 
 #include "airun.cuh"
+#include "iq_grids.cuh"
 
 // ---------------------------------------------------------------------------
 // Block layouts. Sizes are asserted against the on-disk format.
@@ -36,6 +37,10 @@ typedef struct { half d; uint8_t qs[16]; } block_iq4_nl;
 typedef struct { half d; uint16_t scales_h; uint8_t scales_l[4]; uint8_t qs[128]; } block_iq4_xs;
 typedef struct { uint8_t e; uint8_t qs[16]; } block_mxfp4;
 typedef struct { uint8_t d[4]; uint8_t qs[32]; } block_nvfp4;
+typedef struct { half d; uint8_t qs[64]; uint8_t qh[8]; uint8_t scales[8]; } block_iq2_s;
+typedef struct { half d; uint8_t qs[96]; } block_iq3_xxs;
+typedef struct { half d; uint8_t qs[64]; uint8_t qh[8]; uint8_t signs[32]; uint8_t scales[4]; } block_iq3_s;
+typedef struct { half d; uint8_t qs[16]; } block_q2_0;
 
 static_assert(sizeof(block_q8_0)   == 34,  "block_q8_0 layout");
 static_assert(sizeof(block_q4_0)   == 18,  "block_q4_0 layout");
@@ -51,6 +56,10 @@ static_assert(sizeof(block_iq4_nl) == 18,  "block_iq4_nl layout");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs layout");
 static_assert(sizeof(block_mxfp4)  == 17,  "block_mxfp4 layout");
 static_assert(sizeof(block_nvfp4)  == 36,  "block_nvfp4 layout");
+static_assert(sizeof(block_iq2_s)  == 82,  "block_iq2_s layout");
+static_assert(sizeof(block_iq3_xxs)== 98,  "block_iq3_xxs layout");
+static_assert(sizeof(block_iq3_s)  == 110, "block_iq3_s layout");
+static_assert(sizeof(block_q2_0)   == 18,  "block_q2_0 layout");
 
 // Non-linear codebook shared by IQ4_NL and IQ4_XS.
 __device__ __constant__ static const int8_t kvalues_iq4nl[16] = {
@@ -557,6 +566,87 @@ __device__ __forceinline__ void dq_nvfp4(const void* p, int sub, float* out) {
     }
 }
 
+// The IQ lattice types: magnitudes from a codebook (iq_grids.cuh), signs
+// stored apart. A 7-bit sign code carries an implied eighth sign, its parity.
+__device__ __forceinline__ uint32_t ksigns_iq2xs(uint32_t i) {
+    return i | ((__popc(i) & 1) << 7);
+}
+
+__device__ __forceinline__ void dq_iq2_s(const void* p, int sub, float* out) {
+    const block_iq2_s* b = (const block_iq2_s*)p;
+    const float d = __half2float(b->d);
+    const float db[2] = {
+        d * (0.5f + (float)(b->scales[sub] & 0x0F)) * 0.25f,
+        d * (0.5f + (float)(b->scales[sub] >> 4)) * 0.25f,
+    };
+    const uint8_t* qs = b->qs + sub * 4;
+    const uint8_t* signs = b->qs + 32 + sub * 4;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int idx = qs[l] | ((b->qh[sub] << (8 - 2 * l)) & 0x300);
+        const uint64_t g = iq2s_grid[idx];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float v = db[l / 2] * (float)((g >> (8 * j)) & 0xFF);
+            out[l * 8 + j] = (signs[l] >> j) & 1 ? -v : v;
+        }
+    }
+}
+
+__device__ __forceinline__ void dq_iq3_xxs(const void* p, int sub, float* out) {
+    const block_iq3_xxs* b = (const block_iq3_xxs*)p;
+    const float d = __half2float(b->d);
+    const uint8_t* qs = b->qs + sub * 8;
+    const uint8_t* sas = b->qs + 64 + sub * 4;
+    const uint32_t aux = sas[0] | (sas[1] << 8) | (sas[2] << 16) | ((uint32_t)sas[3] << 24);
+    const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t s = ksigns_iq2xs((aux >> (7 * l)) & 127);
+        const uint32_t g1 = iq3xxs_grid[qs[2 * l]];
+        const uint32_t g2 = iq3xxs_grid[qs[2 * l + 1]];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float a = db * (float)((g1 >> (8 * j)) & 0xFF);
+            const float c = db * (float)((g2 >> (8 * j)) & 0xFF);
+            out[l * 8 + j]     = (s >> j) & 1 ? -a : a;
+            out[l * 8 + j + 4] = (s >> (j + 4)) & 1 ? -c : c;
+        }
+    }
+}
+
+__device__ __forceinline__ void dq_iq3_s(const void* p, int sub, float* out) {
+    const block_iq3_s* b = (const block_iq3_s*)p;
+    const float d = __half2float(b->d);
+    const float db = d * (float)(1 + 2 * ((b->scales[sub / 2] >> (4 * (sub % 2))) & 0x0F));
+    const uint8_t* qs = b->qs + sub * 8;
+    const uint32_t h = b->qh[sub];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t g1 = iq3s_grid[qs[2 * l] | ((h << (8 - 2 * l)) & 256)];
+        const uint32_t g2 = iq3s_grid[qs[2 * l + 1] | ((h << (7 - 2 * l)) & 256)];
+        const uint32_t s = b->signs[sub * 4 + l];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float a = db * (float)((g1 >> (8 * j)) & 0xFF);
+            const float c = db * (float)((g2 >> (8 * j)) & 0xFF);
+            out[l * 8 + j]     = (s >> j) & 1 ? -a : a;
+            out[l * 8 + j + 4] = (s >> (j + 4)) & 1 ? -c : c;
+        }
+    }
+}
+
+// Codes 0..3 mean -1, 0, +1, +2; four to a byte, low bits first.
+__device__ __forceinline__ void dq_q2_0(const void* p, int sub, float* out) {
+    const block_q2_0* b = (const block_q2_0*)p;
+    const float d = __half2float(b->d);
+    const uint8_t* qs = b->qs + sub * 8;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        out[j] = d * (float)((int)((qs[j / 4] >> ((j % 4) * 2)) & 3) - 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Type dispatch
 // ---------------------------------------------------------------------------
@@ -575,11 +665,15 @@ __device__ __forceinline__ void dq_nvfp4(const void* p, int sub, float* out) {
 #define AIRUN_TYPE_Q4_K   12
 #define AIRUN_TYPE_Q5_K   13
 #define AIRUN_TYPE_Q6_K   14
+#define AIRUN_TYPE_IQ3_XXS 18
 #define AIRUN_TYPE_IQ4_NL 20
+#define AIRUN_TYPE_IQ3_S  21
+#define AIRUN_TYPE_IQ2_S  22
 #define AIRUN_TYPE_IQ4_XS 23
 #define AIRUN_TYPE_BF16   30
 #define AIRUN_TYPE_MXFP4  39
 #define AIRUN_TYPE_NVFP4  40
+#define AIRUN_TYPE_Q2_0   42
 
 // Compile-time traits so kernels can be templated on the type id: each
 // instantiation inlines exactly one decoder with no branching in the inner loop.
@@ -612,6 +706,10 @@ AIRUN_DEFINE_TRAITS(AIRUN_TYPE_Q4_K,  256,   144, dq_q4_K);
 AIRUN_DEFINE_TRAITS(AIRUN_TYPE_Q5_K,  256,   176, dq_q5_K);
 AIRUN_DEFINE_TRAITS(AIRUN_TYPE_Q6_K,  256,   210, dq_q6_K);
 AIRUN_DEFINE_TRAITS(AIRUN_TYPE_IQ4_XS,256,   136, dq_iq4_xs);
+AIRUN_DEFINE_TRAITS(AIRUN_TYPE_IQ2_S, 256,    82, dq_iq2_s);
+AIRUN_DEFINE_TRAITS(AIRUN_TYPE_IQ3_XXS,256,   98, dq_iq3_xxs);
+AIRUN_DEFINE_TRAITS(AIRUN_TYPE_IQ3_S, 256,   110, dq_iq3_s);
+AIRUN_DEFINE_TRAITS(AIRUN_TYPE_Q2_0,   64,    18, dq_q2_0);
 
 // Decodes group `group` (32 elements) of a row, where `row` points at the start
 // of the row's packed bytes.

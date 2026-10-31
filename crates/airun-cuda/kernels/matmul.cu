@@ -905,6 +905,10 @@ __global__ void dequantize_kernel(
     X(AIRUN_TYPE_Q6_K)           \
     X(AIRUN_TYPE_IQ4_NL)         \
     X(AIRUN_TYPE_IQ4_XS)         \
+    X(AIRUN_TYPE_IQ2_S)          \
+    X(AIRUN_TYPE_IQ3_XXS)        \
+    X(AIRUN_TYPE_IQ3_S)          \
+    X(AIRUN_TYPE_Q2_0)           \
     X(AIRUN_TYPE_MXFP4)         \
     X(AIRUN_TYPE_NVFP4)
 

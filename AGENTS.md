@@ -171,7 +171,13 @@ escala; a ativação é quantizada para o mesmo layout de bloco, mais uma escala
 f32 por token. Ativação em 4 bits, como o llama.cpp faz: na perplexidade em lote
 do 27B (blocos de 128, texto LF) int8 2,0727, FP4 2,0838, llama.cpp GPU 2,0862.
 Lotes de 32+ tokens; `AIRUN_NO_FP4=1` volta ao MMQ int8. O SwiGLU vai dentro da
-quantização da entrada da `down` (`quantize_glu_nvfp4`). Escalas `0x7F` (zero
+quantização da entrada da `down` (`quantize_glu_nvfp4`). O quantizador tem duas
+formas bit-idênticas: a vetorizada (4 lanes por run de 16, float4 coalescido,
+linha em registradores até K = 20480) para linhas alinhadas em 16 bytes e a
+escalar para o resto; o selftest compara as duas. A vetorizada levou o SwiGLU
+de 214 para 66 µs por camada (512 tokens, K 17408) e o pp2048 de 3623 para
+3690 t/s. Pôr o SwiGLU no epílogo do GEMM do `up` (com amax por linha via
+atomicMax) foi medido mais lento: 3450/3380 t/s. Escalas `0x7F` (zero
 para o ggml, NaN para o hardware) são zeradas no carregamento.
 
 O MMQ assíncrono usa **stream-K** quando as tiles não fecham ondas inteiras de
@@ -406,14 +412,21 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
 
 4. **MTP — feito para o qwen35 denso (2026-10-31).** `--draft N` (padrão 3)
    carrega `blk.{n_run}` como cabeça de rascunho e decodifica especulativamente
-   quando a amostragem é gulosa pura (`--temp 0 --repeat-penalty 1`); a saída é
-   idêntica à do decode normal. `crates/airun-core/src/spec.rs`: o verify roda
+   quando a amostragem é gulosa pura (`--temp 0 --repeat-penalty 1`). A saída
+   segue o decode normal, mas **não é garantidamente idêntica**: o verify roda
+   lotes de 2–4 tokens em outros kernels (`matvec_q8_multi`, ordem de soma
+   diferente), e num quase-empate de logits o argmax pode virar — o texto
+   diverge dali em diante, igualmente plausível. `crates/airun-core/src/spec.rs`: o verify roda
    as camadas delta-net sem gravar estado (guarda as entradas em `DeltaStash`) e
    `commit` empurra só os tokens aceitos — `test_delta_defer` no selftest exige
    igualdade bit a bit. A linha do KV do MTP na posição q é o par
-   (h_{q-1}, x_q), como no draft-mtp do llama.cpp. 27B NVFP4 numa 5070 Ti:
-   ~90–103 tok/s contra 49 sem MTP (llama.cpp com draft-mtp, mesmos prompts:
-   91–104).
+   (h_{q-1}, x_q), como no draft-mtp do llama.cpp. Entre dois verifies,
+   `advance_graphed` roda commit + cabeça sobre as linhas do verify + os k
+   rascunhos encadeados (o pick de cada passo vira o token do seguinte no
+   device) como um CUDA graph por contagem aceita m: um lançamento e uma
+   leitura, onde antes o host esperava cada passo da cabeça. Só com uma GPU e
+   grafos ligados. 27B NVFP4 numa 5070 Ti: 93.8–113.6 tok/s contra 49 sem MTP
+   (llama.cpp com draft-mtp, mesmos prompts: 91.6–104.2).
    Falta: cabeça MTP dos MoE (35B-A3B), amostragem não gulosa.
 
 5. **Template Jinja.** O GGUF traz `tokenizer.chat_template`, que hoje é

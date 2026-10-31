@@ -5,7 +5,7 @@
 //! attention. The two layer kinds differ in what they carry between tokens: a
 //! KV cache that grows with context, or a recurrent state that does not.
 
-use airun_cuda::{DeviceBuffer, Stream, device, hybrid, ops};
+use airun_cuda::{DeviceBuffer, Stream, device, hc, hybrid, ops};
 
 use crate::config::{Config, LayerKind};
 use crate::error::{CoreError, Result};
@@ -47,6 +47,31 @@ struct HybridScratch {
     /// The wide q projection before the output gate is split off.
     q_wide: DeviceBuffer<f32>,
     attn_gate: DeviceBuffer<f32>,
+}
+
+/// Scratch for hyper-connection models (see config::HcConfig).
+struct HcScratch {
+    /// The streams normalized by the current mix, [b][hc][d].
+    xn: DeviceBuffer<f32>,
+    /// The mix's gate, [b][hc][d]; the PLE reuses it for its normalized value.
+    gate: DeviceBuffer<f32>,
+    /// The low-rank bottleneck, [b][low_rank].
+    lo: DeviceBuffer<f32>,
+    /// Stream weights for the combine after the block, [b][hc].
+    inject: DeviceBuffer<f32>,
+    /// On the device that runs the PLE layer.
+    ple: Option<PleScratch>,
+}
+
+struct PleScratch {
+    /// The batch's n-gram embeddings, gathered on the host.
+    emb: DeviceBuffer<f32>,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    gated: DeviceBuffer<f32>,
+    /// The convolution's history: the last (kernel-1)*ngram normalized rows.
+    hist: DeviceBuffer<f32>,
+    hist_scratch: DeviceBuffer<f32>,
 }
 
 /// Scratch buffers only mixture-of-experts models need.
@@ -118,7 +143,7 @@ struct DeviceState {
 
     hybrid: Option<HybridScratch>,
     moe: Option<MoeScratch>,
-
+    hc: Option<HcScratch>,
 
     /// One entry per layer on this device, in the same order as `layers`.
     states: Vec<LayerState>,
@@ -230,6 +255,10 @@ impl Runtime {
         let v_width = cfg.kv_dim().max(ssm_v);
         let attn_width = cfg.q_dim().max(ssm_v);
 
+        // Hyper-connections widen the residual to `count` streams.
+        let streams = cfg.hc.map_or(1, |h| h.count);
+        let hc_width = streams * cfg.n_embd;
+
         let model_has_nvfp4 = model.layers.iter().any(|l| match &l.ffn {
             FfnWeights::Dense { gate, .. } => gate.kernel_type().0 == 40,
             FfnWeights::Moe { gate_exps, .. } => gate_exps.kernel_type().0 == 40,
@@ -297,9 +326,9 @@ impl Runtime {
                     cached_ids: DeviceBuffer::new(dev, b * moe.n_experts_used)?,
                     cached_host_ids: std::cell::RefCell::new(airun_cuda::PinnedBuffer::new(b * moe.n_experts_used)?),
                     reader: model.layers.iter().find_map(|l| match &l.ffn {
-                        FfnWeights::Moe { gate_exps, .. } => gate_exps.expert_file_path(),
+                        FfnWeights::Moe { gate_exps, .. } => gate_exps.expert_file_paths(),
                         _ => None,
-                    }).map(|path| ExpertReader::new(path, EXPERT_READERS))
+                    }).map(|paths| ExpertReader::new(&paths, EXPERT_READERS))
                     .transpose()
                     .map_err(|e| CoreError::Other(format!(
                         "cannot reopen the model to stream experts ({e}); check the file is still readable")))?,
@@ -312,10 +341,31 @@ impl Runtime {
                 None => None,
             };
 
+            let hc_scratch = match &cfg.hc {
+                Some(h) => Some(HcScratch {
+                    xn: DeviceBuffer::new(dev, b * hc_width)?,
+                    gate: DeviceBuffer::new(dev, b * hc_width)?,
+                    lo: DeviceBuffer::new(dev, b * h.low_rank)?,
+                    inject: DeviceBuffer::new(dev, b * h.count)?,
+                    ple: match &cfg.ple {
+                        Some(p) if shard.layers.contains(&p.layer) => Some(PleScratch {
+                            emb: DeviceBuffer::new(dev, b * p.n_heads() * p.head_dim)?,
+                            key: DeviceBuffer::new(dev, b * hc_width)?,
+                            value: DeviceBuffer::new(dev, b * cfg.n_embd)?,
+                            gated: DeviceBuffer::new(dev, b * hc_width)?,
+                            hist: DeviceBuffer::zeroed(dev, p.conv_history() * hc_width, &stream)?,
+                            hist_scratch: DeviceBuffer::new(dev, p.conv_history() * hc_width)?,
+                        }),
+                        _ => None,
+                    },
+                }),
+                None => None,
+            };
+
             states.push(DeviceState {
                 device: dev,
                 stream,
-                x: DeviceBuffer::new(dev, b * cfg.n_embd)?,
+                x: DeviceBuffer::new(dev, b * hc_width)?,
                 xb: DeviceBuffer::new(dev, b * cfg.n_embd)?,
                 xb2: DeviceBuffer::new(dev, b * cfg.n_embd)?,
                 q: DeviceBuffer::new(dev, b * q_width)?,
@@ -337,7 +387,7 @@ impl Runtime {
                 q8act: QAct {
                     buf: DeviceBuffer::new(
                         dev,
-                        b * cfg.n_embd.max(ffn_width).max(attn_width) / 32 * 36,
+                        b * cfg.n_embd.max(ffn_width).max(attn_width).max(hc_width) / 32 * 36,
                     )?,
                     valid: std::cell::Cell::new(false),
                     fp4: if model_has_nvfp4 && ops::fp4_supported() {
@@ -350,6 +400,7 @@ impl Runtime {
                 },
                 hybrid: hybrid_scratch,
                 moe: moe_scratch,
+                hc: hc_scratch,
 
                 states: layer_states,
                 layers: shard.layers.clone(),
@@ -420,6 +471,9 @@ impl Runtime {
                     let _ = state.fill_zero(&st.stream);
                     let _ = conv.fill_zero(&st.stream);
                 }
+            }
+            if let Some(p) = st.hc.as_ref().and_then(|h| h.ple.as_ref()) {
+                let _ = p.hist.fill_zero(&st.stream);
             }
             let _ = st.stream.synchronize();
         }
@@ -646,6 +700,7 @@ impl Runtime {
         // hundreds of tiny launches, and issuing them one by one measured
         // ~40% of a decode step as GPU idle time on a 1.7B.
         if tokens.len() == 1 && self.states.len() == 1 && !graphs_disabled()
+            && self.model.config.ple.is_none()
             && !self.states[0].moe.as_ref().is_some_and(|m| m.upload.is_some()) {
             return self.forward_decode_graphed(tokens[0]);
         }
@@ -723,9 +778,12 @@ impl Runtime {
             }
 
             let embd = &self.model.token_embd;
+            // With hyper-connections the embedding lands in xb and is copied
+            // into every stream.
+            let dst = if cfg.hc.is_some() { st.xb.as_mut_ptr() } else { st.x.as_mut_ptr() };
             ops::embed(
                 embd.kernel_type(),
-                st.x.as_mut_ptr(),
+                dst,
                 self.model.embedding_ptr(st.device)?,
                 st.tokens.as_ptr(),
                 n,
@@ -734,7 +792,11 @@ impl Runtime {
                 embd.rows,
                 &st.stream,
             )?;
+            if let Some(h) = &cfg.hc {
+                hc::hc_expand(st.x.as_mut_ptr(), st.xb.as_ptr(), n, h.count, cfg.n_embd, &st.stream)?;
+            }
         }
+        self.ple_stage(token_ids)?;
 
         // --- layers, shard by shard ---
         for si in 0..self.states.len() {
@@ -765,8 +827,11 @@ impl Runtime {
         let st = &self.states[last];
         device::set_device(st.device)?;
 
-        // The last layer's residual add already left this norm in xb.
-        if fused_norms_disabled() || st.layers.is_empty() {
+        // The last layer's residual add already left this norm in xb; on a
+        // hyper-connection model the final mix is the norm.
+        if let Some(head) = &self.model.hc_head {
+            self.hc_mix(last, head, n, &cfg)?;
+        } else if fused_norms_disabled() || st.layers.is_empty() {
             ops::rmsnorm(
                 st.xb.as_mut_ptr(),
                 st.x.as_ptr(),
@@ -874,6 +939,10 @@ impl Runtime {
         let norm_first = !(local > 0 && !fused_norms_disabled());
         let next = self.next_norm(si, local);
         let stash = self.states[si].stash.get(local).and_then(|s| s.as_ref()).filter(|_| self.defer);
+        if cfg.hc.is_some() {
+            return self.run_block_hc(si, &self.model.layers[layer], &self.states[si].states[local], stash,
+                layer, n, cfg);
+        }
         self.run_block(si, &self.model.layers[layer], &self.states[si].states[local], stash, layer,
             n, cfg, norm_first, next)
     }
@@ -1005,6 +1074,118 @@ impl Runtime {
             _ => ops::add(st.x.as_mut_ptr(), st.xb2.as_ptr(), n * cfg.n_embd, stream)?,
         }
 
+        Ok(())
+    }
+
+    /// One block of a hyper-connection model: PLE where the layer has it, then
+    /// mix -> token mixer -> combine, mix -> feed-forward -> combine. The
+    /// mixers read xb and write xb2 as in [`Self::run_block`].
+    #[allow(clippy::too_many_arguments)]
+    fn run_block_hc(
+        &self,
+        si: usize,
+        w: &crate::model::LayerWeights,
+        state: &LayerState,
+        stash: Option<&DeltaStash>,
+        layer: usize,
+        n: usize,
+        cfg: &Config,
+    ) -> Result<()> {
+        let st = &self.states[si];
+        let stream = &st.stream;
+        let streams = cfg.hc.as_ref().map_or(1, |h| h.count);
+        let h = st.hc.as_ref().ok_or_else(|| CoreError::Other("hyper-connection model without its scratch".into()))?;
+        let (mix_attn, mix_ffn) = w.hc.as_ref().ok_or_else(|| CoreError::Other(format!(
+            "layer {layer} has no hyper-connection weights; the file is incomplete")))?;
+
+        if let Some(p) = &w.ple {
+            self.run_ple(si, p, n, cfg)?;
+        }
+
+        self.hc_mix(si, mix_attn, n, cfg)?;
+        match &w.block {
+            Block::Attention(a) => self.run_attention(si, state, a, n, cfg)?,
+            Block::Linear(l) => self.run_linear_attention(si, state, stash, layer, l, n, cfg)?,
+        }
+        trace_block(st, layer, "mixer", n, cfg)?;
+        hc::hc_post(st.x.as_mut_ptr(), st.xb2.as_ptr(), h.inject.as_ptr(), n, streams, cfg.n_embd, stream)?;
+
+        self.hc_mix(si, mix_ffn, n, cfg)?;
+        match &w.ffn {
+            FfnWeights::Moe { router, gate_exps, up_exps, down_exps, shared } =>
+                self.run_moe(si, router, gate_exps, up_exps, down_exps, shared.as_ref(), n, cfg)?,
+            FfnWeights::Dense { .. } => return Err(CoreError::Other(
+                "a hyper-connection model with a dense feed-forward is not supported yet".into())),
+        }
+        trace_block(st, layer, "ffn", n, cfg)?;
+        hc::hc_post(st.x.as_mut_ptr(), st.xb2.as_ptr(), h.inject.as_ptr(), n, streams, cfg.n_embd, stream)?;
+        Ok(())
+    }
+
+    /// A hyper-connection mix of the streams in x into xb (and, when the mix
+    /// has one, the stream weights for the next combine into the inject
+    /// scratch).
+    fn hc_mix(&self, si: usize, mix: &crate::model::HcMix, n: usize, cfg: &Config) -> Result<()> {
+        let st = &self.states[si];
+        let stream = &st.stream;
+        let hcfg = cfg.hc.ok_or_else(|| CoreError::Other("hyper-connection mix without a config".into()))?;
+        let h = st.hc.as_ref().ok_or_else(|| CoreError::Other("hyper-connection model without its scratch".into()))?;
+        let d = cfg.n_embd;
+        hc::rmsnorm_grouped(h.xn.as_mut_ptr(), st.x.as_ptr(), mix.norm.as_ptr(), d, n * hcfg.count, hcfg.count,
+            cfg.rms_eps, stream)?;
+        matvec(&mix.down, &h.xn, &h.lo, n, &st.q8act, stream)?;
+        hc::silu_scale(h.lo.as_mut_ptr(), n * hcfg.low_rank, 1.0 / hcfg.count as f32, stream)?;
+        matvec(&mix.up, &h.lo, &h.gate, n, &st.q8act, stream)?;
+        hc::hc_pre(st.xb.as_mut_ptr(), h.xn.as_ptr(), h.gate.as_ptr(), n, hcfg.count, d, stream)?;
+        if let Some(inject) = &mix.inject {
+            matvec(inject, &h.xn, &h.inject, n, &st.q8act, stream)?;
+        }
+        Ok(())
+    }
+
+    /// The per-layer n-gram embedding block, in place on x. Its inputs were
+    /// staged by [`Self::ple_stage`].
+    fn run_ple(&self, si: usize, p: &crate::model::PleWeights, n: usize, cfg: &Config) -> Result<()> {
+        let st = &self.states[si];
+        let stream = &st.stream;
+        let (hcfg, pc) = match (&cfg.hc, &cfg.ple) {
+            (Some(h), Some(p)) => (h, p),
+            _ => return Err(CoreError::Other("PLE weights without the hc and ple configs".into())),
+        };
+        let h = st.hc.as_ref().ok_or_else(|| CoreError::Other("hyper-connection model without its scratch".into()))?;
+        let ps = h.ple.as_ref().ok_or_else(|| CoreError::Other("the PLE layer's GPU has no PLE scratch".into()))?;
+        let (d, nh) = (cfg.n_embd, hcfg.count);
+        matvec(&p.key, &ps.emb, &ps.key, n, &st.q8act, stream)?;
+        matvec_reuse(&p.value, &ps.emb, &ps.value, n, &st.q8act, stream)?;
+        hc::rmsnorm_grouped(ps.key.as_mut_ptr(), ps.key.as_ptr(), p.norm_key.as_ptr(), d, n * nh, nh, cfg.rms_eps, stream)?;
+        hc::rmsnorm_grouped(h.xn.as_mut_ptr(), st.x.as_ptr(), p.norm_query.as_ptr(), d, n * nh, nh, cfg.rms_eps, stream)?;
+        hc::ple_gate(ps.gated.as_mut_ptr(), ps.key.as_ptr(), h.xn.as_ptr(), ps.value.as_ptr(), n, nh, d, stream)?;
+        hc::rmsnorm_grouped(h.gate.as_mut_ptr(), ps.gated.as_ptr(), p.norm_conv.as_ptr(), d, n * nh, nh, cfg.rms_eps, stream)?;
+        hc::ple_conv(st.x.as_mut_ptr(), ps.gated.as_ptr(), h.gate.as_ptr(), ps.hist.as_mut_ptr(),
+            ps.hist_scratch.as_mut_ptr(), p.conv.as_ptr(), n, nh * d, pc.conv_kernel, pc.ngram, stream)?;
+        Ok(())
+    }
+
+    /// Hashes each token of the batch with its predecessors (from the batch
+    /// and the history) into PLE table rows, decodes them on the host and
+    /// uploads them to the PLE layer's GPU.
+    fn ple_stage(&self, token_ids: &[i32]) -> Result<()> {
+        let (Some(pc), Some(table)) = (&self.model.config.ple, &self.model.ple_table) else { return Ok(()) };
+        let Some(st) = self.states.iter().find(|s| s.layers.contains(&pc.layer)) else { return Ok(()) };
+        let ps = st.hc.as_ref().and_then(|h| h.ple.as_ref())
+            .ok_or_else(|| CoreError::Other("the PLE layer's GPU has no PLE scratch".into()))?;
+        let keep = pc.ngram - 1;
+        let mut seq: Vec<u32> = self.history[self.history.len().saturating_sub(keep)..].to_vec();
+        let prefix = seq.len();
+        seq.extend(token_ids.iter().map(|&t| t as u32));
+        let mut rows = Vec::with_capacity(token_ids.len() * pc.n_heads());
+        for i in 0..token_ids.len() {
+            pc.rows(&seq[..prefix + i + 1], &mut rows);
+        }
+        let mut emb = vec![0f32; rows.len() * pc.head_dim];
+        table.gather(&rows, &mut emb)?;
+        device::set_device(st.device)?;
+        ps.emb.copy_from_host_at(0, &emb, &st.stream)?;
         Ok(())
     }
 
@@ -1404,7 +1585,7 @@ impl Runtime {
             n * ssm.n_v_heads,
             cfg.rms_eps,
             std::env::var("AIRUN_SSM_GATE_BEFORE_NORM").is_ok(),
-            std::env::var("AIRUN_SSM_GATE_SIGMOID").is_ok(),
+            cfg.ssm_gate_sigmoid || std::env::var("AIRUN_SSM_GATE_SIGMOID").is_ok(),
             stream,
         )?;
 
@@ -1959,7 +2140,7 @@ fn upload_experts(
     reader: &ExpertReader,
     stream: &Stream,
 ) -> Result<()> {
-    // (tensor, slot, file offset, staging range)
+    // (tensor, slot, (shard, file offset), staging range)
     let mut jobs = Vec::new();
     let mut used = 0usize;
     for (w, (_, uploads)) in tensors.iter().zip(picks) {
@@ -1983,7 +2164,7 @@ fn upload_experts(
     let mut reads = Vec::with_capacity(jobs.len());
     for (w, _, offset, _) in &jobs {
         let (head, tail) = rest.split_at_mut(w.expert_stride);
-        reads.push((*offset, head));
+        reads.push((offset.0, offset.1, head));
         rest = tail;
     }
     reader.read_all(reads).map_err(|e| CoreError::Other(format!(

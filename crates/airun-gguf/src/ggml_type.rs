@@ -118,11 +118,11 @@ ggml_types! {
     Q8_K    = 15, "Q8_K",    256, 292, Dequant;
     IQ2_XXS = 16, "IQ2_XXS", 256, 66,  Layout;
     IQ2_XS  = 17, "IQ2_XS",  256, 74,  Layout;
-    IQ3_XXS = 18, "IQ3_XXS", 256, 98,  Layout;
+    IQ3_XXS = 18, "IQ3_XXS", 256, 98,  Dequant;
     IQ1_S   = 19, "IQ1_S",   256, 50,  Layout;
     IQ4_NL  = 20, "IQ4_NL",  32,  18,  Full;
-    IQ3_S   = 21, "IQ3_S",   256, 110, Layout;
-    IQ2_S   = 22, "IQ2_S",   256, 82,  Layout;
+    IQ3_S   = 21, "IQ3_S",   256, 110, Dequant;
+    IQ2_S   = 22, "IQ2_S",   256, 82,  Dequant;
     IQ4_XS  = 23, "IQ4_XS",  256, 136, Full;
     I8      = 24, "I8",      1,   1,   Layout;
     I16     = 25, "I16",     1,   2,   Layout;
@@ -136,7 +136,7 @@ ggml_types! {
     MXFP4   = 39, "MXFP4",   32,  17,  Full;
     NVFP4   = 40, "NVFP4",   64,  36,  Full;
     Q1_0    = 41, "Q1_0",    128, 18,  Layout;
-    Q2_0    = 42, "Q2_0",    64,  18,  Layout;
+    Q2_0    = 42, "Q2_0",    64,  18,  Dequant;
 }
 
 impl GgmlType {

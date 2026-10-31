@@ -121,6 +121,91 @@ __global__ __launch_bounds__(256) void quantize_act_nvfp4_kernel(
 #endif
 }
 
+// The same quantization, laid out for the memory system: four lanes share a
+// run, each loading one float4, so a warp reads 512 contiguous bytes; the first
+// NV float4 of every thread stay in registers between the amax pass and the
+// packing pass (all of a row up to K = 1024 * NV), the rest are read again.
+// Bit-identical to quantize_act_nvfp4_kernel. Needs 16-byte aligned rows.
+template <bool GLU>
+__device__ __forceinline__ float4 act4_at(const float4* row, const float4* uprow, int f) {
+    float4 v = row[f];
+    if constexpr (GLU) {
+        const float4 u = uprow[f];
+        v.x = v.x / (1.0f + __expf(-v.x)) * u.x;
+        v.y = v.y / (1.0f + __expf(-v.y)) * u.y;
+        v.z = v.z / (1.0f + __expf(-v.z)) * u.z;
+        v.w = v.w / (1.0f + __expf(-v.w)) * u.w;
+    }
+    return v;
+}
+
+__device__ __forceinline__ float max4(float4 v) {
+    return fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+}
+
+template <bool GLU, int NV>
+__global__ __launch_bounds__(256) void quantize_act4_nvfp4_kernel(
+    const float* __restrict__ x, const float* __restrict__ up, block_nvfp4* __restrict__ out,
+    float* __restrict__ row_scale, const int K) {
+#ifdef AIRUN_FP4_MMA
+    __shared__ float red[8];
+    __shared__ float gs_sh;
+    const int tok = blockIdx.x;
+    const int K4 = K / 4;
+    const float4* row = (const float4*)(x + (size_t)tok * K);
+    const float4* uprow = GLU ? (const float4*)(up + (size_t)tok * K) : nullptr;
+    const int tid = threadIdx.x;
+
+    float4 cache[NV];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NV; ++i) {
+        const int f = tid + i * 256;
+        if (f < K4) {
+            cache[i] = act4_at<GLU>(row, uprow, f);
+            amax = fmaxf(amax, max4(cache[i]));
+        }
+    }
+    for (int f = tid + NV * 256; f < K4; f += 256) amax = fmaxf(amax, max4(act4_at<GLU>(row, uprow, f)));
+    amax = block_reduce_max(amax, red);
+    if (tid == 0) {
+        gs_sh = amax / (6.0f * 448.0f);
+        row_scale[tok] = gs_sh;
+    }
+    __syncthreads();
+    const float gs = gs_sh;
+    const float inv_gs = gs > 0.0f ? 1.0f / gs : 0.0f;
+
+    // Lane q of a run holds its elements 4q .. 4q+3. Word 0 of the run is
+    // elements 0-3 (low nibbles) and 8-11 (high), word 1 is 4-7 and 12-15.
+    const int q = tid & 3;
+    const unsigned group = 0xFu << (tid & 28);
+    block_nvfp4* ob = out + (size_t)tok * (K / 64);
+    auto pack = [&](float4 v, int f) {
+        float sub = max4(v);
+        sub = fmaxf(sub, __shfl_xor_sync(group, sub, 1));
+        sub = fmaxf(sub, __shfl_xor_sync(group, sub, 2));
+        const int code = f32_to_ue4m3(sub / 6.0f * inv_gs);
+        const float scale = ue4m3_hw((uint8_t)code) * gs;
+        const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        const int sh = (q >> 1) * 4;
+        uint32_t p = (f32_to_e2m1(v.x * inv) << sh) | (f32_to_e2m1(v.y * inv) << (8 + sh)) |
+                     (f32_to_e2m1(v.z * inv) << (16 + sh)) | (f32_to_e2m1(v.w * inv) << (24 + sh));
+        p |= __shfl_xor_sync(group, p, 2);
+        const int run = f >> 2;
+        block_nvfp4* b = ob + run / 4;
+        if (q < 2) ((uint32_t*)(b->qs + (run % 4) * 8))[q] = p;
+        else if (q == 2) b->d[run % 4] = (uint8_t)code;
+    };
+#pragma unroll
+    for (int i = 0; i < NV; ++i) {
+        const int f = tid + i * 256;
+        if (f < K4) pack(cache[i], f);
+    }
+    for (int f = tid + NV * 256; f < K4; f += 256) pack(act4_at<GLU>(row, uprow, f), f);
+#endif
+}
+
 __device__ __forceinline__ void mma_nvfp4(float c[4], const uint32_t a[4], const uint32_t b[2],
                                           uint32_t sa, uint32_t sb) {
 #ifdef AIRUN_FP4_MMA
@@ -286,7 +371,11 @@ airun_status airun_quantize_act_nvfp4(const void* x, void* out, int32_t n_tokens
     if (k % 64 != 0) return (airun_status)cudaErrorInvalidValue;
     block_nvfp4* blocks = (block_nvfp4*)out;
     float* scales = (float*)((uint8_t*)out + (size_t)n_tokens * (k / 64) * sizeof(block_nvfp4));
-    quantize_act_nvfp4_kernel<false><<<n_tokens, 256, 0, stream>>>((const float*)x, nullptr, blocks, scales, k);
+    if ((uintptr_t)x % 16 == 0)
+        quantize_act4_nvfp4_kernel<false, 20><<<n_tokens, 256, 0, stream>>>((const float*)x, nullptr, blocks,
+                                                                            scales, k);
+    else
+        quantize_act_nvfp4_kernel<false><<<n_tokens, 256, 0, stream>>>((const float*)x, nullptr, blocks, scales, k);
     AIRUN_CHECK_LAUNCH();
 }
 
@@ -297,8 +386,12 @@ airun_status airun_quantize_glu_nvfp4(const void* gate, const void* up, void* ou
     if (k % 64 != 0) return (airun_status)cudaErrorInvalidValue;
     block_nvfp4* blocks = (block_nvfp4*)out;
     float* scales = (float*)((uint8_t*)out + (size_t)n_tokens * (k / 64) * sizeof(block_nvfp4));
-    quantize_act_nvfp4_kernel<true><<<n_tokens, 256, 0, stream>>>((const float*)gate, (const float*)up, blocks,
-                                                                  scales, k);
+    if ((uintptr_t)gate % 16 == 0 && (uintptr_t)up % 16 == 0)
+        quantize_act4_nvfp4_kernel<true, 20><<<n_tokens, 256, 0, stream>>>((const float*)gate, (const float*)up,
+                                                                           blocks, scales, k);
+    else
+        quantize_act_nvfp4_kernel<true><<<n_tokens, 256, 0, stream>>>((const float*)gate, (const float*)up, blocks,
+                                                                      scales, k);
     AIRUN_CHECK_LAUNCH();
 }
 

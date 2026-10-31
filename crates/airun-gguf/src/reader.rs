@@ -3,6 +3,10 @@
 //! The file is memory-mapped and the header decoded eagerly; tensor payloads are
 //! only ever handed out as borrowed slices into the mapping, so opening a 20 GB
 //! checkpoint costs no resident memory beyond its metadata.
+//!
+//! A model split by `llama-gguf-split` (`name-00001-of-00003.gguf`, ...) opens
+//! from any of its shards: the first carries the metadata, every shard its own
+//! tensors, and each tensor remembers which shard it lives in.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -31,10 +35,12 @@ pub struct TensorInfo {
     pub ty: GgmlType,
     /// Offset relative to the start of the tensor-data section.
     pub offset: u64,
-    /// Absolute offset in the file.
+    /// Absolute offset in its shard's file.
     pub file_offset: u64,
     /// Payload length in bytes.
     pub nbytes: u64,
+    /// Index of the shard file holding the payload; 0 for unsplit models.
+    pub shard: usize,
 }
 
 impl TensorInfo {
@@ -62,20 +68,104 @@ impl TensorInfo {
 pub type Metadata = BTreeMap<String, Value>;
 
 pub struct GgufFile {
-    path: PathBuf,
     version: u32,
     alignment: u64,
     metadata: Metadata,
     tensors: Vec<TensorInfo>,
     tensor_index: BTreeMap<String, usize>,
+    shards: Vec<Shard>,
+}
+
+struct Shard {
+    path: PathBuf,
     data_offset: u64,
     file_len: u64,
     mmap: Mmap,
 }
 
+/// One file's header, before shards are merged.
+struct Parsed {
+    shard: Shard,
+    version: u32,
+    alignment: u64,
+    metadata: Metadata,
+    tensors: Vec<TensorInfo>,
+}
+
+/// `name-00002-of-00003.gguf` -> ("name", 2, 3).
+fn split_name(path: &Path) -> Option<(String, u32, u32)> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let (rest, count) = stem.rsplit_once("-of-")?;
+    let (prefix, no) = rest.rsplit_once('-')?;
+    if no.len() != 5 || count.len() != 5 {
+        return None;
+    }
+    Some((prefix.to_string(), no.parse().ok()?, count.parse().ok()?))
+}
+
 impl GgufFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.as_ref();
+        let first = Self::parse(path, 0)?;
+        let count = first.metadata.get("split.count").and_then(|v| v.as_u64()).unwrap_or(1);
+        if count <= 1 {
+            return Self::assemble(vec![first]);
+        }
+        // Any shard opens the whole model: find the siblings by name.
+        let (prefix, _, named_count) = split_name(path).ok_or_else(|| Error::Corrupt(format!(
+            "{} is one of {count} split files but is not named like `model-00001-of-{count:05}.gguf`; \
+             restore the original shard names", path.display())))?;
+        if u64::from(named_count) != count {
+            return Err(Error::Corrupt(format!(
+                "{} says it is split in {count} but its name says {named_count}; restore the original shard names",
+                path.display())));
+        }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let mut parts = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let p = dir.join(format!("{prefix}-{:05}-of-{count:05}.gguf", i + 1));
+            let part = Self::parse(&p, i)?;
+            let no = part.metadata.get("split.no").and_then(|v| v.as_u64());
+            if no != Some(i as u64) {
+                return Err(Error::Corrupt(format!(
+                    "{} should be shard {i} of {count} but says {no:?}; the split files do not belong together",
+                    p.display())));
+            }
+            parts.push(part);
+        }
+        Self::assemble(parts)
+    }
+
+    /// Merges parsed shards: metadata from the first, tensors from all.
+    fn assemble(parts: Vec<Parsed>) -> Result<Self> {
+        let mut parts = parts.into_iter();
+        let first = parts.next().expect("at least one shard");
+        let mut tensors = first.tensors;
+        let mut shards = vec![first.shard];
+        for part in parts {
+            tensors.extend(part.tensors);
+            shards.push(part.shard);
+        }
+        let mut tensor_index = BTreeMap::new();
+        for (i, t) in tensors.iter().enumerate() {
+            if tensor_index.insert(t.name.clone(), i).is_some() {
+                return Err(Error::Corrupt(format!(
+                    "tensor {:?} appears twice across the split files", t.name)));
+            }
+        }
+        Ok(Self {
+            version: first.version,
+            alignment: first.alignment,
+            metadata: first.metadata,
+            tensors,
+            tensor_index,
+            shards,
+        })
+    }
+
+    fn parse(path: &Path, shard: usize) -> Result<Parsed> {
+        let path = path.to_path_buf();
         let file = File::open(&path).map_err(|e| Error::Io {
             path: path.clone(),
             source: e,
@@ -190,7 +280,6 @@ impl GgufFile {
         }
 
         let mut tensors = Vec::with_capacity(raw.len());
-        let mut tensor_index = BTreeMap::new();
         for (name, dims, ty, offset) in raw {
             let n_elements: u64 = dims.iter().product();
             let nbytes = ty.nbytes(n_elements).ok_or_else(|| {
@@ -221,7 +310,6 @@ impl GgufFile {
                 });
             }
 
-            tensor_index.insert(name.clone(), tensors.len());
             tensors.push(TensorInfo {
                 name,
                 dims,
@@ -229,24 +317,27 @@ impl GgufFile {
                 offset,
                 file_offset,
                 nbytes,
+                shard,
             });
         }
 
-        Ok(Self {
-            path,
+        Ok(Parsed {
+            shard: Shard { path, data_offset, file_len, mmap },
             version,
             alignment,
             metadata,
             tensors,
-            tensor_index,
-            data_offset,
-            file_len,
-            mmap,
         })
     }
 
+    /// The opened model's first shard (the only file, unless split).
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.shards[0].path
+    }
+
+    /// Every file of the model, in shard order.
+    pub fn shard_paths(&self) -> Vec<&Path> {
+        self.shards.iter().map(|s| s.path.as_path()).collect()
     }
     pub fn version(&self) -> u32 {
         self.version
@@ -260,11 +351,13 @@ impl GgufFile {
     pub fn tensors(&self) -> &[TensorInfo] {
         &self.tensors
     }
+    /// Start of the first shard's tensor data.
     pub fn data_offset(&self) -> u64 {
-        self.data_offset
+        self.shards[0].data_offset
     }
+    /// Bytes across all shards.
     pub fn file_len(&self) -> u64 {
-        self.file_len
+        self.shards.iter().map(|s| s.file_len).sum()
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
@@ -292,12 +385,15 @@ impl GgufFile {
             .map_err(|_| Error::Corrupt("tensor offset exceeds address space".into()))?;
         let len = usize::try_from(info.nbytes)
             .map_err(|_| Error::Corrupt("tensor length exceeds address space".into()))?;
-        self.mmap
+        let shard = self.shards.get(info.shard).ok_or_else(|| Error::Corrupt(format!(
+            "tensor {:?} names shard {} of {}", info.name, info.shard, self.shards.len())))?;
+        shard
+            .mmap
             .get(start..start + len)
             .ok_or_else(|| Error::Truncated {
                 what: format!("tensor {:?}", info.name),
                 need: info.file_offset + info.nbytes,
-                have: self.file_len,
+                have: shard.file_len,
             })
     }
 
@@ -308,9 +404,9 @@ impl GgufFile {
         self.tensor_bytes(info)
     }
 
-    /// Total size of the tensor-data section.
+    /// Total size of the tensor-data sections.
     pub fn tensor_data_size(&self) -> u64 {
-        self.file_len.saturating_sub(self.data_offset)
+        self.shards.iter().map(|s| s.file_len.saturating_sub(s.data_offset)).sum()
     }
 
     /// Count of tensors per quantization type, for `inspect` summaries.
@@ -555,6 +651,13 @@ mod tests {
     }
 
     #[test]
+    fn split_names_parse() {
+        assert_eq!(split_name(Path::new("a/b/m-x-00002-of-00003.gguf")), Some(("m-x".into(), 2, 3)));
+        assert_eq!(split_name(Path::new("model.gguf")), None);
+        assert_eq!(split_name(Path::new("m-2-of-3.gguf")), None);
+    }
+
+    #[test]
     fn tensor_info_shape_helpers() {
         let t = TensorInfo {
             name: "blk.0.attn_q.weight".into(),
@@ -563,6 +666,7 @@ mod tests {
             offset: 0,
             file_offset: 0,
             nbytes: 0,
+            shard: 0,
         };
         assert_eq!(t.n_elements(), 2048 * 4096);
         assert_eq!(t.row_size(), 2048);

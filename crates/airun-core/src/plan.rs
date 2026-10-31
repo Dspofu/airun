@@ -649,6 +649,10 @@ mod tests {
             attn_output_gate: false,
             ffn_norm_name: "ffn_norm",
             kv_type: Default::default(),
+            hc: None,
+            ple: None,
+            ssm_gate_sigmoid: false,
+            indexer_top_k: 0,
         }
     }
 

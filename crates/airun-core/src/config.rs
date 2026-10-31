@@ -28,7 +28,9 @@ impl Architecture {
             "qwen3" => Architecture::Qwen3Dense,
             // Same block shape; the q/k norm tensors are simply absent.
             "llama" | "qwen2" => Architecture::Qwen3Dense,
-            "qwen35" | "qwen3next" | "qwen35moe" | "qwen3nextmoe" => {
+            // qwen4exp is the same hybrid with hyper-connections and per-layer
+            // n-gram embeddings around it; Config::hc and ::ple carry those.
+            "qwen35" | "qwen3next" | "qwen35moe" | "qwen3nextmoe" | "qwen4exp" => {
                 Architecture::Qwen3NextHybrid
             }
             "qwen3moe" => Architecture::Unsupported(
@@ -118,6 +120,74 @@ pub struct MoeConfig {
     pub norm_topk: bool,
 }
 
+/// Hyper-connections (Qwen4 preview, DeepSeek-V4): the residual is `count`
+/// parallel streams of the model width. Before each token mixer and each
+/// feed-forward a "mix" normalizes the streams, gates them through a low-rank
+/// projection and averages them into the block's input; after the block a
+/// "combine" adds its output back into every stream under a learned weight.
+/// There are no attn/ffn/output norms: the mixes are the norms.
+#[derive(Debug, Clone, Copy)]
+pub struct HcConfig {
+    pub count: usize,
+    pub low_rank: usize,
+}
+
+/// Per-layer n-gram embeddings (qwen4exp `ple.*`): each token hashes itself
+/// with its predecessors into `n_heads` rows of a huge shared table, which one
+/// layer folds into the residual streams through a gated value and a dilated
+/// causal convolution.
+#[derive(Debug, Clone)]
+pub struct PleConfig {
+    /// The layer that applies it.
+    pub layer: usize,
+    pub ngram: usize,
+    pub heads_per_ngram: usize,
+    pub conv_kernel: usize,
+    /// Ends an n-gram window: it and everything before it read as itself.
+    pub eos: u32,
+    /// Width of one table row; `n_heads` of them make one token's embedding.
+    pub head_dim: usize,
+    pub multipliers: Vec<u64>,
+    pub head_offsets: Vec<u64>,
+    pub head_vocab: Vec<u64>,
+}
+
+impl PleConfig {
+    pub fn n_heads(&self) -> usize {
+        (self.ngram - 1) * self.heads_per_ngram
+    }
+
+    /// Rows of history the dilated convolution reads back (dilation = n-gram).
+    pub fn conv_history(&self) -> usize {
+        (self.conv_kernel - 1) * self.ngram
+    }
+
+    /// The table rows of the token at the end of `window` (oldest first, the
+    /// token itself last). Missing predecessors and anything at or before an
+    /// EOS in the window read as EOS; the token's own EOS does not cut it.
+    pub fn rows(&self, window: &[u32], out: &mut Vec<u64>) {
+        let n = self.ngram;
+        let mut ctx = vec![u64::from(self.eos); n];
+        ctx[0] = u64::from(*window.last().expect("a window holds at least the token"));
+        let mut cut = false;
+        for s in 1..n {
+            let t = if cut || window.len() <= s { None } else { Some(window[window.len() - 1 - s]) };
+            cut = cut || t.is_none() || t == Some(self.eos);
+            ctx[s] = if cut { u64::from(self.eos) } else { u64::from(t.unwrap()) };
+        }
+        for g in 2..=n {
+            let mut mixed = ctx[0].wrapping_mul(self.multipliers[0]);
+            for j in 1..g {
+                mixed ^= ctx[j].wrapping_mul(self.multipliers[j]);
+            }
+            for h in 0..self.heads_per_ngram {
+                let hi = (g - 2) * self.heads_per_ngram + h;
+                out.push(mixed % self.head_vocab[hi] + self.head_offsets[hi]);
+            }
+        }
+    }
+}
+
 /// Everything the forward pass needs to know about a model's shape.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -170,6 +240,17 @@ pub struct Config {
     /// Storage format of the KV cache. A runtime choice, not a file property:
     /// from_gguf leaves it at f16 and the loader applies the user's option.
     pub kv_type: airun_cuda::ops::KvType,
+
+    /// Hyper-connection residual streams, on qwen4exp.
+    pub hc: Option<HcConfig>,
+    /// Per-layer n-gram embeddings, on qwen4exp.
+    pub ple: Option<PleConfig>,
+    /// The delta-net output gate is a sigmoid (qwen4exp) rather than SiLU.
+    pub ssm_gate_sigmoid: bool,
+    /// The QSA indexer's token budget: attention layers with a nonzero
+    /// compress ratio see only the best-scored blocks beyond this many tokens.
+    /// 0 when the model attends densely.
+    pub indexer_top_k: usize,
 }
 
 impl Config {
@@ -333,6 +414,26 @@ impl Config {
             "post_attention_norm"
         };
 
+        let hc = Self::arch_key(gguf, &arch_name, "hyper_connection.count")
+            .and_then(|v| v.as_usize())
+            .map(|count| HcConfig {
+                count,
+                low_rank: Self::arch_key(gguf, &arch_name, "hyper_connection.low_rank")
+                    .and_then(|v| v.as_usize())
+                    .unwrap_or(0),
+            });
+        if let Some(h) = &hc {
+            if h.count <= 1 || h.low_rank == 0 {
+                return Err(CoreError::Other(format!(
+                    "{arch_name}.hyper_connection.count is {} and .low_rank {}; both must be set (count above 1)                      -- the file's metadata is incomplete, re-convert it", h.count, h.low_rank)));
+            }
+        }
+        let ple = Self::ple_config(gguf, &arch_name)?;
+        let indexer_top_k = Self::arch_key(gguf, &arch_name, "attention.indexer.top_k")
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+
+        let ssm_gate_sigmoid = arch_name == "qwen4exp";
         let cfg = Config {
             architecture,
             arch_name,
@@ -363,9 +464,48 @@ impl Config {
             attn_output_gate,
             ffn_norm_name,
             kv_type: Default::default(),
+            ssm_gate_sigmoid,
+            hc,
+            ple,
+            indexer_top_k,
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The `ple.*` keys, when the file has them.
+    fn ple_config(gguf: &GgufFile, arch: &str) -> Result<Option<PleConfig>> {
+        let Some(layers) = Self::arch_key(gguf, arch, "ple.layers").and_then(|v| v.as_array())
+            .and_then(|a| a.as_i64_vec()) else { return Ok(None) };
+        let missing = |k: &str| CoreError::MissingConfig { key: format!("{arch}.{k}") };
+        if layers.len() != 1 {
+            return Err(CoreError::Other(format!(
+                "{arch}.ple.layers lists {} layers; airun supports exactly one PLE layer", layers.len())));
+        }
+        let int = |k: &str| Self::arch_key(gguf, arch, k).and_then(|v| v.as_usize()).ok_or_else(|| missing(k));
+        let list = |k: &str| Self::arch_key(gguf, arch, k).and_then(|v| v.as_array())
+            .and_then(|a| a.as_i64_vec()).map(|v| v.into_iter().map(|x| x as u64).collect::<Vec<_>>())
+            .ok_or_else(|| missing(k));
+        let cfg = PleConfig {
+            layer: layers[0] as usize,
+            ngram: int("ple.ngram_size")?,
+            heads_per_ngram: int("ple.heads_per_ngram")?,
+            conv_kernel: int("ple.conv_kernel")?,
+            eos: int("ple.eos_token_id")? as u32,
+            head_dim: int("embedding_length_per_layer_input")?,
+            multipliers: list("ple.layer_multipliers")?,
+            head_offsets: list("ple.head_offsets")?,
+            head_vocab: list("ple.head_vocab_sizes")?,
+        };
+        if cfg.ngram < 2 || cfg.conv_kernel == 0 || cfg.multipliers.len() < cfg.ngram
+            || cfg.head_offsets.len() < cfg.n_heads() || cfg.head_vocab.len() < cfg.n_heads()
+            || cfg.head_vocab.iter().take(cfg.n_heads()).any(|&v| v == 0)
+        {
+            return Err(CoreError::Other(format!(
+                "{arch}.ple.* metadata is inconsistent (n-gram {}, {} heads, {} multipliers); re-convert the model",
+                cfg.ngram, cfg.n_heads(), cfg.multipliers.len())));
+        }
+        Ok(Some(cfg))
     }
 
     /// RoPE frequencies, including the context-extension scaling the file
@@ -596,6 +736,13 @@ impl Config {
         if self.attn_output_gate {
             s.push_str("\n  gated attention output");
         }
+        if let Some(hc) = &self.hc {
+            s.push_str(&format!("\n  hyper-connections: {} streams, rank {}", hc.count, hc.low_rank));
+        }
+        if let Some(p) = &self.ple {
+            s.push_str(&format!("\n  per-layer n-gram embeddings at layer {}: {} heads of {}, conv {} dilated {}",
+                p.layer, p.n_heads(), p.head_dim, p.conv_kernel, p.ngram));
+        }
         s
     }
 }
@@ -630,6 +777,10 @@ mod tests {
             attn_output_gate: false,
             ffn_norm_name: "ffn_norm",
             kv_type: Default::default(),
+            hc: None,
+            ple: None,
+            ssm_gate_sigmoid: false,
+            indexer_top_k: 0,
         }
     }
 
@@ -657,6 +808,36 @@ mod tests {
             }),
             ..qwen3_1_7b()
         }
+    }
+
+    /// The n-gram hash against values computed independently (Python, from
+    /// llama.cpp's llm_graph_input_ple::set_input) with the Qwen4 preview's
+    /// constants.
+    #[test]
+    fn ple_rows_match_the_reference_hash() {
+        let p = PleConfig {
+            layer: 1,
+            ngram: 3,
+            heads_per_ngram: 8,
+            conv_kernel: 4,
+            eos: 248044,
+            head_dim: 160,
+            multipliers: vec![23703573157769, 20109073645365, 8052911324071],
+            head_offsets: vec![0, 20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297,
+                160000374, 180000455, 200000548, 220000655, 240000802, 260000955, 280001114, 300001275],
+            head_vocab: vec![20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077,
+                20000081, 20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171],
+        };
+        let rows = |w: &[u32]| { let mut v = Vec::new(); p.rows(w, &mut v); v };
+        assert_eq!(rows(&[100, 200, 300]), [6129193, 20484628, 57667260, 77728366, 86357215, 109234597,
+            123551585, 149309416, 172664702, 184433127, 201501905, 227445817, 243341740, 279238932, 284538191,
+            311036336]);
+        // Missing predecessors read as EOS ...
+        assert_eq!(rows(&[100]), [5727835, 21884476, 43702108, 66434789, 84094509, 104112171, 134886528,
+            157314943, 162363667, 189466439, 200618315, 232121522, 258547276, 266199001, 289022207, 305180972]);
+        // ... and an EOS cuts everything at and before it.
+        assert_eq!(rows(&[7, 248044, 300]), rows(&[300]));
+        assert_eq!(rows(&[300])[0], 4401500);
     }
 
     #[test]

@@ -90,13 +90,18 @@ pub fn load(
     if crate::model::embeds_on_host(&config) {
         sizes.embedding = 0;
     }
+    // The n-gram embedding table stays in the file (see model::PleTable).
+    if let Some(t) = config.ple.as_ref().and_then(|_| gguf.tensor("per_layer_token_embd.weight")) {
+        sizes.other = sizes.other.saturating_sub(t.nbytes);
+    }
     let load_mtp = opts.draft > 0 && crate::model::mtp_supported(&config);
     if load_mtp {
         // The head and its own KV cache sit with the output projection.
         sizes.output += sizes.per_layer.get(config.n_run_layers()).copied().unwrap_or(0)
             + config.kv_bytes_per_layer(opts.ctx);
     }
-    if let Some(slots) = opts.expert_cache {
+    let expert_cache = opts.expert_cache.or_else(|| auto_expert_cache(&gguf, &config, &sizes, &devices, opts));
+    if let Some(slots) = expert_cache {
         let moe = config.moe.as_ref().ok_or_else(|| CoreError::Other(
             "--expert-cache requires a MoE model; omit it for dense models".into()))?;
         if slots < moe.n_experts_used || slots > moe.n_experts {
@@ -147,8 +152,15 @@ pub fn load(
             Err(e) => return Err(e),
         };
 
-        if let Some(slots) = opts.expert_cache {
-            placement.notes.push(format!("MoE expert cache: {slots} slots per layer; misses read from the GGUF, weights unchanged"));
+        if let Some(slots) = expert_cache {
+            let how = if opts.expert_cache.is_some() { "" } else { " (sized to fill the GPUs; --expert-cache overrides)" };
+            placement.notes.push(format!("MoE expert cache: {slots} slots per layer{how}; misses read from the GGUF, weights unchanged"));
+        }
+        if config.indexer_top_k > 0 && placement.ctx > config.indexer_top_k {
+            placement.notes.push(format!(
+                "the model's sparse (QSA) attention is not implemented: past {} tokens airun attends to the whole \
+                 context, where the reference attends to its best-scored {} -- output may drift on long inputs",
+                config.indexer_top_k, config.indexer_top_k));
         }
         if opts.kv_type != airun_cuda::ops::KvType::F16 {
             placement.notes.push(format!("KV cache {}", opts.kv_type.name()));
@@ -170,7 +182,7 @@ pub fn load(
             streams.push((shard.device, Stream::new(shard.device)?));
         }
 
-        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, opts.expert_cache, load_mtp, |d, t| {
+        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_cache, load_mtp, |d, t| {
             progress("uploading weights", d, t)
         });
 
@@ -211,6 +223,47 @@ pub fn load(
             },
         ));
     }
+}
+
+/// Expert slots per layer for a MoE model too big for the GPUs: as many as
+/// the free VRAM holds once everything else is placed, so the misses that
+/// stream from the file are as few as memory allows. `None` when the model
+/// fits whole, or is not MoE.
+fn auto_expert_cache(gguf: &GgufFile, config: &Config, sizes: &WeightSizes, devices: &[Device],
+    opts: &LoadOptions) -> Option<usize> {
+    let moe = config.moe.as_ref()?;
+    let used: Vec<&Device> = match &opts.split {
+        SplitMode::Single(target) => devices.iter().filter(|d| d.ordinal == *target).collect(),
+        _ => devices.iter().collect(),
+    };
+    let budget: u64 = used.iter().map(|d| d.free_mem.saturating_sub(opts.reserve_bytes)).sum();
+    let n_layers = config.n_run_layers();
+    let state: u64 = (0..n_layers).map(|l| match config.layer_kind(l) {
+        crate::config::LayerKind::Attention => config.kv_bytes_per_layer(opts.ctx),
+        crate::config::LayerKind::LinearAttention => config.ssm_bytes_per_layer(),
+    }).sum();
+    let scratch = used.len() as u64 * crate::plan::scratch_bytes(config, opts.batch, true);
+    let needed = sizes.total() + state + scratch;
+    if needed <= budget {
+        return None;
+    }
+    // Bytes one slot costs across every layer, and what the experts cost now.
+    let (mut per_slot, mut experts) = (0u64, 0u64);
+    for l in 0..n_layers {
+        for kind in ["gate", "up", "down"] {
+            if let Some(t) = gguf.tensor(&format!("blk.{l}.ffn_{kind}_exps.weight")) {
+                per_slot += t.nbytes / moe.n_experts as u64;
+                experts += t.nbytes;
+            }
+        }
+    }
+    if per_slot == 0 {
+        return None;
+    }
+    // A layer split never lands exactly on the budget; keep 6% of it spare.
+    let room = (budget - budget / 16).checked_sub(needed - experts)?;
+    let slots = (room / per_slot) as usize;
+    (slots >= moe.n_experts_used).then_some(slots.min(moe.n_experts))
 }
 
 /// The next smaller configuration to try, or `None` when out of options.

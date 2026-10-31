@@ -51,15 +51,15 @@ impl GpuTensor {
         if let Some(host) = &self.host_experts { host.slots.borrow_mut().invalidate(); }
     }
 
-    /// Absolute file offset of one expert's packed weights.
-    pub fn expert_file_offset(&self, expert: usize) -> Option<u64> {
+    /// Shard and absolute offset in it of one expert's packed weights.
+    pub fn expert_file_offset(&self, expert: usize) -> Option<(usize, u64)> {
         let host = self.host_experts.as_ref()?;
-        Some(host.file.data_offset() + host.info.offset + (expert * self.expert_stride) as u64)
+        Some((host.info.shard, host.info.file_offset + (expert * self.expert_stride) as u64))
     }
 
-    /// The GGUF the experts are streamed from.
-    pub fn expert_file_path(&self) -> Option<&std::path::Path> {
-        self.host_experts.as_ref().map(|h| h.file.path())
+    /// The GGUF files the experts are streamed from, in shard order.
+    pub fn expert_file_paths(&self) -> Option<Vec<&std::path::Path>> {
+        self.host_experts.as_ref().map(|h| h.file.shard_paths())
     }
 
     pub fn cache_stats(&self) -> (u64, u64) {
@@ -142,12 +142,69 @@ pub enum Block {
     Linear(LinearAttentionWeights),
 }
 
+/// One hyper-connection mix (see [`crate::config::HcConfig`]): a grouped
+/// RMSNorm over the streams, a low-rank gate, and the stream weights for the
+/// combine after the block.
+pub struct HcMix {
+    /// [count * n_embd]: one gamma per stream, already folded to (1 + w).
+    pub norm: DeviceBuffer<f32>,
+    /// [count * n_embd] -> [low_rank].
+    pub down: GpuTensor,
+    /// [low_rank] -> [count * n_embd].
+    pub up: GpuTensor,
+    /// [count * n_embd] -> [count]; absent on the final (output) mix.
+    pub inject: Option<GpuTensor>,
+}
+
+/// The per-layer n-gram embedding block (see [`crate::config::PleConfig`]).
+pub struct PleWeights {
+    /// Embedding -> one key per stream, [n_embd] -> [count * n_embd].
+    pub key: GpuTensor,
+    /// Embedding -> the value every stream gates, [n_embd] -> [n_embd].
+    pub value: GpuTensor,
+    pub norm_key: DeviceBuffer<f32>,
+    pub norm_query: DeviceBuffer<f32>,
+    pub norm_conv: DeviceBuffer<f32>,
+    /// Depthwise taps, [count * n_embd][kernel].
+    pub conv: DeviceBuffer<f32>,
+}
+
+/// The n-gram embedding table, left in the file: at 26.8 GiB for the Qwen4
+/// preview it fits no GPU, and a token reads just 16 rows of it.
+pub struct PleTable {
+    file: Arc<GgufFile>,
+    info: TensorInfo,
+    row_bytes: usize,
+    head_dim: usize,
+}
+
+impl PleTable {
+    /// Decodes `rows` into `out`, `head_dim` floats each, in order.
+    pub fn gather(&self, rows: &[u64], out: &mut [f32]) -> Result<()> {
+        let bytes = self.file.tensor_bytes(&self.info)?;
+        let n_rows = self.info.n_rows();
+        for (r, dst) in rows.iter().zip(out.chunks_mut(self.head_dim)) {
+            if *r >= n_rows {
+                return Err(CoreError::Other(format!(
+                    "PLE row {r} is past the table's {n_rows}; the ple.* metadata does not match the table")));
+            }
+            let at = *r as usize * self.row_bytes;
+            airun_gguf::dequant::dequantize(self.info.ty, &bytes[at..at + self.row_bytes], self.head_dim, dst)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct LayerWeights {
     pub device: i32,
+    /// Empty on hyper-connection models, whose mixes normalize instead.
     pub attn_norm: DeviceBuffer<f32>,
     pub block: Block,
     pub ffn_norm: DeviceBuffer<f32>,
     pub ffn: FfnWeights,
+    /// The mixes before the token mixer and before the feed-forward.
+    pub hc: Option<(HcMix, HcMix)>,
+    pub ple: Option<PleWeights>,
 }
 
 /// The multi-token-prediction head stored after the main layers
@@ -178,6 +235,9 @@ pub struct Model {
     /// The output projection. When embeddings are tied this is a second copy of
     /// the embedding table on the output device.
     pub output: GpuTensor,
+    /// The final hyper-connection mix, which stands in for `output_norm`.
+    pub hc_head: Option<HcMix>,
+    pub ple_table: Option<PleTable>,
     /// Loaded when the file has one and speculative decoding was asked for.
     pub mtp: Option<MtpWeights>,
     pub total_bytes: u64,
@@ -229,7 +289,31 @@ impl Model {
         done += 1;
         progress(done, total_steps);
 
-        let output_norm = load_f32(gguf, "output_norm.weight", out_dev, stream_for(out_dev)?)?;
+        let hc_on = config.hc.is_some();
+        let output_norm = if hc_on {
+            DeviceBuffer::<f32>::new(out_dev, 0)?
+        } else {
+            load_f32(gguf, "output_norm.weight", out_dev, stream_for(out_dev)?)?
+        };
+        let hc_head = if hc_on {
+            Some(load_hc_mix(gguf, "output_hc", out_dev, stream_for(out_dev)?, &config, false)?)
+        } else {
+            None
+        };
+        let ple_table = match &config.ple {
+            Some(p) => {
+                let info = tensor_info(gguf, "per_layer_token_embd.weight", &config.arch_name)?.clone();
+                let layout = info.ty.layout().ok_or_else(|| CoreError::UnsupportedTensorType {
+                    name: info.name.clone(), ty: info.ty.to_string() })?;
+                if info.row_size() as usize != p.head_dim || !airun_gguf::dequant::can_decode(info.ty) {
+                    return Err(CoreError::ShapeMismatch {
+                        name: info.name.clone(), found: info.dims.clone(), expected: vec![p.head_dim as u64] });
+                }
+                let row_bytes = p.head_dim / layout.elements as usize * layout.bytes as usize;
+                Some(PleTable { file: Arc::clone(gguf), info, row_bytes, head_dim: p.head_dim })
+            }
+            None => None,
+        };
         done += 1;
         progress(done, total_steps);
 
@@ -318,12 +402,34 @@ impl Model {
                 }
             };
 
+            let empty = || DeviceBuffer::<f32>::new(dev, 0);
             let w = LayerWeights {
                 device: dev,
-                attn_norm: load_f32(gguf, &name("attn_norm.weight"), dev, stream)?,
+                attn_norm: if hc_on { empty()? } else { load_f32(gguf, &name("attn_norm.weight"), dev, stream)? },
                 block,
-                ffn_norm: load_f32(gguf, &name(&format!("{}.weight", config.ffn_norm_name)), dev, stream)?,
+                ffn_norm: if hc_on {
+                    empty()?
+                } else {
+                    load_f32(gguf, &name(&format!("{}.weight", config.ffn_norm_name)), dev, stream)?
+                },
                 ffn,
+                hc: if hc_on {
+                    Some((load_hc_mix(gguf, &name("hc_attn"), dev, stream, &config, true)?,
+                          load_hc_mix(gguf, &name("hc_ffn"), dev, stream, &config, true)?))
+                } else {
+                    None
+                },
+                ple: match &config.ple {
+                    Some(p) if p.layer == l => Some(PleWeights {
+                        key: load_packed(gguf, &name("ple_key.weight"), dev, stream, &config)?,
+                        value: load_packed(gguf, &name("ple_value.weight"), dev, stream, &config)?,
+                        norm_key: load_f32(gguf, &name("ple_norm_key.weight"), dev, stream)?,
+                        norm_query: load_f32(gguf, &name("ple_norm_query.weight"), dev, stream)?,
+                        norm_conv: load_f32(gguf, &name("ple_norm_conv.weight"), dev, stream)?,
+                        conv: load_f32(gguf, &name("ple_conv1d.weight"), dev, stream)?,
+                    }),
+                    _ => None,
+                },
             };
             total_bytes += layer_bytes(&w);
             layers.push(w);
@@ -356,6 +462,8 @@ impl Model {
             token_embd_host,
             output_norm,
             output,
+            hc_head,
+            ple_table,
             mtp,
             total_bytes,
         })
@@ -377,6 +485,25 @@ impl Model {
             &self.output
         }
     }
+}
+
+/// `<prefix>_norm/_down/_up/_inject.weight`.
+fn load_hc_mix(gguf: &Arc<GgufFile>, prefix: &str, dev: i32, stream: &Stream, config: &Config,
+    inject: bool) -> Result<HcMix> {
+    Ok(HcMix {
+        norm: load_f32(gguf, &format!("{prefix}_norm.weight"), dev, stream)?,
+        down: load_packed(gguf, &format!("{prefix}_down.weight"), dev, stream, config)?,
+        up: load_packed(gguf, &format!("{prefix}_up.weight"), dev, stream, config)?,
+        inject: if inject {
+            Some(load_packed(gguf, &format!("{prefix}_inject.weight"), dev, stream, config)?)
+        } else {
+            None
+        },
+    })
+}
+
+fn hc_bytes(m: &HcMix) -> usize {
+    m.down.bytes() + m.up.bytes() + m.inject.as_ref().map_or(0, |t| t.bytes())
 }
 
 fn layer_bytes(w: &LayerWeights) -> u64 {
@@ -404,7 +531,9 @@ fn layer_bytes(w: &LayerWeights) -> u64 {
                 })
         }
     };
-    (block + ffn) as u64
+    let hc = w.hc.as_ref().map_or(0, |(a, f)| hc_bytes(a) + hc_bytes(f));
+    let ple = w.ple.as_ref().map_or(0, |p| p.key.bytes() + p.value.bytes());
+    (block + ffn + hc + ple) as u64
 }
 
 fn tensor_info<'a>(gguf: &'a GgufFile, name: &str, arch: &str) -> Result<&'a TensorInfo> {
@@ -445,6 +574,8 @@ fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &St
             up: load_packed(gguf, &name("ffn_up.weight"), dev, stream, config)?,
             down: load_packed(gguf, &name("ffn_down.weight"), dev, stream, config)?,
         },
+        hc: None,
+        ple: None,
     };
     let head_norm = if gguf.tensor(&name("nextn.shared_head_norm.weight")).is_some() {
         load_f32(gguf, &name("nextn.shared_head_norm.weight"), dev, stream)?

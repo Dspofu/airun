@@ -13,6 +13,7 @@ use half::f16;
 
 use crate::error::{Error, Result};
 use crate::ggml_type::GgmlType;
+use crate::iq_grids::{IQ2S_GRID, IQ3S_GRID, IQ3XXS_GRID};
 
 /// Non-linear codebook shared by IQ4_NL and IQ4_XS.
 pub const KVALUES_IQ4NL: [i8; 16] = [
@@ -379,6 +380,82 @@ pub fn decode_block(ty: GgmlType, b: &[u8], dst: &mut [f32]) -> Result<()> {
                 }
             }
         }
+        GgmlType::IQ2_S => {
+            // Eight groups of 32, each four lattice points of 8 magnitudes from
+            // a 1024-entry codebook (8 index bits in qs, 2 in qh), a sign byte
+            // per point, and a 4-bit scale per 16.
+            let d = f16_at(b, 0);
+            let (qs, signs, qh, scales) = (&b[2..34], &b[34..66], &b[66..74], &b[74..82]);
+            for ib in 0..8 {
+                let db = [
+                    d * (0.5 + f32::from(scales[ib] & 0x0F)) * 0.25,
+                    d * (0.5 + f32::from(scales[ib] >> 4)) * 0.25,
+                ];
+                for l in 0..4 {
+                    let idx = usize::from(qs[ib * 4 + l]) | ((usize::from(qh[ib]) << (8 - 2 * l)) & 0x300);
+                    let grid = IQ2S_GRID[idx].to_le_bytes();
+                    let s = signs[ib * 4 + l];
+                    for j in 0..8 {
+                        let v = db[l / 2] * f32::from(grid[j]);
+                        dst[ib * 32 + l * 8 + j] = if s & (1 << j) != 0 { -v } else { v };
+                    }
+                }
+            }
+        }
+        GgmlType::IQ3_XXS => {
+            // Eight groups of 32: eight 4-magnitude points from a 256-entry
+            // codebook, then one u32 per group holding four 7-bit sign codes
+            // (the eighth sign is their parity) and a 4-bit scale on top.
+            let d = f16_at(b, 0);
+            let (qs, sas) = (&b[2..66], &b[66..98]);
+            for ib in 0..8 {
+                let aux = u32::from_le_bytes(sas[4 * ib..4 * ib + 4].try_into().unwrap());
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+                for l in 0..4 {
+                    let s = ksigns_iq2xs(((aux >> (7 * l)) & 127) as u8);
+                    let g1 = IQ3XXS_GRID[usize::from(qs[ib * 8 + 2 * l])].to_le_bytes();
+                    let g2 = IQ3XXS_GRID[usize::from(qs[ib * 8 + 2 * l + 1])].to_le_bytes();
+                    let out = &mut dst[ib * 32 + l * 8..ib * 32 + l * 8 + 8];
+                    for j in 0..4 {
+                        let (a, c) = (db * f32::from(g1[j]), db * f32::from(g2[j]));
+                        out[j] = if s & (1 << j) != 0 { -a } else { a };
+                        out[j + 4] = if s & (1 << (j + 4)) != 0 { -c } else { c };
+                    }
+                }
+            }
+        }
+        GgmlType::IQ3_S => {
+            // As IQ3_XXS with a 512-entry codebook (the ninth index bit in qh),
+            // explicit sign bytes, and one 4-bit odd scale per 32.
+            let d = f16_at(b, 0);
+            let (qs, qh, signs, scales) = (&b[2..66], &b[66..74], &b[74..106], &b[106..110]);
+            for ib in 0..8 {
+                let sc = (scales[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+                let db = d * f32::from(1 + 2 * sc);
+                let h = u32::from(qh[ib]);
+                for l in 0..4 {
+                    let i1 = u32::from(qs[ib * 8 + 2 * l]) | ((h << (8 - 2 * l)) & 256);
+                    let i2 = u32::from(qs[ib * 8 + 2 * l + 1]) | ((h << (7 - 2 * l)) & 256);
+                    let (g1, g2) = (IQ3S_GRID[i1 as usize].to_le_bytes(), IQ3S_GRID[i2 as usize].to_le_bytes());
+                    let s = signs[ib * 4 + l];
+                    let out = &mut dst[ib * 32 + l * 8..ib * 32 + l * 8 + 8];
+                    for j in 0..4 {
+                        let (a, c) = (db * f32::from(g1[j]), db * f32::from(g2[j]));
+                        out[j] = if s & (1 << j) != 0 { -a } else { a };
+                        out[j + 4] = if s & (1 << (j + 4)) != 0 { -c } else { c };
+                    }
+                }
+            }
+        }
+        GgmlType::Q2_0 => {
+            // 2-bit codes 0..3 meaning -1, 0, +1, +2, four to a byte, low bits
+            // first, under one f16 scale per 64.
+            let d = f16_at(b, 0);
+            for j in 0..64 {
+                let q = (b[2 + j / 4] >> ((j % 4) * 2)) & 3;
+                dst[j] = d * (i32::from(q) - 1) as f32;
+            }
+        }
         other => {
             return Err(Error::Corrupt(format!(
                 "no CPU decoder for {other}; run `airun inspect` to see the model's type mix"
@@ -410,7 +487,18 @@ pub fn can_decode(ty: GgmlType) -> bool {
             | GgmlType::IQ4_XS
             | GgmlType::MXFP4
             | GgmlType::NVFP4
+            | GgmlType::IQ2_S
+            | GgmlType::IQ3_XXS
+            | GgmlType::IQ3_S
+            | GgmlType::Q2_0
     )
+}
+
+/// A 7-bit sign code plus its parity as the eighth sign: the IQ types keep
+/// an even number of negative values per 8, so the last sign is implied.
+#[inline]
+pub(crate) fn ksigns_iq2xs(i: u8) -> u8 {
+    i | (((i.count_ones() & 1) as u8) << 7)
 }
 
 #[cfg(test)]
@@ -437,6 +525,7 @@ mod tests {
             GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q5_1, GgmlType::Q8_0,
             GgmlType::Q2_K, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K,
             GgmlType::IQ4_NL, GgmlType::IQ4_XS, GgmlType::MXFP4, GgmlType::NVFP4,
+            GgmlType::IQ2_S, GgmlType::IQ3_XXS, GgmlType::IQ3_S, GgmlType::Q2_0,
         ];
         for ty in types {
             let layout = ty.layout().unwrap();
@@ -453,6 +542,28 @@ mod tests {
                 );
             }
             assert_eq!(out.len(), layout.elements as usize);
+        }
+    }
+
+    /// Against ggml's own C decoders: AIRUN_IQ_REF names a directory of
+    /// `<TYPE>.blocks` and the `<TYPE>.f32` ggml decoded from them (a harness
+    /// that compiles ggml-quants.c's dequantize_row_* verbatim writes both).
+    /// Skipped when unset.
+    #[test]
+    fn lattice_types_match_ggml() {
+        let Ok(dir) = std::env::var("AIRUN_IQ_REF") else { return };
+        let dir = std::path::Path::new(&dir);
+        for ty in [GgmlType::IQ2_S, GgmlType::IQ3_XXS, GgmlType::IQ3_S, GgmlType::Q2_0] {
+            let blocks = std::fs::read(dir.join(format!("{ty}.blocks"))).unwrap();
+            let want: Vec<f32> = std::fs::read(dir.join(format!("{ty}.f32"))).unwrap()
+                .chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+            let layout = ty.layout().unwrap();
+            let mut got = vec![0f32; want.len()];
+            for (b, out) in blocks.chunks(layout.bytes as usize).zip(got.chunks_mut(layout.elements as usize)) {
+                decode_block(ty, b, out).unwrap();
+            }
+            let bad = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(bad, 0, "{ty}: {bad} of {} values differ from ggml", want.len());
         }
     }
 

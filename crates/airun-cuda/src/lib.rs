@@ -12,6 +12,7 @@ pub mod buffer;
 pub mod device;
 pub mod error;
 pub mod ffi;
+pub mod hc;
 pub mod hybrid;
 pub mod ops;
 pub mod stream;

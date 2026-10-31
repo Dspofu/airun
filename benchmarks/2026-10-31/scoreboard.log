@@ -1,0 +1,16 @@
+
+[17:45:43] round 1 airun bench
+[17:45:56] round 1 llama-bench
+[17:46:09] round 1 llama-server
+[17:46:18] round 1 llama-server ready=True exited=False
+[17:46:27] round 1 airun mtp
+[17:46:52] round 2 airun bench
+[17:47:04] round 2 llama-bench
+[17:47:18] round 2 llama-server
+[17:47:27] round 2 llama-server ready=True exited=False
+[17:47:35] round 2 airun mtp
+[17:48:00] round 3 airun bench
+[17:48:13] round 3 llama-bench
+[17:48:26] round 3 llama-server
+[17:48:35] round 3 llama-server ready=True exited=False
+[17:48:44] round 3 airun mtp

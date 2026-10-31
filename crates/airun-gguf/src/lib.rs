@@ -9,6 +9,7 @@
 pub mod dequant;
 pub mod error;
 pub mod ggml_type;
+mod iq_grids;
 pub mod quantize;
 pub mod reader;
 pub mod safetensors;

@@ -46,6 +46,15 @@ pub(super) struct Spec {
     vgraph: Option<VerifyGraph>,
     /// The one-row head step as a CUDA graph.
     mgraph: Option<VerifyGraph>,
+    /// [`Runtime::advance_graphed`]'s graphs, by accepted count - 1.
+    agraphs: Vec<Option<AdvanceGraph>>,
+}
+
+/// A captured advance (commit, head rows, k drafts) and its pinned inputs.
+struct AdvanceGraph {
+    graph: Option<airun_cuda::Graph>,
+    tokens: airun_cuda::PinnedBuffer<i32>,
+    positions: airun_cuda::PinnedBuffer<i32>,
 }
 
 /// A captured verify pass and the pinned staging its replays read, as
@@ -123,6 +132,7 @@ impl Runtime {
             synced: false,
             vgraph: None,
             mgraph: None,
+            agraphs: Vec::new(),
         });
         Ok(())
     }
@@ -211,41 +221,127 @@ impl Runtime {
     /// and queues the last row's greedy pick into `picks_host[0]`.
     fn mtp_queue(&mut self, ids: &[i32], pos: &[i32]) -> Result<()> {
         {
-            let cfg = &self.model.config;
-            let mtp = self.model.mtp.as_ref().ok_or_else(|| CoreError::Other(
-                "speculative decoding without an MTP head; this is a bug".into()))?;
-            let sp = self.sp();
-            let si = self.states.len() - 1;
-            let st = &self.states[si];
-            let stream = &st.stream;
-            let n = ids.len();
-            let d = cfg.n_embd;
+            let st = self.states.last().expect("a runtime has at least one device");
             device::set_device(st.device)?;
-
-            st.tokens.copy_from_host_at(0, ids, stream)?;
-            st.positions.copy_from_host_at(0, pos, stream)?;
-            let embd = &self.model.token_embd;
-            ops::embed(embd.kernel_type(), sp.e.as_mut_ptr(), self.model.embedding_ptr(st.device)?,
-                st.tokens.as_ptr(), n, d, embd.row_bytes, embd.rows, stream)?;
-            ops::rmsnorm(sp.e.as_mut_ptr(), sp.e.as_ptr(), mtp.enorm.as_ptr(), d, n, cfg.rms_eps, stream)?;
-            ops::rmsnorm(st.xb2.as_mut_ptr(), sp.h.as_ptr(), mtp.hnorm.as_ptr(), d, n, cfg.rms_eps, stream)?;
-            let row = d * std::mem::size_of::<f32>();
-            ops::copy_2d(sp.cat.as_mut_ptr(), 2 * row, sp.e.as_ptr(), row, row, n, stream)?;
-            ops::copy_2d(sp.cat.offset_ptr(d), 2 * row, st.xb2.as_ptr(), row, row, n, stream)?;
-            matvec(&mtp.eh_proj, &sp.cat, &st.x, n, &st.q8act, stream)?;
-
-            self.run_block(si, &mtp.layer, &sp.kv, None, cfg.n_run_layers(), n, cfg, true, None)?;
-            ops::rmsnorm(st.xb.as_mut_ptr(), st.x.as_ptr(), mtp.head_norm.as_ptr(), d, n, cfg.rms_eps, stream)?;
-
-            let out_w = self.model.output_tensor();
-            ops::matvec(out_w.kernel_type(), out_w.data.as_ptr(), st.xb.offset_ptr((n - 1) * d),
-                sp.logits.as_mut_ptr(), d, cfg.vocab_size, 1, out_w.row_bytes, stream)?;
-            ops::argmax(sp.logits.as_ptr(), cfg.vocab_size, sp.picks.as_mut_ptr(), sp.scratch.as_mut_ptr(),
-                std::ptr::null_mut(), stream)?;
+            st.tokens.copy_from_host_at(0, ids, &st.stream)?;
+            st.positions.copy_from_host_at(0, pos, &st.stream)?;
         }
+        self.mtp_body(ids.len(), 0)?;
         let st = self.states.last().expect("a runtime has at least one device");
         let sp = self.spec.as_mut().expect("set up by spec_init");
         sp.picks.copy_to_host(&mut sp.picks_host.as_mut_slice()[..1], &st.stream)?;
+        Ok(())
+    }
+
+    /// The head over the `n` tokens and positions already on the output
+    /// device, reading `spec.h`; its normed output rows land in xb and the last
+    /// row's greedy pick in `picks[slot]`.
+    fn mtp_body(&self, n: usize, slot: usize) -> Result<()> {
+        let cfg = &self.model.config;
+        let mtp = self.model.mtp.as_ref().ok_or_else(|| CoreError::Other(
+            "speculative decoding without an MTP head; this is a bug".into()))?;
+        let sp = self.sp();
+        let si = self.states.len() - 1;
+        let st = &self.states[si];
+        let stream = &st.stream;
+        let d = cfg.n_embd;
+        let embd = &self.model.token_embd;
+        ops::embed(embd.kernel_type(), sp.e.as_mut_ptr(), self.model.embedding_ptr(st.device)?,
+            st.tokens.as_ptr(), n, d, embd.row_bytes, embd.rows, stream)?;
+        ops::rmsnorm(sp.e.as_mut_ptr(), sp.e.as_ptr(), mtp.enorm.as_ptr(), d, n, cfg.rms_eps, stream)?;
+        ops::rmsnorm(st.xb2.as_mut_ptr(), sp.h.as_ptr(), mtp.hnorm.as_ptr(), d, n, cfg.rms_eps, stream)?;
+        let row = d * std::mem::size_of::<f32>();
+        ops::copy_2d(sp.cat.as_mut_ptr(), 2 * row, sp.e.as_ptr(), row, row, n, stream)?;
+        ops::copy_2d(sp.cat.offset_ptr(d), 2 * row, st.xb2.as_ptr(), row, row, n, stream)?;
+        matvec(&mtp.eh_proj, &sp.cat, &st.x, n, &st.q8act, stream)?;
+
+        self.run_block(si, &mtp.layer, &sp.kv, None, cfg.n_run_layers(), n, cfg, true, None)?;
+        ops::rmsnorm(st.xb.as_mut_ptr(), st.x.as_ptr(), mtp.head_norm.as_ptr(), d, n, cfg.rms_eps, stream)?;
+
+        let out_w = self.model.output_tensor();
+        ops::matvec(out_w.kernel_type(), out_w.data.as_ptr(), st.xb.offset_ptr((n - 1) * d),
+            sp.logits.as_mut_ptr(), d, cfg.vocab_size, 1, out_w.row_bytes, stream)?;
+        ops::argmax(sp.logits.as_ptr(), cfg.vocab_size, sp.picks.offset_ptr(slot), sp.scratch.as_mut_ptr(),
+            std::ptr::null_mut(), stream)?;
+        Ok(())
+    }
+
+    /// Everything between two verifies as one captured graph per accepted
+    /// count `m`: push the m tokens into the delta-net states, feed the head
+    /// the verify's rows, and draft k tokens, each step's pick written straight
+    /// into the next step's token on the device. One launch and one readback,
+    /// where the host had waited on each head step in turn. `toks` are the m
+    /// tokens after the verify's first, `pos0` the position of the first.
+    fn advance_graphed(&mut self, toks: &[u32], pos0: usize) -> Result<Vec<u32>> {
+        let k = self.draft;
+        let m = toks.len();
+        let taken = {
+            let sp = self.spec.as_mut().expect("set up by spec_init");
+            if sp.agraphs.len() < m {
+                sp.agraphs.resize_with(m, || None);
+            }
+            sp.agraphs[m - 1].take()
+        };
+        let mut g = match taken {
+            Some(g) => g,
+            None => AdvanceGraph {
+                graph: None,
+                tokens: airun_cuda::PinnedBuffer::new(m)?,
+                positions: airun_cuda::PinnedBuffer::new(m + k)?,
+            },
+        };
+        for (i, &t) in toks.iter().enumerate() {
+            g.tokens.as_mut_slice()[i] = t as i32;
+        }
+        // The head's rows at pos0 .. pos0+m-1, then the chained steps after.
+        for i in 0..m + k {
+            g.positions.as_mut_slice()[i] = (pos0 + i) as i32;
+        }
+        device::set_device(self.states[0].device)?;
+        let built = if g.graph.is_none() {
+            // SAFETY of the capture: everything queued lives in `self` or `g`,
+            // and `g` goes back into `self.spec` below.
+            airun_cuda::Graph::begin_capture(&self.states[0].stream)?;
+            let queued = self.queue_advance(m, g.tokens.as_slice(), g.positions.as_slice());
+            let ended = airun_cuda::Graph::end_capture(&self.states[0].stream);
+            queued.and_then(|_| Ok(ended?)).map(|gr| g.graph = Some(gr))
+        } else {
+            Ok(())
+        };
+        let launched = built.and_then(|_| {
+            Ok(g.graph.as_ref().expect("graph was just built").launch(&self.states[0].stream)?)
+        });
+        self.spec.as_mut().expect("set up by spec_init").agraphs[m - 1] = Some(g);
+        launched?;
+        self.states[0].stream.synchronize()?;
+        Ok(self.sp().picks_host.as_slice()[..k].iter().map(|&t| t as u32).collect())
+    }
+
+    fn queue_advance(&mut self, m: usize, toks: &[i32], positions: &[i32]) -> Result<()> {
+        let k = self.draft;
+        let d = self.model.config.n_embd;
+        let row = d * std::mem::size_of::<f32>();
+        self.commit(m)?;
+        self.stage_h(false, m)?;
+        self.save_pending(m - 1)?;
+        {
+            let st = &self.states[0];
+            st.tokens.copy_from_host_at(0, toks, &st.stream)?;
+            st.positions.copy_from_host_at(0, &positions[..m], &st.stream)?;
+        }
+        self.mtp_body(m, 0)?;
+        for i in 1..k {
+            let st = &self.states[0];
+            let sp = self.sp();
+            let last = if i == 1 { m - 1 } else { 0 };
+            ops::copy_2d(sp.h.as_mut_ptr(), row, st.xb.offset_ptr(last * d), row, row, 1, &st.stream)?;
+            ops::copy_2d(st.tokens.as_mut_ptr(), 4, sp.picks.offset_ptr(i - 1), 4, 4, 1, &st.stream)?;
+            st.positions.copy_from_host_at(0, &positions[m - 1 + i..m + i], &st.stream)?;
+            self.mtp_body(1, i)?;
+        }
+        let st = &self.states[0];
+        let sp = self.spec.as_mut().expect("set up by spec_init");
+        sp.picks.copy_to_host(&mut sp.picks_host.as_mut_slice()[..k], &st.stream)?;
         Ok(())
     }
 
@@ -511,6 +607,18 @@ impl Runtime {
                 }
 
                 let t1 = std::time::Instant::now();
+                let room = k.min(self.ctx.saturating_sub(p + committed + 1));
+                if ended.is_none() && room == k && k > 0 && self.states.len() == 1 && !graphs_disabled() {
+                    let mut toks = input[1..committed].to_vec();
+                    toks.push(next);
+                    drafts = self.advance_graphed(&toks, p + 1)?;
+                    self.n_past = p + committed;
+                    self.history.extend_from_slice(&input[..committed]);
+                    t = next;
+                    timing[1] += t1.elapsed().as_secs_f64();
+                    steps += 1;
+                    continue;
+                }
                 self.commit(committed)?;
                 self.n_past = p + committed;
                 self.history.extend_from_slice(&input[..committed]);

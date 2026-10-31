@@ -186,6 +186,10 @@ const TYPES: &[GgmlType] = &[
     GgmlType::Q6_K,
     GgmlType::IQ4_NL,
     GgmlType::IQ4_XS,
+    GgmlType::IQ2_S,
+    GgmlType::IQ3_XXS,
+    GgmlType::IQ3_S,
+    GgmlType::Q2_0,
     GgmlType::MXFP4,
     GgmlType::NVFP4,
 ];
@@ -255,8 +259,9 @@ fn f16_scale_offsets(ty: GgmlType) -> &'static [usize] {
         GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::IQ4_NL => &[0],
         // d then dmin / m, both at the front.
         GgmlType::Q4_1 | GgmlType::Q5_1 | GgmlType::Q4_K | GgmlType::Q5_K => &[0, 2],
-        // IQ4_XS keeps d first, followed by packed integer scales.
-        GgmlType::IQ4_XS => &[0],
+        // IQ4_XS keeps d first, followed by packed integer scales; so do the
+        // lattice types and Q2_0.
+        GgmlType::IQ4_XS | GgmlType::IQ2_S | GgmlType::IQ3_XXS | GgmlType::IQ3_S | GgmlType::Q2_0 => &[0],
         GgmlType::Q2_K => &[80, 82],
         GgmlType::Q3_K => &[108],
         GgmlType::Q6_K => &[208],
@@ -681,6 +686,36 @@ fn test_matmul_fp4(device: i32, stream: &Stream, report: &mut Report) -> Result<
         report.case(&format!("matmul NVFP4 x NVFP4 (FP4 tensor cores), {n_tokens} tokens"),
             format!("max_abs {worst_abs:.3e}  error/bound {worst:.2}x  {q_over} activations past the rounding bound"),
             worst <= 1.0 && q_over == 0);
+    }
+
+    // The vectorized quantizer runs on 16-byte aligned rows and the scalar one
+    // on anything else; one float off alignment puts the same rows through
+    // the scalar kernel, and the two must agree to the bit. K past the
+    // vectorized kernel's register cache (20480) covers its reload tail.
+    for k in [512usize, 21504] {
+        let n_tokens = 7;
+        let mut rng = Rng::new(0xF4F4_1000 + k as u64);
+        let g = rng.floats(n_tokens * k + 1);
+        let u = rng.floats(n_tokens * k + 1);
+        let d_g = DeviceBuffer::<f32>::from_slice(device, &g, stream)?;
+        let d_u = DeviceBuffer::<f32>::from_slice(device, &u, stream)?;
+        let bytes = ops::nvfp4_act_bytes(n_tokens, k);
+        let outs: Vec<DeviceBuffer<u8>> =
+            (0..4).map(|_| DeviceBuffer::<u8>::new(device, bytes)).collect::<std::result::Result<_, _>>()?;
+        // Aligned, then the same values one float in (the buffers hold g[1..]
+        // at offset 1, so feed the aligned kernel a host copy shifted down).
+        let d_g1 = DeviceBuffer::<f32>::from_slice(device, &g[1..], stream)?;
+        let d_u1 = DeviceBuffer::<f32>::from_slice(device, &u[1..], stream)?;
+        ops::quantize_act_nvfp4(d_g1.as_ptr(), outs[0].as_mut_ptr(), n_tokens, k, stream)?;
+        ops::quantize_act_nvfp4(d_g.offset_ptr(1), outs[1].as_mut_ptr(), n_tokens, k, stream)?;
+        ops::quantize_glu_nvfp4(d_g1.as_ptr(), d_u1.as_ptr(), outs[2].as_mut_ptr(), n_tokens, k, stream)?;
+        ops::quantize_glu_nvfp4(d_g.offset_ptr(1), d_u.offset_ptr(1), outs[3].as_mut_ptr(), n_tokens, k, stream)?;
+        let o: Vec<Vec<u8>> = outs.iter().map(|b| b.to_vec(stream)).collect::<std::result::Result<_, _>>()?;
+        let diff = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+        let (dp, dg) = (diff(&o[0], &o[1]), diff(&o[2], &o[3]));
+        report.case(&format!("NVFP4 activation quantizer, vectorized = scalar, K {k}"),
+            format!("{dp} bytes differ (plain), {dg} (SwiGLU)"),
+            dp == 0 && dg == 0);
     }
     Ok(())
 }

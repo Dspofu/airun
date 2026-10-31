@@ -310,6 +310,10 @@ __global__ void delta_rule_par_kernel(
 // state as it was). The arithmetic is the in-place kernel's, operation for
 // operation, so the results are bit-identical to it.
 // Blocks reach 128 x 8 = 1024 threads, so registers must stay at 64 per thread.
+// A block-free variant -- a column's eight slices as adjacent lanes reducing
+// by shuffle, each thread loading its own k/q slices a token ahead -- measured
+// slower on the 27B (prefill 2048 3537 vs 3692 t/s, decode 48.9 vs 49.2): the
+// per-thread global loads cost more than the syncs they replaced.
 template <int SLICE>
 __global__ __launch_bounds__(256) void delta_rule_reg_kernel(
     float* __restrict__ state,          // [n_v_heads][head_k_dim][head_v_dim]
