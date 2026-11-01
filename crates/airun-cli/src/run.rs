@@ -210,6 +210,7 @@ impl RunArgs {
             repeat_last_n: self.repeat_last_n,
             logit_bias: Vec::new(),
             seed: self.seed,
+            ..Default::default()
         }
     }
 }

@@ -34,8 +34,9 @@ streams e lançar *nossos* kernels.
 | Runtime Qwen3 denso | gera texto coerente |
 | Multi-GPU (split por camada) | validado com 2 placas |
 | Planner de VRAM | testado, com fallback automático |
-| API no formato do llama-server (OpenAI + nativa, SSE, auth, reasoning, tool calls) | 20/20 em `tests/api_conformance.py` |
-| Amostragem (top-k/p, min-p, typical, top-n-sigma, 3 penalidades, logit_bias) | testada |
+| API no formato do llama-server (OpenAI chat/completions/responses, Anthropic messages, nativa, infill, SSE, auth, reasoning, tool calls, logprobs) | 56/56 em `tests/api_conformance.py` |
+| Amostragem (top-k/p, min-p, typical, top-n-sigma, 3 penalidades, logit_bias, DRY, XTC, dynatemp, mirostat 1/2) | testada |
+| Geração restrita (GBNF, JSON schema, `response_format`) | testada; saída idêntica à do llama-server |
 | Conversão HF → GGUF | Qwen3-8B convertido e executado |
 | Benchmark | funciona |
 
@@ -447,10 +448,22 @@ para que clientes feitos para ele funcionem sem mudança:
 - **Saúde e metadados:** `/health`, `/v1/health`, `/props`, `/models`,
   `/v1/models`, `/slots` e `/metrics` (501, como o llama-server sem
   `--metrics`).
-- **Geração:** `/completion` e `/completions` (nativos), `/v1/completions`,
-  `/chat/completions` e `/v1/chat/completions`.
+- **Geração:** `/completion` e `/completions` (nativos), `/infill`,
+  `/v1/completions`, `/chat/completions` e `/v1/chat/completions`,
+  `/v1/responses` (e `/responses`, OpenAI Responses) e `/v1/messages`
+  (Anthropic Messages), todos com stream.
+- **Contagem:** `/v1/chat/completions/input_tokens`,
+  `/v1/responses/input_tokens` e `/v1/messages/count_tokens` (com e sem
+  `/v1`).
 - **Utilitários:** `/tokenize` (com `with_pieces`), `/detokenize` e
   `/apply-template`.
+- **Sem suporte, respondendo como o llama-server sem a feature:** embeddings
+  (`/embedding(s)`, `/v1/embeddings`), rerank (`/rerank`, `/reranking`,
+  `/v1/rerank(ing)`), `POST /props`, `POST /slots/{id}`,
+  `/v1/audio/transcriptions` (501); `/lora-adapters` (lista vazia /
+  `success`); `/v1/chat/completions/control` (id desconhecido). Esses handlers
+  leem o corpo antes de responder: sem isso a conexão fechava com o cliente
+  ainda enviando e ele via um reset em vez do 501.
 
 Cada resposta traz `timings`, `usage.prompt_tokens_details.cached_tokens` e
 `system_fingerprint`; o stream respeita `stream_options.include_usage`. Erros
@@ -467,15 +480,51 @@ vêm como `{"error": {"code", "message", "type"}}`.
   `<function=..><parameter=..>` do Qwen3.5+ ou JSON do Qwen2.5/3), com
   `finish_reason: tool_calls`. `reasoning_format: none` (ou
   `--reasoning-format none`) deixa o pensamento no `content`.
+- **Responses e Messages** são convertidos para a forma de chat
+  (`responses_to_chat`, `anthropic_to_chat`: `instructions`/`system`,
+  itens `function_call`/`function_call_output`, blocos `tool_use`/
+  `tool_result`/`thinking`, `text.format`, `thinking.type`,
+  `stop_sequences`) e passam pelo mesmo caminho (`chat_job`,
+  `stream_chat`); só a saída muda. Os eventos do Responses levam
+  `sequence_number`/`output_index` como os da OpenAI; os blocos do Messages
+  fecham um antes do próximo abrir, como na Anthropic.
+- **Amostragem:** a cadeia completa do llama.cpp (penalties → DRY →
+  top-n-sigma → top-k → typical → top-p → min-p → XTC → temperatura, com
+  temperatura dinâmica; mirostat 1/2 substitui o que vem depois do DRY). Os
+  `dry_sequence_breakers` viram uma máscara de tokens (o token cujo texto
+  contém um breaker). `ignore_eos` é `logit_bias` -inf nos tokens de fim
+  (reportado como `{"bias": null, "token"}`, como o llama-server).
+- **Gramática** (`airun-core/src/grammar.rs`): GBNF completo (regras,
+  grupos, classes, `* + ? {m,n}`, escapes), autômato com pilhas sobre code
+  points (um caractere partido entre tokens é carregado), e conversor de JSON
+  schema no estilo do llama.cpp (ordem das propriedades preservada; por isso
+  o `serde_json` usa `preserve_order`). `grammar` > `json_schema` >
+  `response_format`. A máscara testa os 256 tokens mais prováveis e só cai
+  para o vocabulário inteiro se nenhum servir. Com o prompt abrindo
+  `<think>`, a gramática espera o `</think>` (`Grammar::after`): o modelo
+  pensa livre e a restrição vale para a resposta. Custo: ~38 contra ~49
+  tok/s no 27B.
+- **Probabilidades:** `n_probs` (nativo), `logprobs: N` (/v1/completions) e
+  `logprobs` + `top_logprobs` (chat) vêm do softmax dos logits crus, antes
+  dos amostradores, como no llama.cpp, inclusive o token de fim; também no
+  stream.
+- **Infill:** `<|repo_name|>myproject`, cada `input_extra`, `<|file_sep|>
+  filename`, depois `<|fim_prefix|>…<|fim_suffix|>…<|fim_middle|>` — o
+  formato do llama.cpp. `<|fim_pad|>`, `<|repo_name|>` e `<|file_sep|>`
+  contam como fim de geração no tokenizer, como no llama.cpp.
 - **Verificação:** `tests/api_conformance.py` grava as respostas de um
-  servidor e as compara chave a chave com as de outro. Em 2026-11-01, com o
-  Qwen3.8-27B, deu 20/20 contra o llama-server b11760, com
-  `/apply-template` idêntico caractere a caractere e o mesmo tool call.
+  servidor e as compara chave a chave (e os nomes de evento SSE) com as de
+  outro. Em 2026-11-01, com o Qwen3.8-27B, deu 56/56 contra o llama-server
+  b11760: gramática, JSON schema, `ignore_eos`, `tool_choice: none`,
+  `json_object`, tool calls e infill com o mesmo texto; `n_probs` dentro de
+  0,002–0,013. No prompt de chat curto sem pensamento o "Hi" sai com
+  logprob -0,175 contra -0,42 no llama.cpp, com prompt e ids idênticos:
+  é numérica do NVFP4 entre os motores, não da API.
 - **Diferença de padrão:** pedidos OpenAI sem `repeat_penalty` usam o
   `--repeat-penalty` do servidor (1,1); o llama-server usa 1,0. O
   `/completion` nativo usa 1,0, como o llama-server.
-- **Ainda não implementado:** `/v1/responses`, `/v1/messages` (Anthropic),
-  `/infill`, embeddings, rerank e `n_probs`.
+- **Ainda não implementado:** embeddings, rerank, áudio, LoRA, slots em
+  arquivo e o controle de uma geração em andamento (`/control`).
 
 ### KV cache quantizado (`--kv-type f16|q8_0|q4_0`)
 

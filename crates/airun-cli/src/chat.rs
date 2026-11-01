@@ -146,6 +146,16 @@ pub fn parse_reply(text: &str, opened: bool, extract_reasoning: bool) -> Reply {
     }
 }
 
+/// [`parse_reply`] for `tool_choice: "none"`: a call the model writes anyway
+/// stays in the content as text, as llama.cpp leaves it.
+pub fn parse_reply_without_tools(text: &str, opened: bool, extract_reasoning: bool) -> Reply {
+    if !extract_reasoning {
+        return Reply { reasoning: None, content: text.trim_end().to_string(), tool_calls: Vec::new() };
+    }
+    let (reasoning, rest) = split_reasoning(text, opened);
+    Reply { reasoning, content: rest.trim().to_string(), tool_calls: Vec::new() }
+}
+
 fn split_reasoning(text: &str, opened: bool) -> (Option<String>, &str) {
     let body = if opened { Some(text) } else { text.trim_start().strip_prefix("<think>") };
     match body {
@@ -222,6 +232,8 @@ pub struct DeltaSplitter {
     done: usize,
     /// A tool call has started: no more content goes out.
     in_tools: bool,
+    /// Tool calls are recognised at all (not with `tool_choice: "none"`).
+    tools: bool,
     /// Just past `</think>`: the blank line before the answer, which may come
     /// in later tokens, is dropped (llama.cpp's content starts at the answer).
     skip_ws: bool,
@@ -240,7 +252,13 @@ const TOOL_START: &str = "<tool_call>";
 impl DeltaSplitter {
     pub fn new(opened: bool, extract_reasoning: bool) -> Self {
         Self { extract_reasoning, in_reasoning: opened && extract_reasoning, done: 0, in_tools: false,
-            skip_ws: false }
+            tools: true, skip_ws: false }
+    }
+
+    /// Streams `<tool_call>` text as content instead of holding it back.
+    pub fn without_tools(mut self) -> Self {
+        self.tools = false;
+        self
     }
 
     /// Deltas for `text`, the whole reply so far; `hold` trailing bytes may
@@ -273,6 +291,12 @@ impl DeltaSplitter {
                 if "<think>".starts_with(t) && !t.is_empty() {
                     return out; // could still become <think>
                 }
+            }
+            if !self.in_reasoning && !self.tools {
+                let cut = floor_char(pending, pending.len());
+                push(&mut out, false, &pending[..cut]);
+                self.done += cut;
+                return out;
             }
             let marker = if self.in_reasoning { THINK_END } else { TOOL_START };
             if let Some(at) = pending.find(marker) {

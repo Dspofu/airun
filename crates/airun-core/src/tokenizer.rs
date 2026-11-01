@@ -142,13 +142,16 @@ impl Tokenizer {
         let eos = get_id("tokenizer.ggml.eos_token_id");
 
         // Any control token that looks like an end-of-turn marker also stops
-        // generation; chat models emit these instead of the raw EOS.
+        // generation; chat models emit these instead of the raw EOS. The
+        // fill-in-the-middle separators count too, as in llama.cpp: a code
+        // model that writes one has finished the hole it was filling.
         let mut eog: Vec<u32> = special
             .iter()
             .filter(|(t, _)| {
                 matches!(
                     t.as_str(),
                     "<|im_end|>" | "<|endoftext|>" | "<|eot_id|>" | "<end_of_turn>"
+                        | "<|fim_pad|>" | "<|repo_name|>" | "<|file_sep|>"
                 )
             })
             .map(|(_, id)| *id)
@@ -374,6 +377,14 @@ impl Tokenizer {
         for &id in ids {
             self.token_bytes(id, false, &mut out);
         }
+        out
+    }
+
+    /// One token's bytes as text a client sees: special tokens are empty, as
+    /// in llama.cpp's probabilities and in a grammar's view of the vocabulary.
+    pub fn piece_bytes(&self, id: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.token_bytes(id, true, &mut out);
         out
     }
 

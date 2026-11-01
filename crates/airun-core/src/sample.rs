@@ -1,10 +1,12 @@
 //! Token sampling.
 //!
-//! The chain is bias -> penalties -> top-n-sigma -> top-k -> typical -> top-p
-//! -> min-p -> temperature, which is the order llama.cpp uses and the one the
-//! OpenAI API assumes. The order is not cosmetic: applying temperature first
-//! would change what top-p selects, and running top-p before top-k would make
-//! top-k a no-op on any distribution top-p already narrowed.
+//! The chain is grammar -> bias -> penalties -> DRY -> top-n-sigma -> top-k ->
+//! typical -> min-p -> top-p -> XTC -> temperature (dynamic when asked), the
+//! order llama.cpp uses and the one the OpenAI API assumes; mirostat, when on,
+//! replaces everything after DRY, as in llama.cpp. The order is not cosmetic:
+//! applying temperature first would change what top-p selects, and running
+//! top-p before top-k would make top-k a no-op on any distribution top-p
+//! already narrowed.
 //!
 //! Every filter keeps at least one candidate. A filter that can empty the set
 //! turns an aggressive setting into a silent fallback to a different sampler,
@@ -41,6 +43,30 @@ pub struct SamplingParams {
     /// f32::NEG_INFINITY removes it from consideration entirely.
     pub logit_bias: Vec<(u32, f32)>,
     pub seed: u64,
+    /// Dynamic temperature: the temperature moves within +-range with the
+    /// candidates' normalized entropy raised to `exponent`. 0 disables.
+    pub dynatemp_range: f32,
+    pub dynatemp_exponent: f32,
+    /// XTC ("exclude top choices"): with this probability, every candidate at
+    /// or above `xtc_threshold` but the least likely of them is removed. 0
+    /// disables.
+    pub xtc_probability: f32,
+    pub xtc_threshold: f32,
+    /// DRY ("don't repeat yourself"): a token that would extend a sequence
+    /// already seen in the last `dry_penalty_last_n` tokens (0: all of them)
+    /// loses `multiplier * base^(length - allowed_length)` of logit once the
+    /// repeat is `allowed_length` long. 0 disables. Tokens marked in
+    /// `dry_breakers` (indexed by id) end any sequence.
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: usize,
+    pub dry_penalty_last_n: usize,
+    pub dry_breakers: std::sync::Arc<Vec<bool>>,
+    /// Mirostat 1 or 2 (0 disables): adaptive truncation that holds the text's
+    /// surprise near `tau`, learning at `eta`.
+    pub mirostat: u8,
+    pub mirostat_tau: f32,
+    pub mirostat_eta: f32,
 }
 
 impl Default for SamplingParams {
@@ -58,11 +84,27 @@ impl Default for SamplingParams {
             repeat_last_n: 64,
             logit_bias: Vec::new(),
             seed: 0,
+            ..Self::off()
         }
     }
 }
 
 impl SamplingParams {
+    /// The samplers llama.cpp adds on top of the classic chain, all off, at
+    /// llama.cpp's default settings.
+    fn off() -> Self {
+        Self {
+            temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, typical_p: 1.0, top_n_sigma: 0.0,
+            repeat_penalty: 1.0, presence_penalty: 0.0, frequency_penalty: 0.0, repeat_last_n: 0,
+            logit_bias: Vec::new(), seed: 0,
+            dynatemp_range: 0.0, dynatemp_exponent: 1.0,
+            xtc_probability: 0.0, xtc_threshold: 0.1,
+            dry_multiplier: 0.0, dry_base: 1.75, dry_allowed_length: 2, dry_penalty_last_n: 0,
+            dry_breakers: std::sync::Arc::new(Vec::new()),
+            mirostat: 0, mirostat_tau: 5.0, mirostat_eta: 0.1,
+        }
+    }
+
     /// Deterministic decoding.
     pub fn greedy() -> Self {
         Self {
@@ -78,18 +120,41 @@ impl SamplingParams {
             repeat_last_n: 0,
             logit_bias: Vec::new(),
             seed: 0,
+            ..Self::off()
         }
     }
 }
 
+/// One sampled token's log-probability and the likeliest alternatives, from
+/// the model's raw distribution (before any sampler), as llama.cpp reports
+/// them for `n_probs` and `logprobs`.
+#[derive(Debug, Clone)]
+pub struct TokenProbs {
+    pub token: u32,
+    pub logprob: f32,
+    /// Best first.
+    pub top: Vec<(u32, f32)>,
+}
+
+/// Where a sampler records [`TokenProbs`], one per sampled token, for the
+/// caller to read while generation runs.
+pub type ProbsSink = std::sync::Arc<std::sync::Mutex<Vec<TokenProbs>>>;
+
 pub struct Sampler {
     params: SamplingParams,
+    /// Only tokens this grammar allows are sampled.
+    grammar: Option<crate::grammar::Grammar>,
+    /// How many alternatives to record per token, and where.
+    n_probs: usize,
+    probs: Option<ProbsSink>,
     rng: Rng,
     /// Scratch reused between calls to keep sampling allocation-free.
     candidates: Vec<(u32, f32)>,
     /// Occurrence counts over the penalty window, indexed by token id. Sized
     /// lazily on first use so a sampler with penalties off costs nothing.
     counts: Vec<u32>,
+    /// Mirostat's running target surprise.
+    mu: f32,
 }
 
 impl Sampler {
@@ -107,13 +172,37 @@ impl Sampler {
         Self {
             params,
             rng: Rng::new(seed),
+            grammar: None,
+            n_probs: 0,
+            probs: None,
             candidates: Vec::new(),
             counts: Vec::new(),
+            mu: 2.0 * 5.0,
         }
+        .with_mu()
+    }
+
+    fn with_mu(mut self) -> Self {
+        self.mu = 2.0 * self.params.mirostat_tau;
+        self
     }
 
     pub fn params(&self) -> &SamplingParams {
         &self.params
+    }
+
+    /// Constrains sampling to `grammar`.
+    pub fn with_grammar(mut self, grammar: crate::grammar::Grammar) -> Self {
+        self.grammar = Some(grammar);
+        self
+    }
+
+    /// Records each sampled token's probabilities and its `n` likeliest
+    /// alternatives into `sink`.
+    pub fn with_probs(mut self, n: usize, sink: ProbsSink) -> Self {
+        self.n_probs = n;
+        self.probs = Some(sink);
+        self
     }
 
     /// True when [`sample`] reduces to the argmax of the raw logits: no
@@ -123,11 +212,27 @@ impl Sampler {
         let p = &self.params;
         let penalizing = (p.repeat_penalty != 1.0 || p.presence_penalty != 0.0
             || p.frequency_penalty != 0.0) && p.repeat_last_n > 0;
-        p.temperature <= 0.0 && p.logit_bias.is_empty() && !penalizing
+        p.temperature <= 0.0 && p.logit_bias.is_empty() && !penalizing && p.dry_multiplier <= 0.0
+            && self.grammar.is_none() && self.probs.is_none()
     }
 
     /// Picks the next token. `logits` is modified in place.
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
+        let raw = self.probs.is_some().then(|| logits.to_vec());
+        if let Some(g) = &self.grammar {
+            g.mask(logits);
+        }
+        let token = self.pick(logits, history);
+        if let Some(g) = &mut self.grammar {
+            g.accept(token);
+        }
+        if let (Some(raw), Some(sink)) = (raw, &self.probs) {
+            sink.lock().unwrap().push(token_probs(&raw, token, self.n_probs));
+        }
+        token
+    }
+
+    fn pick(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
         for &(token, bias) in &self.params.logit_bias {
             if let Some(l) = logits.get_mut(token as usize) {
                 *l += bias;
@@ -149,12 +254,20 @@ impl Sampler {
             );
         }
 
+        if self.params.dry_multiplier > 0.0 {
+            apply_dry(logits, history, &self.params);
+        }
+
         if self.params.top_n_sigma > 0.0 {
             apply_top_n_sigma(logits, self.params.top_n_sigma);
         }
 
         if self.params.temperature <= 0.0 {
             return argmax(logits);
+        }
+
+        if self.params.mirostat != 0 {
+            return self.sample_mirostat(logits);
         }
 
         self.candidates.clear();
@@ -175,9 +288,10 @@ impl Sampler {
         }
         self.candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
-        // Softmax over the surviving candidates, at temperature.
+        // Softmax over the surviving candidates, at temperature -- or at the
+        // dynamic temperature their spread calls for.
         let max = self.candidates[0].1;
-        let inv_t = 1.0 / self.params.temperature;
+        let inv_t = 1.0 / self.dynamic_temperature(max);
         let mut sum = 0f32;
         for c in &mut self.candidates {
             let prob = (((c.1 - max) * inv_t) as f64).exp() as f32;
@@ -212,6 +326,15 @@ impl Sampler {
             self.candidates.truncate(cut.max(1));
         }
 
+        if self.params.xtc_probability > 0.0 && self.rng.next_f32() < self.params.xtc_probability {
+            // Candidates are in descending probability: drop the leading ones
+            // above the threshold but the last of them.
+            let above = self.candidates.iter().take_while(|c| c.1 >= self.params.xtc_threshold).count();
+            if above >= 2 {
+                self.candidates.drain(..above - 1);
+            }
+        }
+
         let total: f32 = self.candidates.iter().map(|c| c.1).sum();
         if total <= 0.0 {
             // Every survivor rounded to zero probability, which a very cold
@@ -227,6 +350,156 @@ impl Sampler {
             }
         }
         self.candidates[self.candidates.len() - 1].0
+    }
+}
+
+/// `token`'s log-probability under softmax(`logits`) and the `n` best.
+fn token_probs(logits: &[f32], token: u32, n: usize) -> TokenProbs {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max + logits.iter().map(|&l| ((l - max) as f64).exp()).sum::<f64>().ln() as f32;
+    let mut ids: Vec<u32> = (0..logits.len() as u32).collect();
+    let n = n.min(ids.len());
+    let mut top = Vec::new();
+    if n > 0 {
+        ids.select_nth_unstable_by(n - 1, |&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+        ids.truncate(n);
+        ids.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+        top = ids.iter().map(|&i| (i, logits[i as usize] - lse)).collect();
+    }
+    let logprob = logits.get(token as usize).map_or(f32::NEG_INFINITY, |&l| l - lse);
+    TokenProbs { token, logprob, top }
+}
+
+impl Sampler {
+    /// The temperature for this step: the configured one, or with dynamic
+    /// temperature the one between `t - range` and `t + range` that the
+    /// candidates' normalized entropy (at temperature 1) calls for.
+    fn dynamic_temperature(&self, max: f32) -> f32 {
+        let (t, r) = (self.params.temperature, self.params.dynatemp_range);
+        if r <= 0.0 || self.candidates.len() < 2 {
+            return t;
+        }
+        let ps: Vec<f64> = self.candidates.iter().map(|c| ((c.1 - max) as f64).exp()).collect();
+        let sum: f64 = ps.iter().sum();
+        let entropy: f64 = -ps.iter().map(|p| p / sum).filter(|&p| p > 0.0).map(|p| p * p.ln()).sum::<f64>();
+        let norm = (entropy / (self.candidates.len() as f64).ln()).clamp(0.0, 1.0);
+        let (lo, hi) = ((t - r).max(0.0), t + r);
+        (lo + (hi - lo) * norm.powf(self.params.dynatemp_exponent as f64) as f32).max(1e-6)
+    }
+
+    /// Mirostat 1 or 2 over the whole vocabulary at temperature, updating mu
+    /// from the surprise of the token it picks.
+    fn sample_mirostat(&mut self, logits: &[f32]) -> u32 {
+        let inv_t = 1.0 / self.params.temperature;
+        self.candidates.clear();
+        self.candidates.extend(logits.iter().copied().enumerate().map(|(i, l)| (i as u32, l * inv_t)));
+        let max = self.candidates.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0f64;
+        for c in &mut self.candidates {
+            c.1 = ((c.1 - max) as f64).exp() as f32;
+            sum += c.1 as f64;
+        }
+        for c in &mut self.candidates {
+            c.1 = (c.1 as f64 / sum) as f32;
+        }
+        // Only the head of the distribution is ever kept, so it alone gets
+        // sorted: sorting the whole vocabulary every token cost a fifth of
+        // the decode speed.
+        let by_prob = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1);
+        let head = |c: &mut Vec<(u32, f32)>, k: usize| {
+            let k = k.clamp(1, c.len());
+            if k < c.len() {
+                c.select_nth_unstable_by(k - 1, by_prob);
+                c.truncate(k);
+            }
+            c.sort_unstable_by(by_prob);
+        };
+        let (tau, eta) = (self.params.mirostat_tau, self.params.mirostat_eta);
+        if self.params.mirostat == 1 {
+            // Estimate the Zipf exponent from the top 100 and pick k from mu.
+            let n = self.candidates.len() as f64;
+            let mut all = std::mem::take(&mut self.candidates);
+            let mut top = all.clone();
+            head(&mut top, 101);
+            self.candidates = top;
+            let m = 100.min(self.candidates.len() - 1);
+            let (mut num, mut den) = (0f64, 0f64);
+            for i in 0..m {
+                let t_i = ((i + 2) as f64 / (i + 1) as f64).ln();
+                let b_i = (self.candidates[i].1 as f64 / self.candidates[i + 1].1.max(f32::MIN_POSITIVE) as f64).ln();
+                num += t_i * b_i;
+                den += t_i * t_i;
+            }
+            let s_hat = if den > 0.0 { num / den } else { 1.0 };
+            let eps = s_hat - 1.0;
+            let k = ((eps * 2f64.powf(self.mu as f64)) / (1.0 - n.powf(-eps))).powf(1.0 / s_hat);
+            let k = if k.is_finite() { k as usize } else { all.len() };
+            head(&mut all, k);
+            self.candidates = all;
+        } else {
+            // Surprise -log2(p) at most mu: p at least 2^-mu.
+            let floor = 2f32.powf(-self.mu);
+            let best = self.candidates.iter().copied().max_by(by_prob).expect("non-empty vocabulary");
+            self.candidates.retain(|c| c.1 >= floor);
+            if self.candidates.is_empty() {
+                self.candidates.push(best);
+            }
+            self.candidates.sort_unstable_by(by_prob);
+        }
+        let total: f32 = self.candidates.iter().map(|c| c.1).sum();
+        let mut target = self.rng.next_f32() * total;
+        let mut pick = self.candidates[self.candidates.len() - 1];
+        for c in &self.candidates {
+            target -= c.1;
+            if target <= 0.0 {
+                pick = *c;
+                break;
+            }
+        }
+        let surprise = -(pick.1 / total).max(f32::MIN_POSITIVE).log2();
+        self.mu -= eta * (surprise - tau);
+        pick.0
+    }
+}
+
+/// DRY: for every earlier position whose preceding tokens repeat the end of
+/// the history, the token that followed it would extend the repeat; it loses
+/// logit by how long that repeat already is. A breaker token stops the match.
+fn apply_dry(logits: &mut [f32], history: &[u32], p: &SamplingParams) {
+    let n = history.len();
+    if n < 2 {
+        return;
+    }
+    let window = if p.dry_penalty_last_n == 0 { n } else { p.dry_penalty_last_n.min(n) };
+    let start = n - window;
+    let breaks = |t: u32| p.dry_breakers.get(t as usize).copied().unwrap_or(false);
+    let last = history[n - 1];
+    if breaks(last) {
+        return;
+    }
+    let mut penalty_len: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for j in start..n - 1 {
+        if history[j] != last {
+            continue;
+        }
+        // Length of the repeat ending at j against the one ending at n - 1.
+        let mut len = 0;
+        while len <= j - start && history[j - len] == history[n - 1 - len] && !breaks(history[j - len]) {
+            len += 1;
+            if j < len + start {
+                break;
+            }
+        }
+        let next = history[j + 1];
+        if len >= p.dry_allowed_length && !breaks(next) {
+            let e = penalty_len.entry(next).or_insert(0);
+            *e = (*e).max(len);
+        }
+    }
+    for (tok, len) in penalty_len {
+        if let Some(l) = logits.get_mut(tok as usize) {
+            *l -= p.dry_multiplier * p.dry_base.powf((len - p.dry_allowed_length) as f32);
+        }
     }
 }
 
@@ -405,6 +678,40 @@ mod tests {
         let mut s = Sampler::new(SamplingParams::greedy());
         let mut logits = vec![0.1, 5.0, 0.3, 2.0];
         assert_eq!(s.sample(&mut logits, &[]), 1);
+    }
+
+    #[test]
+    fn dry_penalizes_the_token_that_would_extend_a_repeat() {
+        // "1 2 3 ... 1 2" : 3 would repeat "1 2 3"; 4 would not.
+        let history = [1u32, 2, 3, 9, 1, 2];
+        let params = SamplingParams { dry_multiplier: 1.0, dry_allowed_length: 2, ..SamplingParams::greedy() };
+        let mut logits = vec![0.0f32; 10];
+        apply_dry(&mut logits, &history, &params);
+        assert!(logits[3] < 0.0);
+        assert_eq!(logits[4], 0.0);
+        // A breaker inside the repeat ends it.
+        let mut breakers = vec![false; 10];
+        breakers[2] = true;
+        let params = SamplingParams { dry_breakers: std::sync::Arc::new(breakers), ..params };
+        let mut logits = vec![0.0f32; 10];
+        apply_dry(&mut logits, &history, &params);
+        assert_eq!(logits[3], 0.0);
+    }
+
+    #[test]
+    fn mirostat_samples_from_the_head_and_adapts() {
+        for version in [1u8, 2] {
+            let params = SamplingParams { temperature: 1.0, mirostat: version, seed: 9, ..SamplingParams::greedy() };
+            let mut s = Sampler::new(params);
+            let mu0 = s.mu;
+            let base: Vec<f32> = (0..1000).map(|i| -(i as f32) * 0.05).collect();
+            for _ in 0..20 {
+                let mut logits = base.clone();
+                let t = s.sample(&mut logits, &[]);
+                assert!(t < 1000);
+            }
+            assert_ne!(s.mu, mu0, "mirostat {version} must learn");
+        }
     }
 
     #[test]

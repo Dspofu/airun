@@ -125,7 +125,12 @@ Get-Content prompt.txt | airun run modelo.gguf -n 500
 
 ## `airun serve`
 
-Sobe uma API HTTP compatível com OpenAI.
+Sobe uma API HTTP no formato do llama-server: OpenAI (chat, completions,
+responses), Anthropic (messages), a nativa do llama.cpp (`/completion`,
+`/infill`) e os utilitários. Os campos de amostragem (`dry_*`, `xtc_*`,
+`dynatemp_*`, `mirostat*`), `grammar`, `json_schema`, `response_format`,
+`n_probs`/`logprobs` e `ignore_eos` vão na requisição, como no llama-server;
+não há flags de servidor para eles.
 
 | Flag | Padrão | O que faz |
 |---|---|---|
