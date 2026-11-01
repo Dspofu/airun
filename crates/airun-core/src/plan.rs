@@ -272,6 +272,24 @@ pub fn scratch_bytes(cfg: &Config, batch: usize, hosts_output: bool) -> u64 {
     total += b * 4; // position ids
     // Bound split-attention scratch at its maximum, including long contexts.
     total += (cfg.n_head * 128 * (cfg.head_dim + 2) * 4) as u64;
+    // Hyper-connections widen the residual to `count` streams, and a mix
+    // holds the normalized streams and their gate; the PLE layer's device
+    // also keeps its key, gated value and embedding rows.
+    if let Some(h) = &cfg.hc {
+        let wide = b * (h.count * cfg.n_embd) as u64;
+        total += ((h.count as u64 - 1) * b * cfg.n_embd as u64 + 2 * wide) * f32_size;
+        if let Some(p) = &cfg.ple {
+            total += (2 * wide + b * cfg.n_embd as u64 + b * (p.n_heads() * p.head_dim) as u64) * f32_size;
+        }
+    }
+    // Batched MoE keeps every (token, expert) pair's output for the combine.
+    if let Some(moe) = &cfg.moe {
+        total += b * (moe.n_experts_used * cfg.n_embd) as u64 * f32_size;
+    }
+    // The QSA indexer's queries and keys.
+    if let Some(ix) = &cfg.indexer {
+        total += b * ((ix.heads + 1) * ix.dim) as u64 * f32_size;
+    }
 
     total + total / 4
 }
@@ -652,7 +670,7 @@ mod tests {
             hc: None,
             ple: None,
             ssm_gate_sigmoid: false,
-            indexer_top_k: 0,
+            indexer: None,
         }
     }
 

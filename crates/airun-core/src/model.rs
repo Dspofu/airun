@@ -161,6 +161,19 @@ pub struct AttentionWeights {
     pub output: GpuTensor,
     pub q_norm: Option<DeviceBuffer<f32>>,
     pub k_norm: Option<DeviceBuffer<f32>>,
+    /// The QSA indexer, on layers that attend sparsely.
+    pub indexer: Option<IndexerWeights>,
+}
+
+/// The QSA indexer of one attention layer: `heads` query heads and one key
+/// head of `dim`, each RMS-normalized and rotated like the attention's own.
+pub struct IndexerWeights {
+    /// [n_embd] -> [heads * dim].
+    pub q: GpuTensor,
+    /// [n_embd] -> [dim].
+    pub k: GpuTensor,
+    pub q_norm: DeviceBuffer<f32>,
+    pub k_norm: DeviceBuffer<f32>,
 }
 
 /// Gated delta-net (linear attention) block weights.
@@ -433,6 +446,15 @@ impl Model {
                     output: load_packed(gguf, &name("attn_output.weight"), dev, stream, &config)?,
                     q_norm: load_f32_optional(gguf, &name("attn_q_norm.weight"), dev, stream)?,
                     k_norm: load_f32_optional(gguf, &name("attn_k_norm.weight"), dev, stream)?,
+                    indexer: match &config.indexer {
+                        Some(ix) if ix.ratio(l) > 0 => Some(IndexerWeights {
+                            q: load_packed(gguf, &name("indexer.q_proj.weight"), dev, stream, &config)?,
+                            k: load_packed(gguf, &name("indexer.k_proj.weight"), dev, stream, &config)?,
+                            q_norm: load_f32(gguf, &name("indexer.q_norm.weight"), dev, stream)?,
+                            k_norm: load_f32(gguf, &name("indexer.k_norm.weight"), dev, stream)?,
+                        }),
+                        _ => None,
+                    },
                 }),
                 LayerKind::LinearAttention => Block::Linear(LinearAttentionWeights {
                     qkv: load_packed(gguf, &name("attn_qkv.weight"), dev, stream, &config)?,
@@ -638,6 +660,7 @@ fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &St
             output: load_packed(gguf, &name("attn_output.weight"), dev, stream, config)?,
             q_norm: load_f32_optional(gguf, &name("attn_q_norm.weight"), dev, stream)?,
             k_norm: load_f32_optional(gguf, &name("attn_k_norm.weight"), dev, stream)?,
+            indexer: None,
         }),
         ffn_norm: load_f32(gguf, &name(&format!("{}.weight", config.ffn_norm_name)), dev, stream)?,
         ffn: FfnWeights::Dense {

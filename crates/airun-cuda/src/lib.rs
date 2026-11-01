@@ -15,6 +15,7 @@ pub mod ffi;
 pub mod hc;
 pub mod hybrid;
 pub mod ops;
+pub mod qsa;
 pub mod stream;
 
 pub use buffer::{DeviceBuffer, PinnedBuffer};

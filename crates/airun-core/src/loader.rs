@@ -177,11 +177,13 @@ pub fn load(
             };
             placement.notes.push(format!("{note}; {rest}"));
         }
-        if config.indexer_top_k > 0 && placement.ctx > config.indexer_top_k {
-            placement.notes.push(format!(
-                "the model's sparse (QSA) attention is not implemented: past {} tokens airun attends to the whole \
-                 context, where the reference attends to its best-scored {} -- output may drift on long inputs",
-                config.indexer_top_k, config.indexer_top_k));
+        if let Some(ix) = &config.indexer {
+            if placement.ctx > ix.top_k && std::env::var("AIRUN_QSA").as_deref() == Ok("off") {
+                placement.notes.push(format!(
+                    "QSA sparse attention off (AIRUN_QSA=off): past {} tokens every query attends to the whole \
+                     context, where the model was trained to see its best-scored {} -- output may drift",
+                    ix.top_k, ix.top_k));
+            }
         }
         if opts.kv_type != airun_cuda::ops::KvType::F16 {
             placement.notes.push(format!("KV cache {}", opts.kv_type.name()));

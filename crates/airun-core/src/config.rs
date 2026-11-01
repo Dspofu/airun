@@ -247,10 +247,35 @@ pub struct Config {
     pub ple: Option<PleConfig>,
     /// The delta-net output gate is a sigmoid (qwen4exp) rather than SiLU.
     pub ssm_gate_sigmoid: bool,
-    /// The QSA indexer's token budget: attention layers with a nonzero
-    /// compress ratio see only the best-scored blocks beyond this many tokens.
-    /// 0 when the model attends densely.
-    pub indexer_top_k: usize,
+    /// The QSA indexer (qwen4exp): attention layers with a nonzero compress
+    /// ratio see only the best-scored blocks once the context outgrows its
+    /// budget. None when the model attends densely.
+    pub indexer: Option<IndexerConfig>,
+}
+
+/// QSA sparse attention. Every attention layer with a nonzero ratio scores
+/// whole blocks of `ratio` cached tokens with a small multi-head indexer and
+/// attends to the incomplete tail block plus the best blocks, `top_k + ratio
+/// - 1` cells in all (llama.cpp's qwen4exp `build_qsa_top_k`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexerConfig {
+    pub top_k: usize,
+    pub heads: usize,
+    pub dim: usize,
+    /// Block size per layer; 0 where the layer attends densely.
+    pub ratios: Vec<usize>,
+}
+
+impl IndexerConfig {
+    /// The block size of layer `l`, 0 when it attends densely.
+    pub fn ratio(&self, l: usize) -> usize {
+        self.ratios.get(l).copied().unwrap_or(0)
+    }
+
+    /// How many cells a query attends to once its context outgrows them.
+    pub fn width(&self, ratio: usize) -> usize {
+        self.top_k + ratio - 1
+    }
 }
 
 impl Config {
@@ -429,9 +454,7 @@ impl Config {
             }
         }
         let ple = Self::ple_config(gguf, &arch_name)?;
-        let indexer_top_k = Self::arch_key(gguf, &arch_name, "attention.indexer.top_k")
-            .and_then(|v| v.as_usize())
-            .unwrap_or(0);
+        let indexer = Self::indexer_config(gguf, &arch_name, n_layers)?;
 
         let ssm_gate_sigmoid = arch_name == "qwen4exp";
         let cfg = Config {
@@ -467,10 +490,35 @@ impl Config {
             ssm_gate_sigmoid,
             hc,
             ple,
-            indexer_top_k,
+            indexer,
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The `attention.indexer.*` and `attention.compress_ratios` keys, when the
+    /// file has them.
+    fn indexer_config(gguf: &GgufFile, arch: &str, n_layers: usize) -> Result<Option<IndexerConfig>> {
+        let key = |s: &str| Self::arch_key(gguf, arch, s).and_then(|v| v.as_usize()).unwrap_or(0);
+        let (top_k, heads, dim) =
+            (key("attention.indexer.top_k"), key("attention.indexer.head_count"), key("attention.indexer.key_length"));
+        if top_k == 0 {
+            return Ok(None);
+        }
+        let ratios: Vec<usize> = match Self::arch_key(gguf, arch, "attention.compress_ratios") {
+            Some(v) => match v.as_array().and_then(|a| a.as_i64_vec()) {
+                Some(r) => r.into_iter().map(|x| x.max(0) as usize).collect(),
+                None => vec![v.as_usize().unwrap_or(0); n_layers],
+            },
+            None => vec![0; n_layers],
+        };
+        if heads == 0 || dim == 0 || dim % 32 != 0 || ratios.iter().any(|&r| r > 64) {
+            return Err(CoreError::Other(format!(
+                "{arch}.attention.indexer has top_k {top_k}, {heads} heads of {dim} and compress ratios {ratios:?}; \
+                 airun needs heads, a key length that is a multiple of 32 and ratios of at most 64 -- \
+                 the file's metadata is incomplete, re-convert it")));
+        }
+        Ok(Some(IndexerConfig { top_k, heads, dim, ratios }))
     }
 
     /// The `ple.*` keys, when the file has them.
@@ -652,7 +700,14 @@ impl Config {
 
     /// Bytes of KV cache for one layer at `ctx` tokens, both K and V.
     pub fn kv_bytes_per_layer(&self, ctx: usize) -> u64 {
-        2 * (self.n_head_kv * ctx) as u64 * self.kv_type.row_bytes(self.head_dim) as u64
+        // A sparse layer also keeps a pooled indexer key per block and the raw
+        // keys of the newest tokens (a batch's worth); the smallest block size
+        // bounds them.
+        let qsa = self.indexer.as_ref().and_then(|ix| {
+            let r = ix.ratios.iter().copied().filter(|&r| r > 0).min()?;
+            (ctx > ix.width(r)).then(|| (ctx / r * ix.dim * 4 + 4096 * ix.dim * 2) as u64)
+        });
+        2 * (self.n_head_kv * ctx) as u64 * self.kv_type.row_bytes(self.head_dim) as u64 + qsa.unwrap_or(0)
     }
 
     /// KV cache across the whole model.
@@ -780,7 +835,7 @@ mod tests {
             hc: None,
             ple: None,
             ssm_gate_sigmoid: false,
-            indexer_top_k: 0,
+            indexer: None,
         }
     }
 

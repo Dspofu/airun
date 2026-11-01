@@ -493,7 +493,10 @@ __global__ __launch_bounds__(32 * ATTN_WARPS) void attention_kernel(
     const int head_dim,
     const int max_seq,
     const float scale,
-    const int sliding_window) {           // 0 disables the window
+    const int sliding_window,             // 0 disables the window
+    const int32_t* __restrict__ idx,      // QSA: key j is cache row idx[j]; null = row j
+    const uint32_t* __restrict__ mask,    // QSA: bit j of row `token` says key j is seen; null = all
+    const int mask_words) {
 
     extern __shared__ float smem[];
     // Layout: [ATTN_WARPS] maxima, [ATTN_WARPS] sums, then the accumulators.
@@ -532,8 +535,10 @@ __global__ __launch_bounds__(32 * ATTN_WARPS) void attention_kernel(
     const int end = SPLIT ? (int)(((int64_t)pos + 1) * (blockIdx.z + 1) / gridDim.z) : pos + 1;
     for (int j = begin + warp; j < end; j += ATTN_WARPS) {
         if (sliding_window > 0 && (pos - j) >= sliding_window) continue;
+        if (mask && !((mask[(size_t)token * mask_words + (j >> 5)] >> (j & 31)) & 1u)) continue;
+        const int r = idx ? idx[j] : j;
 
-        const uint8_t* kj = kbase + (size_t)j * row;
+        const uint8_t* kj = kbase + (size_t)r * row;
         float dot = 0.0f;
 #pragma unroll
         for (int i = 0; i < MAX_DIM_PER_LANE; ++i) {
@@ -548,7 +553,7 @@ __global__ __launch_bounds__(32 * ATTN_WARPS) void attention_kernel(
         const float p    = __expf(dot - new_max);
 
         running_sum = running_sum * corr + p;
-        const uint8_t* vj = vbase + (size_t)j * row;
+        const uint8_t* vj = vbase + (size_t)r * row;
 #pragma unroll
         for (int i = 0; i < MAX_DIM_PER_LANE; ++i) {
             if (i < dpl) acc[i] = fmaf(p, kv_load<KV>(vj, lane + i * 32), acc[i] * corr);
@@ -694,7 +699,7 @@ struct GqaShape {
 // any is stored, so the requests overlap.
 template <int D, int KV>
 __device__ __forceinline__ void gqa_stage(half* tile, const uint8_t* base, size_t row_bytes,
-                                          int t0, int n, int lane) {
+                                          int t0, int n, int lane, const int32_t* rows) {
     constexpr int PIECES = D / 8;                // 16-byte pieces per fp16 row
     constexpr int TOTAL = GQA_TILE * PIECES;
     constexpr int BATCH = 8;
@@ -706,7 +711,7 @@ __device__ __forceinline__ void gqa_stage(half* tile, const uint8_t* base, size_
             const int idx = (b0 + u) * 32 + lane;
             const int r = idx / PIECES, c = idx % PIECES;
             if (r < n) {
-                const uint8_t* row = base + (size_t)(t0 + r) * row_bytes;
+                const uint8_t* row = base + (size_t)(rows ? rows[t0 + r] : t0 + r) * row_bytes;
                 if constexpr (KV == KV_F16) {
                     v[u] = ((const uint4*)row)[c];
                 } else {
@@ -745,7 +750,8 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
     const int n_kv_heads,
     const int max_seq,
     const float scale,
-    const int sliding_window) {
+    const int sliding_window,
+    const int32_t* __restrict__ idx) {    // QSA: key j is cache row idx[j]; null = row j
 
     using S = GqaShape<D>;
     constexpr int LD = S::LD;
@@ -790,7 +796,7 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
 
     for (int t0 = begin; t0 < end; t0 += GQA_TILE) {
         const int n = min(GQA_TILE, end - t0);
-        gqa_stage<D, KV>(tile, kbase, row_bytes, t0, n, lane);
+        gqa_stage<D, KV>(tile, kbase, row_bytes, t0, n, lane, idx);
         __syncwarp();
 
         // Lane `lane` scores key t0 + lane against every query head.
@@ -841,7 +847,7 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
         }
         __syncwarp();   // every lane is done reading K before V overwrites it
 
-        gqa_stage<D, KV>(tile, vbase, row_bytes, t0, n, lane);
+        gqa_stage<D, KV>(tile, vbase, row_bytes, t0, n, lane, idx);
         __syncwarp();
         for (int j = 0; j < n; ++j) {
             const half* vr = tile + j * LD;
@@ -879,7 +885,7 @@ template <int D>
 static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q, const uint8_t* k,
                                      const uint8_t* v, const int32_t* pos, int heads, int kv_heads,
                                      int max_seq, float scale, int window, int splits,
-                                     cudaStream_t stream) {
+                                     const int32_t* idx, cudaStream_t stream) {
     const dim3 grid(kv_heads, splits);
     const int G = heads / kv_heads;
     const size_t smem = (size_t)G * D * 4 + GqaShape<D>::T_BYTES + (size_t)G * GQA_TILE * 4;
@@ -888,7 +894,7 @@ static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q
         cudaFuncSetAttribute(attention_decode_gqa_kernel<D, KVT>,                          \
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
         attention_decode_gqa_kernel<D, KVT><<<grid, 32, smem, stream>>>(                    \
-            partial, q, k, v, pos, heads, kv_heads, max_seq, scale, window);               \
+            partial, q, k, v, pos, heads, kv_heads, max_seq, scale, window, idx);          \
     } while (0)
     switch (kv_type) {
         case KV_Q8_0: GQA_LAUNCH(KV_Q8_0); break;
@@ -957,7 +963,9 @@ __global__ __launch_bounds__(32 * FlashShape<D>::WARPS) void flash_attention_ker
     const int n_kv_heads,
     const int max_seq,
     const float scale,
-    const int sliding_window) {
+    const int sliding_window,
+    const uint32_t* __restrict__ mask,    // QSA: bit j of row `token` says key j is seen; null = all
+    const int mask_words) {
 
     using namespace nvcuda::wmma;
     using S = FlashShape<D>;
@@ -1025,6 +1033,8 @@ __global__ __launch_bounds__(32 * FlashShape<D>::WARPS) void flash_attention_ker
     const int prow = lane / 2;
     const int phalf = lane % 2;
     const int my_pos = row_pos[warp * 16 + prow];
+    const uint32_t* my_mask = mask && my_pos >= 0
+        ? mask + (size_t)(tok0 + warp * 16 + prow) * mask_words : nullptr;
 
     for (int k0 = k_begin; k0 <= hi; k0 += FLASH_KT) {
         // Stage K and V as fp16; keys past `hi` stage zeros and are masked.
@@ -1062,7 +1072,8 @@ __global__ __launch_bounds__(32 * FlashShape<D>::WARPS) void flash_attention_ker
         for (int j = j0; j < j0 + FLASH_KT / 2; ++j) {
             const int key = k0 + j;
             const bool ok = my_pos >= 0 && key <= my_pos &&
-                            (sliding_window <= 0 || my_pos - key < sliding_window);
+                            (sliding_window <= 0 || my_pos - key < sliding_window) &&
+                            (!my_mask || ((my_mask[key >> 5] >> (key & 31)) & 1u));
             const float s = ok ? my_s[prow * LDS + j] : -INFINITY;
             my_s[prow * LDS + j] = s;
             m_tile = fmaxf(m_tile, s);
@@ -1118,7 +1129,7 @@ template <int D>
 static cudaError_t launch_flash(int kv_type, float* out, const float* q, const uint8_t* k,
                                 const uint8_t* v, const int32_t* pos, int n_tokens, int n_heads,
                                 int n_kv_heads, int max_seq, float scale, int window,
-                                cudaStream_t stream) {
+                                const uint32_t* mask, int mask_words, cudaStream_t stream) {
     using S = FlashShape<D>;
     const dim3 grid((n_tokens + S::QT - 1) / S::QT, n_heads);
 #define FLASH_LAUNCH(KVT)                                                                   \
@@ -1126,7 +1137,8 @@ static cudaError_t launch_flash(int kv_type, float* out, const float* q, const u
         cudaFuncSetAttribute(flash_attention_kernel<D, KVT>,                               \
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)S::SMEM);   \
         flash_attention_kernel<D, KVT><<<grid, 32 * S::WARPS, S::SMEM, stream>>>(          \
-            out, q, k, v, pos, n_tokens, n_heads, n_kv_heads, max_seq, scale, window);     \
+            out, q, k, v, pos, n_tokens, n_heads, n_kv_heads, max_seq, scale, window,      \
+            mask, mask_words);                                                             \
     } while (0)
     switch (kv_type) {
         case KV_Q8_0: FLASH_LAUNCH(KV_Q8_0); break;
@@ -1211,7 +1223,9 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
     const int n_kv_heads,
     const int max_seq,
     const float scale,
-    const int sliding_window) {
+    const int sliding_window,
+    const uint32_t* __restrict__ mask,    // QSA: bit j of row `token` says key j is seen; null = all
+    const int mask_words) {
 
     using S = F2Shape<D>;
     constexpr int LD = S::LD;
@@ -1233,6 +1247,8 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
     const int wq0 = tok0 + warp * 16;
     const int pos0 = wq0 + gid < n_tokens ? positions[wq0 + gid] : -1;
     const int pos1 = wq0 + gid + 8 < n_tokens ? positions[wq0 + gid + 8] : -1;
+    const uint32_t* mask0 = mask && pos0 >= 0 ? mask + (size_t)(wq0 + gid) * mask_words : nullptr;
+    const uint32_t* mask1 = mask && pos1 >= 0 ? mask + (size_t)(wq0 + gid + 8) * mask_words : nullptr;
     const size_t row_bytes = kv_row_bytes<KV>(D);
     const uint8_t* kbase = k_cache + (size_t)kvh * max_seq * row_bytes;
     const uint8_t* vbase = v_cache + (size_t)kvh * max_seq * row_bytes;
@@ -1322,7 +1338,15 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
         }
         __syncthreads();
 
-        if (k0 <= whi && k0 + S::KT > wlo) {
+        // Under QSA a warp skips a tile in which none of its queries selected a key.
+        bool seen = true;
+        if (mask) {
+            uint32_t any = 0;
+            for (int w = k0 >> 5; w <= min(k0 + S::KT - 1, whi) >> 5; ++w)
+                any |= (mask0 && w <= (pos0 >> 5) ? mask0[w] : 0u) | (mask1 && w <= (pos1 >> 5) ? mask1[w] : 0u);
+            seen = __any_sync(0xffffffffu, any != 0u);
+        }
+        if (seen && k0 <= whi && k0 + S::KT > wlo) {
             const half* kt = kbuf + st * S::KT * LD;
             const half* vt = vbuf + st * S::KT * LD;
 
@@ -1348,7 +1372,9 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
                 for (int e = 0; e < 4; ++e) {
                     const int key = k0 + 8 * j + tig * 2 + (e & 1);
                     const int pos = e < 2 ? pos0 : pos1;
-                    const bool ok = key <= pos && (sliding_window <= 0 || pos - key < sliding_window);
+                    const uint32_t* mr = e < 2 ? mask0 : mask1;
+                    const bool ok = key <= pos && (sliding_window <= 0 || pos - key < sliding_window) &&
+                                    (!mr || ((mr[key >> 5] >> (key & 31)) & 1u));
                     s[j][e] = ok ? s[j][e] : -INFINITY;
                 }
                 t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
@@ -1415,7 +1441,7 @@ template <int D>
 static cudaError_t launch_flash2(int kv_type, float* out, const float* q, const uint8_t* k,
                                  const uint8_t* v, const int32_t* pos, int n_tokens, int n_heads,
                                  int n_kv_heads, int max_seq, float scale, int window,
-                                 cudaStream_t stream) {
+                                 const uint32_t* mask, int mask_words, cudaStream_t stream) {
     const dim3 grid((n_tokens + F2_QT - 1) / F2_QT, n_heads);
     const size_t smem = F2Shape<D>::SMEM;
 #define F2_LAUNCH(KVT)                                                                      \
@@ -1423,7 +1449,8 @@ static cudaError_t launch_flash2(int kv_type, float* out, const float* q, const 
         cudaFuncSetAttribute(flash2_attention_kernel<D, KVT>,                              \
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
         flash2_attention_kernel<D, KVT><<<grid, 32 * F2_WARPS, smem, stream>>>(            \
-            out, q, k, v, pos, n_tokens, n_heads, n_kv_heads, max_seq, scale, window);     \
+            out, q, k, v, pos, n_tokens, n_heads, n_kv_heads, max_seq, scale, window,      \
+            mask, mask_words);                                                             \
     } while (0)
     switch (kv_type) {
         case KV_Q8_0: F2_LAUNCH(KV_Q8_0); break;
@@ -1494,14 +1521,18 @@ airun_status airun_attention_split(
     void* out, void* partial, const void* q, const void* k, const void* v,
     const void* positions, int32_t heads, int32_t kv_heads, int32_t dim,
     int32_t max_seq, float scale, int32_t window, int32_t splits, int32_t kv_type,
-    cudaStream_t stream) {
+    const void* sel, cudaStream_t stream) {
     if (dim <= 0 || dim % 32 || dim > 256 || kv_heads <= 0 || heads % kv_heads || splits <= 0)
         return AIRUN_ERR_BAD_ARG;
+    // QSA: sel = [count - 1, cache rows...] stands in for the position, so the
+    // kernels walk keys 0..count-1 and read their rows through it.
+    const int32_t* idx = sel ? (const int32_t*)sel + 1 : nullptr;
+    if (sel) positions = sel;
     const dim3 grid(1, heads, splits), block(32, ATTN_WARPS_PREFILL);
     const size_t shared = ATTN_WARPS_PREFILL * (dim + 2) * sizeof(float);
 #define LAUNCH_SPLIT(KV) attention_kernel<ATTN_WARPS_PREFILL, KV, true><<<grid, block, shared, stream>>>( \
         (float*)partial, (const float*)q, (const uint8_t*)k, (const uint8_t*)v,                        \
-        (const int32_t*)positions, heads, kv_heads, dim, max_seq, scale, window)
+        (const int32_t*)positions, heads, kv_heads, dim, max_seq, scale, window, idx, nullptr, 0)
     if (kv_type < KV_F16 || kv_type > KV_Q4_0) return AIRUN_ERR_BAD_ARG;
     const bool gqa = heads / kv_heads <= GQA_MAX && !gqa_decode_disabled() &&
         (dim == 64 || dim == 128 || dim == 256);
@@ -1512,9 +1543,9 @@ airun_status airun_attention_split(
         const int32_t* pp = (const int32_t*)positions;
         float* part = (float*)partial;
         cudaError_t e;
-        if (dim == 64)       e = launch_gqa_decode<64>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, stream);
-        else if (dim == 128) e = launch_gqa_decode<128>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, stream);
-        else                 e = launch_gqa_decode<256>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, stream);
+        if (dim == 64)       e = launch_gqa_decode<64>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, stream);
+        else if (dim == 128) e = launch_gqa_decode<128>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, stream);
+        else                 e = launch_gqa_decode<256>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, stream);
         AIRUN_TRY(e);
     } else {
         switch (kv_type) {
@@ -1691,9 +1722,10 @@ airun_status airun_attention(
     const void* positions,
     int32_t n_tokens, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
     int32_t max_seq, float scale, int32_t sliding_window, int32_t kv_type,
-    cudaStream_t stream) {
+    const void* mask_, int32_t mask_words, cudaStream_t stream) {
 
     if (n_tokens <= 0) return AIRUN_OK;
+    const uint32_t* mask = (const uint32_t*)mask_;
     if (head_dim % 32 != 0 || head_dim > 32 * MAX_DIM_PER_LANE) return AIRUN_ERR_BAD_ARG;
     if (n_kv_heads <= 0 || n_heads % n_kv_heads != 0) return AIRUN_ERR_BAD_ARG;
     if (kv_type < KV_F16 || kv_type > KV_Q4_0) return AIRUN_ERR_BAD_ARG;
@@ -1711,12 +1743,12 @@ airun_status airun_attention(
             const int32_t* pp = (const int32_t*)positions;
             cudaError_t e;
             const bool f2 = !flash2_disabled();
-            if (head_dim == 64)       e = f2 ? launch_flash2<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream)
-                                         : launch_flash<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream);
-            else if (head_dim == 128) e = f2 ? launch_flash2<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream)
-                                         : launch_flash<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream);
-            else                      e = f2 ? launch_flash2<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream)
-                                         : launch_flash<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, stream);
+            if (head_dim == 64)       e = f2 ? launch_flash2<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream)
+                                         : launch_flash<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream);
+            else if (head_dim == 128) e = f2 ? launch_flash2<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream)
+                                         : launch_flash<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream);
+            else                      e = f2 ? launch_flash2<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream)
+                                         : launch_flash<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream);
             AIRUN_TRY(e);
             return AIRUN_OK;
         }
@@ -1729,7 +1761,7 @@ airun_status airun_attention(
         (2 * (WARPS) + (size_t)(WARPS) * head_dim) * sizeof(float), stream>>>(  \
         (float*)out, (const float*)q, (const uint8_t*)k_cache,                  \
         (const uint8_t*)v_cache, (const int32_t*)positions, n_heads,            \
-        n_kv_heads, head_dim, max_seq, scale, sliding_window)
+        n_kv_heads, head_dim, max_seq, scale, sliding_window, nullptr, mask, mask_words)
 #define LAUNCH_KV(WARPS)                                                        \
     switch (kv_type) {                                                          \
         case KV_Q8_0: LAUNCH_ATTENTION(WARPS, KV_Q8_0); break;                  \

@@ -37,7 +37,7 @@ unsafe extern "C" {
     fn airun_attention_split(out: *mut c_void, partial: *mut c_void,
         q: *const c_void, k: *const c_void, v: *const c_void, positions: *const c_void,
         heads: i32, kv_heads: i32, dim: i32, max_seq: i32, scale: f32,
-        window: i32, splits: i32, kv_type: i32, stream: ffi::Stream) -> Status;
+        window: i32, splits: i32, kv_type: i32, sel: *const c_void, stream: ffi::Stream) -> Status;
     fn airun_matvec(
         type_id: i32,
         w: *const c_void,
@@ -166,6 +166,8 @@ unsafe extern "C" {
         scale: f32,
         sliding_window: i32,
         kv_type: i32,
+        mask: *const c_void,
+        mask_words: i32,
         stream: ffi::Stream,
     ) -> Status;
 }
@@ -1032,6 +1034,17 @@ pub fn attention_split(out: *mut c_void, partial: &crate::DeviceBuffer<f32>,
     q: *const c_void, k: *const c_void, v: *const c_void, positions: *const c_void,
     heads: usize, kv_heads: usize, dim: usize, ctx: usize, scale: f32,
     window: usize, splits: usize, kv_type: KvType, stream: &Stream) -> Result<()> {
+    attention_split_sel(out, partial, q, k, v, positions, heads, kv_heads, dim, ctx, scale, window, splits,
+        kv_type, std::ptr::null(), stream)
+}
+
+/// [`attention_split`] over the cells a QSA selection names: `sel` is
+/// `[count - 1, cache row...]` (qsa_select's list) and replaces the position.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_split_sel(out: *mut c_void, partial: &crate::DeviceBuffer<f32>,
+    q: *const c_void, k: *const c_void, v: *const c_void, positions: *const c_void,
+    heads: usize, kv_heads: usize, dim: usize, ctx: usize, scale: f32,
+    window: usize, splits: usize, kv_type: KvType, sel: *const c_void, stream: &Stream) -> Result<()> {
     if dim == 0 || dim > 256 || dim % 32 != 0 || kv_heads == 0 || heads % kv_heads != 0
         || splits == 0 || splits > 256 || partial.len() < heads * splits * (dim + 2) {
         return Err(bad_arg("invalid split attention dimensions or scratch; resize the attention buffers"));
@@ -1041,9 +1054,9 @@ pub fn attention_split(out: *mut c_void, partial: &crate::DeviceBuffer<f32>,
     // position buffers until the stream completes, just as for attention().
     unsafe { ffi::check(airun_attention_split(out, partial.as_mut_ptr(), q, k, v,
         positions, heads as i32, kv_heads as i32, dim as i32, ctx as i32,
-        scale, window as i32, splits as i32, kv_type.id(), stream.raw())) }
+        scale, window as i32, splits as i32, kv_type.id(), sel, stream.raw())) }
     #[cfg(not(airun_cuda))]
-    { let _ = (out, q, k, v, positions, ctx, scale, window, kv_type, stream); Err(CudaError::NotBuiltWithCuda) }
+    { let _ = (out, q, k, v, positions, ctx, scale, window, kv_type, sel, stream); Err(CudaError::NotBuiltWithCuda) }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1061,6 +1074,30 @@ pub fn attention(
     scale: f32,
     sliding_window: usize,
     kv_type: KvType,
+    stream: &Stream,
+) -> Result<()> {
+    attention_masked(out, q, k_cache, v_cache, positions, n_tokens, n_heads, n_kv_heads, head_dim, max_seq,
+        scale, sliding_window, kv_type, None, stream)
+}
+
+/// [`attention`] where query t sees key j only if bit j of `mask` row t is set
+/// (`mask` = (words, words per row), qsa_select's mask).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_masked(
+    out: *mut c_void,
+    q: *const c_void,
+    k_cache: *const c_void,
+    v_cache: *const c_void,
+    positions: *const c_void,
+    n_tokens: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    scale: f32,
+    sliding_window: usize,
+    kv_type: KvType,
+    mask: Option<(*const c_void, usize)>,
     stream: &Stream,
 ) -> Result<()> {
     if head_dim % 32 != 0 || head_dim > 256 {
@@ -1091,12 +1128,14 @@ pub fn attention(
             scale,
             sliding_window as i32,
             kv_type.id(),
+            mask.map_or(std::ptr::null(), |m| m.0),
+            mask.map_or(0, |m| m.1 as i32),
             stream.raw(),
         ))
     }
     #[cfg(not(airun_cuda))]
     {
-        let _ = (out, q, k_cache, v_cache, positions, n_tokens, n_heads, max_seq, scale, sliding_window, kv_type, stream);
+        let _ = (out, q, k_cache, v_cache, positions, n_tokens, n_heads, max_seq, scale, sliding_window, kv_type, mask, stream);
         Err(CudaError::NotBuiltWithCuda)
     }
 }

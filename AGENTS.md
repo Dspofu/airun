@@ -385,9 +385,39 @@ streaming do arquivo (seção acima) continua com `AIRUN_EXPERTS=stream`.
   host num buffer fixado antes de cada replay.
 
 Qwen4 Flash-Next (78 GB, 5070 Ti + 5060 Ti, 64 GB de RAM), prompt de 792
-tokens + 128 gerados, contra o llama.cpp de referência com `--n-cpu-moe 48`:
-prompt 92 vs 42 tok/s, geração 19,5 vs 9,7 tok/s, saída idêntica. A carga leva
-~80 s (fixar ~24 GB de RAM).
+tokens + 128 gerados (`benchmarks/2026-11-01/qwen4.ps1`): airun 92 / 19,4
+tok/s, llama.cpp de referência (`--n-cpu-moe 48`) 31 / 9,5, **Strata 0.1.44
+277 / 32,4** (só a 5070 Ti; experts que faltam na VRAM calculados na CPU com
+AVX2, cache de experts preenchido por um perfil). A airun ainda perde para o
+Strata nesse modelo. A carga leva ~80 s (fixar ~24 GB de RAM).
+
+### Atenção esparsa QSA (qwen4exp)
+
+As camadas de atenção com `compress_ratio` r > 0 só atendem a `top_k + r - 1`
+células (2051 no Qwen4): o bloco final incompleto e os blocos de r tokens com
+maior nota. Kernels em `kernels/qsa.cu`, wrappers em `airun-cuda/src/qsa.rs`,
+orquestração em `Runtime::qsa_select`:
+
+- `qsa_store`: a chave crua do indexador de cada token vai para um anel f16
+  (`QsaCache.ring`, como o cache do indexador do llama.cpp, que é f16).
+- `qsa_pool`: quando o último token de um bloco chega, média das r chaves →
+  RMSNorm (`indexer.k_norm`) → RoPE na primeira posição do bloco. Fica em
+  `QsaCache.pooled` ([ctx/r][128] f32).
+- `qsa_score`: nota = Σ_cabeças relu(q_h · chave), q com RMSNorm e RoPE da
+  posição do token. Pulado quando o contexto da query cabe no orçamento.
+- `qsa_select`: radix select; empate vai para o bloco de menor índice e um
+  bloco pego em parte fica com as primeiras células (o mesmo que o
+  `qsa_select.cu` do Strata). Saída: lista `[count-1, células...]` no decode,
+  que `attention_split_sel` usa no lugar da posição (cabe no CUDA graph), ou
+  uma máscara de bits por query nos lotes (`attention_masked`, que o flash2 usa
+  para pular tiles sem nenhuma célula escolhida).
+
+Com contexto ≤ 2051 a seleção é tudo, e a saída é idêntica à densa. O selftest
+compara pooling, notas, seleção e as duas atenções com a CPU. Perplexidade em
+pedaços de 4096 (posições 2048–4095 pontuadas) num texto de 25 mil tokens:
+referência 5,1563, airun com QSA 5,1684, airun densa (`AIRUN_QSA=off`) 5,1717.
+Em 2048 (tudo denso) a diferença de base airun vs referência já é ±0,5% por
+pedaço, por arredondamento.
 
 ### KV cache quantizado (`--kv-type f16|q8_0|q4_0`)
 

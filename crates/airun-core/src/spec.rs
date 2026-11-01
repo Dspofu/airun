@@ -120,6 +120,7 @@ impl Runtime {
             kv: LayerState::Kv {
                 k: DeviceBuffer::zeroed(dev, kv_bytes, &st.stream)?,
                 v: DeviceBuffer::zeroed(dev, kv_bytes, &st.stream)?,
+                qsa: None,
             },
             h: DeviceBuffer::new(dev, b * cfg.n_embd)?,
             e: DeviceBuffer::new(dev, b * cfg.n_embd)?,

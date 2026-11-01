@@ -1673,6 +1673,7 @@ fn test_attention(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     attention_case(device, stream, report, 16, 2, 128, "head_dim 128, 50-token prefill", &chunk)?;
     attention_case(device, stream, report, 16, 4, 256, "head_dim 256, 50-token prefill", &chunk)?;
     test_split_attention_long(device, stream, report)?;
+    test_qsa(device, stream, report)?;
     test_fused_prologue(device, stream, report)?;
     test_argmax(device, stream, report)?;
     for kv in [ops::KvType::Q8_0, ops::KvType::Q4_0] {
@@ -1901,6 +1902,198 @@ fn test_kv_quant(device: i32, stream: &Stream, report: &mut Report, kv: ops::KvT
     let (chunk_abs, _) = compare(&want, &d_oc.to_vec(stream)?);
     report.case(&format!("{CHUNK}-token prefill attention over {} cache", kv.name()),
         format!("max_abs {chunk_abs:.3e}"), chunk_abs <= 3e-3);
+    Ok(())
+}
+
+/// QSA sparse attention (qwen4exp) against a CPU model of llama.cpp's graph:
+/// the pooled block keys, the block scores, the selected cells (ties to the
+/// lower block, a partly taken block keeping its first cells) and attention
+/// restricted to them, through both the batch mask and the decode list.
+fn test_qsa(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    use airun_cuda::qsa;
+    const DIM: usize = 128;
+    const HEADS: usize = 4;
+    const R: usize = 4;
+    const TOP_K: usize = 64;
+    const WIDTH: usize = TOP_K + R - 1;
+    const CTX: usize = 512;
+    const ROPE: usize = 64;
+    const EPS: f32 = 1e-6;
+    let rope = ops::RopeParams::plain(1e7, 1.0);
+    let mut rng = Rng::new(0x05A_0001);
+
+    // Two calls as two prefill chunks: positions 0..300, then 300..420.
+    let raw = rng.floats(CTX * DIM);
+    let norm: Vec<f32> = rng.floats(DIM).iter().map(|x| 1.0 + 0.5 * x).collect();
+    let calls = [(0usize, 300usize), (300, 120)];
+    let ring_len = 300 + 64;
+    let d_ring = DeviceBuffer::<half::f16>::zeroed(device, ring_len * DIM, stream)?;
+    let d_pooled = DeviceBuffer::<f32>::zeroed(device, CTX / R * DIM, stream)?;
+    let d_norm = DeviceBuffer::from_slice(device, &norm, stream)?;
+    for &(p0, n) in &calls {
+        let pos: Vec<i32> = (p0 as i32..(p0 + n) as i32).collect();
+        let d_pos = DeviceBuffer::from_slice(device, &pos, stream)?;
+        let d_k = DeviceBuffer::from_slice(device, &raw[p0 * DIM..(p0 + n) * DIM], stream)?;
+        qsa::store(d_ring.as_mut_ptr(), d_k.as_ptr(), d_pos.as_ptr(), n, DIM, ring_len, stream)?;
+        qsa::pool(d_pooled.as_mut_ptr(), d_ring.as_ptr(), d_norm.as_ptr(), d_pos.as_ptr(), n, DIM, R, ring_len,
+            CTX / R, EPS, ROPE, rope, stream)?;
+    }
+    let blocks = 420 / R;
+    let mut want_pooled = vec![0f32; blocks * DIM];
+    for b in 0..blocks {
+        let mean: Vec<f32> = (0..DIM).map(|i| {
+            let s: f32 = (0..R).map(|j| half::f16::from_f32(raw[(b * R + j) * DIM + i]).to_f32()).sum();
+            s * (1.0 / R as f32)
+        }).collect();
+        let inv = 1.0 / (mean.iter().map(|x| x * x).sum::<f32>() / DIM as f32 + EPS).sqrt();
+        let x: Vec<f32> = (0..DIM).map(|i| mean[i] * inv * norm[i]).collect();
+        let out = &mut want_pooled[b * DIM..][..DIM];
+        out.copy_from_slice(&x);
+        for p in 0..ROPE / 2 {
+            let (c, sn) = rope.cos_sin(p, ROPE, (b * R) as i32);
+            out[p] = x[p] * c - x[p + ROPE / 2] * sn;
+            out[p + ROPE / 2] = x[p] * sn + x[p + ROPE / 2] * c;
+        }
+    }
+    let pooled = d_pooled.to_vec(stream)?;
+    let (pabs, _) = compare(&want_pooled, &pooled[..blocks * DIM]);
+    report.case("qsa pooled block keys across two calls", format!("max_abs {pabs:.3e}"), pabs <= 5e-4);
+
+    // Scores and selection for the second call's 120 queries, 64 per launch.
+    // Every other query is zero, so all its blocks tie at a score of 0.
+    let n = 120;
+    let pos: Vec<i32> = (300..420).collect();
+    let d_pos = DeviceBuffer::from_slice(device, &pos, stream)?;
+    let mut q = rng.floats(n * HEADS * DIM);
+    for t in (0..n).step_by(2) {
+        for x in &mut q[t * HEADS * DIM..][..HEADS * DIM] { *x = 0.0; }
+    }
+    let d_q = DeviceBuffer::from_slice(device, &q, stream)?;
+    let max_blocks = CTX / R;
+    let words = CTX / 32;
+    let d_scores = DeviceBuffer::<f32>::new(device, 64 * max_blocks)?;
+    let d_mask = DeviceBuffer::<u32>::zeroed(device, n * words, stream)?;
+    let mut score_err = 0f32;
+    let mut sel_ok = true;
+    let mut selected: Vec<Vec<usize>> = Vec::new();
+    for t0 in (0..n).step_by(64) {
+        let g = 64.min(n - t0);
+        qsa::score(d_scores.as_mut_ptr(), max_blocks, d_q.as_ptr(), d_pooled.as_ptr(), d_pos.as_ptr(), t0, g,
+            HEADS, DIM, R, WIDTH, max_blocks, stream)?;
+        qsa::select(d_scores.as_ptr(), max_blocks, d_pos.as_ptr(), t0, g, R, WIDTH, std::ptr::null_mut(),
+            d_mask.as_mut_ptr(), words, stream)?;
+        let sc = d_scores.to_vec(stream)?;
+        for qi in 0..g {
+            let t = t0 + qi;
+            let p = pos[t] as usize;
+            let nb = (p + 1) / R;
+            let s = |b: usize| sc[qi * max_blocks + b];
+            for b in 0..nb {
+                let mut want = 0f32;
+                for h in 0..HEADS {
+                    let d: f32 = (0..DIM).map(|i| q[(t * HEADS + h) * DIM + i] * pooled[b * DIM + i]).sum();
+                    want += d.max(0.0);
+                }
+                score_err = score_err.max((want - s(b)).abs());
+            }
+            // The selection the GPU's own scores call for.
+            let mut order: Vec<usize> = (0..nb).collect();
+            order.sort_by(|&a, &b| s(b).partial_cmp(&s(a)).unwrap().then(a.cmp(&b)));
+            let tail = nb * R;
+            let mut cells: Vec<usize> = (tail..=p).collect();
+            let mut budget = WIDTH - cells.len();
+            for &b in &order {
+                let take = budget.min(R);
+                cells.extend(b * R..b * R + take);
+                budget -= take;
+                if budget == 0 { break; }
+            }
+            cells.sort_unstable();
+            selected.push(cells);
+        }
+    }
+    let mask = d_mask.to_vec(stream)?;
+    for (t, cells) in selected.iter().enumerate() {
+        let p = pos[t] as usize;
+        let got: Vec<usize> = (0..=p).filter(|&j| (mask[t * words + j / 32] >> (j % 32)) & 1 == 1).collect();
+        sel_ok &= &got == cells;
+    }
+    report.case("qsa block scores", format!("max_abs {score_err:.3e}"), score_err <= 1e-4);
+    report.case("qsa selection: tail + best blocks, ties to the lower block", format!("{n} queries"), sel_ok);
+
+    // Attention over the selected cells: head_dim 256, GQA 4x, as qwen4exp.
+    const NH: usize = 8;
+    const NKV: usize = 2;
+    const HD: usize = 256;
+    let k_half: Vec<half::f16> = rng.floats(NKV * CTX * HD).iter().map(|&x| half::f16::from_f32(x)).collect();
+    let v_half: Vec<half::f16> = rng.floats(NKV * CTX * HD).iter().map(|&x| half::f16::from_f32(x)).collect();
+    let qa = rng.floats(n * NH * HD);
+    let scale = 1.0 / (HD as f32).sqrt();
+    let attend = |t: usize, cells: &[usize]| -> Vec<f32> {
+        let mut out = vec![0f32; NH * HD];
+        for h in 0..NH {
+            let kvh = h / (NH / NKV);
+            let qv = &qa[(t * NH + h) * HD..][..HD];
+            let s: Vec<f32> = cells.iter().map(|&j| qv.iter().zip(&k_half[(kvh * CTX + j) * HD..][..HD])
+                .map(|(a, b)| a * b.to_f32()).sum::<f32>() * scale).collect();
+            let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = s.iter().map(|x| (x - m).exp()).collect();
+            let sum: f32 = e.iter().sum();
+            for (ci, &j) in cells.iter().enumerate() {
+                for d in 0..HD {
+                    out[h * HD + d] += e[ci] / sum * v_half[(kvh * CTX + j) * HD + d].to_f32();
+                }
+            }
+        }
+        out
+    };
+    let d_k = DeviceBuffer::from_slice(device, &k_half, stream)?;
+    let d_v = DeviceBuffer::from_slice(device, &v_half, stream)?;
+    let d_qa = DeviceBuffer::from_slice(device, &qa, stream)?;
+    let d_o = DeviceBuffer::<f32>::new(device, n * NH * HD)?;
+    ops::attention_masked(d_o.as_mut_ptr(), d_qa.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_pos.as_ptr(), n, NH, NKV,
+        HD, CTX, scale, 0, ops::KvType::F16, Some((d_mask.as_ptr(), words)), stream)?;
+    let got = d_o.to_vec(stream)?;
+    let want: Vec<f32> = (0..n).flat_map(|t| attend(t, &selected[t])).collect();
+    let (aabs, _) = compare(&want, &got);
+    report.case("qsa prefill attention through the mask (flash)", format!("max_abs {aabs:.3e}"), aabs <= 3e-3);
+    // A single query through the mask: attention_kernel's path.
+    ops::attention_masked(d_o.as_mut_ptr(), d_qa.offset_ptr(7 * NH * HD), d_k.as_ptr(), d_v.as_ptr(),
+        d_pos.offset_ptr(7), 1, NH, NKV, HD, CTX, scale, 0, ops::KvType::F16,
+        Some((d_mask.offset_ptr(7 * words) as *const std::ffi::c_void, words)), stream)?;
+    let mut one = vec![0f32; NH * HD];
+    d_o.copy_to_host(&mut one, stream)?;
+    stream.synchronize()?;
+    let (oabs, _) = compare(&attend(7, &selected[7]), &one);
+    report.case("qsa single-query attention through the mask", format!("max_abs {oabs:.3e}"), oabs <= 1e-3);
+
+    // Decode: one query through the list (the split kernel); position 50 fits
+    // the budget and must attend densely.
+    let d_list = DeviceBuffer::<i32>::new(device, 1 + WIDTH)?;
+    let partial = DeviceBuffer::<f32>::new(device, NH * 16 * (HD + 2))?;
+    let mut dec_err = 0f32;
+    let mut list_ok = true;
+    for (t, p) in [(119usize, 419i32), (118, 418), (5, 50)] {
+        let d_p1 = DeviceBuffer::from_slice(device, &[p], stream)?;
+        qsa::score(d_scores.as_mut_ptr(), max_blocks, d_q.offset_ptr(t * HEADS * DIM), d_pooled.as_ptr(),
+            d_p1.as_ptr(), 0, 1, HEADS, DIM, R, WIDTH, max_blocks, stream)?;
+        qsa::select(d_scores.as_ptr(), max_blocks, d_p1.as_ptr(), 0, 1, R, WIDTH, d_list.as_mut_ptr(),
+            std::ptr::null_mut(), words, stream)?;
+        ops::attention_split_sel(d_o.as_mut_ptr(), &partial, d_qa.offset_ptr(t * NH * HD), d_k.as_ptr(),
+            d_v.as_ptr(), d_p1.as_ptr(), NH, NKV, HD, CTX, scale, 0, 16, ops::KvType::F16, d_list.as_ptr(), stream)?;
+        let mut out = vec![0f32; NH * HD];
+        d_o.copy_to_host(&mut out, stream)?;
+        stream.synchronize()?;
+        let cells: Vec<usize> = if p as usize >= WIDTH { selected[t].clone() } else { (0..=p as usize).collect() };
+        let (e, _) = compare(&attend(t, &cells), &out);
+        dec_err = dec_err.max(e);
+        // The list itself: [count - 1, cells ascending].
+        let list = d_list.to_vec(stream)?;
+        let count = list[0] as usize + 1;
+        list_ok &= list[1..1 + count].iter().map(|&x| x as usize).collect::<Vec<_>>() == cells;
+    }
+    report.case("qsa decode attention through the cell list (split kernel)",
+        format!("max_abs {dec_err:.3e}"), dec_err <= 1e-3 && list_ok);
     Ok(())
 }
 

@@ -14,6 +14,8 @@ use crate::plan::Placement;
 use crate::sample::Sampler;
 use crate::tokenizer::Tokenizer;
 
+use airun_cuda::qsa;
+
 #[path = "spec.rs"]
 mod spec;
 
@@ -24,6 +26,8 @@ enum LayerState {
         // Raw rows in cfg.kv_type's format.
         k: DeviceBuffer<u8>,
         v: DeviceBuffer<u8>,
+        /// The QSA indexer's keys, on layers that attend sparsely.
+        qsa: Option<QsaCache>,
     },
     /// Linear attention: a fixed-size recurrent matrix plus the convolution's
     /// short history. Neither grows with sequence length.
@@ -31,6 +35,36 @@ enum LayerState {
         state: DeviceBuffer<f32>,
         conv: DeviceBuffer<f32>,
     },
+}
+
+/// A sparse attention layer's indexer keys (see airun_cuda::qsa).
+struct QsaCache {
+    /// Raw keys of the newest tokens, [QSA_RING + batch][dim] f16.
+    ring: DeviceBuffer<u16>,
+    ring_len: usize,
+    /// One pooled key per complete block, [ctx / ratio][dim].
+    pooled: DeviceBuffer<f32>,
+    ratio: usize,
+}
+
+/// Extra ring rows beyond the batch: a call reads up to ratio - 1 earlier keys.
+const QSA_RING: usize = 64;
+/// Queries scored and selected per launch in a batch, bounding the scores.
+const QSA_GROUP: usize = 64;
+
+/// Indexer scratch for the sparse attention layers of one device.
+struct QsaScratch {
+    /// Indexer queries [b][heads][dim] and raw keys [b][dim].
+    q: DeviceBuffer<f32>,
+    k: DeviceBuffer<f32>,
+    /// Block scores, [QSA_GROUP][max_blocks].
+    scores: DeviceBuffer<f32>,
+    max_blocks: usize,
+    /// Decode: [count - 1, cells...], what attention_split_sel reads.
+    list: DeviceBuffer<i32>,
+    /// Batches: [b][words] bits of the cells each query sees.
+    mask: DeviceBuffer<u32>,
+    words: usize,
 }
 
 /// Scratch buffers only hybrid models need.
@@ -163,6 +197,7 @@ struct DeviceState {
     hybrid: Option<HybridScratch>,
     moe: Option<MoeScratch>,
     hc: Option<HcScratch>,
+    qsa: Option<QsaScratch>,
 
     /// One entry per layer on this device, in the same order as `layers`.
     states: Vec<LayerState>,
@@ -298,6 +333,18 @@ impl Runtime {
                     LayerKind::Attention => LayerState::Kv {
                         k: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim), &stream)?,
                         v: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim), &stream)?,
+                        qsa: match qsa_ratio(cfg, l, ctx) {
+                            Some(ratio) => {
+                                let dim = cfg.indexer.as_ref().expect("qsa_ratio checked it").dim;
+                                Some(QsaCache {
+                                    ring: DeviceBuffer::zeroed(dev, (QSA_RING + b) * dim, &stream)?,
+                                    ring_len: QSA_RING + b,
+                                    pooled: DeviceBuffer::zeroed(dev, ctx / ratio * dim, &stream)?,
+                                    ratio,
+                                })
+                            }
+                            None => None,
+                        },
                     },
                     LayerKind::LinearAttention => {
                         let ssm = cfg.ssm.as_ref().ok_or_else(|| {
@@ -423,6 +470,26 @@ impl Runtime {
                 None => None,
             };
 
+            // The smallest block size among this device's sparse layers sets
+            // the most blocks a query can score.
+            let qsa_scratch = match (&cfg.indexer, shard.layers.iter().filter_map(|&l| qsa_ratio(cfg, l, ctx)).min()) {
+                (Some(ix), Some(ratio)) => {
+                    let max_blocks = ctx / ratio;
+                    let words = ctx.div_ceil(32);
+                    Some(QsaScratch {
+                        q: DeviceBuffer::new(dev, b * ix.heads * ix.dim)?,
+                        k: DeviceBuffer::new(dev, b * ix.dim)?,
+                        scores: DeviceBuffer::new(dev, QSA_GROUP.min(b) * max_blocks)?,
+                        max_blocks,
+                        list: DeviceBuffer::new(dev, 1 + shard.layers.iter()
+                            .filter_map(|&l| qsa_ratio(cfg, l, ctx)).map(|r| ix.width(r)).max().unwrap_or(0))?,
+                        mask: DeviceBuffer::new(dev, b * words)?,
+                        words,
+                    })
+                }
+                _ => None,
+            };
+
             states.push(DeviceState {
                 device: dev,
                 stream,
@@ -462,6 +529,7 @@ impl Runtime {
                 hybrid: hybrid_scratch,
                 moe: moe_scratch,
                 hc: hc_scratch,
+                qsa: qsa_scratch,
 
                 states: layer_states,
                 layers: shard.layers.clone(),
@@ -1385,6 +1453,51 @@ impl Runtime {
         }
     }
 
+    /// The QSA indexer of one sparse attention layer for the batch's n tokens:
+    /// updates the layer's key cache, then selects the cells every query sees
+    /// into `qs.list` (one token) or `qs.mask` (a batch).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_select(
+        &self,
+        st: &DeviceState,
+        qc: &QsaCache,
+        iw: &crate::model::IndexerWeights,
+        qs: &QsaScratch,
+        ix: &crate::config::IndexerConfig,
+        n: usize,
+        rope_dim: usize,
+        cfg: &Config,
+    ) -> Result<()> {
+        let stream = &st.stream;
+        let pos = st.positions.as_ptr();
+        let width = ix.width(qc.ratio);
+        // The indexer reads the same normalized input as q, k and v.
+        matvec_reuse(&iw.q, &st.xb, &qs.q, n, &st.q8act, stream)?;
+        matvec_reuse(&iw.k, &st.xb, &qs.k, n, &st.q8act, stream)?;
+        ops::rmsnorm(qs.q.as_mut_ptr(), qs.q.as_ptr(), iw.q_norm.as_ptr(), ix.dim, n * ix.heads, cfg.rms_eps,
+            stream)?;
+        ops::rope(qs.q.as_mut_ptr(), pos, n, ix.heads, ix.dim, rope_dim, cfg.rope, false, stream)?;
+        // Raw keys wait in the ring; blocks they complete are pooled, normed
+        // and rotated -- the order llama.cpp applies them in.
+        qsa::store(qc.ring.as_mut_ptr(), qs.k.as_ptr(), pos, n, ix.dim, qc.ring_len, stream)?;
+        qsa::pool(qc.pooled.as_mut_ptr(), qc.ring.as_ptr(), iw.k_norm.as_ptr(), pos, n, ix.dim, qc.ratio,
+            qc.ring_len, self.ctx / qc.ratio, cfg.rms_eps, rope_dim, cfg.rope, stream)?;
+        let max_blocks = self.ctx / qc.ratio;
+        for t0 in (0..n).step_by(QSA_GROUP) {
+            let g = QSA_GROUP.min(n - t0);
+            qsa::score(qs.scores.as_mut_ptr(), qs.max_blocks, qs.q.as_ptr(), qc.pooled.as_ptr(), pos, t0, g,
+                ix.heads, ix.dim, qc.ratio, width, max_blocks, stream)?;
+            let (list, mask) = if n == 1 {
+                (qs.list.as_mut_ptr(), std::ptr::null_mut())
+            } else {
+                (std::ptr::null_mut(), qs.mask.as_mut_ptr())
+            };
+            qsa::select(qs.scores.as_ptr(), qs.max_blocks, pos, t0, g, qc.ratio, width, list, mask, qs.words,
+                stream)?;
+        }
+        Ok(())
+    }
+
     /// Softmax attention, optionally with a per-head sigmoid output gate.
     fn run_attention(
         &self,
@@ -1466,7 +1579,7 @@ impl Runtime {
         // notices is not attending the way it was trained to.
         let rope_off = std::env::var("AIRUN_ROPE_OFF").is_ok();
 
-        let LayerState::Kv { k: kc, v: vc } = kv_state else {
+        let LayerState::Kv { k: kc, v: vc, qsa: qsa_cache } = kv_state else {
             return Err(CoreError::Other(
                 "an attention layer was given a recurrent state".into(),
             ));
@@ -1551,17 +1664,37 @@ impl Runtime {
             )?;
         }
 
+        // QSA: the cells each query attends to, as a list for decode and a
+        // mask for batches; None attends densely.
+        let sparse = match (qsa_cache, &a.indexer, &st.qsa, &cfg.indexer) {
+            (Some(qc), Some(iw), Some(qs), Some(ix)) => {
+                self.qsa_select(st, qc, iw, qs, ix, n, cfg.rope_dim, cfg)?;
+                Some(qs)
+            }
+            _ => None,
+        };
+
         let window = std::env::var("AIRUN_ATTN_WINDOW").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
         if n == 1 && std::env::var("AIRUN_NO_SPLIT_ATTN").is_err() {
-            ops::attention_split(st.attn.as_mut_ptr(), &st.attn_partial,
+            ops::attention_split_sel(st.attn.as_mut_ptr(), &st.attn_partial,
                 st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(), st.positions.as_ptr(),
                 cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
-                window, ops::attention_splits(self.ctx), cfg.kv_type, stream)?;
+                window, ops::attention_splits(self.ctx), cfg.kv_type,
+                sparse.map_or(std::ptr::null(), |qs| qs.list.as_ptr()), stream)?;
         } else {
-            ops::attention(st.attn.as_mut_ptr(), st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
+            // A single query without the split kernel reads the mask too.
+            if n == 1 {
+                if let (Some(qs), Some(qc)) = (sparse, qsa_cache) {
+                    qsa::select(qs.scores.as_ptr(), qs.max_blocks, st.positions.as_ptr(), 0, 1, qc.ratio,
+                        cfg.indexer.as_ref().map_or(0, |ix| ix.width(qc.ratio)), std::ptr::null_mut(),
+                        qs.mask.as_mut_ptr(), qs.words, stream)?;
+                }
+            }
+            ops::attention_masked(st.attn.as_mut_ptr(), st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
                 st.positions.as_ptr(), n, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
-                self.ctx, cfg.attn_scale(), window, cfg.kv_type, stream)?;
+                self.ctx, cfg.attn_scale(), window, cfg.kv_type,
+                sparse.map(|qs| (qs.mask.as_ptr(), qs.words)), stream)?;
         }
         // AIRUN_ATTN_NO_GATE=1 drops the gate entirely, which says whether the
         // gate is the thing going wrong or merely riding along.
@@ -2457,6 +2590,15 @@ fn same_shape(ws: &[&GpuTensor]) -> bool {
 /// has one, the f32 kernel otherwise. The quantization happens even when this
 /// particular weight cannot use it, so a following [`matvec_reuse`] against
 /// the same `x` is valid regardless of how the types are mixed.
+/// The QSA block size of layer `l` when it attends sparsely at this context:
+/// a context no longer than the budget is attended densely, which is exact.
+/// AIRUN_QSA=off attends densely everywhere.
+fn qsa_ratio(cfg: &Config, l: usize, ctx: usize) -> Option<usize> {
+    let ix = cfg.indexer.as_ref()?;
+    let ratio = ix.ratio(l);
+    (ratio > 0 && ctx > ix.width(ratio) && std::env::var("AIRUN_QSA").as_deref() != Ok("off")).then_some(ratio)
+}
+
 fn matvec(
     w: &GpuTensor,
     x: &DeviceBuffer<f32>,

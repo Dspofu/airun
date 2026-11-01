@@ -1,0 +1,7 @@
+prompt: 792 tokens, 128 generated
+round 1 airun    : 792 prompt tokens in 8499 ms (93.2 tok/s)  |  128 generated in 6595 ms (19.4 tok/s)
+round 1 Strata   : prompt 271.32 tok/s, gen 32.69 tok/s
+round 1 llama.cpp: prompt 29.8 tok/s, gen 9.46 tok/s
+round 2 airun    : 792 prompt tokens in 8800 ms (90.0 tok/s)  |  128 generated in 6779 ms (18.9 tok/s)
+round 2 Strata   : prompt 282.47 tok/s, gen 32.12 tok/s
+round 2 llama.cpp: prompt 32.0 tok/s, gen 9.55 tok/s
