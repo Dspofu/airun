@@ -32,6 +32,7 @@ Estas são as flags que decidem **o que vai para qual GPU**.
 | `--no-fallback` | desligado | Falha em vez de reduzir contexto/batch automaticamente para caber. Útil em CI, onde uma redução silenciosa mascara uma regressão. |
 | `--kv-type <tipo>` | `f16` | Formato do KV cache: `f16`, `q8_0` ou `q4_0`. Os quantizados cabem 2x e 3,6x mais contexto na mesma VRAM; no 35B custam +0,001 (q8_0) e +0,02 (q4_0) nats de perda. Vale também para `perplexity`. |
 | `--expert-cache <N>` | todos | Só MoE: mantém N experts por camada na VRAM e lê os demais do GGUF sob demanda, sem requantizar. Resultado idêntico ao modelo residente; a velocidade depende da taxa de acerto e do disco. Vale também para `perplexity`. |
+| *(automático)* | todos | MoE que não cabe nas GPUs sem `--expert-cache`: o airun escolhe quantos experts por camada ficam na VRAM (mede o link PCIe de cada GPU; GPU de link lento recebe só camadas inteiras) e põe o resto em RAM fixada, lida pela GPU. `AIRUN_EXPERTS=stream` volta à leitura do GGUF. |
 | `--draft <N>` | `3` | Decodificação especulativa com a cabeça MTP do próprio modelo (Qwen3.5/3.8 densos): N tokens rascunhados por passo, verificados de uma vez. Só com amostragem gulosa pura (`--temp 0 --repeat-penalty 1`); o texto é idêntico ao do decode normal. `0` desliga e não carrega a cabeça (~240 MB a menos). Ignorada em arquivos sem MTP. |
 
 ### Como a alocação automática decide

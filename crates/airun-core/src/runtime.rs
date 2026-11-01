@@ -64,7 +64,10 @@ struct HcScratch {
 }
 
 struct PleScratch {
-    /// The batch's n-gram embeddings, gathered on the host.
+    /// The batch's n-gram embeddings, gathered on the host into pinned
+    /// memory (a captured decode graph uploads from that address) ...
+    emb_host: std::cell::RefCell<airun_cuda::PinnedBuffer<f32>>,
+    /// ... and on the device.
     emb: DeviceBuffer<f32>,
     key: DeviceBuffer<f32>,
     value: DeviceBuffer<f32>,
@@ -89,6 +92,22 @@ struct MoeScratch {
     reader: Option<ExpertReader>,
     /// Milliseconds spent waiting for routing results and reading misses.
     timing: std::cell::Cell<(f64, f64)>,
+    /// With mapped experts: per local MoE layer, how often each expert was
+    /// routed to since the last rebalance (u32 on the device) ...
+    counts: Option<DeviceBuffer<u32>>,
+    /// ... the decayed history the rebalance ranks by ...
+    scores: std::cell::RefCell<Vec<f32>>,
+    /// ... one expert's worth of VRAM to swap through ...
+    staging: Option<DeviceBuffer<u8>>,
+    /// ... and the batch's host-side experts copied into VRAM before the
+    /// expert kernels run: gate, up and down areas of STAGE_CAP experts, the
+    /// per-id staging index, the staged experts and their count.
+    stage: Option<([DeviceBuffer<u8>; 3], DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<i32>)>,
+    /// ... and the routed experts found in VRAM vs in host memory.
+    mapped_hits: std::cell::Cell<(u64, u64)>,
+    /// Expert-major batches (see hybrid::moe_grouped): per-expert counts,
+    /// offsets, the sorted pairs, and per-pair down projections.
+    grouped: Option<(DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<f32>)>,
 }
 
 /// What a delta-net layer saw during a speculative verify, so the accepted
@@ -155,7 +174,9 @@ struct DeviceState {
 
 /// The captured decode step and the pinned staging its replays read.
 struct DecodeGraph {
-    graph: Option<airun_cuda::Graph>,
+    /// One per shard, each replayed on its device's stream; the residual
+    /// rows cross between GPUs outside the graphs.
+    graphs: Vec<Option<airun_cuda::Graph>>,
     token: airun_cuda::PinnedBuffer<i32>,
     position: airun_cuda::PinnedBuffer<i32>,
 }
@@ -197,6 +218,8 @@ pub struct Runtime {
     spec: Option<spec::Spec>,
     /// Drafts per speculative step (see `set_draft`); 0 decodes plainly.
     draft: usize,
+    /// Forward passes since the mapped experts were last rebalanced.
+    since_rebalance: usize,
 }
 
 /// Greedy decode as a chain of graph launches (see [`Runtime::generate`]): the
@@ -304,6 +327,19 @@ impl Runtime {
                 None => None,
             };
 
+            // Layers of this shard whose experts are split VRAM/host, and the
+            // widest expert among them.
+            let mapped: Vec<&GpuTensor> = shard.layers.iter().filter_map(|&l| match &model.layers[l].ffn {
+                FfnWeights::Moe { gate_exps, .. } if gate_exps.mapped.is_some() => Some(gate_exps),
+                _ => None,
+            }).collect();
+            let mapped_layers = if mapped.is_empty() { 0 } else { shard.layers.len() };
+            let mapped_stride = shard.layers.iter().filter_map(|&l| match &model.layers[l].ffn {
+                FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } =>
+                    Some(gate_exps.expert_stride.max(up_exps.expert_stride).max(down_exps.expert_stride)),
+                _ => None,
+            }).max().unwrap_or(0);
+
             let moe_scratch = match &cfg.moe {
                 Some(moe) => Some(MoeScratch {
                     logits: DeviceBuffer::new(dev, b * moe.n_experts)?,
@@ -333,6 +369,30 @@ impl Runtime {
                     .map_err(|e| CoreError::Other(format!(
                         "cannot reopen the model to stream experts ({e}); check the file is still readable")))?,
                     timing: std::cell::Cell::new((0.0, 0.0)),
+                    counts: if mapped_layers > 0 {
+                        Some(DeviceBuffer::zeroed(dev, mapped_layers * moe.n_experts, &stream)?)
+                    } else {
+                        None
+                    },
+                    scores: std::cell::RefCell::new(vec![0.0; mapped_layers * moe.n_experts]),
+                    staging: if mapped_layers > 0 { Some(DeviceBuffer::new(dev, mapped_stride)?) } else { None },
+                    stage: if mapped_layers > 0 {
+                        Some(([DeviceBuffer::new(dev, STAGE_CAP * mapped_stride)?,
+                               DeviceBuffer::new(dev, STAGE_CAP * mapped_stride)?,
+                               DeviceBuffer::new(dev, STAGE_CAP * mapped_stride)?],
+                              DeviceBuffer::new(dev, STAGE_CAP)?, DeviceBuffer::new(dev, STAGE_CAP)?,
+                              DeviceBuffer::new(dev, 1)?))
+                    } else {
+                        None
+                    },
+                    mapped_hits: std::cell::Cell::new((0, 0)),
+                    grouped: if b >= GROUPED_MIN {
+                        Some((DeviceBuffer::new(dev, moe.n_experts)?, DeviceBuffer::new(dev, moe.n_experts + 1)?,
+                              DeviceBuffer::new(dev, b * moe.n_experts_used)?,
+                              DeviceBuffer::new(dev, b * moe.n_experts_used * cfg.n_embd)?))
+                    } else {
+                        None
+                    },
                     cache_group: model.layers.iter().filter_map(|l| match &l.ffn {
                         FfnWeights::Moe { gate_exps, .. } if gate_exps.host_experts.is_some() =>
                             Some(gate_exps.cache_capacity() / moe.n_experts_used), _ => None,
@@ -349,6 +409,7 @@ impl Runtime {
                     inject: DeviceBuffer::new(dev, b * h.count)?,
                     ple: match &cfg.ple {
                         Some(p) if shard.layers.contains(&p.layer) => Some(PleScratch {
+                            emb_host: std::cell::RefCell::new(airun_cuda::PinnedBuffer::new(b * p.n_heads() * p.head_dim)?),
                             emb: DeviceBuffer::new(dev, b * p.n_heads() * p.head_dim)?,
                             key: DeviceBuffer::new(dev, b * hc_width)?,
                             value: DeviceBuffer::new(dev, b * cfg.n_embd)?,
@@ -424,6 +485,7 @@ impl Runtime {
             skip_logits: false,
             spec: None,
             draft: 0,
+            since_rebalance: 0,
         })
     }
 
@@ -440,13 +502,17 @@ impl Runtime {
     }
 
     pub fn expert_cache_stats(&self) -> (u64, u64) {
-        self.model.layers.iter().fold((0, 0), |(hits, misses), layer| {
+        let stream = self.model.layers.iter().fold((0, 0), |(hits, misses), layer| {
             if let FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } = &layer.ffn {
                 [gate_exps, up_exps, down_exps].iter().fold((hits, misses), |(h, m), w| {
                     let (wh, wm) = w.cache_stats(); (h + wh, m + wm)
                 })
             } else { (hits, misses) }
-        })
+        });
+        // Mapped experts count once per routed expert, not per tensor.
+        let (mh, mm) = self.states.iter().filter_map(|s| s.moe.as_ref())
+            .fold((0, 0), |(h, m), s| { let (a, b) = s.mapped_hits.get(); (h + a, m + b) });
+        (stream.0 + mh, stream.1 + mm)
     }
 
     pub fn n_past(&self) -> usize {
@@ -668,9 +734,83 @@ impl Runtime {
         Ok(ch.slots.as_slice()[slot] as u32)
     }
 
+    /// Moves the most used host-side experts into VRAM in place of the least
+    /// used resident ones, layer by layer, from the routing counts the MoE
+    /// layers accumulated on the device. Runs every few forward passes: the
+    /// counts read back is a synchronization, and each swap moves three
+    /// experts each way across PCIe.
+    fn rebalance_experts(&mut self) -> Result<()> {
+        const EVERY: usize = 8;
+        const MAX_SWAPS: usize = 16;
+        const DECAY: f32 = 0.9;
+        self.since_rebalance += 1;
+        if self.since_rebalance < EVERY {
+            return Ok(());
+        }
+        self.since_rebalance = 0;
+        let Some(ne) = self.model.config.moe.as_ref().map(|m| m.n_experts) else { return Ok(()) };
+        for st in &self.states {
+            let Some(m) = &st.moe else { continue };
+            let (Some(counts), Some(staging)) = (&m.counts, &m.staging) else { continue };
+            device::set_device(st.device)?;
+            let host = counts.to_vec(&st.stream)?;
+            counts.fill_zero(&st.stream)?;
+            let mut scores = m.scores.borrow_mut();
+            let (mut hits, mut misses) = m.mapped_hits.get();
+            for (local, &layer) in st.layers.iter().enumerate() {
+                let FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } = &self.model.layers[layer].ffn else {
+                    continue;
+                };
+                let tensors = [gate_exps, up_exps, down_exps];
+                let Some(gm) = &gate_exps.mapped else { continue };
+                let sc = &mut scores[local * ne..(local + 1) * ne];
+                let c = &host[local * ne..(local + 1) * ne];
+                let place = gm.place.borrow().clone();
+                for e in 0..ne {
+                    if place[e].is_ok() { hits += u64::from(c[e]) } else { misses += u64::from(c[e]) }
+                    sc[e] = sc[e] * DECAY + c[e] as f32;
+                }
+                let mut resident: Vec<usize> = (0..ne).filter(|&e| place[e].is_ok()).collect();
+                let mut outside: Vec<usize> = (0..ne).filter(|&e| place[e].is_err()).collect();
+                resident.sort_by(|&a, &b| sc[a].total_cmp(&sc[b]));
+                outside.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]));
+                let mut swapped = 0;
+                for (&hot, &cold) in outside.iter().zip(&resident).take(MAX_SWAPS) {
+                    // A margin keeps two near-equal experts from trading
+                    // places on every rebalance.
+                    if sc[hot] <= sc[cold] * 1.25 + 1.0 {
+                        break;
+                    }
+                    for t in tensors {
+                        let tm = t.mapped.as_ref().ok_or_else(|| CoreError::Other(
+                            "a layer's expert tensors disagree on where their experts live; reload the model".into()))?;
+                        tm.swap(&t.data, t.expert_stride, hot, cold, staging, &st.stream)?;
+                    }
+                    swapped += 1;
+                }
+                if swapped > 0 {
+                    for t in tensors {
+                        if let Some(tm) = &t.mapped {
+                            tm.publish(&t.data, t.expert_stride, &st.stream)?;
+                        }
+                    }
+                }
+            }
+            m.mapped_hits.set((hits, misses));
+            // The table mirrors are reused by the next publish.
+            st.stream.synchronize()?;
+        }
+        Ok(())
+    }
+
     /// Runs `tokens` through the model, leaving the last one's logits on the
     /// device.
     fn step(&mut self, tokens: &[u32]) -> Result<()> {
+        self.step_inner(tokens)?;
+        self.rebalance_experts()
+    }
+
+    fn step_inner(&mut self, tokens: &[u32]) -> Result<()> {
         if tokens.is_empty() {
             return Err(CoreError::Other("forward called with no tokens".into()));
         }
@@ -699,9 +839,8 @@ impl Runtime {
         // Decode goes through a captured CUDA graph where possible: a step is
         // hundreds of tiny launches, and issuing them one by one measured
         // ~40% of a decode step as GPU idle time on a 1.7B.
-        if tokens.len() == 1 && self.states.len() == 1 && !graphs_disabled()
-            && self.model.config.ple.is_none()
-            && !self.states[0].moe.as_ref().is_some_and(|m| m.upload.is_some()) {
+        if tokens.len() == 1 && !graphs_disabled()
+            && !self.states.iter().any(|s| s.moe.as_ref().is_some_and(|m| m.upload.is_some())) {
             return self.forward_decode_graphed(tokens[0]);
         }
 
@@ -725,30 +864,46 @@ impl Runtime {
         let mut dg = match self.decode_graph.take() {
             Some(dg) => dg,
             None => DecodeGraph {
-                graph: None,
+                graphs: (0..self.states.len()).map(|_| None).collect(),
                 token: airun_cuda::PinnedBuffer::new(1)?,
                 position: airun_cuda::PinnedBuffer::new(1)?,
             },
         };
         dg.token.as_mut_slice()[0] = token as i32;
         dg.position.as_mut_slice()[0] = self.n_past as i32;
-
-        device::set_device(self.states[0].device)?;
-        if dg.graph.is_none() {
-            // SAFETY of the capture: everything queue_forward touches lives in
-            // `self` or in `dg`, both of which outlive the graph.
-            airun_cuda::Graph::begin_capture(&self.states[0].stream)?;
-            let queued = self.queue_forward(dg.token.as_slice(), dg.position.as_slice());
-            let ended = airun_cuda::Graph::end_capture(&self.states[0].stream);
-            queued?;
-            dg.graph = Some(ended?);
+        // The PLE rows are hashed on the host; a captured graph only copies
+        // them from the pinned staging, so refresh it before replaying.
+        let ple_built = self.model.config.ple.as_ref()
+            .and_then(|p| self.states.iter().position(|s| s.layers.contains(&p.layer)))
+            .is_some_and(|si| dg.graphs[si].is_some());
+        if ple_built {
+            self.ple_fill(dg.token.as_slice())?;
         }
-        dg.graph
-            .as_ref()
-            .expect("graph was just built")
-            .launch(&self.states[0].stream)?;
 
+        let mut result = Ok(());
+        for si in 0..self.states.len() {
+            if si > 0 {
+                result = self.handoff(si, 1);
+                if result.is_err() { break; }
+            }
+            device::set_device(self.states[si].device)?;
+            if dg.graphs[si].is_none() {
+                // SAFETY of the capture: everything queue_shard touches lives
+                // in `self` or in `dg`, both of which outlive the graph.
+                airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
+                let queued = self.queue_shard(si, dg.token.as_slice(), dg.position.as_slice(), true, true);
+                let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
+                match queued.and_then(|_| Ok(ended?)) {
+                    Ok(g) => dg.graphs[si] = Some(g),
+                    Err(e) => { result = Err(e); break; }
+                }
+            }
+            result = dg.graphs[si].as_ref().expect("graph was just built")
+                .launch(&self.states[si].stream).map_err(Into::into);
+            if result.is_err() { break; }
+        }
         self.decode_graph = Some(dg);
+        result?;
         self.n_past += 1;
         self.history.push(token);
         Ok(())
@@ -765,18 +920,45 @@ impl Runtime {
     /// [`Self::queue_forward`]; with `upload` false the tokens and positions are
     /// already in the device buffers, and the slices only give their count.
     fn queue_forward_with(&mut self, token_ids: &[i32], positions: &[i32], upload: bool) -> Result<()> {
+        for si in 0..self.states.len() {
+            if si > 0 {
+                self.handoff(si, token_ids.len())?;
+            }
+            self.queue_shard(si, token_ids, positions, upload, true)?;
+        }
+        Ok(())
+    }
+
+    /// Hands the first `n` rows of the residual from shard `si - 1` to shard
+    /// `si`, after the earlier shard's work. Without peer access the copy
+    /// stages through host memory anyway, so overlapping would buy little.
+    fn handoff(&self, si: usize, n: usize) -> Result<()> {
+        let (src, dst) = (&self.states[si - 1], &self.states[si]);
+        src.stream.synchronize()?;
+        device::set_device(dst.device)?;
+        let width = self.model.config.hc.map_or(1, |h| h.count) * self.model.config.n_embd;
+        airun_cuda::copy_peer(dst.x.as_mut_ptr(), dst.device, src.x.as_ptr(), src.device,
+            n * width * std::mem::size_of::<f32>(), &dst.stream)?;
+        Ok(())
+    }
+
+    /// One shard's part of the forward pass on its stream: the embedding on
+    /// the first, the layers, the final norm and logits on the last. With
+    /// `fill_ple` the PLE rows are hashed and gathered here; a graph replay
+    /// does that beforehand (see forward_decode_graphed).
+    fn queue_shard(&mut self, si: usize, token_ids: &[i32], positions: &[i32], upload: bool, fill_ple: bool)
+        -> Result<()> {
         let cfg = self.model.config.clone();
         let n = token_ids.len();
+        device::set_device(self.states[si].device)?;
 
         // --- embedding, on the shard that holds the table ---
-        {
-            let st = &mut self.states[0];
-            device::set_device(st.device)?;
+        if si == 0 {
+            let st = &self.states[0];
             if upload {
-                st.tokens.copy_from_host(&token_ids, &st.stream)?;
-                st.positions.copy_from_host(&positions, &st.stream)?;
+                st.tokens.copy_from_host_at(0, token_ids, &st.stream)?;
+                st.positions.copy_from_host_at(0, positions, &st.stream)?;
             }
-
             let embd = &self.model.token_embd;
             // With hyper-connections the embedding lands in xb and is copied
             // into every stream.
@@ -795,31 +977,23 @@ impl Runtime {
             if let Some(h) = &cfg.hc {
                 hc::hc_expand(st.x.as_mut_ptr(), st.xb.as_ptr(), n, h.count, cfg.n_embd, &st.stream)?;
             }
+        } else if upload {
+            let st = &self.states[si];
+            st.positions.copy_from_host_at(0, positions, &st.stream)?;
         }
-        self.ple_stage(token_ids)?;
-
-        // --- layers, shard by shard ---
-        for si in 0..self.states.len() {
-            if si > 0 {
-                // Hand the activations to the next GPU. Both sides synchronize
-                // here; without peer access the copy stages through host memory
-                // anyway, so overlapping would buy little.
-                let (left, right) = self.states.split_at_mut(si);
-                let src = &left[si - 1];
-                let dst = &mut right[0];
-                src.stream.synchronize()?;
-                device::set_device(dst.device)?;
-                dst.x.copy_from_device(&src.x, &dst.stream)?;
-                dst.positions.copy_from_host(&positions, &dst.stream)?;
-                dst.stream.synchronize()?;
+        if cfg.ple.as_ref().is_some_and(|p| self.states[si].layers.contains(&p.layer)) {
+            if fill_ple {
+                self.ple_fill(token_ids)?;
             }
+            self.ple_upload(si, n)?;
+        }
 
-            device::set_device(self.states[si].device)?;
-            for local in 0..self.states[si].layers.len() {
-                let layer = self.states[si].layers[local];
-                self.run_layer(si, local, layer, n, &cfg)?;
-            }
-
+        for local in 0..self.states[si].layers.len() {
+            let layer = self.states[si].layers[local];
+            self.run_layer(si, local, layer, n, &cfg)?;
+        }
+        if si + 1 < self.states.len() {
+            return Ok(());
         }
 
         // --- final norm and projection, last token only ---
@@ -1061,7 +1235,7 @@ impl Runtime {
                     down_exps,
                     shared,
                 } => self
-                    .run_moe(si, router, gate_exps, up_exps, down_exps, shared.as_ref(), n, cfg)?,
+                    .run_moe(si, layer, router, gate_exps, up_exps, down_exps, shared.as_ref(), n, cfg)?,
             }
         }
         trace_block(st, layer, "ffn", n, cfg)?;
@@ -1113,7 +1287,7 @@ impl Runtime {
         self.hc_mix(si, mix_ffn, n, cfg)?;
         match &w.ffn {
             FfnWeights::Moe { router, gate_exps, up_exps, down_exps, shared } =>
-                self.run_moe(si, router, gate_exps, up_exps, down_exps, shared.as_ref(), n, cfg)?,
+                self.run_moe(si, layer, router, gate_exps, up_exps, down_exps, shared.as_ref(), n, cfg)?,
             FfnWeights::Dense { .. } => return Err(CoreError::Other(
                 "a hyper-connection model with a dense feed-forward is not supported yet".into())),
         }
@@ -1144,7 +1318,7 @@ impl Runtime {
     }
 
     /// The per-layer n-gram embedding block, in place on x. Its inputs were
-    /// staged by [`Self::ple_stage`].
+    /// staged by [`Self::ple_fill`].
     fn run_ple(&self, si: usize, p: &crate::model::PleWeights, n: usize, cfg: &Config) -> Result<()> {
         let st = &self.states[si];
         let stream = &st.stream;
@@ -1167,9 +1341,9 @@ impl Runtime {
     }
 
     /// Hashes each token of the batch with its predecessors (from the batch
-    /// and the history) into PLE table rows, decodes them on the host and
-    /// uploads them to the PLE layer's GPU.
-    fn ple_stage(&self, token_ids: &[i32]) -> Result<()> {
+    /// and the history) into PLE table rows and decodes them on the host into
+    /// the PLE layer's pinned staging.
+    fn ple_fill(&self, token_ids: &[i32]) -> Result<()> {
         let (Some(pc), Some(table)) = (&self.model.config.ple, &self.model.ple_table) else { return Ok(()) };
         let Some(st) = self.states.iter().find(|s| s.layers.contains(&pc.layer)) else { return Ok(()) };
         let ps = st.hc.as_ref().and_then(|h| h.ple.as_ref())
@@ -1182,10 +1356,18 @@ impl Runtime {
         for i in 0..token_ids.len() {
             pc.rows(&seq[..prefix + i + 1], &mut rows);
         }
-        let mut emb = vec![0f32; rows.len() * pc.head_dim];
-        table.gather(&rows, &mut emb)?;
-        device::set_device(st.device)?;
-        ps.emb.copy_from_host_at(0, &emb, &st.stream)?;
+        let mut host = ps.emb_host.borrow_mut();
+        table.gather(&rows, &mut host.as_mut_slice()[..rows.len() * pc.head_dim])?;
+        Ok(())
+    }
+
+    /// Queues the upload of `n` staged PLE rows on shard `si`.
+    fn ple_upload(&self, si: usize, n: usize) -> Result<()> {
+        let (Some(pc), st) = (&self.model.config.ple, &self.states[si]) else { return Ok(()) };
+        let ps = st.hc.as_ref().and_then(|h| h.ple.as_ref())
+            .ok_or_else(|| CoreError::Other("the PLE layer's GPU has no PLE scratch".into()))?;
+        let host = ps.emb_host.borrow();
+        ps.emb.copy_from_host_at(0, &host.as_slice()[..n * pc.n_heads() * pc.head_dim], &st.stream)?;
         Ok(())
     }
 
@@ -1612,6 +1794,7 @@ impl Runtime {
     fn run_moe(
         &self,
         si: usize,
+        layer: usize,
         router: &GpuTensor,
         gate_exps: &GpuTensor,
         up_exps: &GpuTensor,
@@ -1665,6 +1848,62 @@ impl Runtime {
             )?;
         } else {
             st.xb2.fill_zero(stream)?;
+        }
+
+        if gate_exps.mapped.is_some() {
+            if let Some(counts) = &m.counts {
+                let local = st.layers.iter().position(|&l| l == layer).unwrap_or(0);
+                hybrid::moe_count(m.ids.as_ptr(), counts.offset_ptr(local * moe.n_experts),
+                    n * moe.n_experts_used, stream)?;
+            }
+        }
+        // A batch goes expert-major: each expert's weights are read once for
+        // all the tokens routed to it, wherever they live.
+        if let (Some((scratch, offsets, perm, ypair)), true) = (&m.grouped, n >= GROUPED_MIN && m.upload.is_none()) {
+            let k = moe.n_experts_used;
+            hybrid::moe_sort(m.ids.as_ptr(), n * k, moe.n_experts, scratch.as_mut_ptr(), offsets.as_mut_ptr(),
+                perm.as_mut_ptr(), stream)?;
+            let ew = |t: &GpuTensor| hybrid::ExpertWeights {
+                ty: t.kernel_type(),
+                tab: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.table.as_ptr()),
+                base: t.data.as_ptr(),
+                stride: t.expert_stride,
+                row_bytes: t.row_bytes,
+            };
+            hybrid::moe_grouped(ew(gate_exps), ew(up_exps), ew(down_exps), st.xb.as_ptr(), perm.as_ptr(),
+                offsets.as_ptr(), m.weights.as_ptr(), m.h.as_mut_ptr(), ypair.as_mut_ptr(), st.xb2.as_mut_ptr(),
+                cfg.n_embd, moe.expert_ff, n, k, moe.n_experts, stream)?;
+            return Ok(());
+        }
+        if let (Some(gm), Some(um), Some(dm)) = (&gate_exps.mapped, &up_exps.mapped, &down_exps.mapped) {
+            let (areas, sidx, list, n_list) = m.stage.as_ref().ok_or_else(|| CoreError::Other(
+                "mapped experts without a staging area; this is a bug".into()))?;
+            if gate_exps.expert_stride != up_exps.expert_stride {
+                return Err(CoreError::Other("gate and up experts differ in size; this model needs the streamed expert path (AIRUN_EXPERTS=stream)".into()));
+            }
+            let k = moe.n_experts_used;
+            // Tokens per pass, so the host-side experts they route to fit
+            // the staging area even if none of them is resident.
+            let per = (STAGE_CAP / k).max(1);
+            for t0 in (0..n).step_by(per) {
+                let cnt = per.min(n - t0);
+                let ids = m.ids.offset_ptr(t0 * k);
+                hybrid::moe_stage_plan(ids, cnt * k, gm.resident.as_ptr(), moe.n_experts, sidx.as_mut_ptr(),
+                    list.as_mut_ptr(), n_list.as_mut_ptr(), stream)?;
+                for (t, area) in [gate_exps, up_exps, down_exps].iter().zip(areas) {
+                    let tm = t.mapped.as_ref().expect("checked above");
+                    hybrid::moe_stage_copy(tm.table.as_ptr(), list.as_ptr(), n_list.as_ptr(), area.as_mut_ptr(),
+                        t.expert_stride, cnt * k, stream)?;
+                }
+                let staged = |t: &GpuTensor| hybrid::Staged { sidx: sidx.as_ptr(), stride: t.expert_stride };
+                hybrid::moe_gate_up_tab(gate_exps.kernel_type(), gm.table.as_ptr(), um.table.as_ptr(),
+                    st.xb.offset_ptr(t0 * cfg.n_embd), ids, m.h.as_mut_ptr(), cfg.n_embd, moe.expert_ff, cnt, k,
+                    gate_exps.row_bytes, Some((staged(gate_exps), areas[0].as_ptr(), areas[1].as_ptr())), stream)?;
+                hybrid::moe_down_tab(down_exps.kernel_type(), dm.table.as_ptr(), m.h.as_ptr(), ids,
+                    m.weights.offset_ptr(t0 * k), st.xb2.offset_ptr(t0 * cfg.n_embd), moe.expert_ff, cfg.n_embd,
+                    cnt, k, down_exps.row_bytes, Some((staged(down_exps), areas[2].as_ptr())), stream)?;
+            }
+            return Ok(());
         }
 
         if let Some(upload) = &m.upload {
@@ -2119,6 +2358,12 @@ fn matvec_f32_forced() -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCED.get_or_init(|| std::env::var("AIRUN_MATVEC_F32").is_ok_and(|v| v.trim() != "0"))
 }
+
+/// Batches at least this big run the experts expert-major (see run_moe).
+const GROUPED_MIN: usize = 16;
+
+/// Experts a mapped MoE layer stages into VRAM per pass (see run_moe).
+const STAGE_CAP: usize = 64;
 
 /// Concurrent reads when streaming experts. An NVMe drive only reaches its
 /// bandwidth with several requests in flight.

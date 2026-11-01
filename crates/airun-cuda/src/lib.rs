@@ -24,6 +24,31 @@ pub use error::{CudaError, Result};
 pub use stream::{Event, Graph, Stream, time_gpu};
 
 /// Formats a byte count the way every airun diagnostic does.
+/// Raw asynchronous copies on `stream`, for buffers handled as addresses
+/// (mapped expert slots and the like). `bytes` must lie inside both sides.
+pub fn copy_d2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize, stream: &Stream) -> Result<()> {
+    // SAFETY: the caller guarantees both ranges are live device memory.
+    ffi::check(unsafe { ffi::airun_memcpy_d2d(dst, src, bytes as u64, stream.raw()) })
+}
+
+pub fn copy_h2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize, stream: &Stream) -> Result<()> {
+    // SAFETY: the caller guarantees `dst` is device memory and `src` pinned host memory, both live.
+    ffi::check(unsafe { ffi::airun_memcpy_h2d(dst, src, bytes as u64, stream.raw()) })
+}
+
+pub fn copy_d2h(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize, stream: &Stream) -> Result<()> {
+    // SAFETY: the caller guarantees `dst` is pinned host memory and `src` device memory, both live.
+    ffi::check(unsafe { ffi::airun_memcpy_d2h(dst, src, bytes as u64, stream.raw()) })
+}
+
+/// `bytes` from `src` on device `src_dev` to `dst` on `dst_dev`, on `stream`
+/// (staged through the host when the two GPUs have no peer access).
+pub fn copy_peer(dst: *mut std::ffi::c_void, dst_dev: i32, src: *const std::ffi::c_void, src_dev: i32, bytes: usize,
+    stream: &Stream) -> Result<()> {
+    // SAFETY: the caller guarantees both ranges are live on their devices.
+    ffi::check(unsafe { ffi::airun_memcpy_peer(dst, dst_dev, src, src_dev, bytes as u64, stream.raw()) })
+}
+
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;

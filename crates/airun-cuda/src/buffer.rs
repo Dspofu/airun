@@ -290,6 +290,12 @@ impl<T: Copy + Default> PinnedBuffer<T> {
         self.len == 0
     }
 
+    /// The allocation's host address, for asynchronous copies the caller
+    /// orders against every other access.
+    pub fn as_raw(&self) -> *mut c_void {
+        self.ptr
+    }
+
     /// The address a kernel on `device` reads this buffer through (it is
     /// allocated mapped). Every access crosses PCIe, so this suits data read
     /// sparsely, not streamed.

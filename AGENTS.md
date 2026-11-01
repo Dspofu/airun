@@ -356,6 +356,39 @@ antes do leitor paralelo). O bench agora usa uma passagem em inglês para MoE e
 mostra a taxa de acerto; use também `--temp 0.7`, porque o greedy entra em
 laço e flatteria o cache da mesma forma.
 
+### Experts mapeados em RAM (padrão quando o MoE não cabe nas GPUs)
+
+Sem `--expert-cache`, um MoE grande demais vai para `plan_experts`
+(`loader.rs`): `slots` experts por camada ficam na VRAM e os demais numa
+alocação fixada e mapeada (`MappedExperts` em `model.rs`), que a GPU lê pelo
+PCIe. Os kernels acham cada expert por uma tabela de endereços
+(`moe_*_tab`), então nada espera o host e o decode cabe num CUDA graph. O
+streaming do arquivo (seção acima) continua com `AIRUN_EXPERTS=stream`.
+
+- **Decode:** antes do MoE, `moe_stage_plan` + `moe_stage_copy` copiam para um
+  staging na VRAM só os experts roteados que estão na RAM (leituras de 16 B
+  coalescidas). Ler direto da RAM com os decodificadores (leituras estreitas)
+  era 5x mais lento.
+- **Lotes (≥ 16 tokens):** `moe_grouped` ordena os pares (token, slot) por
+  expert e lê os pesos de cada expert uma vez para todos os seus tokens,
+  copiando as linhas do bloco para a memória compartilhada com leituras
+  largas. É bit-idêntico ao caminho por token (selftest).
+- **Residência adaptativa:** o MoE conta o uso de cada expert na GPU
+  (`moe_count`); a cada 8 passos `rebalance_experts` troca os mais usados que
+  estão na RAM pelos menos usados da VRAM (até 16 por camada, com margem).
+- **Link lento:** `plan_experts` mede a banda host→GPU. Uma GPU abaixo de
+  8 GB/s (a 5060 Ti desta máquina está num slot PCIe 3.0 x4: 1,6 GB/s em
+  zero-copy) recebe só camadas inteiras, com todos os experts na VRAM; as
+  demais vão para a GPU de link rápido com experts parciais.
+- **Grafos por GPU:** o decode captura um grafo por shard; o resíduo passa
+  entre as GPUs fora dos grafos, só as linhas do lote. O PLE é preparado no
+  host num buffer fixado antes de cada replay.
+
+Qwen4 Flash-Next (78 GB, 5070 Ti + 5060 Ti, 64 GB de RAM), prompt de 792
+tokens + 128 gerados, contra o llama.cpp de referência com `--n-cpu-moe 48`:
+prompt 92 vs 42 tok/s, geração 19,5 vs 9,7 tok/s, saída idêntica. A carga leva
+~80 s (fixar ~24 GB de RAM).
+
 ### KV cache quantizado (`--kv-type f16|q8_0|q4_0`)
 
 Blocos Q8_0/Q4_0 do GGUF por linha de head, decodificados pelos mesmos

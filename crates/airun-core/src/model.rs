@@ -19,6 +19,8 @@ use crate::plan::Placement;
 pub struct GpuTensor {
     pub data: DeviceBuffer<u8>,
     pub host_experts: Option<HostExperts>,
+    /// Experts split between VRAM slots (`data`) and mapped host memory.
+    pub mapped: Option<MappedExperts>,
     pub ty: airun_gguf::GgmlType,
     /// Row length: the matmul's inner dimension.
     pub k: usize,
@@ -29,6 +31,70 @@ pub struct GpuTensor {
     pub expert_stride: usize,
     pub n_experts: usize,
     pub device: i32,
+}
+
+/// An expert stack too big for VRAM, every expert addressable by the kernels:
+/// `slots` of them in the tensor's VRAM, the rest in page-locked host memory
+/// mapped into the device's address space, read across PCIe as the kernels
+/// touch them. A table of per-expert addresses tells the kernels where each
+/// one is, so routing never waits on the host; [`Self::swap`] moves experts
+/// between the two as their use shifts.
+pub struct MappedExperts {
+    host: airun_cuda::PinnedBuffer<u8>,
+    /// Device address of `host`.
+    host_dev: u64,
+    /// The kernels' table: one address per expert.
+    pub table: DeviceBuffer<u64>,
+    /// 1 per expert in VRAM, 0 per expert in host memory: which ones the
+    /// kernels must stage before computing (see hybrid::moe_stage_plan).
+    pub resident: DeviceBuffer<u8>,
+    resident_mirror: RefCell<airun_cuda::PinnedBuffer<u8>>,
+    /// Its host copy, staged through pinned memory.
+    mirror: RefCell<airun_cuda::PinnedBuffer<u64>>,
+    /// Where each expert is: `Ok(slot)` in VRAM, `Err(index)` in `host`.
+    pub place: RefCell<Vec<std::result::Result<usize, usize>>>,
+}
+
+impl MappedExperts {
+    fn addr(&self, data: &DeviceBuffer<u8>, stride: usize, p: std::result::Result<usize, usize>) -> u64 {
+        match p {
+            Ok(slot) => data.as_ptr() as u64 + (slot * stride) as u64,
+            Err(i) => self.host_dev + (i * stride) as u64,
+        }
+    }
+
+    /// Exchanges expert `hot` (in host memory) with `cold` (in VRAM), through
+    /// `staging` (one stride of VRAM), on `stream`. The caller uploads the
+    /// table afterwards with [`Self::publish`] and must not touch the host
+    /// copy of either expert until the stream has passed this point.
+    pub fn swap(&self, data: &DeviceBuffer<u8>, stride: usize, hot: usize, cold: usize,
+        staging: &DeviceBuffer<u8>, stream: &Stream) -> Result<()> {
+        let mut place = self.place.borrow_mut();
+        let (Err(j), Ok(slot)) = (place[hot], place[cold]) else {
+            return Err(CoreError::Other("expert swap between two experts on the same side; this is a bug".into()));
+        };
+        let slot_ptr = data.offset_ptr(slot * stride);
+        let host_ptr = (self.host.as_raw() as *mut u8).wrapping_add(j * stride);
+        airun_cuda::copy_d2d(staging.as_mut_ptr(), slot_ptr, stride, stream)?;
+        airun_cuda::copy_h2d(slot_ptr, host_ptr as *const std::ffi::c_void, stride, stream)?;
+        airun_cuda::copy_d2h(host_ptr as *mut std::ffi::c_void, staging.as_ptr(), stride, stream)?;
+        place[hot] = Ok(slot);
+        place[cold] = Err(j);
+        Ok(())
+    }
+
+    /// Rewrites the kernels' table from `place`.
+    pub fn publish(&self, data: &DeviceBuffer<u8>, stride: usize, stream: &Stream) -> Result<()> {
+        let mut mirror = self.mirror.borrow_mut();
+        let mut res = self.resident_mirror.borrow_mut();
+        for (e, p) in self.place.borrow().iter().enumerate() {
+            mirror.as_mut_slice()[e] = self.addr(data, stride, *p);
+            res.as_mut_slice()[e] = p.is_ok() as u8;
+        }
+        self.table.copy_from_host_at(0, mirror.as_slice(), stream)?;
+        self.resident.copy_from_host_at(0, res.as_slice(), stream)?;
+        Ok(())
+    }
 }
 
 pub struct HostExperts {
@@ -70,7 +136,11 @@ impl GpuTensor {
     }
 
     pub fn cache_capacity(&self) -> usize {
-        if self.host_experts.is_some() { self.data.len() / self.expert_stride } else { self.n_experts }
+        if self.host_experts.is_some() || self.mapped.is_some() {
+            self.data.len() / self.expert_stride
+        } else {
+            self.n_experts
+        }
     }
 
     pub fn kernel_type(&self) -> airun_cuda::ops::KernelType {
@@ -253,7 +323,7 @@ impl Model {
         config: Config,
         placement: Placement,
         streams: &[(i32, Stream)],
-        expert_cache: Option<usize>,
+        expert_slots: Option<&[usize]>,
         load_mtp: bool,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Self> {
@@ -325,6 +395,7 @@ impl Model {
                 GpuTensor {
                     data: DeviceBuffer::<u8>::new(out_dev, 0)?,
                     host_experts: None,
+                    mapped: None,
                     ty: token_embd.ty,
                     k: token_embd.k,
                     rows: token_embd.rows,
@@ -389,9 +460,9 @@ impl Model {
                 };
                 FfnWeights::Moe {
                     router: load_packed(gguf, &name("ffn_gate_inp.weight"), dev, stream, &config)?,
-                    gate_exps: load_cached(gguf, &name("ffn_gate_exps.weight"), dev, stream, &config, expert_cache)?,
-                    up_exps: load_cached(gguf, &name("ffn_up_exps.weight"), dev, stream, &config, expert_cache)?,
-                    down_exps: load_cached(gguf, &name("ffn_down_exps.weight"), dev, stream, &config, expert_cache)?,
+                    gate_exps: load_cached(gguf, &name("ffn_gate_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]))?,
+                    up_exps: load_cached(gguf, &name("ffn_up_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]))?,
+                    down_exps: load_cached(gguf, &name("ffn_down_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]))?,
                     shared,
                 }
             } else {
@@ -612,6 +683,7 @@ fn describe_packed(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Confi
     Ok(GpuTensor {
         data: DeviceBuffer::<u8>::new(device, 0)?,
         host_experts: None,
+        mapped: None,
         ty: info.ty,
         k,
         rows: info.n_rows() as usize,
@@ -663,7 +735,33 @@ fn load_cached(
     };
     let expert_stride = if n_experts > 1 { rows * row_bytes } else { 0 };
 
-    let (data, host_experts) = if let Some(slots) = slots.filter(|&s| s < n_experts) {
+    let mapped_mode = experts_mapped();
+    let mut mapped = None;
+    let (data, host_experts) = if let Some(slots) = slots.filter(|&s| s < n_experts && mapped_mode) {
+        let bytes = gguf.tensor_bytes(info)?;
+        let data = DeviceBuffer::<u8>::new(device, slots * expert_stride)?;
+        data.copy_from_host_at(0, &bytes[..slots * expert_stride], stream)?;
+        let mut host = airun_cuda::PinnedBuffer::<u8>::new((n_experts - slots) * expert_stride).map_err(|e|
+            CoreError::Other(format!("cannot pin {} of host memory for the experts that do not fit in VRAM ({e}); \
+                free RAM, or set AIRUN_EXPERTS=stream to read them from the file instead",
+                airun_cuda::human_bytes(((n_experts - slots) * expert_stride) as u64))))?;
+        host.as_mut_slice().copy_from_slice(&bytes[slots * expert_stride..]);
+        let host_dev = host.device_ptr(device)? as u64;
+        let m = MappedExperts {
+            host,
+            host_dev,
+            table: DeviceBuffer::new(device, n_experts)?,
+            mirror: RefCell::new(airun_cuda::PinnedBuffer::new(n_experts)?),
+            resident: DeviceBuffer::new(device, n_experts)?,
+            resident_mirror: RefCell::new(airun_cuda::PinnedBuffer::new(n_experts)?),
+            place: RefCell::new((0..n_experts).map(|e| if e < slots { Ok(e) } else { Err(e - slots) }).collect()),
+        };
+        m.publish(&data, expert_stride, stream)?;
+        // The pinned mirror is reused by the next publish; let this one land.
+        stream.synchronize()?;
+        mapped = Some(m);
+        (data, None)
+    } else if let Some(slots) = slots.filter(|&s| s < n_experts) {
         (DeviceBuffer::new(device, slots * expert_stride)?, Some(HostExperts {
             file: Arc::clone(gguf), info: info.clone(), slots: RefCell::new(ExpertSlots::new(slots)),
         }))
@@ -680,6 +778,7 @@ fn load_cached(
     Ok(GpuTensor {
         data,
         host_experts,
+        mapped,
         ty: info.ty,
         k,
         rows,
@@ -688,6 +787,12 @@ fn load_cached(
         n_experts,
         device,
     })
+}
+
+/// Whether experts that do not fit in VRAM live in mapped host memory (the
+/// default) or are read from the GGUF on each miss (AIRUN_EXPERTS=stream).
+pub fn experts_mapped() -> bool {
+    std::env::var("AIRUN_EXPERTS").map_or(true, |v| v.trim() != "stream")
 }
 
 /// Uploads a tensor widened to f32. Used for norms and delta-net coefficients.

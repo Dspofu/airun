@@ -100,19 +100,36 @@ pub fn load(
         sizes.output += sizes.per_layer.get(config.n_run_layers()).copied().unwrap_or(0)
             + config.kv_bytes_per_layer(opts.ctx);
     }
-    let expert_cache = opts.expert_cache.or_else(|| auto_expert_cache(&gguf, &config, &sizes, &devices, opts));
-    if let Some(slots) = expert_cache {
-        let moe = config.moe.as_ref().ok_or_else(|| CoreError::Other(
-            "--expert-cache requires a MoE model; omit it for dense models".into()))?;
-        if slots < moe.n_experts_used || slots > moe.n_experts {
-            return Err(CoreError::Other(format!(
-                "--expert-cache must be between {} and {}; choose enough slots for every active expert",
-                moe.n_experts_used, moe.n_experts)));
+    let mut split = opts.split.clone();
+    let mut expert_note = None;
+    let expert_slots: Option<Vec<usize>> = match opts.expert_cache {
+        Some(slots) => {
+            let moe = config.moe.as_ref().ok_or_else(|| CoreError::Other(
+                "--expert-cache requires a MoE model; omit it for dense models".into()))?;
+            if slots < moe.n_experts_used || slots > moe.n_experts {
+                return Err(CoreError::Other(format!(
+                    "--expert-cache must be between {} and {}; choose enough slots for every active expert",
+                    moe.n_experts_used, moe.n_experts)));
+            }
+            expert_note = Some(format!("MoE expert cache: {slots} slots per layer"));
+            Some(vec![slots; config.n_run_layers()])
         }
+        None => match plan_experts(&gguf, &config, &sizes, &devices, opts) {
+            Some(p) => {
+                if let (Some(counts), SplitMode::Auto) = (p.counts, &opts.split) {
+                    split = SplitMode::Manual(counts);
+                }
+                expert_note = Some(p.note);
+                Some(p.slots)
+            }
+            None => None,
+        },
+    };
+    if let (Some(slots), Some(moe)) = (&expert_slots, config.moe.as_ref()) {
         for l in 0..config.n_run_layers() {
             for kind in ["gate", "up", "down"] {
                 if let Some(t) = gguf.tensor(&format!("blk.{l}.ffn_{kind}_exps.weight")) {
-                    sizes.per_layer[l] -= t.nbytes - t.nbytes / moe.n_experts as u64 * slots as u64;
+                    sizes.per_layer[l] -= t.nbytes - t.nbytes / moe.n_experts as u64 * slots[l] as u64;
                 }
             }
         }
@@ -129,7 +146,7 @@ pub fn load(
         let req = PlacementRequest {
             ctx,
             batch,
-            split: opts.split.clone(),
+            split: split.clone(),
             gpu_layers: opts.gpu_layers,
             reserve_bytes: reserve,
             allow_ctx_shrink: opts.allow_fallback,
@@ -152,9 +169,13 @@ pub fn load(
             Err(e) => return Err(e),
         };
 
-        if let Some(slots) = expert_cache {
-            let how = if opts.expert_cache.is_some() { "" } else { " (sized to fill the GPUs; --expert-cache overrides)" };
-            placement.notes.push(format!("MoE expert cache: {slots} slots per layer{how}; misses read from the GGUF, weights unchanged"));
+        if let Some(note) = &expert_note {
+            let rest = if crate::model::experts_mapped() {
+                "the rest in pinned RAM, read by the GPU"
+            } else {
+                "misses read from the GGUF"
+            };
+            placement.notes.push(format!("{note}; {rest}"));
         }
         if config.indexer_top_k > 0 && placement.ctx > config.indexer_top_k {
             placement.notes.push(format!(
@@ -182,7 +203,7 @@ pub fn load(
             streams.push((shard.device, Stream::new(shard.device)?));
         }
 
-        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_cache, load_mtp, |d, t| {
+        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_slots.as_deref(), load_mtp, |d, t| {
             progress("uploading weights", d, t)
         });
 
@@ -225,45 +246,127 @@ pub fn load(
     }
 }
 
-/// Expert slots per layer for a MoE model too big for the GPUs: as many as
-/// the free VRAM holds once everything else is placed, so the misses that
-/// stream from the file are as few as memory allows. `None` when the model
-/// fits whole, or is not MoE.
-fn auto_expert_cache(gguf: &GgufFile, config: &Config, sizes: &WeightSizes, devices: &[Device],
-    opts: &LoadOptions) -> Option<usize> {
+/// How a MoE model too big for the GPUs is spread: expert slots per layer,
+/// and (when it decides the split) layers per device in the planner's order.
+struct ExpertPlan {
+    slots: Vec<usize>,
+    counts: Option<Vec<f32>>,
+    note: String,
+}
+
+/// Host-to-device bandwidth below which a GPU only takes layers whose experts
+/// all fit in its VRAM: reading experts across a PCIe 3.0 x4 slot (measured
+/// 1.6 GB/s on a 5060 Ti) cost more than the rest of the layer.
+const SLOW_LINK_GBPS: f64 = 8.0;
+
+/// Plans expert residency for a MoE model too big for the GPUs, or `None`
+/// when it fits whole or is not MoE. GPUs with a slow host link get whole
+/// layers, all experts resident; the rest of the layers go to the fast-link
+/// GPUs with as many expert slots per layer as their VRAM holds, the other
+/// experts left in host memory.
+fn plan_experts(gguf: &GgufFile, config: &Config, sizes: &WeightSizes, devices: &[Device],
+    opts: &LoadOptions) -> Option<ExpertPlan> {
     let moe = config.moe.as_ref()?;
-    let used: Vec<&Device> = match &opts.split {
+    let ne = moe.n_experts as u64;
+    let mut used: Vec<&Device> = match &opts.split {
         SplitMode::Single(target) => devices.iter().filter(|d| d.ordinal == *target).collect(),
         _ => devices.iter().collect(),
     };
-    let budget: u64 = used.iter().map(|d| d.free_mem.saturating_sub(opts.reserve_bytes)).sum();
+    // The planner's order: fastest first, which takes the first layers.
+    used.sort_by(|a, b| b.perf_score().partial_cmp(&a.perf_score())
+        .unwrap_or(std::cmp::Ordering::Equal).then(a.ordinal.cmp(&b.ordinal)));
     let n_layers = config.n_run_layers();
-    let state: u64 = (0..n_layers).map(|l| match config.layer_kind(l) {
+    let state = |l: usize| match config.layer_kind(l) {
         crate::config::LayerKind::Attention => config.kv_bytes_per_layer(opts.ctx),
         crate::config::LayerKind::LinearAttention => config.ssm_bytes_per_layer(),
-    }).sum();
-    let scratch = used.len() as u64 * crate::plan::scratch_bytes(config, opts.batch, true);
-    let needed = sizes.total() + state + scratch;
-    if needed <= budget {
+    };
+    let experts: Vec<u64> = (0..n_layers).map(|l| ["gate", "up", "down"].iter()
+        .filter_map(|k| gguf.tensor(&format!("blk.{l}.ffn_{k}_exps.weight")).map(|t| t.nbytes)).sum()).collect();
+    let budget = |d: &Device| {
+        let b = d.free_mem.saturating_sub(opts.reserve_bytes);
+        b - b / 16 - crate::plan::scratch_bytes(config, opts.batch, true)
+    };
+    let total_budget: u64 = used.iter().map(|d| budget(d)).sum();
+    let fixed = sizes.embedding + sizes.output + sizes.other;
+    let full: u64 = (0..n_layers).map(|l| sizes.per_layer[l] + state(l)).sum::<u64>() + fixed;
+    if full <= total_budget {
         return None;
     }
-    // Bytes one slot costs across every layer, and what the experts cost now.
-    let (mut per_slot, mut experts) = (0u64, 0u64);
-    for l in 0..n_layers {
-        for kind in ["gate", "up", "down"] {
-            if let Some(t) = gguf.tensor(&format!("blk.{l}.ffn_{kind}_exps.weight")) {
-                per_slot += t.nbytes / moe.n_experts as u64;
-                experts += t.nbytes;
-            }
+
+    let slow: Vec<bool> = if used.len() > 1 {
+        used.iter().map(|d| measure_h2d_gbps(d.ordinal).is_some_and(|g| g < SLOW_LINK_GBPS)).collect()
+    } else {
+        vec![false]
+    };
+    // Whole layers for the slow-link GPUs, taken from the end, where the
+    // planner puts its last devices; the output head sits with the last one.
+    let mut counts = vec![0usize; used.len()];
+    let mut end = n_layers;
+    for di in (0..used.len()).rev() {
+        if !slow[di] || slow.iter().all(|&s| s) {
+            continue;
+        }
+        let mut room = budget(used[di]).saturating_sub(if di == used.len() - 1 { sizes.output + sizes.other } else { 0 });
+        while end > 0 {
+            let cost = sizes.per_layer[end - 1] + state(end - 1);
+            if cost > room { break; }
+            room -= cost;
+            end -= 1;
+            counts[di] += 1;
         }
     }
-    if per_slot == 0 {
+    // The fast GPUs share layers 0..end with uniform slots.
+    let fast: Vec<usize> = (0..used.len()).filter(|&i| !(slow[i] && !slow.iter().all(|&s| s))).collect();
+    let fast_budget: u64 = fast.iter().map(|&i| budget(used[i])).sum();
+    let out_on_fast = counts.last().copied().unwrap_or(0) == 0;
+    let fast_fixed = sizes.embedding + if out_on_fast { sizes.output + sizes.other } else { 0 };
+    let base: u64 = (0..end).map(|l| sizes.per_layer[l] - experts[l] + state(l)).sum::<u64>() + fast_fixed;
+    let per_slot: u64 = (0..end).map(|l| experts[l] / ne).sum();
+    let slots_fast = if per_slot == 0 { moe.n_experts } else {
+        ((fast_budget.checked_sub(base)? / per_slot) as usize).min(moe.n_experts)
+    };
+    if slots_fast < moe.n_experts_used {
         return None;
     }
-    // A layer split never lands exactly on the budget; keep 6% of it spare.
-    let room = (budget - budget / 16).checked_sub(needed - experts)?;
-    let slots = (room / per_slot) as usize;
-    (slots >= moe.n_experts_used).then_some(slots.min(moe.n_experts))
+    // Split the fast layers in proportion to the fast GPUs' budgets.
+    let mut left = end;
+    for (k, &i) in fast.iter().enumerate() {
+        let c = if k + 1 == fast.len() { left } else {
+            ((end as u64 * budget(used[i]) / fast_budget.max(1)) as usize).min(left)
+        };
+        counts[i] = c;
+        left -= c;
+    }
+    let slots: Vec<usize> = (0..n_layers).map(|l| if l < end { slots_fast } else { moe.n_experts }).collect();
+    let whole = n_layers - end;
+    let note = if whole > 0 {
+        format!("MoE experts: {slots_fast} of {} per layer in VRAM on layers 0..{}; layers {end}..{} whole on the \
+                 GPU(s) with a slow host link", moe.n_experts, end.saturating_sub(1), n_layers - 1)
+    } else {
+        format!("MoE expert cache: {slots_fast} slots per layer (sized to fill the GPUs; --expert-cache overrides)")
+    };
+    Some(ExpertPlan {
+        slots,
+        counts: (whole > 0).then(|| counts.iter().map(|&c| c as f32).collect()),
+        note,
+    })
+}
+
+/// Pinned host-to-device bandwidth of `ordinal`, from a few 64 MiB copies.
+fn measure_h2d_gbps(ordinal: i32) -> Option<f64> {
+    const BYTES: usize = 64 << 20;
+    device::set_device(ordinal).ok()?;
+    let stream = Stream::new(ordinal).ok()?;
+    let host = airun_cuda::PinnedBuffer::<u8>::new(BYTES).ok()?;
+    let dev = airun_cuda::DeviceBuffer::<u8>::new(ordinal, BYTES).ok()?;
+    dev.copy_from_host_at(0, host.as_slice(), &stream).ok()?;
+    stream.synchronize().ok()?;
+    let t = std::time::Instant::now();
+    for _ in 0..3 {
+        dev.copy_from_host_at(0, host.as_slice(), &stream).ok()?;
+    }
+    stream.synchronize().ok()?;
+    Some(3.0 * BYTES as f64 / t.elapsed().as_secs_f64() / 1e9)
 }
 
 /// The next smaller configuration to try, or `None` when out of options.

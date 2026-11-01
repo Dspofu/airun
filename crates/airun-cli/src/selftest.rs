@@ -1618,6 +1618,43 @@ fn test_moe_ffn(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
         format!("delta between expert sets {diff:.3e}"),
         diff > 1e-3,
     );
+
+    // The expert-major batch path against the token-major kernels, bit for
+    // bit: expert 0 takes every token's first slot, more than one chunk of
+    // pairs, and the other slots spread over the rest.
+    const N2: usize = 20;
+    let x2 = rng.floats(N2 * N_EMBD);
+    let ids2: Vec<i32> = (0..N2 * TOP_K)
+        .map(|i| if i % TOP_K == 0 { 0 } else { ((i / TOP_K) % (N_EXPERTS - 1) + 1) as i32 })
+        .collect();
+    let w2: Vec<f32> = (0..N2 * TOP_K).map(|i| 0.2 + 0.05 * (i % 7) as f32).collect();
+    let d_x2 = DeviceBuffer::<f32>::from_slice(device, &x2, stream)?;
+    let d_ids2 = DeviceBuffer::<i32>::from_slice(device, &ids2, stream)?;
+    let d_w2 = DeviceBuffer::<f32>::from_slice(device, &w2, stream)?;
+    let d_h2 = DeviceBuffer::<f32>::new(device, N2 * TOP_K * FF)?;
+    let kt = ops::KernelType(ty.id() as i32);
+    let token_major = DeviceBuffer::<f32>::zeroed(device, N2 * N_EMBD, stream)?;
+    airun_cuda::hybrid::moe_gate_up(kt, d_gate.as_ptr(), d_up.as_ptr(), d_x2.as_ptr(), d_ids2.as_ptr(),
+        d_h2.as_mut_ptr(), N_EMBD, FF, N2, TOP_K, gate_row_bytes, gate_stride, stream)?;
+    airun_cuda::hybrid::moe_down(kt, d_down.as_ptr(), d_h2.as_ptr(), d_ids2.as_ptr(), d_w2.as_ptr(),
+        token_major.as_mut_ptr(), FF, N_EMBD, N2, TOP_K, down_row_bytes, down_stride, stream)?;
+    let grouped = DeviceBuffer::<f32>::zeroed(device, N2 * N_EMBD, stream)?;
+    let scratch = DeviceBuffer::<i32>::new(device, N_EXPERTS)?;
+    let offsets = DeviceBuffer::<i32>::new(device, N_EXPERTS + 1)?;
+    let perm = DeviceBuffer::<i32>::new(device, N2 * TOP_K)?;
+    let ypair = DeviceBuffer::<f32>::new(device, N2 * TOP_K * N_EMBD)?;
+    airun_cuda::hybrid::moe_sort(d_ids2.as_ptr(), N2 * TOP_K, N_EXPERTS, scratch.as_mut_ptr(), offsets.as_mut_ptr(),
+        perm.as_mut_ptr(), stream)?;
+    let ew = |base: *const std::ffi::c_void, stride: usize, row_bytes: usize| airun_cuda::hybrid::ExpertWeights {
+        ty: kt, tab: std::ptr::null(), base, stride, row_bytes };
+    airun_cuda::hybrid::moe_grouped(ew(d_gate.as_ptr(), gate_stride, gate_row_bytes),
+        ew(d_up.as_ptr(), gate_stride, gate_row_bytes), ew(d_down.as_ptr(), down_stride, down_row_bytes),
+        d_x2.as_ptr(), perm.as_ptr(), offsets.as_ptr(), d_w2.as_ptr(), d_h2.as_mut_ptr(), ypair.as_mut_ptr(),
+        grouped.as_mut_ptr(), N_EMBD, FF, N2, TOP_K, N_EXPERTS, stream)?;
+    let (a, b) = (token_major.to_vec(stream)?, grouped.to_vec(stream)?);
+    let bad = a.iter().zip(&b).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+    report.case("moe expert-major batch == token-major", format!("{bad} values differ, peak {:.3e}", scale_of(&a)),
+        bad == 0 && scale_of(&a) > 1e-3);
     Ok(())
 }
 
