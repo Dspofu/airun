@@ -5,7 +5,7 @@ curta.
 
 ```
 airun run        gerar texto
-airun serve      API HTTP compatível com OpenAI
+airun serve      API HTTP no formato do llama-server (OpenAI + nativa)
 airun inspect    descrever um arquivo GGUF
 airun gpu        listar GPUs CUDA detectadas
 airun convert    safetensors (HuggingFace) -> GGUF
@@ -34,6 +34,9 @@ Estas são as flags que decidem **o que vai para qual GPU**.
 | `--expert-cache <N>` | todos | Só MoE: mantém N experts por camada na VRAM e lê os demais do GGUF sob demanda, sem requantizar. Resultado idêntico ao modelo residente; a velocidade depende da taxa de acerto e do disco. Vale também para `perplexity`. |
 | *(automático)* | todos | MoE que não cabe nas GPUs sem `--expert-cache`: o airun escolhe quantos experts por camada ficam na VRAM (mede o link PCIe de cada GPU; GPU de link lento recebe só camadas inteiras) e põe o resto em RAM fixada, lida pela GPU. `AIRUN_EXPERTS=stream` volta à leitura do GGUF. |
 | `--draft <N>` | `3` | Decodificação especulativa com a cabeça MTP do próprio modelo (Qwen3.5/3.8 densos): N tokens rascunhados por passo, verificados de uma vez. Só com amostragem gulosa pura (`--temp 0 --repeat-penalty 1`); o texto é idêntico ao do decode normal. `0` desliga e não carrega a cabeça (~240 MB a menos). Ignorada em arquivos sem MTP. |
+| *(automático)* | MoE com experts em RAM | Perfil de roteamento: a airun conta quais experts cada camada usa e grava em `%LOCALAPPDATA%\airun\profiles\` (ou `~/.cache/airun/profiles/`); na carga seguinte os mais usados já começam na VRAM. `AIRUN_EXPERT_PROFILE=<arquivo>` muda o lugar, `AIRUN_EXPERT_PROFILE=off` desliga. |
+| *(automático)* | MoE com experts em RAM | No decode, os experts que faltam na VRAM são copiados num stream paralelo enquanto os residentes calculam. `AIRUN_MOE_OVERLAP=0` volta a um stream só. |
+| *(automático)* | MoE, sm_80+ | Lotes de 64+ tokens (prompt) calculam os experts em tensor cores (fp16, acumulação f32). `AIRUN_MOE_MMA=0` volta aos kernels f32. |
 | *(automático)* | qwen4exp | Atenção esparsa QSA: além de 2051 tokens de contexto, cada camada de atenção vê só o bloco final e os 512 blocos de 4 tokens com maior nota do indexador, como o modelo foi treinado. `AIRUN_QSA=off` volta à atenção densa (só para comparação). |
 
 ### Como a alocação automática decide
@@ -129,8 +132,9 @@ Sobe uma API HTTP compatível com OpenAI.
 | `--host <ip>` | `127.0.0.1` | Endereço de bind. Use `0.0.0.0` para expor na rede. |
 | `--port <N>` | `8080` | Porta. |
 | `--api-key <chave>` | — | Exige `Authorization: Bearer <chave>`. Também lida da variável `AIRUN_API_KEY`. **Sem esta flag não há autenticação nenhuma** — não use `--host 0.0.0.0` sem ela. |
-| `--served-model-name <nome>` | nome do arquivo | Nome reportado em `/v1/models`. |
-| `--default-max-tokens <N>` | `512` | Limite quando a requisição não especifica um. |
+| `--served-model-name <nome>` (ou `--alias`) | nome do arquivo | Nome reportado em `/v1/models`. |
+| `--default-max-tokens <N>` | `512` | Limite das requisições OpenAI que não especificam um. O `/completion` nativo gera até o fim, como o llama-server. |
+| `--reasoning-format <deepseek\|none>` | `deepseek` | Onde vai o pensamento (`<think>`) das respostas de chat: em `reasoning_content` (padrão do llama-server) ou no `content`. O `reasoning_format` da requisição tem prioridade. |
 | `--repeat-penalty <f>` | `1.1` | Penalidade multiplicativa em tokens recentes quando a requisição não pede uma. `1.0` desliga. |
 | `--repeat-last-n <N>` | `64` | Quantos tokens recentes as penalidades consideram. |
 

@@ -30,6 +30,34 @@ O Strata não roda esse modelo (só o Flash-Next). Contra o llama.cpp, veja
 (pp512 / pp2048 / decode). Esta rodada repetiu o `airun bench` depois do QSA:
 3796 / 3688 / 49,1.
 
+## Repetição depois do commit do QSA (340a77c), 3 rodadas
+
+O Strata recusa o 27B (`iq_pack.py`: "the model has no expert tensors"); ele só
+roda o Flash-Next.
+
+**Qwen3.8-27B NVFP4** (`scoreboard-27b.ps1`, melhor de 3, tok/s):
+
+| Teste | airun | llama.cpp | airun / llama.cpp |
+|---|---|---|---|
+| prompt 512 | 3797 | 3472 | 1,09 |
+| prompt 2048 | 3690 | 3652 | 1,01 |
+| geração 128 | 49,0 | 47,9 | 1,02 |
+| MTP, prompt 1 | 113,7 | 104,6 | 1,09 |
+| MTP, prompt 2 | 94,9 | 91,7 | 1,03 |
+
+**Qwen4 Flash-Next** (`qwen4.ps1`, prompt / geração em tok/s):
+
+| Rodada | airun | Strata | llama.cpp |
+|---|---|---|---|
+| 1 | 88,6 / 19,1 | 263,7 / 32,9 | 36,8 / 9,5 |
+| 2 | 90,3 / 19,2 | 136,2 / 33,0 | 37,4 / 9,6 |
+| 3 | 82,3 / 18,7 | 110,6 / 33,5 | 35,4 / 9,8 |
+
+O prompt do Strata caiu nas rodadas 2 e 3, que rodaram logo depois das outras
+engines. Uma causa plausível, que não verifiquei, é a parte do prompt que ele
+calcula na CPU disputando RAM e cache de arquivo. A geração dele ficou estável
+em ~33 tok/s.
+
 ## QSA (atenção esparsa do qwen4exp)
 
 Perplexidade num texto de 25 mil tokens (AGENTS.md + FLAGS.md + docs do

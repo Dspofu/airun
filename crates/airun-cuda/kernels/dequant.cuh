@@ -476,14 +476,53 @@ __device__ __forceinline__ void dq_q3_K(const void* p, int sub, float* out) {
     }
 }
 
+// kvalues_iq4nl as four words of int8 lanes, for __byte_perm lookups: the
+// __constant__ table indexed by a different nibble in every lane serialized
+// up to 16 ways and held the IQ4_NL expert down projection at ~50 GB/s.
+#define IQ4_T0 0xBFAD9881u   // codes 0..3:   -127 -104  -83  -65
+#define IQ4_T1 0xF6EADDCFu   // codes 4..7:    -49  -35  -22  -10
+#define IQ4_T2 0x26190D01u   // codes 8..11:     1   13   25   38
+#define IQ4_T3 0x71594535u   // codes 12..15:   53   69   89  113
+
+// The int8 codebook values of the eight nibbles of `w`: `lo` gets the low
+// nibbles of its four bytes, `hi` the high ones (IQ4's layout: byte i holds
+// elements i and i + 16). Bit 3 of each nibble picks the upper half table.
+__device__ __forceinline__ void iq4_codes8(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    const uint32_t half_sel = 0x32103210u | ((w & 0x88888888u) >> 1);
+    uint32_t t[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t s = w >> (16 * i);
+        const uint32_t a = __byte_perm(IQ4_T0, IQ4_T1, s);
+        const uint32_t c = __byte_perm(IQ4_T2, IQ4_T3, s);
+        t[i] = __byte_perm(a, c, half_sel >> (16 * i));   // [b0lo b0hi b1lo b1hi], [b2lo b2hi b3lo b3hi]
+    }
+    lo = __byte_perm(t[0], t[1], 0x6420);
+    hi = __byte_perm(t[0], t[1], 0x7531);
+}
+
+// 32 IQ4 elements from 16 code bytes held as four words, scaled by `d`.
+__device__ __forceinline__ void iq4_decode32(const uint32_t (&q)[4], float d, float* out) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint32_t lo, hi;
+        iq4_codes8(q[j], lo, hi);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            out[4 * j + k]      = d * (float)(int8_t)(lo >> (8 * k));
+            out[16 + 4 * j + k] = d * (float)(int8_t)(hi >> (8 * k));
+        }
+    }
+}
+
 __device__ __forceinline__ void dq_iq4_nl(const void* p, int sub, float* out) {
     const block_iq4_nl* b = (const block_iq4_nl*)p + sub;
     const float d = __half2float(b->d);
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        out[i]      = d * (float)kvalues_iq4nl[b->qs[i] & 0x0F];
-        out[i + 16] = d * (float)kvalues_iq4nl[b->qs[i] >> 4];
-    }
+    // An 18-byte block keeps its codes 2-byte aligned: two halves per word.
+    const uint16_t* h = (const uint16_t*)b->qs;
+    const uint32_t q[4] = {h[0] | ((uint32_t)h[1] << 16), h[2] | ((uint32_t)h[3] << 16),
+                           h[4] | ((uint32_t)h[5] << 16), h[6] | ((uint32_t)h[7] << 16)};
+    iq4_decode32(q, d, out);
 }
 
 __device__ __forceinline__ void dq_iq4_xs(const void* p, int sub, float* out) {
@@ -495,12 +534,10 @@ __device__ __forceinline__ void dq_iq4_xs(const void* p, int sub, float* out) {
                  | (((b->scales_h >> (2 * sub)) & 3) << 4);
     const float dl = d * (float)(ls - 32);
 
-    const uint8_t* qs = b->qs + sub * 16;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        out[i]      = dl * (float)kvalues_iq4nl[qs[i] & 0x0F];
-        out[i + 16] = dl * (float)kvalues_iq4nl[qs[i] >> 4];
-    }
+    // A 136-byte block keeps its codes word aligned.
+    const uint32_t* w = (const uint32_t*)(b->qs + sub * 16);
+    const uint32_t q[4] = {w[0], w[1], w[2], w[3]};
+    iq4_decode32(q, dl, out);
 }
 
 __device__ __forceinline__ void dq_mxfp4(const void* p, int sub, float* out) {

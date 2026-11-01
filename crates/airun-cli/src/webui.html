@@ -653,6 +653,9 @@ async function generate() {
   controller = new AbortController();
   const t0 = performance.now();
   let acc = "", firstTokenAt = null, nChunks = 0, pending = false, stopped = false;
+  // The server streams the thinking as reasoning_content (llama-server's
+  // shape); it is put back in <think> form, which the rest of the page splits.
+  let reasoning = "", content = "";
 
   // Re-rendering markdown per chunk is wasted work; once per frame is enough.
   const paint = () => {
@@ -694,11 +697,14 @@ async function generate() {
           let j;
           try { j = JSON.parse(payload); } catch (_) { continue; }
           if (j.error) throw new Error(j.error.message || "server error");
-          const piece = j.choices?.[0]?.delta?.content;
-          if (!piece) continue;
+          const delta = j.choices?.[0]?.delta || {};
+          const thought = delta.reasoning_content, piece = delta.content;
+          if (!thought && !piece) continue;
           if (firstTokenAt === null) firstTokenAt = performance.now();
           nChunks++;
-          acc += piece;
+          if (thought) reasoning += thought;
+          if (piece) content += piece;
+          acc = reasoning ? "<think>\n" + reasoning + (content ? "\n</think>\n\n" + content : "") : content;
           if (state.thinkEnd === null && acc.includes("</think>")) state.thinkEnd = performance.now();
           paint();
         }

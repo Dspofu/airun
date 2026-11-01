@@ -141,7 +141,8 @@ struct MoeScratch {
     mapped_hits: std::cell::Cell<(u64, u64)>,
     /// Expert-major batches (see hybrid::moe_grouped): per-expert counts,
     /// offsets, the sorted pairs, and per-pair down projections.
-    grouped: Option<(DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<f32>)>,
+    /// (counts, offsets, perm, ypair, fp16 activations) of the expert-major batch path.
+    grouped: Option<(DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<f32>, DeviceBuffer<u16>)>,
 }
 
 /// What a delta-net layer saw during a speculative verify, so the accepted
@@ -174,6 +175,11 @@ struct QAct {
 struct DeviceState {
     device: i32,
     stream: Stream,
+    /// Copies host-side experts into the staging area while `stream`
+    /// computes the resident ones (see run_moe), forked and joined by events.
+    side: Stream,
+    fork: airun_cuda::Event,
+    join: airun_cuda::Event,
 
     x: DeviceBuffer<f32>,
     xb: DeviceBuffer<f32>,
@@ -255,6 +261,8 @@ pub struct Runtime {
     draft: usize,
     /// Forward passes since the mapped experts were last rebalanced.
     since_rebalance: usize,
+    /// Rebalances so far; every PROFILE_SAVE_EVERY of them saves the profile.
+    rebalances: usize,
 }
 
 /// Greedy decode as a chain of graph launches (see [`Runtime::generate`]): the
@@ -280,6 +288,13 @@ struct ChainGraph {
 fn decode_pipeline_disabled() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *D.get_or_init(|| std::env::var("AIRUN_NO_DECODE_PIPELINE").is_ok_and(|v| v.trim() != "0"))
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // The counts since the last rebalance are lost; the rest is kept.
+        self.save_expert_profile();
+    }
 }
 
 impl Runtime {
@@ -421,7 +436,23 @@ impl Runtime {
                     } else {
                         None
                     },
-                    scores: std::cell::RefCell::new(vec![0.0; mapped_layers * moe.n_experts]),
+                    // Seeded from the routing profile at the decayed counts'
+                    // steady state, so a rebalance weighs what a few tokens
+                    // route against the long-run use, not against nothing.
+                    scores: std::cell::RefCell::new({
+                        let mut sc = vec![0.0; mapped_layers * moe.n_experts];
+                        if let (true, Some(p)) = (mapped_layers > 0, &model.expert_profile) {
+                            let steady = REBALANCE_EVERY as f32 * moe.n_experts_used as f32 / (1.0 - REBALANCE_DECAY);
+                            for (local, &l) in shard.layers.iter().enumerate() {
+                                if let Some(sh) = p.borrow().shares(l) {
+                                    for (d, x) in sc[local * moe.n_experts..][..moe.n_experts].iter_mut().zip(sh) {
+                                        *d = x * steady;
+                                    }
+                                }
+                            }
+                        }
+                        sc
+                    }),
                     staging: if mapped_layers > 0 { Some(DeviceBuffer::new(dev, mapped_stride)?) } else { None },
                     stage: if mapped_layers > 0 {
                         Some(([DeviceBuffer::new(dev, STAGE_CAP * mapped_stride)?,
@@ -436,7 +467,8 @@ impl Runtime {
                     grouped: if b >= GROUPED_MIN {
                         Some((DeviceBuffer::new(dev, moe.n_experts)?, DeviceBuffer::new(dev, moe.n_experts + 1)?,
                               DeviceBuffer::new(dev, b * moe.n_experts_used)?,
-                              DeviceBuffer::new(dev, b * moe.n_experts_used * cfg.n_embd)?))
+                              DeviceBuffer::new(dev, b * moe.n_experts_used * cfg.n_embd)?,
+                              DeviceBuffer::new(dev, b * cfg.n_embd)?))
                     } else {
                         None
                     },
@@ -493,6 +525,9 @@ impl Runtime {
             states.push(DeviceState {
                 device: dev,
                 stream,
+                side: Stream::new(dev)?,
+                fork: airun_cuda::Event::new()?,
+                join: airun_cuda::Event::new()?,
                 x: DeviceBuffer::new(dev, b * hc_width)?,
                 xb: DeviceBuffer::new(dev, b * cfg.n_embd)?,
                 xb2: DeviceBuffer::new(dev, b * cfg.n_embd)?,
@@ -554,6 +589,7 @@ impl Runtime {
             spec: None,
             draft: 0,
             since_rebalance: 0,
+            rebalances: 0,
         })
     }
 
@@ -808,14 +844,13 @@ impl Runtime {
     /// counts read back is a synchronization, and each swap moves three
     /// experts each way across PCIe.
     fn rebalance_experts(&mut self) -> Result<()> {
-        const EVERY: usize = 8;
         const MAX_SWAPS: usize = 16;
-        const DECAY: f32 = 0.9;
         self.since_rebalance += 1;
-        if self.since_rebalance < EVERY {
+        if self.since_rebalance < REBALANCE_EVERY {
             return Ok(());
         }
         self.since_rebalance = 0;
+        self.rebalances += 1;
         let Some(ne) = self.model.config.moe.as_ref().map(|m| m.n_experts) else { return Ok(()) };
         for st in &self.states {
             let Some(m) = &st.moe else { continue };
@@ -836,7 +871,10 @@ impl Runtime {
                 let place = gm.place.borrow().clone();
                 for e in 0..ne {
                     if place[e].is_ok() { hits += u64::from(c[e]) } else { misses += u64::from(c[e]) }
-                    sc[e] = sc[e] * DECAY + c[e] as f32;
+                    sc[e] = sc[e] * REBALANCE_DECAY + c[e] as f32;
+                }
+                if let Some(p) = &self.model.expert_profile {
+                    p.borrow_mut().add(layer, c);
                 }
                 let mut resident: Vec<usize> = (0..ne).filter(|&e| place[e].is_ok()).collect();
                 let mut outside: Vec<usize> = (0..ne).filter(|&e| place[e].is_err()).collect();
@@ -844,9 +882,11 @@ impl Runtime {
                 outside.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]));
                 let mut swapped = 0;
                 for (&hot, &cold) in outside.iter().zip(&resident).take(MAX_SWAPS) {
-                    // A margin keeps two near-equal experts from trading
-                    // places on every rebalance.
-                    if sc[hot] <= sc[cold] * 1.25 + 1.0 {
+                    // A swap moves both experts across PCIe, three times
+                    // what one miss costs; it pays only when the hot expert
+                    // is expected to be routed a few times more than the
+                    // cold one (the scores count about the last 80 tokens).
+                    if sc[hot] <= sc[cold] * 1.25 + SWAP_MARGIN {
                         break;
                     }
                     for t in tensors {
@@ -868,7 +908,21 @@ impl Runtime {
             // The table mirrors are reused by the next publish.
             st.stream.synchronize()?;
         }
+        if self.rebalances % PROFILE_SAVE_EVERY == 0 {
+            self.save_expert_profile();
+        }
         Ok(())
+    }
+
+    /// Saves the routing profile; a failure is reported and otherwise ignored,
+    /// since the profile only speeds up the next load.
+    fn save_expert_profile(&self) {
+        if let Some(p) = &self.model.expert_profile {
+            let mut p = p.borrow_mut();
+            if let Err(e) = p.save() {
+                eprintln!("warning: cannot save the expert routing profile to {} ({e}); the next load                     will place experts without it -- check the directory is writable, or set                     AIRUN_EXPERT_PROFILE to another path", p.path().display());
+            }
+        }
     }
 
     /// Runs `tokens` through the model, leaving the last one's logits on the
@@ -1425,7 +1479,11 @@ impl Runtime {
             pc.rows(&seq[..prefix + i + 1], &mut rows);
         }
         let mut host = ps.emb_host.borrow_mut();
+        let t = std::time::Instant::now();
         table.gather(&rows, &mut host.as_mut_slice()[..rows.len() * pc.head_dim])?;
+        if std::env::var("AIRUN_PLE_TIMING").is_ok() && rows.len() > 64 {
+            eprintln!("PLE gather: {} rows in {:.1} ms", rows.len(), t.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(())
     }
 
@@ -1992,7 +2050,7 @@ impl Runtime {
         }
         // A batch goes expert-major: each expert's weights are read once for
         // all the tokens routed to it, wherever they live.
-        if let (Some((scratch, offsets, perm, ypair)), true) = (&m.grouped, n >= GROUPED_MIN && m.upload.is_none()) {
+        if let (Some((scratch, offsets, perm, ypair, xh)), true) = (&m.grouped, n >= GROUPED_MIN && m.upload.is_none()) {
             let k = moe.n_experts_used;
             hybrid::moe_sort(m.ids.as_ptr(), n * k, moe.n_experts, scratch.as_mut_ptr(), offsets.as_mut_ptr(),
                 perm.as_mut_ptr(), stream)?;
@@ -2002,10 +2060,12 @@ impl Runtime {
                 base: t.data.as_ptr(),
                 stride: t.expert_stride,
                 row_bytes: t.row_bytes,
+                resident: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.resident.as_ptr()),
             };
             hybrid::moe_grouped(ew(gate_exps), ew(up_exps), ew(down_exps), st.xb.as_ptr(), perm.as_ptr(),
                 offsets.as_ptr(), m.weights.as_ptr(), m.h.as_mut_ptr(), ypair.as_mut_ptr(), st.xb2.as_mut_ptr(),
-                cfg.n_embd, moe.expert_ff, n, k, moe.n_experts, stream)?;
+                cfg.n_embd, moe.expert_ff, n, k, moe.n_experts, xh.as_mut_ptr(),
+                moe_overlap().then_some((&st.side, &st.fork, &st.join)), stream)?;
             return Ok(());
         }
         if let (Some(gm), Some(um), Some(dm)) = (&gate_exps.mapped, &up_exps.mapped, &down_exps.mapped) {
@@ -2023,18 +2083,37 @@ impl Runtime {
                 let ids = m.ids.offset_ptr(t0 * k);
                 hybrid::moe_stage_plan(ids, cnt * k, gm.resident.as_ptr(), moe.n_experts, sidx.as_mut_ptr(),
                     list.as_mut_ptr(), n_list.as_mut_ptr(), stream)?;
+                // The copy crosses PCIe on the side stream while the resident
+                // experts compute here; the staged ones follow once it lands.
+                // AIRUN_MOE_OVERLAP=0 keeps it all on one stream.
+                let overlap = moe_overlap();
+                let copy_on = if overlap {
+                    st.fork.record(stream)?;
+                    st.side.wait_for(&st.fork)?;
+                    &st.side
+                } else {
+                    stream
+                };
                 for (t, area) in [gate_exps, up_exps, down_exps].iter().zip(areas) {
                     let tm = t.mapped.as_ref().expect("checked above");
                     hybrid::moe_stage_copy(tm.table.as_ptr(), list.as_ptr(), n_list.as_ptr(), area.as_mut_ptr(),
-                        t.expert_stride, cnt * k, stream)?;
+                        t.expert_stride, cnt * k, copy_on)?;
                 }
-                let staged = |t: &GpuTensor| hybrid::Staged { sidx: sidx.as_ptr(), stride: t.expert_stride };
-                hybrid::moe_gate_up_tab(gate_exps.kernel_type(), gm.table.as_ptr(), um.table.as_ptr(),
-                    st.xb.offset_ptr(t0 * cfg.n_embd), ids, m.h.as_mut_ptr(), cfg.n_embd, moe.expert_ff, cnt, k,
-                    gate_exps.row_bytes, Some((staged(gate_exps), areas[0].as_ptr(), areas[1].as_ptr())), stream)?;
-                hybrid::moe_down_tab(down_exps.kernel_type(), dm.table.as_ptr(), m.h.as_ptr(), ids,
-                    m.weights.offset_ptr(t0 * k), st.xb2.offset_ptr(t0 * cfg.n_embd), moe.expert_ff, cfg.n_embd,
-                    cnt, k, down_exps.row_bytes, Some((staged(down_exps), areas[2].as_ptr())), stream)?;
+                let staged = |t: &GpuTensor, only: i32| hybrid::Staged { sidx: sidx.as_ptr(), stride: t.expert_stride, only };
+                let passes: &[i32] = if overlap { &[1, 2] } else { &[0] };
+                for &only in passes {
+                    if only == 2 {
+                        st.join.record(&st.side)?;
+                        stream.wait_for(&st.join)?;
+                    }
+                    hybrid::moe_gate_up_tab(gate_exps.kernel_type(), gm.table.as_ptr(), um.table.as_ptr(),
+                        st.xb.offset_ptr(t0 * cfg.n_embd), ids, m.h.as_mut_ptr(), cfg.n_embd, moe.expert_ff, cnt, k,
+                        gate_exps.row_bytes, Some((staged(gate_exps, only), areas[0].as_ptr(), areas[1].as_ptr())),
+                        stream)?;
+                    hybrid::moe_down_tab(down_exps.kernel_type(), dm.table.as_ptr(), m.h.as_ptr(), ids,
+                        m.weights.offset_ptr(t0 * k), st.xb2.offset_ptr(t0 * cfg.n_embd), moe.expert_ff, cfg.n_embd,
+                        cnt, k, down_exps.row_bytes, Some((staged(down_exps, only), areas[2].as_ptr())), stream)?;
+                }
             }
             return Ok(());
         }
@@ -2494,6 +2573,21 @@ fn matvec_f32_forced() -> bool {
 
 /// Batches at least this big run the experts expert-major (see run_moe).
 const GROUPED_MIN: usize = 16;
+/// Whether run_moe copies host-side experts on a side stream while the
+/// resident ones compute (AIRUN_MOE_OVERLAP=0 turns it off).
+fn moe_overlap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AIRUN_MOE_OVERLAP").as_deref() != Ok("0"))
+}
+
+/// Forward passes between expert rebalances, and the decay of the routing
+/// scores at each one.
+const REBALANCE_EVERY: usize = 8;
+const REBALANCE_DECAY: f32 = 0.9;
+/// Routings a swapped-in expert must be ahead of the one it evicts by.
+const SWAP_MARGIN: f32 = 4.0;
+/// Rebalances between saves of the routing profile (also saved on drop).
+const PROFILE_SAVE_EVERY: usize = 64;
 
 /// Experts a mapped MoE layer stages into VRAM per pass (see run_moe).
 const STAGE_CAP: usize = 64;

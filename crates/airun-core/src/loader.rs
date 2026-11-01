@@ -135,6 +135,21 @@ pub fn load(
         }
     }
 
+    // Which experts take the VRAM slots: the most routed ones of earlier runs.
+    let mut profile = match (&expert_slots, config.moe.as_ref()) {
+        (Some(_), Some(moe)) if crate::model::experts_mapped() =>
+            crate::expert_profile::ExpertProfile::open(gguf.path(), gguf.file_len(), config.n_run_layers(), moe.n_experts),
+        _ => None,
+    };
+    if let (Some(p), Some(note)) = (&profile, &mut expert_note) {
+        let known = (0..config.n_run_layers()).filter(|&l| p.knows(l)).count();
+        note.push_str(&if known > 0 {
+            format!("; resident experts chosen by the routing profile {}", p.path().display())
+        } else {
+            format!("; no routing profile yet, it is learned from this run into {}", p.path().display())
+        });
+    }
+
     // Ladder of retries. Each rung halves the memory the run needs; the first
     // that both plans and allocates wins.
     let mut fallbacks = Vec::new();
@@ -205,11 +220,11 @@ pub fn load(
             streams.push((shard.device, Stream::new(shard.device)?));
         }
 
-        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_slots.as_deref(), load_mtp, |d, t| {
+        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_slots.as_deref(), profile.as_ref(), load_mtp, |d, t| {
             progress("uploading weights", d, t)
         });
 
-        let model = match attempt {
+        let mut model = match attempt {
             Ok(m) => m,
             Err(e) if opts.allow_fallback && e.is_capacity_error() => {
                 // The plan said it fits but the driver disagreed: fragmentation,
@@ -226,6 +241,7 @@ pub fn load(
             }
             Err(e) => return Err(e),
         };
+        model.expert_profile = profile.take().map(std::cell::RefCell::new);
 
         progress("building tokenizer", 0, 1);
         let tokenizer = Tokenizer::from_gguf(&gguf)?;

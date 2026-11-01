@@ -259,6 +259,51 @@ pub struct PleTable {
     info: TensorInfo,
     row_bytes: usize,
     head_dim: usize,
+    /// Reads the rows in parallel: most are random SSD reads (gather_pool).
+    pool: crate::gather_pool::GatherPool,
+}
+
+/// Rows the gather threads keep in flight. More only contended on the
+/// working-set lock their page faults take (128 measured slower than 32).
+const PLE_READERS: usize = 32;
+
+/// Asks Windows to read the pages under `ranges` ((address, length) pairs)
+/// in one call: the memory manager queues the reads together, where faulting
+/// them in from many threads contends on the process's working-set lock.
+/// Elsewhere, and on failure, the gather simply faults them in.
+fn prefetch_pages(ranges: &[(usize, usize)]) {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Range {
+            addr: *mut std::ffi::c_void,
+            len: usize,
+        }
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn PrefetchVirtualMemory(process: *mut std::ffi::c_void, n: usize, ranges: *const Range, flags: u32)
+                -> i32;
+        }
+        let list: Vec<Range> = ranges.iter().map(|&(a, l)| Range { addr: a as *mut _, len: l }).collect();
+        // SAFETY: every range lies inside the live read-only mapping of the
+        // model file; the call only schedules reads of it.
+        unsafe { PrefetchVirtualMemory(GetCurrentProcess(), list.len(), list.as_ptr(), 0) };
+    }
+    #[cfg(not(windows))]
+    let _ = ranges;
+}
+
+/// A pointer the gather threads write disjoint rows through.
+struct RowsOut(*mut f32);
+// SAFETY: every row index is written by exactly one thread, and the buffer
+// outlives the pool run that writes it.
+unsafe impl Sync for RowsOut {}
+
+impl RowsOut {
+    /// Row i of `hd` floats. SAFETY: the caller owns row i and it is in bounds.
+    unsafe fn row(&self, i: usize, hd: usize) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(i * hd), hd) }
+    }
 }
 
 impl PleTable {
@@ -266,13 +311,36 @@ impl PleTable {
     pub fn gather(&self, rows: &[u64], out: &mut [f32]) -> Result<()> {
         let bytes = self.file.tensor_bytes(&self.info)?;
         let n_rows = self.info.n_rows();
-        for (r, dst) in rows.iter().zip(out.chunks_mut(self.head_dim)) {
-            if *r >= n_rows {
-                return Err(CoreError::Other(format!(
-                    "PLE row {r} is past the table's {n_rows}; the ple.* metadata does not match the table")));
-            }
-            let at = *r as usize * self.row_bytes;
-            airun_gguf::dequant::dequantize(self.info.ty, &bytes[at..at + self.row_bytes], self.head_dim, dst)?;
+        if let Some(r) = rows.iter().find(|&&r| r >= n_rows) {
+            return Err(CoreError::Other(format!(
+                "PLE row {r} is past the table's {n_rows}; the ple.* metadata does not match the table")));
+        }
+        if out.len() < rows.len() * self.head_dim {
+            return Err(CoreError::Other("PLE gather given too small an output; this is a bug".into()));
+        }
+        let (hd, rb, ty) = (self.head_dim, self.row_bytes, self.info.ty);
+        if rows.len() > 64 {
+            const PAGE: usize = 4096;
+            let base = bytes.as_ptr() as usize;
+            let mut ranges: Vec<(usize, usize)> = rows.iter().map(|&r| {
+                let a = base + r as usize * rb;
+                let start = a / PAGE * PAGE;
+                (start, (a + rb).div_ceil(PAGE) * PAGE - start)
+            }).collect();
+            ranges.sort_unstable();
+            ranges.dedup();
+            prefetch_pages(&ranges);
+        }
+        let dst = RowsOut(out.as_mut_ptr());
+        let ok = self.pool.run(rows.len(), &|i| {
+            let at = rows[i] as usize * rb;
+            // SAFETY: row i owns out[i * hd..(i + 1) * hd], checked in bounds above.
+            let row = unsafe { dst.row(i, hd) };
+            airun_gguf::dequant::dequantize(ty, &bytes[at..at + rb], hd, row).is_ok()
+        });
+        if !ok {
+            return Err(CoreError::Other(format!(
+                "cannot decode the PLE table's {ty} rows; check the model file with airun inspect")));
         }
         Ok(())
     }
@@ -324,6 +392,9 @@ pub struct Model {
     /// Loaded when the file has one and speculative decoding was asked for.
     pub mtp: Option<MtpWeights>,
     pub total_bytes: u64,
+    /// Routing counts that chose the resident experts, updated as the
+    /// runtime routes and saved when it is done (see expert_profile).
+    pub expert_profile: Option<RefCell<crate::expert_profile::ExpertProfile>>,
 }
 
 impl Model {
@@ -337,6 +408,7 @@ impl Model {
         placement: Placement,
         streams: &[(i32, Stream)],
         expert_slots: Option<&[usize]>,
+        profile: Option<&crate::expert_profile::ExpertProfile>,
         load_mtp: bool,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Self> {
@@ -393,7 +465,8 @@ impl Model {
                         name: info.name.clone(), found: info.dims.clone(), expected: vec![p.head_dim as u64] });
                 }
                 let row_bytes = p.head_dim / layout.elements as usize * layout.bytes as usize;
-                Some(PleTable { file: Arc::clone(gguf), info, row_bytes, head_dim: p.head_dim })
+                Some(PleTable { file: Arc::clone(gguf), info, row_bytes, head_dim: p.head_dim,
+                    pool: crate::gather_pool::GatherPool::new(PLE_READERS) })
             }
             None => None,
         };
@@ -437,6 +510,7 @@ impl Model {
                 .ok_or_else(|| CoreError::Other(format!("layer {l} was not placed on any GPU")))?;
             let stream = stream_for(dev)?;
             let name = |suffix: &str| format!("blk.{l}.{suffix}");
+            let order = profile.filter(|p| p.knows(l)).map(|p| p.order(l));
 
             let block = match config.layer_kind(l) {
                 LayerKind::Attention => Block::Attention(AttentionWeights {
@@ -482,9 +556,12 @@ impl Model {
                 };
                 FfnWeights::Moe {
                     router: load_packed(gguf, &name("ffn_gate_inp.weight"), dev, stream, &config)?,
-                    gate_exps: load_cached(gguf, &name("ffn_gate_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]))?,
-                    up_exps: load_cached(gguf, &name("ffn_up_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]))?,
-                    down_exps: load_cached(gguf, &name("ffn_down_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]))?,
+                    gate_exps: load_cached(gguf, &name("ffn_gate_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]),
+                        order.as_deref())?,
+                    up_exps: load_cached(gguf, &name("ffn_up_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]),
+                        order.as_deref())?,
+                    down_exps: load_cached(gguf, &name("ffn_down_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]),
+                        order.as_deref())?,
                     shared,
                 }
             } else {
@@ -559,6 +636,7 @@ impl Model {
             ple_table,
             mtp,
             total_bytes,
+            expert_profile: None,
         })
     }
 
@@ -724,12 +802,12 @@ fn load_packed(
     stream: &Stream,
     config: &Config,
 ) -> Result<GpuTensor> {
-    load_cached(gguf, name, device, stream, config, None)
+    load_cached(gguf, name, device, stream, config, None, None)
 }
 
 fn load_cached(
     gguf: &Arc<GgufFile>, name: &str, device: i32, stream: &Stream,
-    config: &Config, slots: Option<usize>,
+    config: &Config, slots: Option<usize>, order: Option<&[usize]>,
 ) -> Result<GpuTensor> {
     let info = tensor_info(gguf, name, &config.arch_name)?;
 
@@ -762,13 +840,28 @@ fn load_cached(
     let mut mapped = None;
     let (data, host_experts) = if let Some(slots) = slots.filter(|&s| s < n_experts && mapped_mode) {
         let bytes = gguf.tensor_bytes(info)?;
+        // The profile's most routed experts take the VRAM slots; without one,
+        // the first `slots` by index do.
+        let order: Vec<usize> = match order {
+            Some(o) if o.len() == n_experts => o.to_vec(),
+            _ => (0..n_experts).collect(),
+        };
+        let expert = |e: usize| &bytes[e * expert_stride..(e + 1) * expert_stride];
         let data = DeviceBuffer::<u8>::new(device, slots * expert_stride)?;
-        data.copy_from_host_at(0, &bytes[..slots * expert_stride], stream)?;
+        for (slot, &e) in order[..slots].iter().enumerate() {
+            data.copy_from_host_at(slot * expert_stride, expert(e), stream)?;
+        }
         let mut host = airun_cuda::PinnedBuffer::<u8>::new((n_experts - slots) * expert_stride).map_err(|e|
             CoreError::Other(format!("cannot pin {} of host memory for the experts that do not fit in VRAM ({e}); \
                 free RAM, or set AIRUN_EXPERTS=stream to read them from the file instead",
                 airun_cuda::human_bytes(((n_experts - slots) * expert_stride) as u64))))?;
-        host.as_mut_slice().copy_from_slice(&bytes[slots * expert_stride..]);
+        for (i, &e) in order[slots..].iter().enumerate() {
+            host.as_mut_slice()[i * expert_stride..(i + 1) * expert_stride].copy_from_slice(expert(e));
+        }
+        let mut place = vec![Ok(0); n_experts];
+        for (i, &e) in order.iter().enumerate() {
+            place[e] = if i < slots { Ok(i) } else { Err(i - slots) };
+        }
         let host_dev = host.device_ptr(device)? as u64;
         let m = MappedExperts {
             host,
@@ -777,7 +870,7 @@ fn load_cached(
             mirror: RefCell::new(airun_cuda::PinnedBuffer::new(n_experts)?),
             resident: DeviceBuffer::new(device, n_experts)?,
             resident_mirror: RefCell::new(airun_cuda::PinnedBuffer::new(n_experts)?),
-            place: RefCell::new((0..n_experts).map(|e| if e < slots { Ok(e) } else { Err(e - slots) }).collect()),
+            place: RefCell::new(place),
         };
         m.publish(&data, expert_stride, stream)?;
         // The pinned mirror is reused by the next publish; let this one land.

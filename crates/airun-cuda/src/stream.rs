@@ -92,6 +92,10 @@ impl Event {
         Ok(Self { raw })
     }
 
+    pub fn raw(&self) -> ffi::Event {
+        self.raw
+    }
+
     pub fn record(&self, stream: &Stream) -> Result<()> {
         // SAFETY: both handles are live for the duration of the call.
         ffi::check(unsafe { ffi::airun_event_record(self.raw, stream.raw()) })

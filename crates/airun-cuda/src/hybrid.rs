@@ -155,11 +155,11 @@ unsafe extern "C" {
     fn airun_moe_gate_up_tab(type_id: i32, gate_w: *const c_void, up_w: *const c_void, x: *const c_void,
         ids: *const c_void, h: *mut c_void, k: i32, ff: i32, n_tokens: i32, top_k: i32, row_bytes: u64,
         expert_stride: u64, gate_tab: *const c_void, up_tab: *const c_void, sidx: *const c_void,
-        gate_stage: *const c_void, up_stage: *const c_void, stream: ffi::Stream) -> Status;
+        gate_stage: *const c_void, up_stage: *const c_void, only: i32, stream: ffi::Stream) -> Status;
     fn airun_moe_down_tab(type_id: i32, down_w: *const c_void, h: *const c_void, ids: *const c_void,
         weights: *const c_void, y: *mut c_void, ff: i32, n_embd: i32, n_tokens: i32, top_k: i32, row_bytes: u64,
         expert_stride: u64, down_tab: *const c_void, sidx: *const c_void, down_stage: *const c_void,
-        stream: ffi::Stream) -> Status;
+        only: i32, stream: ffi::Stream) -> Status;
     fn airun_moe_stage_plan(ids: *const c_void, n_ids: i32, resident: *const c_void, n_experts: i32,
         sidx: *mut c_void, list: *mut c_void, n_list: *mut c_void, stream: ffi::Stream) -> Status;
     fn airun_moe_stage_copy(tab: *const c_void, list: *const c_void, n_list: *const c_void, stage: *mut c_void,
@@ -172,7 +172,8 @@ unsafe extern "C" {
         gate_stride: u64, down_stride: u64, x: *const c_void, perm: *const c_void, offsets: *const c_void,
         weights: *const c_void, h: *mut c_void, ypair: *mut c_void, y: *mut c_void, k: i32, ff: i32,
         n_tokens: i32, top_k: i32, n_experts: i32, gate_row_bytes: u64, down_row_bytes: u64,
-        stream: ffi::Stream) -> Status;
+        gate_res: *const c_void, down_res: *const c_void, xh: *mut c_void, side: ffi::Stream, ev_fork: *mut c_void,
+        ev_join: *mut c_void, stream: ffi::Stream) -> Status;
 
     fn airun_sigmoid_scale_rows(
         x: *mut c_void,
@@ -696,6 +697,9 @@ pub fn moe_down(
 pub struct Staged {
     pub sidx: *const c_void,
     pub stride: usize,
+    /// Which slots this launch computes: 0 all, 1 the resident ones, 2 the
+    /// staged ones (so the resident experts can run while the others copy).
+    pub only: i32,
 }
 
 /// [`moe_gate_up`] with the experts found through per-expert address tables
@@ -705,8 +709,8 @@ pub struct Staged {
 pub fn moe_gate_up_tab(ty: KernelType, gate_tab: *const c_void, up_tab: *const c_void, x: *const c_void,
     ids: *const c_void, h: *mut c_void, k: usize, ff: usize, n_tokens: usize, top_k: usize, row_bytes: usize,
     staged: Option<(Staged, *const c_void, *const c_void)>, stream: &Stream) -> Result<()> {
-    let (sidx, stride, gs, us) = staged.map_or((std::ptr::null(), 0, std::ptr::null(), std::ptr::null()),
-        |(s, g, u)| (s.sidx, s.stride, g, u));
+    let (sidx, stride, gs, us, only) = staged.map_or((std::ptr::null(), 0, std::ptr::null(), std::ptr::null(), 0),
+        |(s, g, u)| (s.sidx, s.stride, g, u, s.only));
     if k % 32 != 0 {
         return Err(bad_arg(format!("expert inner dimension {k} must be divisible by 32")));
     }
@@ -714,11 +718,11 @@ pub fn moe_gate_up_tab(ty: KernelType, gate_tab: *const c_void, up_tab: *const c
     // SAFETY: as moe_gate_up; every table entry addresses one whole expert.
     unsafe {
         ffi::check(airun_moe_gate_up_tab(ty.0, std::ptr::null(), std::ptr::null(), x, ids, h, k as i32, ff as i32,
-            n_tokens as i32, top_k as i32, row_bytes as u64, stride as u64, gate_tab, up_tab, sidx, gs, us,
+            n_tokens as i32, top_k as i32, row_bytes as u64, stride as u64, gate_tab, up_tab, sidx, gs, us, only,
             stream.raw()))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(ty, gate_tab, up_tab, x, ids, h, k, ff, n_tokens, top_k, row_bytes, sidx, stride, gs, us, stream)
+    needs_cuda!(ty, gate_tab, up_tab, x, ids, h, k, ff, n_tokens, top_k, row_bytes, sidx, stride, gs, us, only, stream)
 }
 
 /// [`moe_down`] through an address table, as [`moe_gate_up_tab`].
@@ -726,7 +730,8 @@ pub fn moe_gate_up_tab(ty: KernelType, gate_tab: *const c_void, up_tab: *const c
 pub fn moe_down_tab(ty: KernelType, down_tab: *const c_void, h: *const c_void, ids: *const c_void,
     weights: *const c_void, y: *mut c_void, ff: usize, n_embd: usize, n_tokens: usize, top_k: usize,
     row_bytes: usize, staged: Option<(Staged, *const c_void)>, stream: &Stream) -> Result<()> {
-    let (sidx, stride, ds) = staged.map_or((std::ptr::null(), 0, std::ptr::null()), |(s, d)| (s.sidx, s.stride, d));
+    let (sidx, stride, ds, only) =
+        staged.map_or((std::ptr::null(), 0, std::ptr::null(), 0), |(s, d)| (s.sidx, s.stride, d, s.only));
     if ff % 32 != 0 {
         return Err(bad_arg(format!("expert feed-forward width {ff} must be divisible by 32")));
     }
@@ -734,10 +739,10 @@ pub fn moe_down_tab(ty: KernelType, down_tab: *const c_void, h: *const c_void, i
     // SAFETY: as moe_down; every table entry addresses one whole expert.
     unsafe {
         ffi::check(airun_moe_down_tab(ty.0, std::ptr::null(), h, ids, weights, y, ff as i32, n_embd as i32,
-            n_tokens as i32, top_k as i32, row_bytes as u64, stride as u64, down_tab, sidx, ds, stream.raw()))
+            n_tokens as i32, top_k as i32, row_bytes as u64, stride as u64, down_tab, sidx, ds, only, stream.raw()))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(ty, down_tab, h, ids, weights, y, ff, n_embd, n_tokens, top_k, row_bytes, sidx, stride, ds, stream)
+    needs_cuda!(ty, down_tab, h, ids, weights, y, ff, n_embd, n_tokens, top_k, row_bytes, sidx, stride, ds, only, stream)
 }
 
 /// Assigns each routed expert that is not `resident` (u8 per expert) a
@@ -786,6 +791,9 @@ pub struct ExpertWeights {
     pub base: *const c_void,
     pub stride: usize,
     pub row_bytes: usize,
+    /// With `tab`: u8 per expert, 1 when it is in VRAM (MappedExperts'
+    /// residency map), so the kernels can read those in place.
+    pub resident: *const c_void,
 }
 
 /// The whole routed feed-forward of a batch, expert-major (see
@@ -794,8 +802,8 @@ pub struct ExpertWeights {
 #[allow(clippy::too_many_arguments)]
 pub fn moe_grouped(gate: ExpertWeights, up: ExpertWeights, down: ExpertWeights, x: *const c_void,
     perm: *const c_void, offsets: *const c_void, weights: *const c_void, h: *mut c_void, ypair: *mut c_void,
-    y: *mut c_void, k: usize, ff: usize, n_tokens: usize, top_k: usize, n_experts: usize, stream: &Stream)
-    -> Result<()> {
+    y: *mut c_void, k: usize, ff: usize, n_tokens: usize, top_k: usize, n_experts: usize, xh: *mut c_void,
+    side: Option<(&Stream, &crate::Event, &crate::Event)>, stream: &Stream) -> Result<()> {
     if gate.ty != up.ty || gate.row_bytes != up.row_bytes || gate.stride != up.stride {
         return Err(bad_arg("gate and up experts must share a type and layout".to_string()));
     }
@@ -805,7 +813,10 @@ pub fn moe_grouped(gate: ExpertWeights, up: ExpertWeights, down: ExpertWeights, 
         ffi::check(airun_moe_grouped(gate.ty.0, down.ty.0, gate.tab, up.tab, down.tab, gate.base, up.base,
             down.base, gate.stride as u64, down.stride as u64, x, perm, offsets, weights, h, ypair, y, k as i32,
             ff as i32, n_tokens as i32, top_k as i32, n_experts as i32, gate.row_bytes as u64,
-            down.row_bytes as u64, stream.raw()))
+            down.row_bytes as u64, gate.resident, down.resident, xh,
+            side.map_or(std::ptr::null_mut(), |(s, _, _)| s.raw()),
+            side.map_or(std::ptr::null_mut(), |(_, f, _)| f.raw()),
+            side.map_or(std::ptr::null_mut(), |(_, _, j)| j.raw()), stream.raw()))
     }
     #[cfg(not(airun_cuda))]
     needs_cuda!(gate.ty, x, perm, offsets, weights, h, ypair, y, k, ff, n_tokens, top_k, n_experts, stream)

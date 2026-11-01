@@ -1,0 +1,7 @@
+round,engine,prompt_tps,gen_tps
+1,airun,447.0,39.2
+1,strata,414.38,34.10
+1,llama.cpp,35.9,9.89
+2,airun,449.3,39.4
+2,strata,426.55,33.94
+2,llama.cpp,35.0,9.91

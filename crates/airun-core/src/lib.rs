@@ -3,6 +3,8 @@
 pub mod config;
 pub mod error;
 mod expert_cache;
+mod gather_pool;
+pub mod expert_profile;
 mod expert_reader;
 pub mod loader;
 pub mod model;

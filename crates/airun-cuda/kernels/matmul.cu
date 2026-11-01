@@ -524,6 +524,13 @@ __global__ __launch_bounds__(32 * TR / 16) void matvec_wmma_kernel(
 #define WMMA_SMALL_TR 128
 #define WMMA_SMALL_TC 64
 #define WMMA_SMALL_TK 64
+// For few rows and a long K (the hyper-connection down projection, 320 rows x
+// 10240; the MoE router, 512 x 2560) the big tile made ~12 blocks for a 70-SM
+// card, each walking all of K: the tensor cores sat mostly idle. A small tile
+// spreads the same work over ~7x the blocks.
+#define WMMA_MID_TR 64
+#define WMMA_MID_TC 32
+#define WMMA_MID_TK 64
 
 // ---------------------------------------------------------------------------
 // Integer (dp4a) path: quantized activations against quantized weights.
@@ -1334,7 +1341,23 @@ airun_status airun_matvec(
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
 
-        if (cc_major >= 8) {
+        int n_sm = 1;
+        cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
+        const long big_blocks = (long)((n_rows + WMMA_BIG_TR - 1) / WMMA_BIG_TR)
+                              * ((n_tokens + WMMA_BIG_TC - 1) / WMMA_BIG_TC);
+        if (cc_major >= 8 && big_blocks < 2L * n_sm) {
+            const dim3 wblock(32 * WMMA_MID_TR / 16);
+            const dim3 wgrid((n_rows + WMMA_MID_TR - 1) / WMMA_MID_TR,
+                             (n_tokens + WMMA_MID_TC - 1) / WMMA_MID_TC);
+            const size_t wsmem = (size_t)(WMMA_MID_TR + WMMA_MID_TC)
+                               * (WMMA_MID_TK + WMMA_PAD) * sizeof(half);
+#define LAUNCH(TYPE)                                                                          matvec_wmma_kernel<TYPE, WMMA_MID_TR, WMMA_MID_TC, WMMA_MID_TK>                       <<<wgrid, wblock, wsmem, stream>>>(                                               (const uint8_t*)w, (const float*)x, (float*)y,                                    k, n_rows, n_tokens, (size_t)row_bytes);
+            switch (type_id) {
+                AIRUN_FOR_EACH_TYPE(AIRUN_CASE)
+                default: return AIRUN_ERR_BAD_TYPE;
+            }
+#undef LAUNCH
+        } else if (cc_major >= 8) {
             const dim3 wblock(32 * WMMA_BIG_TR / 16);
             const dim3 wgrid((n_rows + WMMA_BIG_TR - 1) / WMMA_BIG_TR,
                              (n_tokens + WMMA_BIG_TC - 1) / WMMA_BIG_TC);

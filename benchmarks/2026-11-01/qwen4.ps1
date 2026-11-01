@@ -16,6 +16,7 @@ param(
     [string]$Airun = "F:\coding\ia\airun\target\release\airun.exe",
     [string]$Strata = "E:\Strata",
     [string]$StrataPack = "E:\Strata-data\packs\iq3_s-abl",
+    [string]$StrataExe = "",
     [string]$LlamaBin = "",
     [string]$Work = $env:TEMP
 )
@@ -36,6 +37,7 @@ $ids = $ids.Trim().TrimStart('[').TrimEnd(']') -replace '\s', ''
 [IO.File]::WriteAllText("$Work\q4bench.ids", $ids)
 Note "prompt: $(($ids -split ',').Count) tokens, $N generated"
 $shard2 = $Model -replace '00001-of-', '00002-of-'
+if (-not $StrataExe) { $StrataExe = "$Strata\engine\strata.exe" }
 
 for ($r = 1; $r -le $Rounds; $r++) {
     # airun
@@ -47,7 +49,7 @@ for ($r = 1; $r -le $Rounds; $r++) {
     # Strata
     $env:PATH = "$Strata\.venv\Lib\site-packages\nvidia\cu13\bin\x86_64;$env:PATH"
     Push-Location $Strata
-    $o = cmd /c "`"$Strata\engine\strata.exe`" --pack `"$StrataPack`" --native `"$Model`" --ple-gguf `"$shard2`" --expert-profile `"$Strata\data\expert-profile.bin`" --expert-cache auto --prefill 512 --spec 4 --spec-min-p 0.5 --max-context 4096 --tokens-file `"$Work\q4bench.ids`" --max-new $N 2>nul"
+    $o = cmd /c "`"$StrataExe`" --pack `"$StrataPack`" --native `"$Model`" --ple-gguf `"$shard2`" --expert-profile `"$Strata\data\expert-profile.bin`" --expert-cache auto --prefill 512 --spec 4 --spec-min-p 0.5 --max-context 4096 --tokens-file `"$Work\q4bench.ids`" --max-new $N 2>nul"
     Pop-Location
     $p = ($o | Select-String '^prefill\s.*->\s*([\d.]+) tok/s').Matches
     $g = ($o | Select-String '^decode\s.*->\s*([\d.]+) tok/s').Matches

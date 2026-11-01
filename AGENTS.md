@@ -34,7 +34,7 @@ streams e lançar *nossos* kernels.
 | Runtime Qwen3 denso | gera texto coerente |
 | Multi-GPU (split por camada) | validado com 2 placas |
 | Planner de VRAM | testado, com fallback automático |
-| API OpenAI (chat, completions, SSE, auth) | validada |
+| API no formato do llama-server (OpenAI + nativa, SSE, auth, reasoning, tool calls) | 20/20 em `tests/api_conformance.py` |
 | Amostragem (top-k/p, min-p, typical, top-n-sigma, 3 penalidades, logit_bias) | testada |
 | Conversão HF → GGUF | Qwen3-8B convertido e executado |
 | Benchmark | funciona |
@@ -385,11 +385,32 @@ streaming do arquivo (seção acima) continua com `AIRUN_EXPERTS=stream`.
   host num buffer fixado antes de cada replay.
 
 Qwen4 Flash-Next (78 GB, 5070 Ti + 5060 Ti, 64 GB de RAM), prompt de 792
-tokens + 128 gerados (`benchmarks/2026-11-01/qwen4.ps1`): airun 92 / 19,4
-tok/s, llama.cpp de referência (`--n-cpu-moe 48`) 31 / 9,5, **Strata 0.1.44
-277 / 32,4** (só a 5070 Ti; experts que faltam na VRAM calculados na CPU com
-AVX2, cache de experts preenchido por um perfil). A airun ainda perde para o
-Strata nesse modelo. A carga leva ~80 s (fixar ~24 GB de RAM).
+tokens + 128 gerados (`benchmarks/2026-11-01/qwen4.ps1`): veja os números em
+`benchmarks/2026-11-01/RESULTADOS.md`. O que levou a airun de 92 / 19 tok/s
+para ~287 / ~39 (à frente do Strata 0.1.44, ~270 / ~33):
+
+- **Tabelas `__constant__`:** `kvalues_iq4nl` indexada por nibbles diferentes
+  em cada lane serializava até 16x. IQ4_NL/IQ4_XS agora usam `__byte_perm`
+  (`iq4_codes8`), como o FP4. Só isso valia ~5 ms por token.
+- **Perfil de roteamento** (`expert_profile.rs`): a carga põe na VRAM os
+  experts mais usados nas execuções anteriores, e as notas do rebalanceamento
+  partem do perfil. Uma troca só acontece com ~4 roteamentos de vantagem,
+  porque cada uma move os dois experts pela PCIe.
+- **Cópia sobreposta:** o decode copia os experts ausentes num stream lateral
+  (`DeviceState.side`, eventos `fork`/`join`, que funcionam dentro do CUDA
+  graph) enquanto os residentes calculam (`Staged.only`).
+- **Router em um warp** (`moe_router_warp_kernel`): 25 → 4 µs por camada.
+- **MoE agrupado em tensor cores** (`moe_mma_*`, lotes de 64+): decodifica
+  cada fatia de 64 de K uma vez para fp16 e usa `mma.sync`. Experts na VRAM
+  são lidos direto, sem copiar as linhas, o que dá ocupação 3x maior; os da
+  RAM são copiados com leituras largas. Abaixo de 64 tokens ficam os kernels
+  f32, o que mantém prompts curtos idênticos à referência.
+- **PLE em paralelo** (`gather_pool.rs`): a tabela de 26,8 GB não cabe no
+  cache de arquivos, então cada linha é uma leitura aleatória no SSD. Lidas
+  uma a uma, deixavam a GPU parada 1,4 s num prompt de 792 tokens. 32 threads
+  persistentes as leem juntas.
+
+A carga leva ~80 s (fixar ~24 GB de RAM).
 
 ### Atenção esparsa QSA (qwen4exp)
 
@@ -418,6 +439,43 @@ pedaços de 4096 (posições 2048–4095 pontuadas) num texto de 25 mil tokens:
 referência 5,1563, airun com QSA 5,1684, airun densa (`AIRUN_QSA=off`) 5,1717.
 Em 2048 (tudo denso) a diferença de base airun vs referência já é ±0,5% por
 pedaço, por arredondamento.
+
+### API HTTP (`airun serve`) no formato do llama-server
+
+As rotas, os campos de requisição e as respostas seguem os do `llama-server`,
+para que clientes feitos para ele funcionem sem mudança:
+- **Saúde e metadados:** `/health`, `/v1/health`, `/props`, `/models`,
+  `/v1/models`, `/slots` e `/metrics` (501, como o llama-server sem
+  `--metrics`).
+- **Geração:** `/completion` e `/completions` (nativos), `/v1/completions`,
+  `/chat/completions` e `/v1/chat/completions`.
+- **Utilitários:** `/tokenize` (com `with_pieces`), `/detokenize` e
+  `/apply-template`.
+
+Cada resposta traz `timings`, `usage.prompt_tokens_details.cached_tokens` e
+`system_fingerprint`; o stream respeita `stream_options.include_usage`. Erros
+vêm como `{"error": {"code", "message", "type"}}`.
+
+- **Template:** o prompt de chat é o template Jinja do próprio GGUF
+  (`chat.rs`, minijinja com métodos de string do Python), como o `--jinja` do
+  llama.cpp. Ferramentas, respostas de ferramentas, `enable_thinking` e
+  `reasoning_effort` (no corpo ou em `chat_template_kwargs`) chegam ao
+  template. Argumentos de tool call enviados como string JSON viram objetos
+  antes.
+- **Resposta:** é dividida em `reasoning_content` (o bloco `<think>`),
+  `content` e `tool_calls` (`<tool_call>` no formato XML
+  `<function=..><parameter=..>` do Qwen3.5+ ou JSON do Qwen2.5/3), com
+  `finish_reason: tool_calls`. `reasoning_format: none` (ou
+  `--reasoning-format none`) deixa o pensamento no `content`.
+- **Verificação:** `tests/api_conformance.py` grava as respostas de um
+  servidor e as compara chave a chave com as de outro. Em 2026-11-01, com o
+  Qwen3.8-27B, deu 20/20 contra o llama-server b11760, com
+  `/apply-template` idêntico caractere a caractere e o mesmo tool call.
+- **Diferença de padrão:** pedidos OpenAI sem `repeat_penalty` usam o
+  `--repeat-penalty` do servidor (1,1); o llama-server usa 1,0. O
+  `/completion` nativo usa 1,0, como o llama-server.
+- **Ainda não implementado:** `/v1/responses`, `/v1/messages` (Anthropic),
+  `/infill`, embeddings, rerank e `n_probs`.
 
 ### KV cache quantizado (`--kv-type f16|q8_0|q4_0`)
 

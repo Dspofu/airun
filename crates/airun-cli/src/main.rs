@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! airun -- multi-modal LLM runtime for NVIDIA GPUs.
 
 mod bench;
@@ -9,6 +10,7 @@ mod quantize;
 mod run;
 mod selftest;
 mod tokenize;
+mod chat;
 mod serve;
 
 use anyhow::Result;

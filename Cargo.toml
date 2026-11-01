@@ -28,6 +28,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = "0.8"
 tokio-stream = "0.1"
+# Runs the GGUF's own chat template, as llama.cpp's --jinja does.
+minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [profile.release]
 opt-level = 3
