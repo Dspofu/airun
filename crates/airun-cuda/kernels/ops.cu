@@ -1210,26 +1210,44 @@ struct F2Shape {
 };
 
 __device__ __forceinline__ uint32_t f2_pack(float lo, float hi) {
+#if __CUDA_ARCH__ >= 800
     uint32_t r;
     asm("cvt.rn.f16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(hi), "f"(lo));
     return r;
+#else
+    // cvt.rn.f16x2.f32 (packed) is sm_80+; sub-sm_80 never launch this kernel.
+    // Convert each float separately (single cvt.rn.f16.f32, fine on sm_75) and
+    // pack by hand: lo in the low 16 bits, hi in the high 16 (same layout).
+    unsigned short l, h;
+    asm("cvt.rn.f16.f32 %0, %1;\n" : "=h"(l) : "f"(lo));
+    asm("cvt.rn.f16.f32 %0, %1;\n" : "=h"(h) : "f"(hi));
+    return (uint32_t)l | ((uint32_t)h << 16);
+#endif
 }
 
 __device__ __forceinline__ void f2_mma(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void)c; (void)a; (void)b0; (void)b1;   // m16n8k16 is sm_80+; sub-sm_80 never launch this kernel
+#endif
 }
 
 // The same MMA accumulating in fp16: twice the rate of fp32 accumulation on
 // GeForce tensor cores. Used for P.V within one key tile only (see the P.V
 // step of flash2_attention_kernel), so no long sum is ever held in fp16.
 __device__ __forceinline__ void f2_mma_h(uint32_t c[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
     asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
         "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
         : "+r"(c[0]), "+r"(c[1])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void)c; (void)a; (void)b0; (void)b1;   // m16n8k16 is sm_80+; sub-sm_80 never launch this kernel
+#endif
 }
 
 __device__ __forceinline__ float2 f2_unpack(uint32_t h) {
@@ -1251,9 +1269,13 @@ __device__ __forceinline__ void f2_ldsm_t(uint32_t r[4], const void* p) {
 // cp.async that zero-fills when `valid` is false, so keys past the end stage
 // as zeros without a branch around the copy.
 __device__ __forceinline__ void f2_cp16(void* smem, const void* gmem, bool valid) {
+#if __CUDA_ARCH__ >= 800
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     const int n = valid ? 16 : 0;
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(n));
+#else
+    (void)smem; (void)gmem; (void)valid;   // cp.async is sm_80+; sub-sm_80 never launch this kernel
+#endif
 }
 
 template <int D, int KV, bool PV16>
@@ -1374,7 +1396,9 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
                 *(uint4*)(vd + r * LD + c * 8) = make_uint4(vw[0], vw[1], vw[2], vw[3]);
             }
         }
+#if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.commit_group;\n" ::);
+#endif
     };
 
     stage(k_begin, 0);
@@ -1382,9 +1406,13 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
     for (int k0 = k_begin; k0 <= hi; k0 += S::KT, st ^= 1) {
         if (k0 + S::KT <= hi) {
             stage(k0 + S::KT, st ^ 1);
+#if __CUDA_ARCH__ >= 800
             asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
         } else {
+#if __CUDA_ARCH__ >= 800
             asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
         }
         __syncthreads();
 

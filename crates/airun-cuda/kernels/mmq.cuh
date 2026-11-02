@@ -554,12 +554,16 @@ constexpr size_t mmq_async_smem() {
 
 template <int BYTES>
 __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
+#if __CUDA_ARCH__ >= 800
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     if constexpr (BYTES == 16) {
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
     } else {
         asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(s), "l"(gmem));
     }
+#else
+    (void)smem; (void)gmem;   // cp.async is sm_80+; sub-sm_80 never launch this kernel
+#endif
 }
 
 // Stream-K: with too few tiles for whole waves (a 128-token prefill's 2560-row
@@ -674,7 +678,9 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
             for (int i = 0; i < XT; ++i) {
                 if (xsrc_t[i]) cp_async<16>(xdst + xdst_t[i], xsrc_t[i] + xoff);
             }
+#if __CUDA_ARCH__ >= 800
             asm volatile("cp.async.commit_group;\n" ::);
+#endif
         };
 
         // The previous tile's last chunk and epilogue read these buffers.
@@ -690,7 +696,9 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
         issue(g_begin, 0);
         int stage = 0;
         for (int g0 = g_begin; g0 < g_end; g0 += MMQ_KG, stage ^= 1) {
+#if __CUDA_ARCH__ >= 800
             asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
             // After this barrier every warp has finished the previous chunk's MMAs,
             // so the other stage is free: the next copy goes out here and needs no
             // barrier of its own at the end of the chunk (there were three per

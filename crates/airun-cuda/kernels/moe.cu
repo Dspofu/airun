@@ -577,10 +577,14 @@ __global__ void moe_combine_kernel(const float* __restrict__ ypair, const float*
 #define MMA_MIN_TOKENS 64  // smaller batches stay on the f32 grouped kernels
 
 __device__ __forceinline__ void moe_mma16816(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void)c; (void)a; (void)b0; (void)b1;   // m16n8k16 is sm_80+; sub-sm_80 never launch this kernel
+#endif
 }
 
 __device__ __forceinline__ half moe_to_half(float v) {
