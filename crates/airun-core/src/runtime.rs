@@ -37,6 +37,61 @@ enum LayerState {
     },
 }
 
+/// The first bytes of a [`Runtime::save_state`] file, with its format version.
+const STATE_MAGIC: &[u8] = b"AIRUNST1";
+
+/// A cache buffer of any element type, for saving and restoring it.
+enum StateBuf<'a> {
+    U8(&'a DeviceBuffer<u8>),
+    U16(&'a DeviceBuffer<u16>),
+    F32(&'a DeviceBuffer<f32>),
+}
+
+impl StateBuf<'_> {
+    /// Appends `len` elements from `offset` to `out`, as little-endian bytes.
+    fn save(&self, offset: usize, len: usize, stream: &Stream, out: &mut Vec<u8>) -> Result<()> {
+        fn go<T: Copy + Default>(b: &DeviceBuffer<T>, offset: usize, len: usize, stream: &Stream,
+            out: &mut Vec<u8>) -> Result<()> {
+            let mut host = vec![T::default(); len];
+            b.copy_to_host_at(offset, &mut host, stream)?;
+            stream.synchronize()?;
+            // SAFETY: plain integers and floats, read as their bytes (all
+            // supported hosts are little-endian, as the GPUs are).
+            out.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(host.as_ptr().cast::<u8>(), std::mem::size_of_val(host.as_slice()))
+            });
+            Ok(())
+        }
+        match self {
+            Self::U8(b) => go(b, offset, len, stream, out),
+            Self::U16(b) => go(b, offset, len, stream, out),
+            Self::F32(b) => go(b, offset, len, stream, out),
+        }
+    }
+
+    /// Fills `len` elements from `offset` with the next bytes of `input`.
+    fn load(&self, offset: usize, len: usize, stream: &Stream, input: &mut &[u8]) -> Result<()> {
+        fn go<T: Copy + Default>(b: &DeviceBuffer<T>, offset: usize, len: usize, stream: &Stream,
+            input: &mut &[u8]) -> Result<()> {
+            let n = len * std::mem::size_of::<T>();
+            let (head, rest) = input.split_at_checked(n).ok_or_else(|| CoreError::Other(
+                "the saved state cannot be restored: it is truncated; save it again".into()))?;
+            let mut host = vec![T::default(); len];
+            // SAFETY: `host` has exactly n bytes of plain-old-data elements.
+            unsafe { std::ptr::copy_nonoverlapping(head.as_ptr(), host.as_mut_ptr().cast::<u8>(), n) };
+            b.copy_from_host_at(offset, &host, stream)?;
+            stream.synchronize()?;
+            *input = rest;
+            Ok(())
+        }
+        match self {
+            Self::U8(b) => go(b, offset, len, stream, input),
+            Self::U16(b) => go(b, offset, len, stream, input),
+            Self::F32(b) => go(b, offset, len, stream, input),
+        }
+    }
+}
+
 /// A sparse attention layer's indexer keys (see airun_cuda::qsa).
 struct QsaCache {
     /// Raw keys of the newest tokens, [QSA_RING + batch][dim] f16.
@@ -109,6 +164,9 @@ struct PleScratch {
     /// The convolution's history: the last (kernel-1)*ngram normalized rows.
     hist: DeviceBuffer<f32>,
     hist_scratch: DeviceBuffer<f32>,
+    /// Recorded once the staged rows have been copied to the device, so the
+    /// host does not overwrite them while the upload is still queued.
+    uploaded: airun_cuda::Event,
 }
 
 /// Scratch buffers only mixture-of-experts models need.
@@ -180,6 +238,10 @@ struct DeviceState {
     side: Stream,
     fork: airun_cuda::Event,
     join: airun_cuda::Event,
+    /// Cross-GPU handoff (see Runtime::handoff): this shard finished the
+    /// rows it passes on, and the rows it received have been copied in.
+    sent: airun_cuda::Event,
+    copied: airun_cuda::Event,
 
     x: DeviceBuffer<f32>,
     xb: DeviceBuffer<f32>,
@@ -495,6 +557,7 @@ impl Runtime {
                             gated: DeviceBuffer::new(dev, b * hc_width)?,
                             hist: DeviceBuffer::zeroed(dev, p.conv_history() * hc_width, &stream)?,
                             hist_scratch: DeviceBuffer::new(dev, p.conv_history() * hc_width)?,
+                            uploaded: airun_cuda::Event::new()?,
                         }),
                         _ => None,
                     },
@@ -528,6 +591,8 @@ impl Runtime {
                 side: Stream::new(dev)?,
                 fork: airun_cuda::Event::new()?,
                 join: airun_cuda::Event::new()?,
+                sent: airun_cuda::Event::new()?,
+                copied: airun_cuda::Event::new()?,
                 x: DeviceBuffer::new(dev, b * hc_width)?,
                 xb: DeviceBuffer::new(dev, b * cfg.n_embd)?,
                 xb2: DeviceBuffer::new(dev, b * cfg.n_embd)?,
@@ -647,6 +712,142 @@ impl Runtime {
             }
             let _ = st.stream.synchronize();
         }
+    }
+
+    /// The sequence in the caches, as bytes: its tokens, the KV rows they
+    /// filled, and every recurrent state (delta-net matrices and convolution
+    /// histories, the QSA key ring, the PLE history). [`load_state`] puts it
+    /// back, so a conversation resumes without replaying its prompt --
+    /// llama-server's slot save and restore.
+    pub fn save_state(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(STATE_MAGIC);
+        for v in self.state_fingerprint() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.n_past as u64).to_le_bytes());
+        out.extend_from_slice(&(self.history.len() as u64).to_le_bytes());
+        for t in &self.history {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        self.walk_state(|buf, offset, len, stream| buf.save(offset, len, stream, &mut out))?;
+        Ok(out)
+    }
+
+    /// Restores what [`save_state`] wrote, for this same model and context.
+    /// Returns how many tokens the caches now hold.
+    pub fn load_state(&mut self, bytes: &[u8]) -> Result<usize> {
+        let bad = |why: &str| CoreError::Other(format!(
+            "the saved state cannot be restored: {why}; save it again with this model and --ctx-size"));
+        let mut input = bytes.strip_prefix(STATE_MAGIC).ok_or_else(|| bad("it is not an airun state file"))?;
+        let u64_at = |input: &mut &[u8]| -> Result<u64> {
+            let (head, rest) = input.split_at_checked(8).ok_or_else(|| bad("it is truncated"))?;
+            *input = rest;
+            Ok(u64::from_le_bytes(head.try_into().unwrap()))
+        };
+        for want in self.state_fingerprint() {
+            if u64_at(&mut input)? != want {
+                return Err(bad("it was saved from a different model or context size"));
+            }
+        }
+        let n_past = u64_at(&mut input)? as usize;
+        let n_hist = u64_at(&mut input)? as usize;
+        if n_past > self.ctx || n_hist != n_past {
+            return Err(bad("its token count does not fit this context"));
+        }
+        let (hist, rest) = input.split_at_checked(n_hist * 4).ok_or_else(|| bad("it is truncated"))?;
+        let history: Vec<u32> = hist.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        input = rest;
+        // The rows written depend on the position, so it must be set first.
+        self.n_past = n_past;
+        let loaded = self.walk_state(|buf, offset, len, stream| buf.load(offset, len, stream, &mut input));
+        if let Err(e) = loaded {
+            // Half-written caches are garbage: start over rather than resume them.
+            self.reset();
+            return Err(e);
+        }
+        if !input.is_empty() {
+            self.reset();
+            return Err(bad("it has trailing data"));
+        }
+        self.history = history;
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+        Ok(n_past)
+    }
+
+    /// The final hidden state (after the output norm) of every token of
+    /// `tokens`, run as a fresh sequence, `n_embd` floats per token: what
+    /// embeddings are pooled from. The caches then hold `tokens`.
+    pub fn hidden_states(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.len() > self.ctx {
+            return Err(CoreError::Other(format!(
+                "{} tokens do not fit a context of {}; shorten the input or raise --ctx-size",
+                tokens.len(), self.ctx)));
+        }
+        self.reset();
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+        let n_embd = self.model.config.n_embd;
+        let mut out = vec![0f32; tokens.len() * n_embd];
+        for start in (0..tokens.len()).step_by(self.max_batch.max(1)) {
+            let chunk = &tokens[start..(start + self.max_batch).min(tokens.len())];
+            let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+            let positions: Vec<i32> = (0..chunk.len()).map(|i| (self.n_past + i) as i32).collect();
+            self.skip_logits = true;
+            let queued = self.queue_forward(&ids, &positions);
+            self.skip_logits = false;
+            queued?;
+            self.n_past += chunk.len();
+            self.history.extend_from_slice(chunk);
+            let st = self.states.last().expect("a runtime has at least one device");
+            device::set_device(st.device)?;
+            st.xb.copy_to_host(&mut out[start * n_embd..(start + chunk.len()) * n_embd], &st.stream)?;
+            st.stream.synchronize()?;
+        }
+        Ok(out)
+    }
+
+    /// What a state file must agree with to be loaded here.
+    fn state_fingerprint(&self) -> [u64; 6] {
+        let cfg = &self.model.config;
+        [cfg.n_layers as u64, cfg.n_embd as u64, cfg.vocab_size as u64, self.ctx as u64,
+            cfg.kv_type.row_bytes(cfg.head_dim) as u64, cfg.n_head_kv as u64]
+    }
+
+    /// Calls `f(buffer, offset, len, stream)` on every stretch of cache that
+    /// holds the current sequence, in a fixed order.
+    fn walk_state(&self, mut f: impl FnMut(StateBuf<'_>, usize, usize, &Stream) -> Result<()>) -> Result<()> {
+        let cfg = &self.model.config;
+        let row = cfg.kv_type.row_bytes(cfg.head_dim);
+        for st in &self.states {
+            device::set_device(st.device)?;
+            for state in &st.states {
+                match state {
+                    LayerState::Kv { k, v, qsa } => {
+                        // [head][ctx][row]: the first n_past rows of each head.
+                        for h in 0..cfg.n_head_kv {
+                            f(StateBuf::U8(k), h * self.ctx * row, self.n_past * row, &st.stream)?;
+                            f(StateBuf::U8(v), h * self.ctx * row, self.n_past * row, &st.stream)?;
+                        }
+                        if let Some(q) = qsa {
+                            f(StateBuf::U16(&q.ring), 0, q.ring.len(), &st.stream)?;
+                            f(StateBuf::F32(&q.pooled), 0, q.pooled.len(), &st.stream)?;
+                        }
+                    }
+                    LayerState::Delta { state, conv } => {
+                        f(StateBuf::F32(state), 0, state.len(), &st.stream)?;
+                        f(StateBuf::F32(conv), 0, conv.len(), &st.stream)?;
+                    }
+                }
+            }
+            if let Some(p) = st.hc.as_ref().and_then(|h| h.ple.as_ref()) {
+                f(StateBuf::F32(&p.hist), 0, p.hist.len(), &st.stream)?;
+            }
+        }
+        Ok(())
     }
 
     /// Runs `tokens` through the model and returns the logits for the last one.
@@ -925,6 +1126,13 @@ impl Runtime {
         }
     }
 
+    /// Queues `tokens` into the caches without reading anything back: a
+    /// prompt chunk that is not the last. Successive chunks overlap across
+    /// GPUs; [`Self::forward`] on the last one waits for all of them.
+    pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        self.step(tokens)
+    }
+
     /// Runs `tokens` through the model, leaving the last one's logits on the
     /// device.
     fn step(&mut self, tokens: &[u32]) -> Result<()> {
@@ -991,6 +1199,19 @@ impl Runtime {
                 position: airun_cuda::PinnedBuffer::new(1)?,
             },
         };
+        // The previous replay copies its token and position out of these
+        // pinned slots when it runs, not when it is launched. Decode reads
+        // each step's result before the next, but a batch-1 prefill queues
+        // step after step: overwriting the slots first fed every queued
+        // replay the latest token and position, and the prompt came out
+        // garbled (`-b 1` answered "The capital of France is" with "a 2013
+        // American comedy"). Wait for the previous replay to have run.
+        if dg.graphs.iter().any(Option::is_some) {
+            for st in &self.states {
+                device::set_device(st.device)?;
+                st.stream.synchronize()?;
+            }
+        }
         dg.token.as_mut_slice()[0] = token as i32;
         dg.position.as_mut_slice()[0] = self.n_past as i32;
         // The PLE rows are hashed on the host; a captured graph only copies
@@ -1042,6 +1263,14 @@ impl Runtime {
     /// [`Self::queue_forward`]; with `upload` false the tokens and positions are
     /// already in the device buffers, and the slices only give their count.
     fn queue_forward_with(&mut self, token_ids: &[i32], positions: &[i32], upload: bool) -> Result<()> {
+        // The previous batch's PLE upload may still be queued behind a shard
+        // that runs asynchronously (see handoff); its staging is refilled
+        // below. (The decode graph path synchronizes every stream instead.)
+        for st in &self.states {
+            if let Some(ps) = st.hc.as_ref().and_then(|h| h.ple.as_ref()) {
+                ps.uploaded.synchronize()?;
+            }
+        }
         for si in 0..self.states.len() {
             if si > 0 {
                 self.handoff(si, token_ids.len())?;
@@ -1052,15 +1281,28 @@ impl Runtime {
     }
 
     /// Hands the first `n` rows of the residual from shard `si - 1` to shard
-    /// `si`, after the earlier shard's work. Without peer access the copy
-    /// stages through host memory anyway, so overlapping would buy little.
+    /// `si`, after the earlier shard's work, without blocking the host.
+    ///
+    /// The receiving stream waits on an event for the sender's rows, and the
+    /// sender's stream waits for the copy before it can overwrite them with
+    /// the next batch. So a prefill pipelines: the first GPU runs chunk c+1
+    /// while the second runs chunk c. The handoff used to synchronize the
+    /// sender from the host, which ran the GPUs strictly in turn: split over
+    /// a 5070 Ti and a 5060 Ti (half the SMs), a 4k prompt fell from 3653 to
+    /// 2501 tok/s where llama.cpp's pipelined split kept 3514.
     fn handoff(&self, si: usize, n: usize) -> Result<()> {
         let (src, dst) = (&self.states[si - 1], &self.states[si]);
-        src.stream.synchronize()?;
+        device::set_device(src.device)?;
+        src.sent.record(&src.stream)?;
         device::set_device(dst.device)?;
+        dst.stream.wait_for(&src.sent)?;
         let width = self.model.config.hc.map_or(1, |h| h.count) * self.model.config.n_embd;
         airun_cuda::copy_peer(dst.x.as_mut_ptr(), dst.device, src.x.as_ptr(), src.device,
             n * width * std::mem::size_of::<f32>(), &dst.stream)?;
+        dst.copied.record(&dst.stream)?;
+        device::set_device(src.device)?;
+        src.stream.wait_for(&dst.copied)?;
+        device::set_device(dst.device)?;
         Ok(())
     }
 
@@ -1494,6 +1736,7 @@ impl Runtime {
             .ok_or_else(|| CoreError::Other("the PLE layer's GPU has no PLE scratch".into()))?;
         let host = ps.emb_host.borrow();
         ps.emb.copy_from_host_at(0, &host.as_slice()[..n * pc.n_heads() * pc.head_dim], &st.stream)?;
+        ps.uploaded.record(&st.stream)?;
         Ok(())
     }
 
@@ -1752,7 +1995,7 @@ impl Runtime {
             ops::attention_masked(st.attn.as_mut_ptr(), st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
                 st.positions.as_ptr(), n, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
                 self.ctx, cfg.attn_scale(), window, cfg.kv_type,
-                sparse.map(|qs| (qs.mask.as_ptr(), qs.words)), stream)?;
+                sparse.map(|qs| (qs.mask.as_ptr(), qs.words)), self.n_past + n, stream)?;
         }
         // AIRUN_ATTN_NO_GATE=1 drops the gate entirely, which says whether the
         // gate is the thing going wrong or merely riding along.

@@ -181,9 +181,16 @@ pub fn run(args: BenchArgs) -> Result<()> {
             runtime.reset();
             let start = std::time::Instant::now();
             let mut fed = 0;
+            // As `generate` prefills: only the last chunk's logits are read
+            // back. Reading every chunk's would synchronize between chunks
+            // and keep a split model's GPUs from overlapping them.
             while fed < prompt.len() {
                 let take = (prompt.len() - fed).min(args.batch_size);
-                runtime.forward(&prompt[fed..fed + take])?;
+                if fed + take < prompt.len() {
+                    runtime.prefill_chunk(&prompt[fed..fed + take])?;
+                } else {
+                    runtime.forward(&prompt[fed..fed + take])?;
+                }
                 fed += take;
             }
             let ms = start.elapsed().as_secs_f64() * 1000.0;

@@ -142,6 +142,11 @@ não há flags de servidor para eles.
 | `--reasoning-format <deepseek\|none>` | `deepseek` | Onde vai o pensamento (`<think>`) das respostas de chat: em `reasoning_content` (padrão do llama-server) ou no `content`. O `reasoning_format` da requisição tem prioridade. |
 | `--repeat-penalty <f>` | `1.1` | Penalidade multiplicativa em tokens recentes quando a requisição não pede uma. `1.0` desliga. |
 | `--repeat-last-n <N>` | `64` | Quantos tokens recentes as penalidades consideram. |
+| `--reasoning-budget <N>` | `-1` | Tokens de pensamento antes de o `</think>` ser forçado; `-1` é sem limite. O `reasoning_budget_tokens` da requisição tem prioridade. |
+| `--reasoning-budget-message <texto>` | — | Texto escrito antes do `</think>` forçado. |
+| `--slot-save-path <dir>` | — | Habilita `POST /slots/0?action=save\|restore\|erase`, que gravam e carregam o cache da conversa nesse diretório. Sem ela, 501. |
+| `--embeddings` | desligado | Habilita `/embedding` e `/v1/embeddings`. Sem ela, 501. |
+| `--pooling <none\|mean\|cls\|last>` | do GGUF, senão `last` | Como os estados dos tokens viram um embedding. `none` devolve um vetor por token (só no endpoint nativo). |
 
 Mais todas as flags de memória e alocação da seção acima.
 
@@ -425,6 +430,7 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_NO_MMQ_SPLIT=1` | Sem split-K no MMQ (onde o stream-K não roda: kernel síncrono, Q6_K). |
 | `AIRUN_MMQ_TC=64` ou `=128` | Força a largura da tile de tokens do MMQ. Padrão: 128 a partir de 128 tokens. |
 | `AIRUN_NO_MMQ_GLU=1` | Gate, up e SwiGLU do prefill em três lançamentos em vez de um. |
+| `AIRUN_ATTN_PV_F32=1` | O prefill soma P·V em fp32 também com contexto longo (a partir de 4096 chaves, o padrão é fp16 por tile de chaves, somado em fp32). |
 | `AIRUN_NO_FLASH2=1` | O prefill usa a flash attention WMMA antiga em vez da de `mma.sync` (head_dim 64/128). |
 | `AIRUN_NO_SPLIT_ATTN=1` | O decode usa o kernel de atenção de um bloco por head, sem dividir o contexto. |
 | `AIRUN_NO_FUSED_PROLOGUE=1` | q/k norm, RoPE e escrita no cache em lançamentos separados. |

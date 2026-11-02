@@ -2060,15 +2060,22 @@ fn test_qsa(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
     let d_qa = DeviceBuffer::from_slice(device, &qa, stream)?;
     let d_o = DeviceBuffer::<f32>::new(device, n * NH * HD)?;
     ops::attention_masked(d_o.as_mut_ptr(), d_qa.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_pos.as_ptr(), n, NH, NKV,
-        HD, CTX, scale, 0, ops::KvType::F16, Some((d_mask.as_ptr(), words)), stream)?;
+        HD, CTX, scale, 0, ops::KvType::F16, Some((d_mask.as_ptr(), words)), 0, stream)?;
     let got = d_o.to_vec(stream)?;
     let want: Vec<f32> = (0..n).flat_map(|t| attend(t, &selected[t])).collect();
     let (aabs, _) = compare(&want, &got);
     report.case("qsa prefill attention through the mask (flash)", format!("max_abs {aabs:.3e}"), aabs <= 3e-3);
+    // The same, as a batch deep in a long context would run it: P.V summed in
+    // fp16 per key tile.
+    ops::attention_masked(d_o.as_mut_ptr(), d_qa.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_pos.as_ptr(), n, NH, NKV,
+        HD, CTX, scale, 0, ops::KvType::F16, Some((d_mask.as_ptr(), words)), 1 << 20, stream)?;
+    let got = d_o.to_vec(stream)?;
+    let (pabs, _) = compare(&want, &got);
+    report.case("qsa prefill attention, fp16 P.V tiles (long context)", format!("max_abs {pabs:.3e}"), pabs <= 3e-3);
     // A single query through the mask: attention_kernel's path.
     ops::attention_masked(d_o.as_mut_ptr(), d_qa.offset_ptr(7 * NH * HD), d_k.as_ptr(), d_v.as_ptr(),
         d_pos.offset_ptr(7), 1, NH, NKV, HD, CTX, scale, 0, ops::KvType::F16,
-        Some((d_mask.offset_ptr(7 * words) as *const std::ffi::c_void, words)), stream)?;
+        Some((d_mask.offset_ptr(7 * words) as *const std::ffi::c_void, words)), 0, stream)?;
     let mut one = vec![0f32; NH * HD];
     d_o.copy_to_host(&mut one, stream)?;
     stream.synchronize()?;

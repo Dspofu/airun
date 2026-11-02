@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use airun_core::grammar::{Grammar, json_object_grammar, json_schema_grammar};
 use airun_core::{ProbsSink, Runtime, Sampler, SamplingParams, TokenProbs, loader};
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response, Sse, sse::Event};
 use axum::routing::{get, post};
@@ -122,6 +122,33 @@ pub struct ServeArgs {
     /// content). A request's own `reasoning_format` wins.
     #[arg(long, default_value = "deepseek")]
     pub reasoning_format: String,
+
+    /// Tokens a chat reply may spend thinking before `</think>` is forced;
+    /// -1 is unlimited. A request's `reasoning_budget_tokens` (or
+    /// `thinking_budget_tokens`) wins.
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    pub reasoning_budget: i64,
+
+    /// Text written before the forced `</think>` when the budget runs out.
+    #[arg(long, default_value = "")]
+    pub reasoning_budget_message: String,
+
+    /// Directory where `POST /slots/0?action=save|restore` keeps the cache
+    /// of a conversation. Unset: slot actions answer 501, as in llama-server.
+    #[arg(long)]
+    pub slot_save_path: Option<PathBuf>,
+
+    /// Serve `/embedding` and `/v1/embeddings` from the model's final hidden
+    /// state. Without it they answer 501, as in llama-server.
+    #[arg(long, alias = "embedding")]
+    pub embeddings: bool,
+
+    /// How a text's token states become one embedding: none (one per
+    /// token, native endpoint only), mean, cls (the first token) or last.
+    /// Default: the GGUF's pooling_type, or last for a generative model,
+    /// whose last token is the one that has read the whole text.
+    #[arg(long, value_parser = ["none", "mean", "cls", "last"])]
+    pub pooling: Option<String>,
 }
 
 /// What the last request asked for and how far it got, for `/slots`.
@@ -155,6 +182,16 @@ struct AppState {
     processing: AtomicBool,
     tasks: AtomicU64,
     slot: std::sync::Mutex<SlotInfo>,
+    reasoning_budget: Option<usize>,
+    reasoning_budget_message: String,
+    slot_save_path: Option<PathBuf>,
+    embeddings: bool,
+    pooling: Pooling,
+    /// The token sequences of `<think>` and `</think>`, if the template thinks.
+    think_tags: Option<(Vec<u32>, Vec<u32>)>,
+    /// Chat completions in flight, by id: whether they accept `/control`, and
+    /// the flag that ends their reasoning.
+    active: std::sync::Mutex<std::collections::HashMap<String, (bool, Arc<AtomicBool>)>>,
     /// Each token's bytes as a client sees them (special tokens empty), for
     /// grammars, probabilities and DRY's sequence breakers.
     pieces: Arc<Vec<Vec<u8>>>,
@@ -387,6 +424,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let bos = token_text(runtime.tokenizer.bos);
     let eos = token_text(runtime.tokenizer.eos);
     let thinking = Thinking::from_template(&template_src);
+    let think_tags = thinking.supported.then(|| {
+        (runtime.tokenizer.encode("<think>", false), runtime.tokenizer.encode("</think>", false))
+    }).filter(|(a, b)| !a.is_empty() && !b.is_empty());
     let template = if template_src.is_empty() {
         None
     } else {
@@ -395,6 +435,18 @@ pub fn run(args: ServeArgs) -> Result<()> {
             Err(e) => {
                 eprintln!("warning: {e}; chat prompts are built as plain ChatML instead");
                 None
+            }
+        }
+    };
+    let pooling = match args.pooling.as_deref() {
+        Some(p) => Pooling::from_name(p),
+        None => {
+            let arch = meta_str("general.architecture").unwrap_or_default();
+            match gguf.as_ref().and_then(|g| g.get(&format!("{arch}.pooling_type"))).and_then(|v| v.as_u64()) {
+                Some(0) => Pooling::None,
+                Some(1) => Pooling::Mean,
+                Some(2) => Pooling::Cls,
+                _ => Pooling::Last,
             }
         }
     };
@@ -440,6 +492,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         grammar: None,
         n_probs: None,
         dry_breakers: DRY_BREAKERS.map(str::to_string).to_vec(),
+        reasoning: None,
     };
     let props = json!({
         // llama-server's
@@ -535,6 +588,13 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eog,
         default_breakers,
         fim,
+        reasoning_budget: (args.reasoning_budget >= 0).then_some(args.reasoning_budget as usize),
+        reasoning_budget_message: args.reasoning_budget_message.clone(),
+        slot_save_path: args.slot_save_path.clone(),
+        embeddings: args.embeddings,
+        pooling,
+        think_tags,
+        active: Default::default(),
     });
 
     let app = Router::new()
@@ -563,9 +623,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/infill", post(infill))
-        .route("/embedding", post(no_embeddings))
-        .route("/embeddings", post(no_embeddings))
-        .route("/v1/embeddings", post(no_embeddings))
+        .route("/embedding", post(embeddings_native))
+        .route("/embeddings", post(embeddings_native))
+        .route("/v1/embeddings", post(embeddings_oai))
         .route("/rerank", post(no_rerank))
         .route("/reranking", post(no_rerank))
         .route("/v1/rerank", post(no_rerank))
@@ -722,9 +782,202 @@ async fn metrics_handler() -> Response {
 // reads the body it ignores, or the connection can close while the client is
 // still sending it and the client sees a reset instead of the answer.
 
-async fn no_embeddings(_body: axum::body::Bytes) -> Response {
+fn no_embeddings() -> Response {
     api_error(StatusCode::NOT_IMPLEMENTED,
         "This server does not support embeddings. Start it with `--embeddings`", "not_supported_error")
+}
+
+// --- embeddings ------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum Pooling {
+    None,
+    Mean,
+    Cls,
+    Last,
+}
+
+impl Pooling {
+    fn from_name(s: &str) -> Self {
+        match s {
+            "none" => Self::None,
+            "mean" => Self::Mean,
+            "cls" => Self::Cls,
+            _ => Self::Last,
+        }
+    }
+}
+
+/// llama.cpp's `embd_normalize`: -1 none, 0 max-absolute scaled to int16,
+/// 1 taxicab, 2 euclidean (the default), p > 2 the p-norm.
+fn normalize(v: &mut [f32], p: i64) {
+    let norm = match p {
+        ..0 => return,
+        0 => v.iter().fold(0f32, |m, x| m.max(x.abs())) / 32760.0,
+        1 => v.iter().map(|x| x.abs()).sum(),
+        2 => v.iter().map(|x| x * x).sum::<f32>().sqrt(),
+        p => v.iter().map(|x| x.abs().powi(p as i32)).sum::<f32>().powf(1.0 / p as f32),
+    };
+    let scale = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+    v.iter_mut().for_each(|x| *x *= scale);
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// The texts of an embedding request, tokenized: a string, token ids, or a
+/// list of either (llama.cpp's prompt shapes).
+fn embedding_inputs(rt: &Runtime, v: &Value) -> Vec<Vec<u32>> {
+    let one = |x: &Value| -> Option<Vec<u32>> {
+        match x {
+            Value::String(s) => Some(rt.tokenizer.encode(s, true)),
+            Value::Array(a) if a.iter().all(Value::is_u64) => Some(a.iter().map(|t| t.as_u64().unwrap() as u32).collect()),
+            Value::Array(a) => {
+                // Mixed strings and ids form one prompt.
+                let mut ids = Vec::new();
+                for p in a {
+                    match p {
+                        Value::String(s) => ids.extend(rt.tokenizer.encode(s, ids.is_empty())),
+                        t => ids.push(t.as_u64()? as u32),
+                    }
+                }
+                Some(ids)
+            }
+            _ => None,
+        }
+    };
+    match v {
+        Value::Array(a) if !a.is_empty() && !a.iter().all(Value::is_u64)
+            && a.iter().all(|x| x.is_string() || x.is_array()) => a.iter().filter_map(one).collect(),
+        x => one(x).into_iter().collect(),
+    }
+}
+
+/// Runs each input and pools it: one vector per input, or one per token
+/// with no pooling. Returns the vectors and the tokens each input took.
+fn embed_all(state: &AppState, inputs: &[Vec<u32>], norm: i64) -> airun_core::Result<Vec<(Vec<Vec<f32>>, usize)>> {
+    let mut rt = state.runtime.blocking_lock();
+    let n_embd = rt.model.config.n_embd;
+    let mut out = Vec::new();
+    for tokens in inputs {
+        let h = rt.hidden_states(tokens)?;
+        let rows: Vec<&[f32]> = h.chunks_exact(n_embd).collect();
+        let vecs = match state.pooling {
+            // Token states come out as they are, as llama.cpp's do.
+            Pooling::None => rows.iter().map(|r| r.to_vec()).collect(),
+            pooling => {
+                let mut v = match pooling {
+                    Pooling::Mean => {
+                        let mut m = vec![0f32; n_embd];
+                        for r in &rows {
+                            m.iter_mut().zip(r.iter()).for_each(|(a, b)| *a += b);
+                        }
+                        m.iter_mut().for_each(|a| *a /= rows.len() as f32);
+                        m
+                    }
+                    Pooling::Cls => rows[0].to_vec(),
+                    _ => rows[rows.len() - 1].to_vec(),
+                };
+                normalize(&mut v, norm);
+                vec![v]
+            }
+        };
+        out.push((vecs, tokens.len()));
+    }
+    Ok(out)
+}
+
+/// The inputs and normalization of an embedding request, or the error.
+async fn embedding_request(state: &AppState, req: &Value, input: Option<&Value>)
+    -> Result<(Vec<Vec<u32>>, i64), Response> {
+    let Some(input) = input else {
+        return Err(api_error(StatusCode::BAD_REQUEST, "\"input\" or \"content\" must be provided",
+            "invalid_request_error"));
+    };
+    let inputs = embedding_inputs(&*state.runtime.lock().await, input);
+    if inputs.is_empty() || inputs.iter().any(Vec::is_empty) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Input content cannot be empty", "invalid_request_error"));
+    }
+    Ok((inputs, req.get("embd_normalize").and_then(Value::as_i64).unwrap_or(2)))
+}
+
+/// llama.cpp's native `/embedding`: `[{index, embedding: [[...]]}]`, one
+/// entry per input, with a vector per token when pooling is none.
+async fn embeddings_native(State(state): State<Arc<AppState>>, headers: HeaderMap, body: axum::body::Bytes)
+    -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    if !state.embeddings {
+        return no_embeddings();
+    }
+    let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
+    let (inputs, norm) = match embedding_request(&state, &req, req.get("content").or_else(|| req.get("input"))).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let st = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || embed_all(&st, &inputs, norm)).await {
+        Ok(Ok(all)) => Json(Value::Array(all.into_iter().enumerate()
+            .map(|(i, (vecs, _))| json!({ "index": i, "embedding": vecs })).collect())).into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, e.to_string(), "invalid_request_error"),
+        Err(e) => generation_failed(e),
+    }
+}
+
+/// OpenAI's `/v1/embeddings`, floats or base64.
+async fn embeddings_oai(State(state): State<Arc<AppState>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    if !state.embeddings {
+        return no_embeddings();
+    }
+    if state.pooling == Pooling::None {
+        return api_error(StatusCode::BAD_REQUEST,
+            "Pooling type 'none' is not OAI compatible. Please use a different pooling type (--pooling)",
+            "invalid_request_error");
+    }
+    let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
+    let base64_out = match req.get("encoding_format").and_then(Value::as_str) {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(_) => return api_error(StatusCode::BAD_REQUEST,
+            "The format to return the embeddings in. Can be either float or base64", "invalid_request_error"),
+    };
+    let (inputs, norm) = match embedding_request(&state, &req, req.get("input")).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let model = req.get("model").and_then(Value::as_str).map_or_else(|| state.model_name.clone(), str::to_owned);
+    let st = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || embed_all(&st, &inputs, norm)).await {
+        Ok(Ok(all)) => {
+            let n: usize = all.iter().map(|x| x.1).sum();
+            let data: Vec<Value> = all.into_iter().enumerate().map(|(i, (mut vecs, _))| {
+                let v = vecs.swap_remove(0);
+                if base64_out {
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    json!({ "embedding": base64(&bytes), "index": i, "object": "embedding", "encoding_format": "base64" })
+                } else {
+                    json!({ "embedding": v, "index": i, "object": "embedding" })
+                }
+            }).collect();
+            Json(json!({ "model": model, "object": "list", "usage": { "prompt_tokens": n, "total_tokens": n },
+                "data": data })).into_response()
+        }
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, e.to_string(), "invalid_request_error"),
+        Err(e) => generation_failed(e),
+    }
 }
 
 async fn no_rerank(_body: axum::body::Bytes) -> Response {
@@ -741,9 +994,69 @@ async fn props_post(_body: axum::body::Bytes) -> Response {
         "This server does not support changing global properties. Start it with `--props`", "not_supported_error")
 }
 
-async fn slot_action(_body: axum::body::Bytes) -> Response {
-    api_error(StatusCode::NOT_IMPLEMENTED,
-        "This server does not support slots action. Start it with `--slot-save-path`", "not_supported_error")
+/// llama-server's slot actions on the one slot: `save` writes the cache of
+/// the current conversation to a file under `--slot-save-path`, `restore`
+/// loads one back (the next request that continues it skips the replay, which
+/// on a hybrid model is the only way to resume a long prompt without
+/// reprocessing it), `erase` empties the cache.
+async fn slot_action(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>, body: axum::body::Bytes) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let Some(dir) = state.slot_save_path.clone() else {
+        return api_error(StatusCode::NOT_IMPLEMENTED,
+            "This server does not support slots action. Start it with `--slot-save-path`", "not_supported_error");
+    };
+    let bad = |m: &str| api_error(StatusCode::BAD_REQUEST, m, "invalid_request_error");
+    if id.parse::<i64>().ok() != Some(0) {
+        return bad("Invalid slot ID");
+    }
+    let action = query.get("action").map(String::as_str).unwrap_or_default().to_string();
+    if !["save", "restore", "erase"].contains(&action.as_str()) {
+        return bad("Invalid action");
+    }
+    let req = if body.is_empty() { json!({}) } else { match parse_body(&body) { Ok(v) => v, Err(e) => return e } };
+    let filename = req.get("filename").and_then(Value::as_str).unwrap_or_default().to_string();
+    // A bare file name: no directories, so a request cannot reach outside
+    // the save path.
+    let valid_name = !filename.is_empty() && filename.len() <= 255 && filename != "." && filename != ".."
+        && !filename.chars().any(|c| matches!(c, '/' | '\\' | ':' | '\0') || c.is_control());
+    if action != "erase" && !valid_name {
+        return bad("Invalid filename");
+    }
+    let st = Arc::clone(&state);
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let mut rt = st.runtime.blocking_lock();
+        let start = std::time::Instant::now();
+        let path = dir.join(&filename);
+        match action.as_str() {
+            "save" => {
+                let bytes = rt.save_state().map_err(|e| e.to_string())?;
+                std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes))
+                    .map_err(|e| format!("could not write {}: {e}; check --slot-save-path", path.display()))?;
+                Ok(json!({ "id_slot": 0, "filename": filename, "n_saved": rt.n_past(), "n_written": bytes.len(),
+                    "timings": { "save_ms": start.elapsed().as_secs_f64() * 1000.0 } }))
+            }
+            "restore" => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("Unable to restore slot: could not read {}: {e}", path.display()))?;
+                let n = rt.load_state(&bytes).map_err(|e| format!("Unable to restore slot: {e}"))?;
+                Ok(json!({ "id_slot": 0, "filename": filename, "n_restored": n, "n_read": bytes.len(),
+                    "timings": { "restore_ms": start.elapsed().as_secs_f64() * 1000.0 } }))
+            }
+            _ => {
+                let n = rt.n_past();
+                rt.reset();
+                Ok(json!({ "id_slot": 0, "n_erased": n }))
+            }
+        }
+    }).await;
+    match out {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => bad(&e),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("slot action failed: {e}"), "server_error"),
+    }
 }
 
 /// No LoRA adapters are loaded, so there is nothing to list or scale.
@@ -761,19 +1074,34 @@ async fn lora_set(State(state): State<Arc<AppState>>, headers: HeaderMap, _body:
     Json(json!({ "success": true })).into_response()
 }
 
-/// llama-server's control of a running completion (ending its reasoning
-/// early). Generations here are not addressable by id while they run, so
-/// every id is unknown, which is what llama-server says for a finished one.
+/// llama-server's control of a running completion: `reasoning_end` makes a
+/// chat completion that asked for `reasoning_control` close its thinking at
+/// the next token and move on to the answer. It runs beside the generation
+/// (it never takes the model lock), so a client sends it mid-stream.
 async fn completion_control(State(state): State<Arc<AppState>>, headers: HeaderMap, body: axum::body::Bytes)
     -> Response {
     if let Err(e) = check_auth(&state, &headers) {
         return e;
     }
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
-    if req.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
+    let Some(id) = req.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
         return api_error(StatusCode::BAD_REQUEST, "missing completion id", "invalid_request_error");
+    };
+    if req.get("action").and_then(Value::as_str) != Some("reasoning_end") {
+        return api_error(StatusCode::BAD_REQUEST,
+            "unknown control action; the only one is \"reasoning_end\"", "invalid_request_error");
     }
-    Json(json!({ "success": false, "message": "no active completion for this id" })).into_response()
+    let found = state.active.lock().unwrap().get(id).cloned();
+    let body = match found {
+        None => json!({ "success": false, "message": "no active completion for this id" }),
+        Some((false, _)) => json!({ "success": false,
+            "message": "reasoning control not enabled for this completion; send `reasoning_control: true` with it" }),
+        Some((true, stop)) => {
+            stop.store(true, Ordering::Relaxed);
+            json!({ "success": true })
+        }
+    };
+    Json(body).into_response()
 }
 
 async fn tokenize(State(state): State<Arc<AppState>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
@@ -842,6 +1170,8 @@ struct GenSpec {
     /// Report each token's probability and this many alternatives.
     n_probs: Option<usize>,
     dry_breakers: Vec<String>,
+    /// A limit on the reply's reasoning, or a way to end it from `/control`.
+    reasoning: Option<airun_core::ReasoningBudget>,
 }
 
 /// How a finished generation went.
@@ -886,6 +1216,7 @@ impl AppState {
             grammar: self.grammar_of(req)?,
             n_probs,
             dry_breakers,
+            reasoning: None,
         })
     }
 
@@ -985,6 +1316,9 @@ fn run_generation(state: &AppState, spec: &GenSpec,
     }
     if let Some(n) = spec.n_probs {
         sampler = sampler.with_probs(n, Arc::clone(&sink));
+    }
+    if let Some(r) = &spec.reasoning {
+        sampler = sampler.with_reasoning_budget(r.clone());
     }
     let mut text = String::new();
     let mut word: Option<String> = None;
@@ -1395,6 +1729,8 @@ struct ChatJob {
     extract: bool,
     /// Tool calls are parsed out of the reply (not with `tool_choice: "none"`).
     tools: bool,
+    /// The request asked for `reasoning_control`, and the flag `/control` raises.
+    control: (bool, Arc<AtomicBool>),
 }
 
 impl ChatJob {
@@ -1427,7 +1763,44 @@ async fn chat_job(state: &AppState, req: &Value, n_probs: Option<usize>) -> Resu
     }
     let extract = spec.reasoning_format != "none";
     let tools = req.get("tool_choice").and_then(Value::as_str) != Some("none");
-    Ok(ChatJob { spec, opened, extract, tools })
+    // llama.cpp's reasoning budget: a token limit on the thinking, and/or a
+    // way to end it from outside.
+    let reasoning_control = req.get("reasoning_control").and_then(Value::as_bool).unwrap_or(false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = req.get("reasoning_budget_tokens").or_else(|| req.get("thinking_budget_tokens"))
+        .and_then(Value::as_i64).map_or(state.reasoning_budget, |b| (b >= 0).then_some(b as usize));
+    if let Some((start, end)) = &state.think_tags {
+        if budget.is_some() || reasoning_control {
+            let message = req.get("reasoning_budget_message").and_then(Value::as_str)
+                .unwrap_or(&state.reasoning_budget_message);
+            let rt = state.runtime.lock().await;
+            let mut forced = if message.is_empty() { Vec::new() } else { rt.tokenizer.encode(message, false) };
+            forced.extend_from_slice(end);
+            spec.reasoning = Some(airun_core::ReasoningBudget {
+                start: start.clone(), end: end.clone(), forced, budget, stop: Arc::clone(&stop), opened,
+            });
+        }
+    }
+    Ok(ChatJob { spec, opened, extract, tools, control: (reasoning_control, stop) })
+}
+
+/// Keeps a completion addressable by `/control` while it runs.
+struct Active {
+    state: Arc<AppState>,
+    id: String,
+}
+
+impl Active {
+    fn register(state: &Arc<AppState>, id: &str, job: &ChatJob) -> Self {
+        state.active.lock().unwrap().insert(id.to_string(), (job.control.0, Arc::clone(&job.control.1)));
+        Self { state: Arc::clone(state), id: id.to_string() }
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.state.active.lock().unwrap().remove(&self.id);
+    }
 }
 
 /// Runs a chat job, handing `emit` each reasoning or content delta with the
@@ -1477,6 +1850,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap
     let include_usage = req.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false);
     let model = req.get("model").and_then(Value::as_str).map_or_else(|| state.model_name.clone(), str::to_owned);
     let id = completion_id("chatcmpl-");
+    let active = Active::register(&state, &id, &job);
     let created = now();
     let envelope = move |choices: Value| json!({
         "choices": choices, "created": created, "id": id, "model": model,
@@ -1486,6 +1860,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap
     if !job.spec.stream {
         let st = Arc::clone(&state);
         let out = tokio::task::spawn_blocking(move || {
+            let _active = active;
             run_generation(&st, &job.spec, |_, _, _, _| true).map(|(end, text)| {
                 let reply = job.reply(&text);
                 let mut message = json!({ "role": "assistant", "content": reply.content });
@@ -1523,6 +1898,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap
     let (tx, rx) = mpsc::unbounded_channel();
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
+        let _active = active;
         let with_probs = job.spec.n_probs.is_some();
         let delta = |d: Value, probs: &[TokenProbs]| {
             let mut c = json!({ "finish_reason": null, "index": 0, "delta": d });
@@ -1742,12 +2118,14 @@ async fn responses(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
     let job = match chat_job(&state, &chat, None).await { Ok(j) => j, Err(e) => return e };
     let model = req.get("model").and_then(Value::as_str).map_or_else(|| state.model_name.clone(), str::to_owned);
     let id = completion_id("resp_");
+    let active = Active::register(&state, &id, &job);
     let (rs_id, msg_id) = (completion_id("rs_"), completion_id("msg_"));
     let created = now();
 
     if !job.spec.stream {
         let st = Arc::clone(&state);
         let out = tokio::task::spawn_blocking(move || {
+            let _active = active;
             run_generation(&st, &job.spec, |_, _, _, _| true).map(|(end, text)| {
                 let reply = job.reply(&text);
                 let mut output = Vec::new();
@@ -1775,6 +2153,7 @@ async fn responses(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
     let (tx, rx) = mpsc::unbounded_channel();
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
+        let _active = active;
         let mut seq = 0u64;
         // Every event names its type twice (SSE `event:` and `type`) and is
         // numbered, as OpenAI's are.
@@ -1980,10 +2359,12 @@ async fn anthropic_messages(State(state): State<Arc<AppState>>, headers: HeaderM
     let job = match chat_job(&state, &chat, None).await { Ok(j) => j, Err(e) => return e };
     let model = req.get("model").and_then(Value::as_str).map_or_else(|| state.model_name.clone(), str::to_owned);
     let id = completion_id("msg_");
+    let active = Active::register(&state, &id, &job);
 
     if !job.spec.stream {
         let st = Arc::clone(&state);
         let out = tokio::task::spawn_blocking(move || {
+            let _active = active;
             run_generation(&st, &job.spec, |_, _, _, _| true).map(|(end, text)| {
                 let reply = job.reply(&text);
                 let mut content = Vec::new();
@@ -2017,6 +2398,7 @@ async fn anthropic_messages(State(state): State<Arc<AppState>>, headers: HeaderM
     let (tx, rx) = mpsc::unbounded_channel();
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
+        let _active = active;
         let send = |name: &str, mut data: Value| {
             data["type"] = json!(name);
             tx.send(Ok(Event::default().event(name).data(data.to_string()))).is_ok()

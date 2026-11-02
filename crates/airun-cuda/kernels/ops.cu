@@ -1164,6 +1164,11 @@ static cudaError_t launch_flash(int kv_type, float* out, const float* q, const u
 // a warp's last query position are skipped: half the work of a causal prefill.
 // ---------------------------------------------------------------------------
 #define F2_KT 64
+// Keys the batch's last query must see before P.V is summed in fp16 per
+// tile. Below it the gain is small, and short prompts keep the fp32 path bit
+// for bit (fp16 sums flipped a near-tie token of a 20-token Qwen4 prompt
+// against the reference).
+#define F2_PV16_MIN_KEYS 4096
 #define F2_WARPS 8
 #define F2_QT (16 * F2_WARPS)
 
@@ -1191,6 +1196,20 @@ __device__ __forceinline__ void f2_mma(float c[4], const uint32_t a[4], uint32_t
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// The same MMA accumulating in fp16: twice the rate of fp32 accumulation on
+// GeForce tensor cores. Used for P.V within one key tile only (see the P.V
+// step of flash2_attention_kernel), so no long sum is ever held in fp16.
+__device__ __forceinline__ void f2_mma_h(uint32_t c[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ float2 f2_unpack(uint32_t h) {
+    return __half22float2(*reinterpret_cast<const __half2*>(&h));
+}
+
 __device__ __forceinline__ void f2_ldsm(uint32_t r[4], const void* p) {
     const unsigned a = (unsigned)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -1211,7 +1230,7 @@ __device__ __forceinline__ void f2_cp16(void* smem, const void* gmem, bool valid
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(n));
 }
 
-template <int D, int KV>
+template <int D, int KV, bool PV16>
 __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
     float* __restrict__ out,              // [n_tokens][n_heads][D]
     const float* __restrict__ q,          // [n_tokens][n_heads][D]
@@ -1255,6 +1274,11 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
 
     // The keys this warp and this block can see.
     int whi = max(pos0, pos1);
+    // The earliest query position in the warp (padding rows count as none):
+    // keys up to it are visible to every row.
+    int wmin = min(pos0 >= 0 ? pos0 : 0x7fffffff, pos1 >= 0 ? pos1 : 0x7fffffff);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) wmin = min(wmin, __shfl_xor_sync(0xffffffffu, wmin, o));
     int wlo = 0x7fffffff;
     if (pos0 >= 0) wlo = sliding_window > 0 ? max(0, pos0 - sliding_window + 1) : 0;
     if (pos1 >= 0) wlo = min(wlo, sliding_window > 0 ? max(0, pos1 - sliding_window + 1) : 0);
@@ -1365,17 +1389,23 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
             }
 
             // Mask, then the online softmax on rows gid (s[.][0..1]) and gid+8.
+            // A tile wholly before every query of the warp, with no window or
+            // QSA mask, has nothing to mask and no -inf to guard: at long
+            // context that is nearly every tile.
+            const bool open = !mask && sliding_window <= 0 && k0 + S::KT - 1 <= wmin;
             float t0 = -INFINITY, t1 = -INFINITY;
 #pragma unroll
             for (int j = 0; j < NJ; ++j) {
+                if (!open) {
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const int key = k0 + 8 * j + tig * 2 + (e & 1);
-                    const int pos = e < 2 ? pos0 : pos1;
-                    const uint32_t* mr = e < 2 ? mask0 : mask1;
-                    const bool ok = key <= pos && (sliding_window <= 0 || pos - key < sliding_window) &&
-                                    (!mr || ((mr[key >> 5] >> (key & 31)) & 1u));
-                    s[j][e] = ok ? s[j][e] : -INFINITY;
+                    for (int e = 0; e < 4; ++e) {
+                        const int key = k0 + 8 * j + tig * 2 + (e & 1);
+                        const int pos = e < 2 ? pos0 : pos1;
+                        const uint32_t* mr = e < 2 ? mask0 : mask1;
+                        const bool ok = key <= pos && (sliding_window <= 0 || pos - key < sliding_window) &&
+                                        (!mr || ((mr[key >> 5] >> (key & 31)) & 1u));
+                        s[j][e] = ok ? s[j][e] : -INFINITY;
+                    }
                 }
                 t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
                 t1 = fmaxf(t1, fmaxf(s[j][2], s[j][3]));
@@ -1391,10 +1421,17 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
             float r0 = 0.0f, r1 = 0.0f;
 #pragma unroll
             for (int j = 0; j < NJ; ++j) {
-                s[j][0] = s[j][0] == -INFINITY ? 0.0f : exp2f(s[j][0] - n0);
-                s[j][1] = s[j][1] == -INFINITY ? 0.0f : exp2f(s[j][1] - n0);
-                s[j][2] = s[j][2] == -INFINITY ? 0.0f : exp2f(s[j][2] - n1);
-                s[j][3] = s[j][3] == -INFINITY ? 0.0f : exp2f(s[j][3] - n1);
+                if (open) {
+                    s[j][0] = exp2f(s[j][0] - n0);
+                    s[j][1] = exp2f(s[j][1] - n0);
+                    s[j][2] = exp2f(s[j][2] - n1);
+                    s[j][3] = exp2f(s[j][3] - n1);
+                } else {
+                    s[j][0] = s[j][0] == -INFINITY ? 0.0f : exp2f(s[j][0] - n0);
+                    s[j][1] = s[j][1] == -INFINITY ? 0.0f : exp2f(s[j][1] - n0);
+                    s[j][2] = s[j][2] == -INFINITY ? 0.0f : exp2f(s[j][2] - n1);
+                    s[j][3] = s[j][3] == -INFINITY ? 0.0f : exp2f(s[j][3] - n1);
+                }
                 r0 += s[j][0] + s[j][1];
                 r1 += s[j][2] + s[j][3];
             }
@@ -1406,21 +1443,55 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
             l1 = l1 * c1 + r1;
             m0 = n0;
             m1 = n1;
+            // Once the running maxima settle, most tiles change no row's
+            // maximum: skip rescaling O by 1.
+            if (__any_sync(0xffffffffu, c0 != 1.0f || c1 != 1.0f)) {
 #pragma unroll
-            for (int j = 0; j < ND; ++j) { o[j][0] *= c0; o[j][1] *= c0; o[j][2] *= c1; o[j][3] *= c1; }
+                for (int j = 0; j < ND; ++j) { o[j][0] *= c0; o[j][1] *= c0; o[j][2] *= c1; o[j][3] *= c1; }
+            }
 
             // O += P V. Two adjacent S tiles are one k16 A fragment of P.
+            if constexpr (PV16) {
+                // The tile's P V summed in fp16 (at most KT terms, each a
+                // probability <= 1 times a value), then added to the fp32 O:
+                // the double-rate MMA without a long fp16 sum. llama.cpp keeps
+                // the whole O in fp16.
+                uint32_t pa[S::KT / 16][4];
 #pragma unroll
-            for (int kk = 0; kk < S::KT / 16; ++kk) {
-                const uint32_t pa[4] = {
-                    f2_pack(s[2 * kk][0], s[2 * kk][1]), f2_pack(s[2 * kk][2], s[2 * kk][3]),
-                    f2_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]), f2_pack(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+                for (int kk = 0; kk < S::KT / 16; ++kk) {
+                    pa[kk][0] = f2_pack(s[2 * kk][0], s[2 * kk][1]);
+                    pa[kk][1] = f2_pack(s[2 * kk][2], s[2 * kk][3]);
+                    pa[kk][2] = f2_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+                    pa[kk][3] = f2_pack(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+                }
 #pragma unroll
                 for (int jd = 0; jd < ND; jd += 2) {
-                    uint32_t b[4];
-                    f2_ldsm_t(b, vt + (16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8) * LD + 8 * jd + (lane >> 4) * 8);
-                    f2_mma(o[jd], pa, b[0], b[1]);
-                    f2_mma(o[jd + 1], pa, b[2], b[3]);
+                    uint32_t ca[2] = {0u, 0u}, cb[2] = {0u, 0u};
+#pragma unroll
+                    for (int kk = 0; kk < S::KT / 16; ++kk) {
+                        uint32_t b[4];
+                        f2_ldsm_t(b, vt + (16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8) * LD + 8 * jd + (lane >> 4) * 8);
+                        f2_mma_h(ca, pa[kk], b[0], b[1]);
+                        f2_mma_h(cb, pa[kk], b[2], b[3]);
+                    }
+                    const float2 a0 = f2_unpack(ca[0]), a1 = f2_unpack(ca[1]);
+                    const float2 b0 = f2_unpack(cb[0]), b1 = f2_unpack(cb[1]);
+                    o[jd][0] += a0.x; o[jd][1] += a0.y; o[jd][2] += a1.x; o[jd][3] += a1.y;
+                    o[jd + 1][0] += b0.x; o[jd + 1][1] += b0.y; o[jd + 1][2] += b1.x; o[jd + 1][3] += b1.y;
+                }
+            } else {
+#pragma unroll
+                for (int kk = 0; kk < S::KT / 16; ++kk) {
+                    const uint32_t pa[4] = {
+                        f2_pack(s[2 * kk][0], s[2 * kk][1]), f2_pack(s[2 * kk][2], s[2 * kk][3]),
+                        f2_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]), f2_pack(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+                    for (int jd = 0; jd < ND; jd += 2) {
+                        uint32_t b[4];
+                        f2_ldsm_t(b, vt + (16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8) * LD + 8 * jd + (lane >> 4) * 8);
+                        f2_mma(o[jd], pa, b[0], b[1]);
+                        f2_mma(o[jd + 1], pa, b[2], b[3]);
+                    }
                 }
             }
         }
@@ -1437,20 +1508,35 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
     }
 }
 
+// AIRUN_ATTN_PV_F32=1 accumulates P.V in fp32 throughout, to measure the
+// per-tile fp16 sums against.
+static bool pv_f32() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_ATTN_PV_F32");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 template <int D>
 static cudaError_t launch_flash2(int kv_type, float* out, const float* q, const uint8_t* k,
                                  const uint8_t* v, const int32_t* pos, int n_tokens, int n_heads,
                                  int n_kv_heads, int max_seq, float scale, int window,
-                                 const uint32_t* mask, int mask_words, cudaStream_t stream) {
+                                 const uint32_t* mask, int mask_words, bool pv16, cudaStream_t stream) {
     const dim3 grid((n_tokens + F2_QT - 1) / F2_QT, n_heads);
     const size_t smem = F2Shape<D>::SMEM;
-#define F2_LAUNCH(KVT)                                                                      \
+#define F2_LAUNCH_PV(KVT, PV)                                                               \
     do {                                                                                   \
-        cudaFuncSetAttribute(flash2_attention_kernel<D, KVT>,                              \
+        cudaFuncSetAttribute(flash2_attention_kernel<D, KVT, PV>,                          \
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
-        flash2_attention_kernel<D, KVT><<<grid, 32 * F2_WARPS, smem, stream>>>(            \
+        flash2_attention_kernel<D, KVT, PV><<<grid, 32 * F2_WARPS, smem, stream>>>(        \
             out, q, k, v, pos, n_tokens, n_heads, n_kv_heads, max_seq, scale, window,      \
             mask, mask_words);                                                             \
+    } while (0)
+#define F2_LAUNCH(KVT)                                                                      \
+    do {                                                                                   \
+        if (pv16 && !pv_f32()) F2_LAUNCH_PV(KVT, true); else F2_LAUNCH_PV(KVT, false);               \
     } while (0)
     switch (kv_type) {
         case KV_Q8_0: F2_LAUNCH(KV_Q8_0); break;
@@ -1458,6 +1544,7 @@ static cudaError_t launch_flash2(int kv_type, float* out, const float* q, const 
         default:      F2_LAUNCH(KV_F16); break;
     }
 #undef F2_LAUNCH
+#undef F2_LAUNCH_PV
     return cudaGetLastError();
 }
 
@@ -1722,10 +1809,11 @@ airun_status airun_attention(
     const void* positions,
     int32_t n_tokens, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
     int32_t max_seq, float scale, int32_t sliding_window, int32_t kv_type,
-    const void* mask_, int32_t mask_words, cudaStream_t stream) {
+    const void* mask_, int32_t mask_words, int32_t keys, cudaStream_t stream) {
 
     if (n_tokens <= 0) return AIRUN_OK;
     const uint32_t* mask = (const uint32_t*)mask_;
+    const bool pv16 = keys >= F2_PV16_MIN_KEYS;
     if (head_dim % 32 != 0 || head_dim > 32 * MAX_DIM_PER_LANE) return AIRUN_ERR_BAD_ARG;
     if (n_kv_heads <= 0 || n_heads % n_kv_heads != 0) return AIRUN_ERR_BAD_ARG;
     if (kv_type < KV_F16 || kv_type > KV_Q4_0) return AIRUN_ERR_BAD_ARG;
@@ -1743,11 +1831,11 @@ airun_status airun_attention(
             const int32_t* pp = (const int32_t*)positions;
             cudaError_t e;
             const bool f2 = !flash2_disabled();
-            if (head_dim == 64)       e = f2 ? launch_flash2<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream)
+            if (head_dim == 64)       e = f2 ? launch_flash2<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, pv16, stream)
                                          : launch_flash<64>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream);
-            else if (head_dim == 128) e = f2 ? launch_flash2<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream)
+            else if (head_dim == 128) e = f2 ? launch_flash2<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, pv16, stream)
                                          : launch_flash<128>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream);
-            else                      e = f2 ? launch_flash2<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream)
+            else                      e = f2 ? launch_flash2<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, pv16, stream)
                                          : launch_flash<256>(kv_type, (float*)out, qq, kk, vv, pp, n_tokens, n_heads, n_kv_heads, max_seq, scale, sliding_window, mask, mask_words, stream);
             AIRUN_TRY(e);
             return AIRUN_OK;

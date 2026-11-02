@@ -213,6 +213,45 @@ kernel por (head de KV, split) que lê o cache uma vez para todo o grupo GQA
 prefill em lote chega aos mesmos logits que alimentar token a token — é o
 único teste que roda esses kernels com pesos reais.
 
+**Prefill com contexto longo (2026-11-01).** O prefill de prompts longos
+perdia de 28% a 37% para o llama.cpp com o 27B dividido entre as duas GPUs.
+Duas causas, nessa ordem de peso:
+
+1. **As GPUs rodavam em série.** O `handoff` entre shards sincronizava a GPU
+   de origem pelo host, e o `airun bench` lia os logits de todo pedaço de
+   prompt, o que sincroniza também. Uma 5060 Ti (metade dos SMs) atrás da
+   5070 Ti derrubava 4k de prompt de 3653 (uma GPU) para 2501 tok/s; o
+   llama.cpp, que encadeia as GPUs, mantinha 3514.
+   - Agora o `handoff` só ordena por eventos: o stream de destino espera o
+     `sent` da origem, e a origem espera o `copied` do destino antes de
+     sobrescrever `x`. A GPU 0 roda o pedaço c+1 enquanto a GPU 1 roda o c.
+   - O bench usa `Runtime::prefill_chunk` nos pedaços intermediários, como o
+     `generate`.
+   - Quem enche um buffer pinado no host precisa esperar o upload anterior,
+     porque o host não para mais entre os pedaços. O PLE tem o evento
+     `uploaded`; o MoE já sincronizava. Split: 4k a 3566 tok/s.
+2. **A atenção do prefill estava em 55 TFLOPS** com head_dim 256
+   (`crates/airun-cuda/tests/attention_bench.rs`, ignorado, mede isolado).
+   Com 255 registradores só cabe um bloco de 8 warps por SM, e os dois
+   warps de cada partição fazem a softmax juntos enquanto o tensor core
+   espera, então o que pesa é o custo por tile fora das MMAs. Três cortes
+   levaram a 72,7 TFLOPS:
+   - **P·V em fp16 por tile de chaves:** soma de no máximo 32 termos ≤ 1
+     vezes V, somada a um O em fp32. É a MMA de taxa dupla, sem guardar uma
+     soma longa em fp16; o llama.cpp guarda o O inteiro em fp16. O kernel
+     só usa isso quando o lote vê 4096+ chaves (`keys` de
+     `attention_masked`). Em prompt curto a soma em fp16 virava um token
+     quase empatado do Qwen4 contra a referência, e o ganho é pequeno.
+     Perplexidade com pedaços de 8k: 1,2960 contra 1,2999 em fp32.
+     `AIRUN_ATTN_PV_F32=1` desliga.
+   - **Caminho sem máscara:** um tile inteiro antes de todas as consultas
+     do warp não precisa de máscara nem das guardas de `-inf`.
+   - **Reescala preguiçosa:** o O só é reescalado quando o máximo de alguma
+     linha muda.
+
+Agrupar as cabeças do GQA não reduziria o tráfego: a intensidade por tile
+de K/V é a mesma, porque o kernel é limitado por cálculo, não por memória.
+
 **Três armadilhas de kernel que custaram horas em 2026-09-26:**
 - Um array de registradores (`acc[h]`) indexado num laço com limite de tempo
   de execução vai inteiro para a memória local. Use `#pragma unroll` com o
@@ -236,8 +275,10 @@ rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
 
 2. **Estas GPUs não têm P2P.** `cudaDeviceCanAccessPeer` retorna 0. Cópias
    entre GPUs passam pela RAM. Por isso o planner prefere uma GPU só quando o
-   modelo cabe — e por isso o split 50/50 é mais lento (94 t/s) que uma placa
-   só (234 t/s) no modelo de 1.7B, medido com o contexto vazio.
+   modelo cabe. No decode o split custa: no 1.7B, 94 t/s contra 234 t/s numa
+   placa só, com o contexto vazio. No prefill as GPUs se sobrepõem (veja
+   "Prefill com contexto longo" acima) e o split quase não perde. Nunca
+   sincronize um stream pelo host entre shards: isso põe as GPUs em série.
 
 3. **CUDA 13 removeu campos de `cudaDeviceProp`** (`memoryClockRate`). Nunca
    faça bind direto dessa struct do Rust — use o shim em `kernels/device.cu`.
@@ -457,13 +498,33 @@ para que clientes feitos para ele funcionem sem mudança:
   `/v1`).
 - **Utilitários:** `/tokenize` (com `with_pieces`), `/detokenize` e
   `/apply-template`.
-- **Sem suporte, respondendo como o llama-server sem a feature:** embeddings
-  (`/embedding(s)`, `/v1/embeddings`), rerank (`/rerank`, `/reranking`,
-  `/v1/rerank(ing)`), `POST /props`, `POST /slots/{id}`,
-  `/v1/audio/transcriptions` (501); `/lora-adapters` (lista vazia /
-  `success`); `/v1/chat/completions/control` (id desconhecido). Esses handlers
-  leem o corpo antes de responder: sem isso a conexão fechava com o cliente
-  ainda enviando e ele via um reset em vez do 501.
+- **Embeddings** (`--embeddings`): `/embedding(s)` nativo e
+  `/v1/embeddings` (float ou base64), do estado final (depois da norma de
+  saída) via `Runtime::hidden_states`; pooling `--pooling
+  none|mean|cls|last` (padrão: o `pooling_type` do GGUF, senão `last`, que
+  num modelo gerativo é o token que leu o texto todo), `embd_normalize` como
+  no llama.cpp. Sem a flag: 501.
+- **Slots** (`--slot-save-path DIR`): `POST /slots/0?action=save|restore|
+  erase` gravam/carregam o cache inteiro (`Runtime::save_state`/
+  `load_state`: linhas de KV usadas, matrizes delta-net, conv, anel QSA,
+  histórico PLE). Num híbrido é o único jeito de retomar um prompt longo sem
+  reprocessar; a continuação sai idêntica token a token. O arquivo do 27B é
+  grande (~283 MB em 1925 tokens: as 48 matrizes delta-net são f32). Nome de
+  arquivo sem diretório. Sem a flag: 501.
+- **Raciocínio controlado:** `reasoning_budget_tokens` (ou
+  `thinking_budget_tokens`, ou `--reasoning-budget`) e
+  `reasoning_budget_message` fecham o `<think>` à força depois de N tokens
+  (`ReasoningBudget` no amostrador); com `reasoning_control: true`,
+  `POST /v1/chat/completions/control {"id", "action": "reasoning_end"}`
+  fecha o pensamento de uma geração em andamento (vale para chat, Responses
+  e Messages). Ambos desligam o argmax na GPU e o MTP daquela requisição.
+- **Sem suporte, respondendo como o llama-server sem a feature:** rerank
+  (`/rerank`, `/reranking`, `/v1/rerank(ing)`; precisa de um modelo
+  reranker com cabeça de classificação), `POST /props`,
+  `/v1/audio/transcriptions` (501; os modelos não têm encoder de áudio);
+  `/lora-adapters` (lista vazia / `success`). Esses handlers leem o corpo
+  antes de responder: sem isso a conexão fechava com o cliente ainda
+  enviando e ele via um reset em vez do 501.
 
 Cada resposta traz `timings`, `usage.prompt_tokens_details.cached_tokens` e
 `system_fingerprint`; o stream respeita `stream_options.include_usage`. Erros
@@ -518,13 +579,20 @@ vêm como `{"error": {"code", "message", "type"}}`.
   b11760: gramática, JSON schema, `ignore_eos`, `tool_choice: none`,
   `json_object`, tool calls e infill com o mesmo texto; `n_probs` dentro de
   0,002–0,013. No prompt de chat curto sem pensamento o "Hi" sai com
-  logprob -0,175 contra -0,42 no llama.cpp, com prompt e ids idênticos:
-  é numérica do NVFP4 entre os motores, não da API.
+  logprob -0,175 contra -0,42 no llama.cpp, com prompt e ids idênticos. O
+  caminho todo em f32 do airun (`-b 1`, `AIRUN_MATVEC_F32=1
+  AIRUN_NO_FP4=1 AIRUN_NO_MMQ=1`) dá -0,183: o airun normal fica a 0,01 do
+  cálculo exato e o llama.cpp a 0,24 (quantização das ativações dele).
 - **Diferença de padrão:** pedidos OpenAI sem `repeat_penalty` usam o
   `--repeat-penalty` do servidor (1,1); o llama-server usa 1,0. O
   `/completion` nativo usa 1,0, como o llama-server.
-- **Ainda não implementado:** embeddings, rerank, áudio, LoRA, slots em
-  arquivo e o controle de uma geração em andamento (`/control`).
+- **Ainda não implementado:** rerank, áudio e LoRA (nenhum dos modelos
+  alvo tem cabeça de rerank, encoder de áudio ou adaptadores).
+- **Bug corrigido junto (2026-11-01):** com `-b 1` o prefill passava token a
+  token pelo grafo de decode sem sincronizar, e cada replay lia o token e a
+  posição já sobrescritos no buffer pinado ("The capital of France is" →
+  "a 2013 American comedy"). `forward_decode_graphed` agora espera o replay
+  anterior antes de reescrever os slots; o decode não muda (48,4 tok/s).
 
 ### KV cache quantizado (`--kv-type f16|q8_0|q4_0`)
 

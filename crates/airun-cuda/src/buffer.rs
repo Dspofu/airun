@@ -187,6 +187,18 @@ impl<T: Copy> DeviceBuffer<T> {
         })
     }
 
+    /// Queues a device-to-host copy of `dst.len()` elements starting at `offset`.
+    pub fn copy_to_host_at(&self, offset: usize, dst: &mut [T], stream: &Stream) -> Result<()> {
+        if offset > self.len || dst.len() > self.len - offset {
+            return Err(CudaError::Runtime { code: -1, name: "AIRUN_COPY_TOO_LARGE".into(),
+                message: "download exceeds buffer bounds; reduce the download or enlarge the buffer".into() });
+        }
+        if dst.is_empty() { return Ok(()); }
+        // SAFETY: the source range is checked above.
+        ffi::check(unsafe { ffi::airun_memcpy_d2h(dst.as_mut_ptr().cast(), self.offset_ptr(offset),
+            std::mem::size_of_val(dst) as u64, stream.raw()) })
+    }
+
     /// Copies from another buffer, which may live on a different device.
     pub fn copy_from_device(&mut self, src: &DeviceBuffer<T>, stream: &Stream) -> Result<()> {
         let n = src.len.min(self.len);

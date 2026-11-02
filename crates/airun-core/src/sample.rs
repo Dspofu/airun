@@ -140,6 +140,72 @@ pub struct TokenProbs {
 /// caller to read while generation runs.
 pub type ProbsSink = std::sync::Arc<std::sync::Mutex<Vec<TokenProbs>>>;
 
+/// A limit on a reply's reasoning, as llama.cpp's reasoning budget: once the
+/// block has used `budget` tokens, or once `stop` is raised from outside (the
+/// server's `/control`), the sampler stops sampling and writes `forced` (an
+/// optional message, then the end tag) so the model moves on to its answer.
+#[derive(Clone)]
+pub struct ReasoningBudget {
+    /// Token sequences that open and close a reasoning block.
+    pub start: Vec<u32>,
+    pub end: Vec<u32>,
+    /// What closes the block when it is cut short.
+    pub forced: Vec<u32>,
+    /// Reasoning tokens allowed; None: unlimited.
+    pub budget: Option<usize>,
+    /// Raised to end the reasoning at the next token.
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The reply starts inside a block (the prompt opened it).
+    pub opened: bool,
+}
+
+/// Where a [`ReasoningBudget`] stands.
+struct BudgetState {
+    rules: ReasoningBudget,
+    inside: bool,
+    used: usize,
+    /// Next position in `forced`, while forcing.
+    forcing: Option<usize>,
+    /// The tokens this sampler produced, for matching the tags.
+    recent: Vec<u32>,
+}
+
+impl BudgetState {
+    /// The token to emit regardless of the logits, if the block is being closed.
+    fn forced(&mut self) -> Option<u32> {
+        if self.forcing.is_none() && self.inside {
+            let out_of_budget = self.rules.budget.is_some_and(|b| self.used >= b);
+            if out_of_budget || self.rules.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                self.forcing = Some(0);
+            }
+        }
+        let i = self.forcing?;
+        let t = *self.rules.forced.get(i)?;
+        self.forcing = Some(i + 1);
+        Some(t)
+    }
+
+    fn accept(&mut self, token: u32) {
+        self.recent.push(token);
+        if self.forcing.is_some_and(|i| i >= self.rules.forced.len()) {
+            self.forcing = None;
+            self.inside = false;
+            return;
+        }
+        if self.forcing.is_some() {
+            return;
+        }
+        if self.inside {
+            self.used += 1;
+            if !self.rules.end.is_empty() && self.recent.ends_with(&self.rules.end) {
+                self.inside = false;
+            }
+        } else if !self.rules.start.is_empty() && self.recent.ends_with(&self.rules.start) {
+            self.inside = true;
+        }
+    }
+}
+
 pub struct Sampler {
     params: SamplingParams,
     /// Only tokens this grammar allows are sampled.
@@ -147,6 +213,7 @@ pub struct Sampler {
     /// How many alternatives to record per token, and where.
     n_probs: usize,
     probs: Option<ProbsSink>,
+    budget: Option<BudgetState>,
     rng: Rng,
     /// Scratch reused between calls to keep sampling allocation-free.
     candidates: Vec<(u32, f32)>,
@@ -175,6 +242,7 @@ impl Sampler {
             grammar: None,
             n_probs: 0,
             probs: None,
+            budget: None,
             candidates: Vec::new(),
             counts: Vec::new(),
             mu: 2.0 * 5.0,
@@ -205,6 +273,13 @@ impl Sampler {
         self
     }
 
+    /// Limits the reply's reasoning (see [`ReasoningBudget`]).
+    pub fn with_reasoning_budget(mut self, rules: ReasoningBudget) -> Self {
+        let inside = rules.opened;
+        self.budget = Some(BudgetState { rules, inside, used: 0, forcing: None, recent: Vec::new() });
+        self
+    }
+
     /// True when [`sample`] reduces to the argmax of the raw logits: no
     /// temperature, no biases, no penalty that could move the maximum. The
     /// runtime then computes the argmax on the GPU instead of copying logits.
@@ -213,16 +288,25 @@ impl Sampler {
         let penalizing = (p.repeat_penalty != 1.0 || p.presence_penalty != 0.0
             || p.frequency_penalty != 0.0) && p.repeat_last_n > 0;
         p.temperature <= 0.0 && p.logit_bias.is_empty() && !penalizing && p.dry_multiplier <= 0.0
-            && self.grammar.is_none() && self.probs.is_none()
+            && self.grammar.is_none() && self.probs.is_none() && self.budget.is_none()
     }
 
     /// Picks the next token. `logits` is modified in place.
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
         let raw = self.probs.is_some().then(|| logits.to_vec());
-        if let Some(g) = &self.grammar {
-            g.mask(logits);
+        let forced = self.budget.as_mut().and_then(BudgetState::forced);
+        if forced.is_none() {
+            if let Some(g) = &self.grammar {
+                g.mask(logits);
+            }
         }
-        let token = self.pick(logits, history);
+        let token = match forced {
+            Some(t) => t,
+            None => self.pick(logits, history),
+        };
+        if let Some(b) = &mut self.budget {
+            b.accept(token);
+        }
         if let Some(g) = &mut self.grammar {
             g.accept(token);
         }
@@ -696,6 +780,40 @@ mod tests {
         let mut logits = vec![0.0f32; 10];
         apply_dry(&mut logits, &history, &params);
         assert_eq!(logits[3], 0.0);
+    }
+
+    fn budget(budget: Option<usize>, stop: bool) -> ReasoningBudget {
+        ReasoningBudget {
+            start: vec![90], end: vec![91], forced: vec![7, 91], budget,
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(stop)), opened: true,
+        }
+    }
+
+    /// Greedy picks token 1 forever; the budget cuts the reasoning off with
+    /// the forced message and end tag, then sampling resumes.
+    #[test]
+    fn a_reasoning_budget_forces_the_end_tag() {
+        let mut s = Sampler::new(SamplingParams::greedy()).with_reasoning_budget(budget(Some(3), false));
+        assert!(!s.is_pure_greedy());
+        let mut logits = vec![0.0f32; 100];
+        logits[1] = 5.0;
+        let out: Vec<u32> = (0..7).map(|_| s.sample(&mut logits.clone(), &[])).collect();
+        assert_eq!(out, vec![1, 1, 1, 7, 91, 1, 1]);
+    }
+
+    #[test]
+    fn a_raised_stop_ends_the_reasoning_at_once() {
+        let rules = budget(None, false);
+        let stop = std::sync::Arc::clone(&rules.stop);
+        let mut s = Sampler::new(SamplingParams::greedy()).with_reasoning_budget(rules);
+        let mut logits = vec![0.0f32; 100];
+        logits[1] = 5.0;
+        assert_eq!(s.sample(&mut logits.clone(), &[]), 1);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let out: Vec<u32> = (0..3).map(|_| s.sample(&mut logits.clone(), &[])).collect();
+        assert_eq!(out, vec![7, 91, 1]);
+        // Outside the block, a stop that stays raised changes nothing.
+        assert_eq!(s.sample(&mut logits.clone(), &[]), 1);
     }
 
     #[test]
