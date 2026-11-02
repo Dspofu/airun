@@ -249,6 +249,40 @@ Duas causas, nessa ordem de peso:
    - **Reescala preguiçosa:** o O só é reescalado quando o máximo de alguma
      linha muda.
 
+**Alocação: `--alloc auto|gpu|memory` e `--main-gpu` (2026-11-02).**
+
+- **Planner** (`plan.rs`):
+  - `AllocMode` decide se pesos podem ir para a RAM.
+  - `--main-gpu` vira o primeiro de `ordered`.
+  - `fill_fastest_first(.., fewest)` usa só as GPUs necessárias em `auto`.
+  - `spill_to_ram` enche as outras GPUs com as últimas camadas e deixa na
+    RAM, com o KV na VRAM da principal, o que a principal não comporta.
+  - O resultado fica no `Shard`: `ram_layers` e `staging_bytes`.
+- **Loader** (`model.rs`):
+  - `load_ram` guarda a matriz em RAM fixada, com o sanitize de NVFP4 feito
+    na CPU, e `GpuTensor::ptr()` aponta para o staging.
+  - `LayerWeights::ram_copies` lista as cópias da camada.
+- **Runtime:** `queue_shard` enfileira as cópias antes da camada, no mesmo
+  stream. No grafo de decode elas viram nós de cópia.
+- **Validado:** 120 tokens idênticos com 22 camadas em RAM contra o modelo
+  na VRAM, e o Qwen4 idêntico à referência.
+- **Limites:**
+  - Camadas MoE inteiras em RAM ainda não existem; para MoE o planner não
+    transborda e os experts usam o caminho antigo.
+  - A cópia não se sobrepõe ao cálculo. O link está no limite (~26 GB/s), e
+    sobrepor esconderia só os ~20% que o cálculo leva.
+
+**Decode com contexto longo.** `attention_decode_gqa_kernel` lê K e V a ~80%
+da banda (711 GB/s na 5070 Ti, 323 na 5060 Ti, em 128k;
+`decode_attention_bandwidth` em `attention_bench.rs`, com
+`AIRUN_BENCH_DEVICE`). Ele divide o cache em até 256 pedaços, e 4 KV heads ×
+256 dá 1024 blocos. Na 5060 Ti (144 blocos por vez) isso fazia 7,1 ondas, a
+oitava quase vazia. `attention_active_splits` agora arredonda para ondas
+inteiras, com a concorrência real da GPU: +2% no decode a 128k.
+`AIRUN_NO_SPLIT_WAVES=1` desliga.
+- **cp.async não ajudou:** tentei carregar o tile com `cp.async` (todas as
+  peças em voo) e caiu para 636 GB/s. A latência por tile não era o gargalo.
+
 Agrupar as cabeças do GQA não reduziria o tráfego: a intensidade por tile
 de K/V é a mesma, porque o kernel é limitado por cálculo, não por memória.
 
@@ -275,8 +309,12 @@ rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
 
 2. **Estas GPUs não têm P2P.** `cudaDeviceCanAccessPeer` retorna 0. Cópias
    entre GPUs passam pela RAM. Por isso o planner prefere uma GPU só quando o
-   modelo cabe. No decode o split custa: no 1.7B, 94 t/s contra 234 t/s numa
-   placa só, com o contexto vazio. No prefill as GPUs se sobrepõem (veja
+   modelo cabe e, quando não cabe, enche a mais rápida primeiro
+   (`fill_fastest_first`, em `plan.rs`). Dividir pela VRAM livre punha metade
+   do 27B na 5060 Ti, que tem metade da banda da 5070 Ti. Como o decode roda as
+   placas em série, isso custava 28%: decode @16 em 33,7 contra 43,0 tok/s e
+   @32k em 28,9 contra 37,1. No decode o split custa: no 1.7B, 94 t/s contra
+   234 t/s numa placa só, com o contexto vazio. No prefill as GPUs se sobrepõem (veja
    "Prefill com contexto longo" acima) e o split quase não perde. Nunca
    sincronize um stream pelo host entre shards: isso põe as GPUs em série.
 

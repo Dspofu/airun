@@ -34,7 +34,8 @@ pub enum CoreError {
     #[error(
         "model {model:?} needs {} but only {} of GPU memory is usable at context {ctx}.\n  \
          {detail}\n  \
-         Try: a smaller --ctx-size, a more compact quantization, or adding a GPU with --gpus.",
+         Try: --alloc auto to keep what the GPUs cannot hold in RAM (slower, but it runs), \
+         a smaller --ctx-size, a more compact quantization, or adding a GPU with --gpus.",
         airun_cuda::human_bytes(*needed),
         airun_cuda::human_bytes(*available)
     )]

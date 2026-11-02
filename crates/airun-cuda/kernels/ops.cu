@@ -612,12 +612,19 @@ __global__ __launch_bounds__(32 * ATTN_WARPS) void attention_kernel(
 // fixed when the decode step is captured into a CUDA graph, so the count has
 // to be worked out on the device from the position.
 #define GQA_KEYS_PER_SPLIT 64
+//
+// `wave` (0: off) is how many splits of one KV head run at once on this GPU.
+// Past one wave, the count drops to a whole number of waves: a last wave with
+// a few blocks in it costs as much as a full one. At 128k tokens on 36 SMs,
+// 256 splits were 7.1 waves of 36, an eighth wave nearly empty.
 __device__ __forceinline__ int attention_active_splits(const int32_t* positions, int window,
-                                                       int splits, int keys_per_split) {
+                                                       int splits, int keys_per_split, int wave = 0) {
     if (keys_per_split <= 0) return splits;
     const int pos = positions[0];
     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
-    return min(splits, max(1, (pos + 1 - lo + keys_per_split - 1) / keys_per_split));
+    int a = min(splits, max(1, (pos + 1 - lo + keys_per_split - 1) / keys_per_split));
+    if (wave > 0 && a > wave) a -= a % wave;
+    return a;
 }
 
 // One block per head, head_dim threads. The splits' (max, sum) pairs are
@@ -627,14 +634,14 @@ __device__ __forceinline__ int attention_active_splits(const int32_t* positions,
 // 17 us per layer at 3072 tokens, a sixth of the decode step's attention.
 #define MERGE_MAX_SPLITS 256
 __global__ void attention_merge_kernel(float* out, const float* partial,
-    int head_dim, int splits, const int32_t* positions, int window, int keys_per_split) {
+    int head_dim, int splits, const int32_t* positions, int window, int keys_per_split, int wave) {
     __shared__ float s_m[MERGE_MAX_SPLITS];
     __shared__ float s_w[MERGE_MAX_SPLITS];
     __shared__ float s_total;
     const int head = blockIdx.x;
     const float* base = partial + (size_t)head * splits * (head_dim + 2);
     const int active = min(MERGE_MAX_SPLITS,
-                           attention_active_splits(positions, window, splits, keys_per_split));
+                           attention_active_splits(positions, window, splits, keys_per_split, wave));
     for (int s = threadIdx.x; s < active; s += blockDim.x) {
         const float* p = base + (size_t)s * (head_dim + 2);
         s_m[s] = p[1] > 0.0f ? p[0] : -INFINITY;   // empty splits carry no weight
@@ -751,7 +758,8 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
     const int max_seq,
     const float scale,
     const int sliding_window,
-    const int32_t* __restrict__ idx) {    // QSA: key j is cache row idx[j]; null = row j
+    const int32_t* __restrict__ idx,      // QSA: key j is cache row idx[j]; null = row j
+    const int wave) {                     // see attention_active_splits
 
     using S = GqaShape<D>;
     constexpr int LD = S::LD;
@@ -773,7 +781,7 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
     const int pos = positions[0];
     const int lo = sliding_window > 0 ? max(0, pos - sliding_window + 1) : 0;
     const int span = pos + 1 - lo;
-    const int splits = attention_active_splits(positions, sliding_window, gridDim.y, GQA_KEYS_PER_SPLIT);
+    const int splits = attention_active_splits(positions, sliding_window, gridDim.y, GQA_KEYS_PER_SPLIT, wave);
     if (split >= splits) return;   // the merge reads only the active ones
     const int begin = lo + (int)((int64_t)span * split / splits);
     const int end = lo + (int)((int64_t)span * (split + 1) / splits);
@@ -881,11 +889,22 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
         }
     }
 }
+// AIRUN_NO_SPLIT_WAVES=1 keeps every split a position has keys for, however
+// the last wave falls (see attention_active_splits).
+static bool split_waves_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_SPLIT_WAVES");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 template <int D>
 static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q, const uint8_t* k,
                                      const uint8_t* v, const int32_t* pos, int heads, int kv_heads,
                                      int max_seq, float scale, int window, int splits,
-                                     const int32_t* idx, cudaStream_t stream) {
+                                     const int32_t* idx, int* wave_out, cudaStream_t stream) {
     const dim3 grid(kv_heads, splits);
     const int G = heads / kv_heads;
     const size_t smem = (size_t)G * D * 4 + GqaShape<D>::T_BYTES + (size_t)G * GQA_TILE * 4;
@@ -893,8 +912,15 @@ static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q
     do {                                                                                   \
         cudaFuncSetAttribute(attention_decode_gqa_kernel<D, KVT>,                          \
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
+        int per_sm = 0, dev = 0, sms = 0;                                                  \
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm,                             \
+            attention_decode_gqa_kernel<D, KVT>, 32, smem);                                \
+        cudaGetDevice(&dev);                                                               \
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);                 \
+        const int wave = split_waves_disabled() ? 0 : max(1, per_sm * sms / kv_heads);    \
+        *wave_out = wave;                                                                  \
         attention_decode_gqa_kernel<D, KVT><<<grid, 32, smem, stream>>>(                    \
-            partial, q, k, v, pos, heads, kv_heads, max_seq, scale, window, idx);          \
+            partial, q, k, v, pos, heads, kv_heads, max_seq, scale, window, idx, wave);    \
     } while (0)
     switch (kv_type) {
         case KV_Q8_0: GQA_LAUNCH(KV_Q8_0); break;
@@ -1623,6 +1649,7 @@ airun_status airun_attention_split(
     if (kv_type < KV_F16 || kv_type > KV_Q4_0) return AIRUN_ERR_BAD_ARG;
     const bool gqa = heads / kv_heads <= GQA_MAX && !gqa_decode_disabled() &&
         (dim == 64 || dim == 128 || dim == 256);
+    int wave = 0;
     if (gqa) {
         const float* qq = (const float*)q;
         const uint8_t* kk = (const uint8_t*)k;
@@ -1630,9 +1657,9 @@ airun_status airun_attention_split(
         const int32_t* pp = (const int32_t*)positions;
         float* part = (float*)partial;
         cudaError_t e;
-        if (dim == 64)       e = launch_gqa_decode<64>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, stream);
-        else if (dim == 128) e = launch_gqa_decode<128>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, stream);
-        else                 e = launch_gqa_decode<256>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, stream);
+        if (dim == 64)       e = launch_gqa_decode<64>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, &wave, stream);
+        else if (dim == 128) e = launch_gqa_decode<128>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, &wave, stream);
+        else                 e = launch_gqa_decode<256>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, idx, &wave, stream);
         AIRUN_TRY(e);
     } else {
         switch (kv_type) {
@@ -1644,7 +1671,7 @@ airun_status airun_attention_split(
 #undef LAUNCH_SPLIT
     AIRUN_TRY(cudaGetLastError());
     attention_merge_kernel<<<heads, dim, 0, stream>>>((float*)out, (const float*)partial, dim, splits,
-        (const int32_t*)positions, window, gqa ? GQA_KEYS_PER_SPLIT : 0);
+        (const int32_t*)positions, window, gqa ? GQA_KEYS_PER_SPLIT : 0, wave);
     AIRUN_CHECK_LAUNCH();
 }
 

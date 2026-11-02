@@ -31,6 +31,17 @@ pub struct GpuTensor {
     pub expert_stride: usize,
     pub n_experts: usize,
     pub device: i32,
+    /// Set when the weights stay in RAM (`--alloc auto|memory` with a model the
+    /// GPUs cannot hold): `data` is empty and the kernels read the copy the
+    /// runtime stages into VRAM right before the layer runs.
+    pub ram: Option<RamWeights>,
+}
+
+/// A tensor kept in pinned RAM, and where its staged copy lands in VRAM.
+pub struct RamWeights {
+    pub host: airun_cuda::PinnedBuffer<u8>,
+    /// Device address inside the layer's GPU's staging buffer.
+    pub staged: u64,
 }
 
 /// An expert stack too big for VRAM, every expert addressable by the kernels:
@@ -104,6 +115,15 @@ pub struct HostExperts {
 }
 
 impl GpuTensor {
+    /// Where the kernels read the weights: the tensor's VRAM, or for one kept
+    /// in RAM its staged copy.
+    pub fn ptr(&self) -> *const std::ffi::c_void {
+        match &self.ram {
+            Some(r) => r.staged as *const std::ffi::c_void,
+            None => self.data.as_ptr(),
+        }
+    }
+
     /// Assigns a device slot to every id, returning the slots and the
     /// `(slot, expert)` pairs that must be uploaded before the kernels run. The
     /// caller synchronizes before evicting slots a previous token still reads,
@@ -356,6 +376,9 @@ pub struct LayerWeights {
     /// The mixes before the token mixer and before the feed-forward.
     pub hc: Option<(HcMix, HcMix)>,
     pub ple: Option<PleWeights>,
+    /// For a layer whose weights stay in RAM, the copies that stage them into
+    /// VRAM before it runs: (pinned host address, device address, bytes).
+    pub ram_copies: Vec<(usize, u64, usize)>,
 }
 
 /// The multi-token-prediction head stored after the main layers
@@ -395,6 +418,9 @@ pub struct Model {
     /// Routing counts that chose the resident experts, updated as the
     /// runtime routes and saved when it is done (see expert_profile).
     pub expert_profile: Option<RefCell<crate::expert_profile::ExpertProfile>>,
+    /// The VRAM that layers kept in RAM are staged through, one per GPU that
+    /// runs any (sized by the planner for the largest such layer).
+    pub ram_staging: Vec<DeviceBuffer<u8>>,
 }
 
 impl Model {
@@ -489,6 +515,7 @@ impl Model {
                     expert_stride: 0,
                     n_experts: 1,
                     device: out_dev,
+                    ram: None,
                 }
             } else {
                 let t = load_packed(gguf, "token_embd.weight", out_dev, stream_for(out_dev)?, &config)?;
@@ -503,6 +530,14 @@ impl Model {
         done += 1;
         progress(done, total_steps);
 
+        let mut ram_staging: Vec<DeviceBuffer<u8>> = Vec::new();
+        for dev in placement.devices() {
+            let bytes = placement.staging_bytes(dev);
+            if bytes > 0 && !ram_staging.iter().any(|b| b.device() == dev) {
+                ram_staging.push(DeviceBuffer::<u8>::new(dev, bytes as usize)?);
+            }
+        }
+
         let mut layers = Vec::with_capacity(n_run);
         for l in 0..n_run {
             let dev = placement
@@ -511,19 +546,45 @@ impl Model {
             let stream = stream_for(dev)?;
             let name = |suffix: &str| format!("blk.{l}.{suffix}");
             let order = profile.filter(|p| p.knows(l)).map(|p| p.order(l));
+            // A layer kept in RAM: its matrices are pinned host copies, staged
+            // one after another into its GPU's staging buffer.
+            let staging = placement.layer_in_ram(l).then(|| {
+                ram_staging.iter().find(|b| b.device() == dev).map(|b| (b.as_ptr() as u64, b.len()))
+            }).flatten();
+            let cursor = std::cell::Cell::new(0usize);
+            let copies = RefCell::new(Vec::new());
+            let packed = |n: &str| -> Result<GpuTensor> {
+                match staging {
+                    Some((base, cap)) => {
+                        let t = load_ram(gguf, n, dev, &config, base + cursor.get() as u64)?;
+                        let len = t.ram.as_ref().map_or(0, |r| r.host.len());
+                        if cursor.get() + len > cap {
+                            return Err(CoreError::Other(format!(
+                                "layer {l} does not fit the {} staging buffer planned for it; this is a bug",
+                                airun_cuda::human_bytes(cap as u64))));
+                        }
+                        if let Some(r) = &t.ram {
+                            copies.borrow_mut().push((r.host.as_raw() as usize, r.staged, len));
+                        }
+                        cursor.set(cursor.get() + len.div_ceil(256) * 256);
+                        Ok(t)
+                    }
+                    None => load_packed(gguf, n, dev, stream, &config),
+                }
+            };
 
             let block = match config.layer_kind(l) {
                 LayerKind::Attention => Block::Attention(AttentionWeights {
-                    q: load_packed(gguf, &name("attn_q.weight"), dev, stream, &config)?,
-                    k: load_packed(gguf, &name("attn_k.weight"), dev, stream, &config)?,
-                    v: load_packed(gguf, &name("attn_v.weight"), dev, stream, &config)?,
-                    output: load_packed(gguf, &name("attn_output.weight"), dev, stream, &config)?,
+                    q: packed(&name("attn_q.weight"))?,
+                    k: packed(&name("attn_k.weight"))?,
+                    v: packed(&name("attn_v.weight"))?,
+                    output: packed(&name("attn_output.weight"))?,
                     q_norm: load_f32_optional(gguf, &name("attn_q_norm.weight"), dev, stream)?,
                     k_norm: load_f32_optional(gguf, &name("attn_k_norm.weight"), dev, stream)?,
                     indexer: match &config.indexer {
                         Some(ix) if ix.ratio(l) > 0 => Some(IndexerWeights {
-                            q: load_packed(gguf, &name("indexer.q_proj.weight"), dev, stream, &config)?,
-                            k: load_packed(gguf, &name("indexer.k_proj.weight"), dev, stream, &config)?,
+                            q: packed(&name("indexer.q_proj.weight"))?,
+                            k: packed(&name("indexer.k_proj.weight"))?,
                             q_norm: load_f32(gguf, &name("indexer.q_norm.weight"), dev, stream)?,
                             k_norm: load_f32(gguf, &name("indexer.k_norm.weight"), dev, stream)?,
                         }),
@@ -531,31 +592,31 @@ impl Model {
                     },
                 }),
                 LayerKind::LinearAttention => Block::Linear(LinearAttentionWeights {
-                    qkv: load_packed(gguf, &name("attn_qkv.weight"), dev, stream, &config)?,
-                    gate: load_packed(gguf, &name("attn_gate.weight"), dev, stream, &config)?,
+                    qkv: packed(&name("attn_qkv.weight"))?,
+                    gate: packed(&name("attn_gate.weight"))?,
                     conv1d: load_f32(gguf, &name("ssm_conv1d.weight"), dev, stream)?,
                     a_log: load_delta_decay_coeff(gguf, &name("ssm_a"), dev, stream)?,
                     dt_bias: load_f32(gguf, &name("ssm_dt.bias"), dev, stream)?,
-                    alpha: load_packed(gguf, &name("ssm_alpha.weight"), dev, stream, &config)?,
-                    beta: load_packed(gguf, &name("ssm_beta.weight"), dev, stream, &config)?,
+                    alpha: packed(&name("ssm_alpha.weight"))?,
+                    beta: packed(&name("ssm_beta.weight"))?,
                     norm: load_f32(gguf, &name("ssm_norm.weight"), dev, stream)?,
-                    out: load_packed(gguf, &name("ssm_out.weight"), dev, stream, &config)?,
+                    out: packed(&name("ssm_out.weight"))?,
                 }),
             };
 
             let ffn = if config.moe.is_some() {
                 let shared = if gguf.tensor(&name("ffn_gate_shexp.weight")).is_some() {
                     Some(SharedExpert {
-                        router: load_packed(gguf, &name("ffn_gate_inp_shexp.weight"), dev, stream, &config)?,
-                        gate: load_packed(gguf, &name("ffn_gate_shexp.weight"), dev, stream, &config)?,
-                        up: load_packed(gguf, &name("ffn_up_shexp.weight"), dev, stream, &config)?,
-                        down: load_packed(gguf, &name("ffn_down_shexp.weight"), dev, stream, &config)?,
+                        router: packed(&name("ffn_gate_inp_shexp.weight"))?,
+                        gate: packed(&name("ffn_gate_shexp.weight"))?,
+                        up: packed(&name("ffn_up_shexp.weight"))?,
+                        down: packed(&name("ffn_down_shexp.weight"))?,
                     })
                 } else {
                     None
                 };
                 FfnWeights::Moe {
-                    router: load_packed(gguf, &name("ffn_gate_inp.weight"), dev, stream, &config)?,
+                    router: packed(&name("ffn_gate_inp.weight"))?,
                     gate_exps: load_cached(gguf, &name("ffn_gate_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]),
                         order.as_deref())?,
                     up_exps: load_cached(gguf, &name("ffn_up_exps.weight"), dev, stream, &config, expert_slots.map(|s| s[l]),
@@ -566,9 +627,9 @@ impl Model {
                 }
             } else {
                 FfnWeights::Dense {
-                    gate: load_packed(gguf, &name("ffn_gate.weight"), dev, stream, &config)?,
-                    up: load_packed(gguf, &name("ffn_up.weight"), dev, stream, &config)?,
-                    down: load_packed(gguf, &name("ffn_down.weight"), dev, stream, &config)?,
+                    gate: packed(&name("ffn_gate.weight"))?,
+                    up: packed(&name("ffn_up.weight"))?,
+                    down: packed(&name("ffn_down.weight"))?,
                 }
             };
 
@@ -591,8 +652,8 @@ impl Model {
                 },
                 ple: match &config.ple {
                     Some(p) if p.layer == l => Some(PleWeights {
-                        key: load_packed(gguf, &name("ple_key.weight"), dev, stream, &config)?,
-                        value: load_packed(gguf, &name("ple_value.weight"), dev, stream, &config)?,
+                        key: packed(&name("ple_key.weight"))?,
+                        value: packed(&name("ple_value.weight"))?,
                         norm_key: load_f32(gguf, &name("ple_norm_key.weight"), dev, stream)?,
                         norm_query: load_f32(gguf, &name("ple_norm_query.weight"), dev, stream)?,
                         norm_conv: load_f32(gguf, &name("ple_norm_conv.weight"), dev, stream)?,
@@ -600,6 +661,7 @@ impl Model {
                     }),
                     _ => None,
                 },
+                ram_copies: copies.into_inner(),
             };
             total_bytes += layer_bytes(&w);
             layers.push(w);
@@ -637,6 +699,7 @@ impl Model {
             mtp,
             total_bytes,
             expert_profile: None,
+            ram_staging,
         })
     }
 
@@ -748,6 +811,7 @@ fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &St
         },
         hc: None,
         ple: None,
+        ram_copies: Vec::new(),
     };
     let head_norm = if gguf.tensor(&name("nextn.shared_head_norm.weight")).is_some() {
         load_f32(gguf, &name("nextn.shared_head_norm.weight"), dev, stream)?
@@ -792,6 +856,7 @@ fn describe_packed(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Confi
         expert_stride: 0,
         n_experts: 1,
         device,
+        ram: None,
     })
 }
 
@@ -902,7 +967,37 @@ fn load_cached(
         expert_stride,
         n_experts,
         device,
+        ram: None,
     })
+}
+
+/// A matrix kept in pinned RAM, to be staged to `staged` before use (see
+/// [`RamWeights`]).
+fn load_ram(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Config, staged: u64) -> Result<GpuTensor> {
+    let info = tensor_info(gguf, name, &config.arch_name)?;
+    if !airun_cuda::ops::KernelType(info.ty.id() as i32).is_supported() {
+        return Err(CoreError::UnsupportedTensorType { name: name.to_string(), ty: info.ty.to_string() });
+    }
+    let bytes = gguf.tensor_bytes(info)?;
+    let mut host = airun_cuda::PinnedBuffer::<u8>::new(bytes.len()).map_err(|e| CoreError::Other(format!(
+        "cannot pin {} of RAM for {name} ({e}); free RAM, lower --ctx-size so fewer layers stay in RAM, \
+         or use --alloc gpu", airun_cuda::human_bytes(bytes.len() as u64))))?;
+    host.as_mut_slice().copy_from_slice(bytes);
+    // As load_cached does on the GPU: ggml reads a 0x7F NVFP4 run scale as
+    // zero, the FP4 tensor cores as NaN. Each 36-byte block starts with its
+    // four scales.
+    if info.ty == airun_gguf::GgmlType::NVFP4 && airun_cuda::ops::fp4_supported() {
+        for block in host.as_mut_slice().chunks_exact_mut(36) {
+            for d in &mut block[..4] {
+                if *d == 0x7F {
+                    *d = 0;
+                }
+            }
+        }
+    }
+    let mut t = describe_packed(gguf, name, device, config)?;
+    t.ram = Some(RamWeights { host, staged });
+    Ok(t)
 }
 
 /// Whether experts that do not fit in VRAM live in mapped host memory (the

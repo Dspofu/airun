@@ -26,6 +26,45 @@ pub enum SplitMode {
     Single(i32),
 }
 
+/// Where weights may live (`--alloc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AllocMode {
+    /// airun decides: as few GPUs as the model needs, the main one first, and
+    /// RAM only for what no GPU holds.
+    #[default]
+    Auto,
+    /// GPU memory only. A model that does not fit gets a smaller context, or
+    /// an error saying what is missing; nothing goes to RAM.
+    Gpu,
+    /// The selected GPUs, then RAM for what they do not hold, keeping the
+    /// requested context.
+    Memory,
+}
+
+impl AllocMode {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "gpu" => Ok(Self::Gpu),
+            "memory" | "ram" => Ok(Self::Memory),
+            _ => Err(format!("unknown --alloc '{s}': use auto, gpu or memory")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gpu => "gpu",
+            Self::Memory => "memory",
+        }
+    }
+
+    /// Whether weights may be kept in RAM when the GPUs are full.
+    pub fn spills(self) -> bool {
+        self != Self::Gpu
+    }
+}
+
 /// What the caller wants; the planner turns this into a [`Placement`].
 #[derive(Debug, Clone)]
 pub struct PlacementRequest {
@@ -41,6 +80,10 @@ pub struct PlacementRequest {
     pub reserve_bytes: u64,
     /// Permit shrinking the context to make the model fit.
     pub allow_ctx_shrink: bool,
+    pub alloc: AllocMode,
+    /// The GPU filled first and the one that runs layers kept in RAM. None:
+    /// the fastest.
+    pub main_gpu: Option<i32>,
 }
 
 impl Default for PlacementRequest {
@@ -52,6 +95,8 @@ impl Default for PlacementRequest {
             gpu_layers: None,
             reserve_bytes: 384 << 20,
             allow_ctx_shrink: true,
+            alloc: AllocMode::Auto,
+            main_gpu: None,
         }
     }
 }
@@ -70,11 +115,17 @@ pub struct Shard {
     pub hosts_embedding: bool,
     /// Holds the final norm and output projection.
     pub hosts_output: bool,
+    /// Layers of this shard whose weights stay in pinned RAM and are copied
+    /// into `staging_bytes` of VRAM right before they run. Their KV cache or
+    /// recurrent state is on the GPU like any other layer's.
+    pub ram_layers: Vec<usize>,
+    pub ram_bytes: u64,
+    pub staging_bytes: u64,
 }
 
 impl Shard {
     pub fn total_bytes(&self) -> u64 {
-        self.weight_bytes + self.kv_bytes + self.scratch_bytes
+        self.weight_bytes + self.kv_bytes + self.scratch_bytes + self.staging_bytes
     }
 
     pub fn headroom(&self) -> i64 {
@@ -121,6 +172,16 @@ impl Placement {
         self.shards.iter().map(|s| s.device).collect()
     }
 
+    /// Whether layer `l`'s weights stay in RAM.
+    pub fn layer_in_ram(&self, l: usize) -> bool {
+        self.shards.iter().any(|s| s.ram_layers.contains(&l))
+    }
+
+    /// VRAM staging for the layers in RAM on `device`.
+    pub fn staging_bytes(&self, device: i32) -> u64 {
+        self.shards.iter().filter(|s| s.device == device).map(|s| s.staging_bytes).sum()
+    }
+
     /// Number of points in the forward pass where activations cross GPUs.
     pub fn crossings(&self) -> usize {
         self.shards.len().saturating_sub(1)
@@ -160,6 +221,17 @@ impl Placement {
                 airun_cuda::human_bytes(s.total_bytes()),
                 airun_cuda::human_bytes(s.budget_bytes),
             );
+            if !s.ram_layers.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "      layers {}..{} ({}) in RAM: {} pinned, copied through {} of VRAM before they run",
+                    s.ram_layers[0],
+                    s.ram_layers[s.ram_layers.len() - 1],
+                    s.ram_layers.len(),
+                    airun_cuda::human_bytes(s.ram_bytes),
+                    airun_cuda::human_bytes(s.staging_bytes),
+                );
+            }
         }
         for note in &self.notes {
             let _ = writeln!(out, "  note: {note}");
@@ -322,6 +394,12 @@ pub fn plan(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.ordinal.cmp(&b.ordinal))
     });
+    if let Some(main) = req.main_gpu {
+        let i = ordered.iter().position(|d| d.ordinal == main).ok_or_else(|| CoreError::Other(format!(
+            "--main-gpu {main} is not among the GPUs in use; list it in --gpus, or check `airun gpu`")))?;
+        let d = ordered.remove(i);
+        ordered.insert(0, d);
+    }
 
     let budgets: BTreeMap<i32, u64> = ordered
         .iter()
@@ -405,6 +483,8 @@ fn try_place(
     let fixed = sizes.embedding + sizes.output + sizes.other;
     let total_needed: u64 = layer_cost.iter().sum::<u64>() + fixed;
     let mut batch = req.batch;
+    // Layers whose weights end up in RAM (see spill_to_ram).
+    let mut ram: Vec<usize> = Vec::new();
 
     // Which devices to use, and how many layers each takes.
     let assignment: Vec<(i32, usize)> = match &req.split {
@@ -417,7 +497,21 @@ fn try_place(
                     needed: total_needed,
                     detail: format!("GPU {target} was requested but is not available"),
                 })?;
-            vec![(dev.ordinal, n_layers)]
+            let budget = budgets.get(&dev.ordinal).copied().unwrap_or(0);
+            if req.alloc.spills() && cfg.moe.is_none() && total_needed + scratch_bytes(cfg, batch, true) > budget {
+                match spill_to_ram(&[dev], &budgets, &layer_cost, sizes, cfg, batch, &per_layer_state) {
+                    Some((a, r)) => {
+                        notes.push(format!(
+                            "GPU {} holds {} of {n_layers} layers; the other {} stay in RAM (--alloc {})",
+                            dev.ordinal, n_layers - r.len(), r.len(), req.alloc.name()));
+                        ram = r;
+                        a
+                    }
+                    None => vec![(dev.ordinal, n_layers)],
+                }
+            } else {
+                vec![(dev.ordinal, n_layers)]
+            }
         }
         SplitMode::Manual(fractions) => {
             if fractions.len() != ordered.len() {
@@ -457,8 +551,11 @@ fn try_place(
                 }
                 (b < req.batch && fits(d, b)).then_some((d, b))
             });
+            // With a main GPU named, "the fastest" means it.
             let single = if fastest.is_some_and(|d| fits(d, req.batch)) {
                 fastest
+            } else if req.main_gpu.is_some() {
+                None
             } else if let Some((d, b)) = shrunk {
                 batch = b;
                 notes.push(format!("prefill batch reduced to {b} so the model stays on the fastest GPU"));
@@ -485,11 +582,46 @@ fn try_place(
                         detail: "no GPU has free memory after the reserve".into(),
                     });
                 }
-                notes.push(
-                    "model exceeds any single GPU; splitting layers in proportion to free VRAM"
-                        .to_string(),
-                );
-                split_by_fraction(ordered, &caps, sum, n_layers)
+                // Fill the fastest GPU first, the next with what is left, and
+                // so on. A decode step runs the shards one after another, so a
+                // layer on a card with half the bandwidth costs twice as much
+                // there; splitting in proportion to free VRAM (as before) put
+                // half the 27B on a 5060 Ti that has half a 5070 Ti's
+                // bandwidth. A pipelined prefill also wins: its pace is the
+                // slower shard's, and the slow card now holds the least.
+                match fill_fastest_first(ordered, &budgets, &layer_cost, sizes, cfg, batch,
+                    req.alloc != AllocMode::Memory) {
+                    Some(a) => {
+                        notes.push(format!(
+                            "model exceeds any single GPU; filling GPU {} ({}) first",
+                            ordered[0].ordinal,
+                            if req.main_gpu.is_some() { "--main-gpu" } else { "the fastest" }));
+                        a
+                    }
+                    None if req.alloc.spills() && cfg.moe.is_none() => {
+                        match spill_to_ram(ordered, &budgets, &layer_cost, sizes, cfg, batch, &per_layer_state) {
+                            Some((a, r)) => {
+                                notes.push(format!(
+                                    "the GPUs hold {} of {n_layers} layers; the other {} stay in RAM and run on \
+                                     GPU {} (--alloc {}; --alloc gpu keeps everything in VRAM)",
+                                    n_layers - r.len(), r.len(), ordered[0].ordinal, req.alloc.name()));
+                                ram = r;
+                                a
+                            }
+                            None => return Err(Shortfall {
+                                needed: total_needed,
+                                detail: "even with the weights in RAM, the KV cache does not fit the GPUs".into(),
+                            }),
+                        }
+                    }
+                    None => {
+                        notes.push(
+                            "model exceeds any single GPU; splitting layers in proportion to free VRAM"
+                                .to_string(),
+                        );
+                        split_by_fraction(ordered, &caps, sum, n_layers)
+                    }
+                }
             }
         }
     };
@@ -509,7 +641,9 @@ fn try_place(
         let hosts_embedding = i == 0;
         let hosts_output = i == n_shards - 1;
 
-        let weight_bytes: u64 = layers.iter().map(|&l| sizes.per_layer[l]).sum::<u64>()
+        let ram_layers: Vec<usize> = layers.iter().copied().filter(|l| ram.contains(l)).collect();
+        let ram_bytes: u64 = ram_layers.iter().map(|&l| sizes.per_layer[l]).sum();
+        let weight_bytes: u64 = layers.iter().map(|&l| sizes.per_layer[l]).sum::<u64>() - ram_bytes
             + if hosts_embedding { sizes.embedding } else { 0 }
             + if hosts_output {
                 sizes.output + sizes.other
@@ -527,6 +661,9 @@ fn try_place(
             budget_bytes: budgets.get(ordinal).copied().unwrap_or(0),
             hosts_embedding,
             hosts_output,
+            staging_bytes: staging_for(&ram_layers, sizes),
+            ram_layers,
+            ram_bytes,
         });
     }
 
@@ -570,6 +707,113 @@ fn try_place(
     }
 
     Ok(Placement { shards, ctx, batch, notes })
+}
+
+/// Contiguous layer runs that fill each GPU in `ordered` (fastest first) up
+/// to its budget before the next takes any. With `fewest`, a GPU that can
+/// hold everything left (with the output head) takes it and the rest are not
+/// used: a third card that two already make unnecessary only adds a crossing
+/// (`--alloc auto`). Without it every GPU takes at least one layer (`--alloc
+/// memory`: the GPUs the user listed). None if the GPUs run out, so the
+/// caller can fall back.
+fn fill_fastest_first(
+    ordered: &[&Device],
+    budgets: &BTreeMap<i32, u64>,
+    layer_cost: &[u64],
+    sizes: &WeightSizes,
+    cfg: &Config,
+    batch: usize,
+    fewest: bool,
+) -> Option<Vec<(i32, usize)>> {
+    let n_layers = layer_cost.len();
+    let mut out = Vec::with_capacity(ordered.len());
+    let mut next = 0usize;
+    for (i, d) in ordered.iter().enumerate() {
+        let budget = budgets.get(&d.ordinal).copied().unwrap_or(0);
+        let embed = if i == 0 { sizes.embedding } else { 0 };
+        let rest: u64 = layer_cost[next..].iter().sum();
+        let last = i + 1 == ordered.len();
+        if (fewest || last) && embed + rest + sizes.output + sizes.other + scratch_bytes(cfg, batch, true) <= budget {
+            out.push((d.ordinal, n_layers - next));
+            return Some(out);
+        }
+        if last {
+            return None;
+        }
+        let mut used = embed + scratch_bytes(cfg, batch, false);
+        let start = next;
+        let room = if fewest { n_layers } else { n_layers - (ordered.len() - 1 - i) };
+        while next < room && used + layer_cost[next] <= budget {
+            used += layer_cost[next];
+            next += 1;
+        }
+        out.push((d.ordinal, next - start));
+    }
+    None
+}
+
+/// VRAM to stage the largest of `ram_layers` (plus room for the per-tensor
+/// alignment the loader adds).
+fn staging_for(ram_layers: &[usize], sizes: &WeightSizes) -> u64 {
+    ram_layers.iter().map(|&l| sizes.per_layer[l] + (64 << 10)).max().unwrap_or(0)
+}
+
+/// A layout for a model the GPUs cannot hold: every GPU but the main one
+/// (`ordered[0]`) filled with whole layers from the end of the model, the
+/// main GPU running the rest, of which those that do not fit keep their
+/// weights in RAM. The main GPU runs them because it is filled first and is
+/// expected to have the fastest host link (a slow slot reads RAM at a few
+/// GB/s). Their KV caches stay in its VRAM, so the context is kept. Returns
+/// the layer counts per GPU in order and the layers in RAM, or None when
+/// even then the main GPU cannot hold its share.
+fn spill_to_ram(
+    ordered: &[&Device],
+    budgets: &BTreeMap<i32, u64>,
+    layer_cost: &[u64],
+    sizes: &WeightSizes,
+    cfg: &Config,
+    batch: usize,
+    state: &dyn Fn(usize) -> u64,
+) -> Option<(Vec<(i32, usize)>, Vec<usize>)> {
+    let n_layers = layer_cost.len();
+    let mut counts = vec![0usize; ordered.len()];
+    let mut end = n_layers;
+    // The other GPUs, last first, take layers from the end.
+    for i in (1..ordered.len()).rev() {
+        let last = i + 1 == ordered.len();
+        let budget = budgets.get(&ordered[i].ordinal).copied().unwrap_or(0);
+        let mut used = scratch_bytes(cfg, batch, last) + if last { sizes.output + sizes.other } else { 0 };
+        while end > 1 && used + layer_cost[end - 1] <= budget {
+            used += layer_cost[end - 1];
+            end -= 1;
+            counts[i] += 1;
+        }
+    }
+    // The main GPU runs layers 0..end; move weights to RAM from the end of
+    // that range until its share fits.
+    let only = ordered.len() == 1;
+    let budget = budgets.get(&ordered[0].ordinal).copied().unwrap_or(0);
+    let fixed = sizes.embedding + scratch_bytes(cfg, batch, only) + if only { sizes.output + sizes.other } else { 0 };
+    let states: u64 = (0..end).map(state).sum();
+    let mut resident: u64 = (0..end).map(|l| sizes.per_layer[l]).sum();
+    let mut ram = Vec::new();
+    let mut first_ram = end;
+    loop {
+        let staging = staging_for(&ram, sizes);
+        if fixed + states + resident + staging <= budget {
+            break;
+        }
+        if first_ram == 0 {
+            return None;
+        }
+        first_ram -= 1;
+        resident -= sizes.per_layer[first_ram];
+        ram.insert(0, first_ram);
+    }
+    counts[0] = end;
+    let mut out: Vec<(i32, usize)> = ordered.iter().zip(&counts).map(|(d, &c)| (d.ordinal, c)).collect();
+    out.retain(|&(_, c)| c > 0);
+    Some((out, ram))
 }
 
 /// Splits `n_layers` into contiguous runs proportional to `weights`.
@@ -697,6 +941,82 @@ mod tests {
         assert_eq!(p.crossings(), 0);
     }
 
+    /// Two cards with the same memory, one with half the SMs and bus: the
+    /// fast one is filled first and the slow one takes only the rest. The
+    /// split used to follow free memory, which here meant half and half.
+    #[test]
+    fn an_oversized_model_fills_the_fastest_gpu_first() {
+        let cfg = config(40);
+        let sz = sizes(40, 500); // ~19.5 GiB, over any single card
+        let devs = vec![device(0, 15, 70, 256), device(1, 15, 36, 128)];
+        let p = plan(&cfg, &sz, &devs, &PlacementRequest::default()).unwrap();
+
+        assert_eq!(p.shards.len(), 2);
+        assert_eq!(p.shards[0].device, 0, "the fast card holds the first layers");
+        assert_eq!(p.shards.iter().map(|s| s.layers.len()).sum::<usize>(), 40);
+        assert!(p.shards[0].layers.len() > p.shards[1].layers.len());
+        // Full: it fits its budget, and one more layer would not.
+        let fast = &p.shards[0];
+        let layer = (500u64 << 20) + fast.kv_bytes / fast.layers.len() as u64;
+        assert!(fast.total_bytes() <= fast.budget_bytes);
+        assert!(fast.budget_bytes - fast.total_bytes() < layer,
+            "the fast card has room for another layer: {:?}",
+            p.shards.iter().map(|s| s.layers.len()).collect::<Vec<_>>());
+    }
+
+    fn layers(p: &Placement) -> Vec<usize> {
+        p.shards.iter().map(|s| s.layers.len()).collect()
+    }
+
+    /// Two GPUs are enough: the third is left out instead of taking a layer
+    /// and adding a crossing.
+    #[test]
+    fn auto_uses_only_the_gpus_it_needs() {
+        let cfg = config(40);
+        let sz = sizes(40, 500); // ~19.5 GiB
+        let devs = vec![device(0, 15, 70, 256), device(1, 15, 36, 128), device(2, 15, 36, 128)];
+        let p = plan(&cfg, &sz, &devs, &PlacementRequest::default()).unwrap();
+        assert_eq!(p.shards.len(), 2, "{:?}", layers(&p));
+        let memory = PlacementRequest { alloc: AllocMode::Memory, ..Default::default() };
+        let p = plan(&cfg, &sz, &devs, &memory).unwrap();
+        assert_eq!(p.shards.len(), 3, "--alloc memory uses every listed GPU: {:?}", layers(&p));
+    }
+
+    #[test]
+    fn the_main_gpu_is_filled_first() {
+        let cfg = config(40);
+        let sz = sizes(40, 500);
+        let devs = vec![device(0, 15, 70, 256), device(1, 15, 36, 128)];
+        let req = PlacementRequest { main_gpu: Some(1), ..Default::default() };
+        let p = plan(&cfg, &sz, &devs, &req).unwrap();
+        assert_eq!(p.shards[0].device, 1);
+        assert!(p.shards[0].layers.len() > p.shards[1].layers.len(), "{:?}", layers(&p));
+        let bad = PlacementRequest { main_gpu: Some(7), ..Default::default() };
+        assert!(plan(&cfg, &sz, &devs, &bad).is_err());
+    }
+
+    /// A model bigger than the GPU keeps its context and puts the layers that
+    /// do not fit in RAM; --alloc gpu shrinks the context instead.
+    #[test]
+    fn what_no_gpu_holds_goes_to_ram_unless_gpu_only() {
+        let cfg = config(40);
+        let sz = sizes(40, 500); // ~19.5 GiB on one 15 GiB card
+        let devs = vec![device(0, 15, 70, 256)];
+        let req = PlacementRequest { ctx: 8192, ..Default::default() };
+        let p = plan(&cfg, &sz, &devs, &req).unwrap();
+        assert_eq!(p.ctx, 8192);
+        let s = &p.shards[0];
+        assert_eq!(s.layers.len(), 40);
+        assert!(!s.ram_layers.is_empty() && s.ram_layers.len() < 40);
+        // The RAM layers are the last ones, and the GPU still fits.
+        assert_eq!(*s.ram_layers.last().unwrap(), 39);
+        assert!(s.total_bytes() <= s.budget_bytes);
+        assert!(s.staging_bytes >= 500 << 20);
+
+        let gpu_only = PlacementRequest { ctx: 8192, alloc: AllocMode::Gpu, allow_ctx_shrink: false, ..Default::default() };
+        assert!(plan(&cfg, &sz, &devs, &gpu_only).is_err(), "--alloc gpu must not spill");
+    }
+
     #[test]
     fn an_oversized_model_splits_proportionally() {
         let cfg = config(40);
@@ -716,6 +1036,8 @@ mod tests {
         );
     }
 
+    /// GPU memory only (--alloc gpu): the context shrinks instead of the
+    /// weights going to RAM, which is what the other modes do.
     #[test]
     fn context_shrinks_rather_than_failing() {
         let cfg = config(28);
@@ -725,6 +1047,7 @@ mod tests {
         let req = PlacementRequest {
             ctx: 32768,
             allow_ctx_shrink: true,
+            alloc: AllocMode::Gpu,
             ..Default::default()
         };
         let p = plan(&cfg, &sz, &devs, &req).unwrap();
@@ -740,6 +1063,7 @@ mod tests {
         let devs = vec![device(0, 15, 70, 256)];
         let req = PlacementRequest {
             allow_ctx_shrink: false,
+            alloc: AllocMode::Gpu,
             ..Default::default()
         };
         let err = plan(&cfg, &sz, &devs, &req).unwrap_err();

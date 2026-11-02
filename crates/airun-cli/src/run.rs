@@ -8,6 +8,23 @@ use airun_core::{LoadOptions, Sampler, SamplingParams, SplitMode, apply_chat_tem
 use anyhow::{Context, Result};
 use clap::Args;
 
+/// Where weights may live; shared by every command that loads a model.
+#[derive(Args, Clone, Debug, Default)]
+pub struct AllocArgs {
+    /// Where the weights go: auto (the GPUs the model needs, the main one
+    /// first, then RAM for what they cannot hold), gpu (VRAM only: a model
+    /// that does not fit gets a smaller context or an error) or memory (every
+    /// GPU in --gpus, then RAM). RAM layers are read across PCIe each step,
+    /// so they are much slower than VRAM ones.
+    #[arg(long, default_value = "auto", value_parser = airun_core::AllocMode::parse)]
+    pub alloc: airun_core::AllocMode,
+
+    /// CUDA ordinal of the GPU filled first, which also runs the layers kept
+    /// in RAM (give it the fastest PCIe slot). Default: the fastest GPU.
+    #[arg(long)]
+    pub main_gpu: Option<i32>,
+}
+
 #[derive(Args, Clone)]
 pub struct RunArgs {
     /// Path to a .gguf model file.
@@ -65,6 +82,9 @@ pub struct RunArgs {
     /// Keep the whole model on one GPU, by ordinal.
     #[arg(long)]
     pub single_gpu: Option<i32>,
+
+    #[command(flatten)]
+    pub alloc: AllocArgs,
 
     /// VRAM left free on each GPU, in MiB.
     #[arg(long, default_value_t = 384)]
@@ -146,6 +166,7 @@ impl RunArgs {
             gpus: Vec::new(),
             tensor_split: Vec::new(),
             single_gpu: None,
+            alloc: AllocArgs::default(),
             expert_cache: None,
             kv_type: KvType::F16,
             vram_reserve: 384,
@@ -193,6 +214,8 @@ impl RunArgs {
             reserve_bytes: self.vram_reserve << 20,
             allow_fallback: !self.no_fallback,
             draft: self.draft,
+            alloc: self.alloc.alloc,
+            main_gpu: self.alloc.main_gpu,
         }
     }
 

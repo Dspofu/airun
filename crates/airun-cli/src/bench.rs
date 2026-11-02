@@ -63,6 +63,9 @@ pub struct BenchArgs {
     #[arg(long, value_delimiter = ',')]
     pub tensor_split: Vec<f32>,
 
+    #[command(flatten)]
+    pub alloc: crate::run::AllocArgs,
+
     /// Build prompts from this text instead of a repeated token. MoE models use
     /// a built-in English passage by default: a repeated token routes to the
     /// same few experts every step, which makes an expert cache look perfect.
@@ -127,6 +130,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     run_args.batch_size = args.batch_size;
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();
+    run_args.alloc = args.alloc.clone();
 
     let (mut runtime, report) = loader::load(&args.model, &run_args.load_options(), |_, _, _| {})
         .with_context(|| format!("failed to load {}", args.model.display()))?;

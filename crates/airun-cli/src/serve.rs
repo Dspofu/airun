@@ -98,6 +98,9 @@ pub struct ServeArgs {
     #[arg(long)]
     pub single_gpu: Option<i32>,
 
+    #[command(flatten)]
+    pub alloc: crate::run::AllocArgs,
+
     /// VRAM left free on each GPU, in MiB.
     #[arg(long, default_value_t = 384)]
     pub vram_reserve: u64,
@@ -399,6 +402,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();
     run_args.single_gpu = args.single_gpu;
+    run_args.alloc = args.alloc.clone();
     run_args.vram_reserve = args.vram_reserve;
 
     eprintln!("loading {}", args.model.display());

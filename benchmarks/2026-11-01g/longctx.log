@@ -1,0 +1,130 @@
+﻿
+[22:52:46] airun bench 8k/32k
+Qwen3.8-27B (qwen35) - 65 layers, 5120 embd, 24 heads (4 kv, GQA 6x), head_dim 256, ffn 17408, vocab 248320, q/k norm, 1 MTP layer(s) skipped
+  rope: 64 of 256 dims, base 10000000, YaRN x4 (dims 14..22 ramp, mscale 1.1386)
+  hybrid: 48 linear-attention + 16 attention layers; delta-net 48 v-heads x 16 k-heads, state 128x128, conv 4
+  gated attention output
+weights 13.57 GiB loaded in 6.9s
+memory plan (context 36864 tokens):
+  GPU 0 NVIDIA GeForce RTX 5070 Ti layers 0..58 (59)       +embed
+      weights  11.77 GiB  kv   2.11 GiB  scratch 271.52 MiB  =   14.14 GiB of  14.31 GiB budget
+  GPU 1 NVIDIA GeForce RTX 5060 Ti layers 59..63 (5)       +output
+      weights   1.81 GiB  kv 297.35 MiB  scratch 272.70 MiB  =    2.36 GiB of  14.44 GiB budget
+  note: model exceeds any single GPU; filling the fastest GPU first
+  note: 1 activation handoff(s) per forward pass between GPUs
+
+test                   median          min          max expert hit
+-------------------------------------------------------------------
+prefill 8192        3693.5 t/s    3693.5 t/s    3693.5 t/s           
+prefill 32768       3055.2 t/s    3055.2 t/s    3055.2 t/s           
+decode 128 @ 16       42.1 t/s      42.1 t/s      42.1 t/s           
+decode 128 @ 32768      37.1 t/s      37.1 t/s      37.1 t/s           
+
+1 run(s) per test after 1 warm-up run(s); median reported
+
+[22:53:53] llama-bench 8k/32k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","8192","0","0","2026-11-02T01:54:07Z","2342922700","0","3496.487528","0.000000"
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","32768","0","0","2026-11-02T01:54:12Z","11449353800","0","2861.995583","0.000000"
+[22:54:37] llama-bench decode @16/32k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","0","128","0","2026-11-02T01:54:45Z","3913968400","0","32.703381","0.000000"
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","0","128","32768","2026-11-02T01:54:49Z","4403083200","0","29.070539","0.000000"
+[22:55:08] airun bench 128k
+Qwen3.8-27B (qwen35) - 65 layers, 5120 embd, 24 heads (4 kv, GQA 6x), head_dim 256, ffn 17408, vocab 248320, q/k norm, 1 MTP layer(s) skipped
+  rope: 64 of 256 dims, base 10000000, YaRN x4 (dims 14..22 ramp, mscale 1.1386)
+  hybrid: 48 linear-attention + 16 attention layers; delta-net 48 v-heads x 16 k-heads, state 128x128, conv 4
+  gated attention output
+weights 13.57 GiB loaded in 7.2s
+memory plan (context 131328 tokens):
+  GPU 0 NVIDIA GeForce RTX 5070 Ti layers 0..42 (43)       +embed
+      weights   8.58 GiB  kv   5.11 GiB  scratch 271.52 MiB  =   13.96 GiB of  14.31 GiB budget
+  GPU 1 NVIDIA GeForce RTX 5060 Ti layers 43..63 (21)      +output
+      weights   5.00 GiB  kv   3.05 GiB  scratch 272.70 MiB  =    8.32 GiB of  14.44 GiB budget
+  note: model exceeds any single GPU; filling the fastest GPU first
+  note: 1 activation handoff(s) per forward pass between GPUs
+
+test                   median          min          max expert hit
+-------------------------------------------------------------------
+prefill 131072      2428.3 t/s    2428.3 t/s    2428.3 t/s           
+decode 128 @ 131072      23.5 t/s      23.5 t/s      23.5 t/s           
+
+1 run(s) per test after 0 warm-up run(s); median reported
+
+[22:57:11] llama-bench 128k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","131072","0","0","2026-11-02T01:57:19Z","82058799300","0","1597.293662","0.000000"
+[23:00:06] llama-bench decode @128k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","0","128","131072","2026-11-02T02:00:14Z","6332964300","0","20.211704","0.000000"
+[23:01:55] airun bench 8k/32k
+Qwen3.8-27B (qwen35) - 65 layers, 5120 embd, 24 heads (4 kv, GQA 6x), head_dim 256, ffn 17408, vocab 248320, q/k norm, 1 MTP layer(s) skipped
+  rope: 64 of 256 dims, base 10000000, YaRN x4 (dims 14..22 ramp, mscale 1.1386)
+  hybrid: 48 linear-attention + 16 attention layers; delta-net 48 v-heads x 16 k-heads, state 128x128, conv 4
+  gated attention output
+weights 13.57 GiB loaded in 6.9s
+memory plan (context 36864 tokens):
+  GPU 0 NVIDIA GeForce RTX 5070 Ti layers 0..58 (59)       +embed
+      weights  11.77 GiB  kv   2.11 GiB  scratch 271.52 MiB  =   14.14 GiB of  14.31 GiB budget
+  GPU 1 NVIDIA GeForce RTX 5060 Ti layers 59..63 (5)       +output
+      weights   1.81 GiB  kv 297.35 MiB  scratch 272.70 MiB  =    2.36 GiB of  14.44 GiB budget
+  note: model exceeds any single GPU; filling the fastest GPU first
+  note: 1 activation handoff(s) per forward pass between GPUs
+
+test                   median          min          max expert hit
+-------------------------------------------------------------------
+prefill 8192        3648.6 t/s    3648.6 t/s    3648.6 t/s           
+prefill 32768       3015.0 t/s    3015.0 t/s    3015.0 t/s           
+decode 128 @ 16       42.1 t/s      42.1 t/s      42.1 t/s           
+decode 128 @ 32768      37.4 t/s      37.4 t/s      37.4 t/s           
+
+1 run(s) per test after 1 warm-up run(s); median reported
+
+[23:03:02] llama-bench 8k/32k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","8192","0","0","2026-11-02T02:03:10Z","2597549400","0","3153.741754","0.000000"
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","32768","0","0","2026-11-02T02:03:15Z","12404343000","0","2641.655427","0.000000"
+[23:03:42] llama-bench decode @16/32k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","0","128","0","2026-11-02T02:03:50Z","4369098100","0","29.296664","0.000000"
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","0","128","32768","2026-11-02T02:03:55Z","4652928400","0","27.509557","0.000000"
+[23:04:15] airun bench 128k
+Qwen3.8-27B (qwen35) - 65 layers, 5120 embd, 24 heads (4 kv, GQA 6x), head_dim 256, ffn 17408, vocab 248320, q/k norm, 1 MTP layer(s) skipped
+  rope: 64 of 256 dims, base 10000000, YaRN x4 (dims 14..22 ramp, mscale 1.1386)
+  hybrid: 48 linear-attention + 16 attention layers; delta-net 48 v-heads x 16 k-heads, state 128x128, conv 4
+  gated attention output
+weights 13.57 GiB loaded in 7.2s
+memory plan (context 131328 tokens):
+  GPU 0 NVIDIA GeForce RTX 5070 Ti layers 0..42 (43)       +embed
+      weights   8.58 GiB  kv   5.11 GiB  scratch 271.52 MiB  =   13.96 GiB of  14.31 GiB budget
+  GPU 1 NVIDIA GeForce RTX 5060 Ti layers 43..63 (21)      +output
+      weights   5.00 GiB  kv   3.05 GiB  scratch 272.70 MiB  =    8.32 GiB of  14.44 GiB budget
+  note: model exceeds any single GPU; filling the fastest GPU first
+  note: 1 activation handoff(s) per forward pass between GPUs
+
+test                   median          min          max expert hit
+-------------------------------------------------------------------
+prefill 131072      2397.8 t/s    2397.8 t/s    2397.8 t/s           
+decode 128 @ 131072      22.4 t/s      22.4 t/s      22.4 t/s           
+
+1 run(s) per test after 0 warm-up run(s); median reported
+
+[23:06:19] llama-bench 128k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","131072","0","0","2026-11-02T02:06:27Z","88552953800","0","1480.153901","0.000000"
+[23:09:27] llama-bench decode @128k
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,repack,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"b68449857","11760","AMD Ryzen 7 5700X3D 8-Core Processor           ","NVIDIA GeForce RTX 5070 Ti, NVIDIA GeForce RTX 5060 Ti","CUDA","D:\modelsAI\gguf\qwen3.8\Qwen3.8-27B-NVFP4-Q5K-mtp-yarn1m.gguf","qwen35 27B NVFP4","15694925824","27320697856","512","512","8","0x0","0","50","f16","f16","-1","0","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","1","0","0","0","128","131072","2026-11-02T02:09:35Z","6274842700","0","20.398918","0.000000"
+[23:11:16] done
+
+test                 airun       llama ratio
+----                 -----       ----- -----
+prefill 8192        3693,5 3496,487528  1,06
+prefill 32768       3055,2 2861,995583  1,07
+decode 128 @ 16       42,1   32,703381  1,29
+decode 128 @ 32768    37,4   29,070539  1,29
+prefill 131072      2428,3 1597,293662  1,52
+decode 128 @ 131072   23,5   20,398918  1,15
+
+
+

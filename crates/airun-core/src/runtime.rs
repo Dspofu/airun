@@ -893,7 +893,7 @@ impl Runtime {
         let mut host = vec![0f32; ROWS * cfg.vocab_size];
         for r0 in (0..n).step_by(ROWS) {
             let m = ROWS.min(n - r0);
-            ops::matvec(out_w.kernel_type(), out_w.data.as_ptr(), st.xb.offset_ptr(r0 * cfg.n_embd),
+            ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr(r0 * cfg.n_embd),
                 buf.as_mut_ptr(), cfg.n_embd, cfg.vocab_size, m, out_w.row_bytes, &st.stream)?;
             buf.copy_to_host(&mut host[..m * cfg.vocab_size], &st.stream)?;
             st.stream.synchronize()?;
@@ -1354,6 +1354,14 @@ impl Runtime {
 
         for local in 0..self.states[si].layers.len() {
             let layer = self.states[si].layers[local];
+            // A layer kept in RAM (--alloc): copy its weights into the staging
+            // VRAM, in stream order, so they land after the previous such
+            // layer is done with it. In a captured decode graph these are copy
+            // nodes from the same pinned addresses.
+            for &(host, dev, bytes) in &self.model.layers[layer].ram_copies {
+                airun_cuda::copy_h2d(dev as *mut std::ffi::c_void, host as *const std::ffi::c_void, bytes,
+                    &self.states[si].stream)?;
+            }
             self.run_layer(si, local, layer, n, &cfg)?;
         }
         if si + 1 < self.states.len() {
@@ -1396,7 +1404,7 @@ impl Runtime {
         let last_row = st.xb.offset_ptr((n - 1) * cfg.n_embd);
         ops::matvec(
             out_w.kernel_type(),
-            out_w.data.as_ptr(),
+            out_w.ptr(),
             last_row,
             logits.as_mut_ptr(),
             cfg.n_embd,
@@ -1560,16 +1568,16 @@ impl Runtime {
                     let glu = n > 1 && !matvec_f32_forced() && same_shape(&[gate, up])
                         && !fp4_prefill(gate, n, &st.q8act)
                         && ops::matvec_supports_q8(gate.kernel_type())
-                        && ops::mmq_glu_supported(gate.kernel_type(), gate.data.as_ptr(),
-                            up.data.as_ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
+                        && ops::mmq_glu_supported(gate.kernel_type(), gate.ptr(),
+                            up.ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
                     if n == 1 && same_shape(&[gate, up]) && !q8_decode(gate) {
                         // Decode: gate, up and SwiGLU in one launch, bit-identical.
-                        ops::matvec_glu(gate.kernel_type(), gate.data.as_ptr(), up.data.as_ptr(),
+                        ops::matvec_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
                             st.xb.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, gate.row_bytes,
                             stream)?;
                     } else if glu {
                         ops::quantize_act(st.xb.as_ptr(), st.q8act.buf.as_mut_ptr(), n * gate.k, stream)?;
-                        ops::matvec_q8_glu(gate.kernel_type(), gate.data.as_ptr(), up.data.as_ptr(),
+                        ops::matvec_q8_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
                             st.q8act.buf.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, n,
                             gate.row_bytes, stream)?;
                     } else if fp4_prefill(gate, n, &st.q8act) && fp4_prefill(down, n, &st.q8act) {
@@ -1848,7 +1856,7 @@ impl Runtime {
             // small to keep DRAM busy (see matvec3_kernel).
             ops::matvec3(
                 a.q.kernel_type(),
-                [a.q.data.as_ptr(), a.k.data.as_ptr(), a.v.data.as_ptr()],
+                [a.q.ptr(), a.k.ptr(), a.v.ptr()],
                 st.xb.as_ptr(),
                 [st.q.as_mut_ptr(), st.k.as_mut_ptr(), st.v.as_mut_ptr()],
                 a.q.k,
@@ -2300,7 +2308,7 @@ impl Runtime {
             let ew = |t: &GpuTensor| hybrid::ExpertWeights {
                 ty: t.kernel_type(),
                 tab: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.table.as_ptr()),
-                base: t.data.as_ptr(),
+                base: t.ptr(),
                 stride: t.expert_stride,
                 row_bytes: t.row_bytes,
                 resident: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.resident.as_ptr()),
@@ -2401,13 +2409,13 @@ impl Runtime {
                 host_ids.as_mut_slice()[..gate_ids.len()].copy_from_slice(gate_ids);
                 m.cached_ids.copy_from_host_at(0, &host_ids.as_slice()[..gate_ids.len()], stream)?;
                 hybrid::moe_gate_up(
-                    gate_exps.kernel_type(), gate_exps.data.as_ptr(), up_exps.data.as_ptr(),
+                    gate_exps.kernel_type(), gate_exps.ptr(), up_exps.ptr(),
                     st.xb.offset_ptr(t * cfg.n_embd), m.cached_ids.as_ptr(), m.h.as_mut_ptr(),
                     cfg.n_embd, moe.expert_ff, count, moe.n_experts_used,
                     gate_exps.row_bytes, gate_exps.expert_stride, stream,
                 )?;
                 hybrid::moe_down(
-                    down_exps.kernel_type(), down_exps.data.as_ptr(), m.h.as_ptr(),
+                    down_exps.kernel_type(), down_exps.ptr(), m.h.as_ptr(),
                     m.cached_ids.as_ptr(), m.weights.offset_ptr(t * moe.n_experts_used),
                     st.xb2.offset_ptr(t * cfg.n_embd), moe.expert_ff, cfg.n_embd,
                     count, moe.n_experts_used, down_exps.row_bytes, down_exps.expert_stride, stream,
@@ -2420,8 +2428,8 @@ impl Runtime {
 
         hybrid::moe_gate_up(
             gate_exps.kernel_type(),
-            gate_exps.data.as_ptr(),
-            up_exps.data.as_ptr(),
+            gate_exps.ptr(),
+            up_exps.ptr(),
             st.xb.as_ptr(),
             m.ids.as_ptr(),
             m.h.as_mut_ptr(),
@@ -2436,7 +2444,7 @@ impl Runtime {
 
         hybrid::moe_down(
             down_exps.kernel_type(),
-            down_exps.data.as_ptr(),
+            down_exps.ptr(),
             m.h.as_ptr(),
             m.ids.as_ptr(),
             m.weights.as_ptr(),
@@ -2980,7 +2988,7 @@ fn matvec_reuse(
             ops::quantize_act_nvfp4(x.as_ptr(), buf.as_mut_ptr(), n, w.k, stream)?;
             q8.fp4_valid.set(true);
         }
-        ops::matmul_nvfp4(w.data.as_ptr(), w.row_bytes, buf.as_ptr(), out.as_mut_ptr(), w.k, w.rows, n, stream)?;
+        ops::matmul_nvfp4(w.ptr(), w.row_bytes, buf.as_ptr(), out.as_mut_ptr(), w.k, w.rows, n, stream)?;
         return Ok(());
     }
     let batch_q8 = n < 64 || ops::mmq_supported();
@@ -2992,7 +3000,7 @@ fn matvec_reuse(
         }
         ops::matvec_q8(
             w.kernel_type(),
-            w.data.as_ptr(),
+            w.ptr(),
             q8.buf.as_ptr(),
             out.as_mut_ptr(),
             w.k,
@@ -3005,7 +3013,7 @@ fn matvec_reuse(
     }
     ops::matvec(
         w.kernel_type(),
-        w.data.as_ptr(),
+        w.ptr(),
         x.as_ptr(),
         out.as_mut_ptr(),
         w.k,

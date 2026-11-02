@@ -21,14 +21,21 @@ airun run   Qwen3.8-27B-NVFP4.gguf -p "Explique o que é um kernel de GPU" -n 20
 
 ## Destaques
 
-- **Mais rápida que o llama.cpp** no Qwen3.8-27B NVFP4 em prompt, de 512
-  a 131.072 tokens, em geração e em decodificação especulativa com MTP. E
+- **Mais rápida que o llama.cpp** no Qwen3.8-27B NVFP4 em todos os testes:
+  prompt de 512 a 131.072 tokens, geração com 16 a 131.072 de contexto e
+  decodificação especulativa com MTP. E
   **mais rápida que o Strata e o llama.cpp** no Qwen4 Flash-Next (MoE de
-  78 GB numa máquina com 32 GB de VRAM). Onde ainda perde (geração com 128k
-  de contexto, ~4%), a tabela mostra.
-- **Modelos maiores que a VRAM:** experts de MoE ficam em RAM fixada e são
-  lidos pela GPU através da PCIe, guiados por um perfil de roteamento que a
-  airun aprende e guarda por modelo.
+  78 GB numa máquina com 32 GB de VRAM). Com contexto longo, a vantagem chega
+  a +52% no prompt de 128k tokens e +15% na geração.
+- **Modelos maiores que a VRAM:** `--alloc auto` (o padrão) enche a GPU
+  principal, depois as outras, e só então usa a RAM para o que sobrou.
+  - **Modelo denso:** camadas inteiras ficam em RAM fixada e são copiadas
+    para a VRAM antes de rodar, com o contexto mantido e resultado idêntico.
+  - **MoE:** os experts menos usados ficam em RAM e são lidos pela PCIe,
+    guiados por um perfil de roteamento que a airun aprende e guarda por
+    modelo.
+  - **Outros modos:** `--alloc gpu` usa só a VRAM, e `--main-gpu` escolhe a
+    principal.
 - **API completa no formato do `llama-server`:** OpenAI (chat, completions,
   responses), Anthropic (messages), `/completion` e `/infill` nativos,
   tool calls, reasoning, logprobs, gramáticas GBNF e JSON schema, embeddings,
@@ -66,27 +73,26 @@ Uma GPU, melhor de 3 rodadas alternadas, tok/s
 
 Mesmo modelo dividido entre as duas GPUs (com 32k+ de contexto ele não cabe
 numa placa), lotes de prompt de 512, melhor de 2 rodadas, tok/s
-([`benchmarks/2026-11-01f`](benchmarks/2026-11-01f/RESULTADOS.md)):
+([`benchmarks/2026-11-01g`](benchmarks/2026-11-01g/RESULTADOS.md)):
 
 | Teste | airun | llama.cpp b11760 | |
 |---|---:|---:|---:|
-| prompt de 8k tokens | **3519** | 3211 | +10% |
-| prompt de 32k tokens | **2821** | 2631 | +7% |
-| prompt de 128k tokens | **1735** | 1599 | +9% |
-| geração @ 16 de contexto | **31,3** | 30,8 | +2% |
-| geração @ 32k | 27,5 | **27,8** | −1% |
-| geração @ 128k | 19,7 | **21,8** | −9% |
+| prompt de 8k tokens | **3694** | 3496 | +6% |
+| prompt de 32k tokens | **3055** | 2862 | +7% |
+| prompt de 128k tokens | **2428** | 1597 | +52% |
+| geração @ 16 de contexto | **42,1** | 32,7 | +29% |
+| geração @ 32k | **37,4** | 29,1 | +29% |
+| geração @ 128k | **23,5** | 20,4 | +15% |
 
-O prompt longo saiu de 28–37% atrás para 7–10% à frente
-([antes](benchmarks/2026-11-01e/RESULTADOS.md)).
+No início da noite o prompt longo perdia de 28% a 37%
+([antes](benchmarks/2026-11-01e/RESULTADOS.md)). Três mudanças viraram o
+jogo:
 
-- **GPUs em paralelo:** as duas passaram a trabalhar ao mesmo tempo, cada uma
-  num pedaço do prompt.
+- **GPUs em paralelo no prefill:** as duas placas trabalham ao mesmo tempo,
+  cada uma num pedaço do prompt.
 - **Atenção do prefill:** subiu de 55 para 73 TFLOPS.
-
-A geração com 128k de contexto é a diferença que sobra. Medida isolada, ela
-fica em 20,9 contra 21,4–21,8; na tabela pesa também o calor dos prefills
-logo antes.
+- **O planner enche a GPU mais rápida primeiro,** em vez de dividir o modelo
+  ao meio entre uma placa rápida e uma com metade da banda.
 
 ### Qwen4 Flash-Next (MoE, IQ3_S, 78 GB) contra Strata e llama.cpp
 
@@ -239,10 +245,14 @@ modelo que não suporta com uma mensagem explícita em vez de gerar lixo.
   somado em fp16 por tile de chaves (no máximo 32 termos) e acumulado em
   fp32, o que dá a taxa dupla do tensor core sem a imprecisão de guardar o
   acumulador inteiro em fp16.
-- **Planejador de VRAM** que lê o tamanho exato de cada tensor do GGUF. Quando
-  não cabe, ele reduz lote, contexto ou reserva, nessa ordem, e diz o que
-  mudou. Uma GPU só quando o modelo cabe nela, porque cruzar PCIe sem P2P
-  custa mais do que a segunda placa rende.
+- **Planejador de VRAM** que lê o tamanho exato de cada tensor do GGUF:
+  - **Uma GPU só** quando o modelo cabe nela, porque cruzar PCIe sem P2P custa
+    mais do que a segunda placa rende.
+  - **Quando não cabe, enche a GPU mais rápida primeiro.** O decode passa
+    pelas placas uma depois da outra, e a lenta deve ficar só com o resto.
+    Isso deu +28% no decode do 27B em relação a dividir pela VRAM livre.
+  - **Quando nem assim cabe,** reduz lote, contexto ou reserva, nessa ordem,
+    e diz o que mudou.
 
 ---
 

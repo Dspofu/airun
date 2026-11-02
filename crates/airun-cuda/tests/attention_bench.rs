@@ -26,6 +26,44 @@ fn rand_f16_bits(n: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// One decode step's attention (a single query) over a long cache, in GB/s of
+/// K and V read: decode attention is bandwidth-bound.
+#[test]
+#[ignore]
+fn decode_attention_bandwidth() {
+    // AIRUN_BENCH_DEVICE picks the GPU (the slower card of a split matters).
+    let dev: i32 = std::env::var("AIRUN_BENCH_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    device::set_device(dev).unwrap();
+    let stream = Stream::new(dev).unwrap();
+    for &depth in &[8192usize, 32768, 131072] {
+        let ctx = depth;
+        let row = HEAD_DIM * 2;
+        let kv_bytes = N_KV_HEADS * ctx * row;
+        let k = DeviceBuffer::<u8>::from_slice(dev, &rand_f16_bits(kv_bytes / 2, 1), &stream).unwrap();
+        let v = DeviceBuffer::<u8>::from_slice(dev, &rand_f16_bits(kv_bytes / 2, 2), &stream).unwrap();
+        let q_host: Vec<f32> = (0..N_HEADS * HEAD_DIM).map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 0.3).collect();
+        let q = DeviceBuffer::<f32>::from_slice(dev, &q_host, &stream).unwrap();
+        let out = DeviceBuffer::<f32>::new(dev, N_HEADS * HEAD_DIM).unwrap();
+        let positions = DeviceBuffer::<i32>::from_slice(dev, &[(depth - 1) as i32], &stream).unwrap();
+        let splits = ops::attention_splits(ctx);
+        let partial = DeviceBuffer::<f32>::new(dev, N_HEADS * splits * (HEAD_DIM + 2)).unwrap();
+        let run = || ops::attention_split(out.as_mut_ptr(), &partial, q.as_ptr(), k.as_ptr(), v.as_ptr(),
+            positions.as_ptr(), N_HEADS, N_KV_HEADS, HEAD_DIM, ctx, 1.0 / (HEAD_DIM as f32).sqrt(), 0, splits,
+            KvType::F16, &stream).unwrap();
+        run();
+        stream.synchronize().unwrap();
+        let iters = 50;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            run();
+        }
+        stream.synchronize().unwrap();
+        let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!("decode depth {depth:>6}: {us:8.1} us per layer, {:6.1} GB/s of K+V ({splits} splits)",
+            2.0 * kv_bytes as f64 / us / 1e3);
+    }
+}
+
 #[test]
 #[ignore]
 fn prefill_attention_throughput() {

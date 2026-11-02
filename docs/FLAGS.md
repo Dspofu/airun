@@ -28,6 +28,8 @@ Estas são as flags que decidem **o que vai para qual GPU**.
 | `--gpus <lista>` | todas | Ordinais CUDA a usar, ex.: `--gpus 0,1`. **Atenção:** ordinal CUDA não é o índice do `nvidia-smi`. Rode `airun gpu` para ver a correspondência. |
 | `--tensor-split <fracoes>` | — | Proporção manual de camadas por GPU, ex.: `--tensor-split 0.7,0.3`. Uma entrada por GPU selecionada. Desliga o modo automático. |
 | `--single-gpu <ordinal>` | — | Força o modelo inteiro numa placa. Conflita com `--tensor-split`. |
+| `--alloc <auto\|gpu\|memory>` | `auto` | Onde os pesos podem ficar. `auto`: a airun decide — usa só as GPUs que o modelo precisa, a principal primeiro, e a RAM só para o que nenhuma GPU comporta. `gpu`: só VRAM; o que não couber reduz o contexto ou dá erro, e nada vai para a RAM (nem experts de MoE). `memory`: todas as GPUs de `--gpus` e depois a RAM. Nos modos com RAM o contexto pedido é mantido. |
+| `--main-gpu <ordinal>` | a mais rápida | A GPU enchida primeiro, que também roda as camadas mantidas na RAM — escolha a do slot PCIe mais rápido. |
 | `--vram-reserve <MiB>` | `384` | VRAM deixada livre em cada GPU. O Windows/WDDM não entrega os últimos megabytes; reduza só se souber o que está fazendo. |
 | `--no-fallback` | desligado | Falha em vez de reduzir contexto/batch automaticamente para caber. Útil em CI, onde uma redução silenciosa mascara uma regressão. |
 | `--kv-type <tipo>` | `f16` | Formato do KV cache: `f16`, `q8_0` ou `q4_0`. Os quantizados cabem 2x e 3,6x mais contexto na mesma VRAM; no 35B custam +0,001 (q8_0) e +0,02 (q4_0) nats de perda. Vale também para `perplexity`. |
@@ -45,12 +47,30 @@ Sem `--tensor-split` nem `--single-gpu`, o planner:
 
 1. Lê os tamanhos **exatos** de cada tensor no cabeçalho GGUF (não estima).
 2. Soma pesos + KV cache + scratch.
-3. **Se couber numa GPU só, usa uma GPU só** — mesmo havendo outras livres.
-   Atravessar PCIe custa mais do que a segunda placa ganha, especialmente sem
-   P2P.
-4. Se não couber, divide as camadas em faixas contíguas proporcionais à VRAM
-   livre de cada placa, colocando mais na mais rápida.
-5. Se ainda não couber, desce a escada de fallback (veja abaixo).
+3. **Se couber numa GPU só, usa uma GPU só** — a principal (`--main-gpu`, ou
+   a mais rápida), mesmo havendo outras livres. Atravessar PCIe custa mais do
+   que a segunda placa ganha, especialmente sem P2P.
+4. Se não couber, enche a principal primeiro e passa à seguinte só o que
+   sobrar, em faixas contíguas de camadas. No decode as placas trabalham uma
+   depois da outra, então uma camada numa placa com metade da banda custa o
+   dobro. Com o 27B numa 5070 Ti + 5060 Ti, trocar a divisão pela VRAM livre
+   (metade em cada) por esta levou o decode de 33,7 para 43,0 tok/s. Em
+   `--alloc auto` uma GPU que não é necessária fica de fora; em `memory`
+   todas as de `--gpus` recebem camadas.
+5. Se nem todas as GPUs juntas comportam o modelo:
+   - `--alloc auto|memory`: as outras GPUs ficam cheias com as últimas
+     camadas, e as que sobram ficam com os pesos em **RAM fixada**, rodando
+     na principal. Antes de cada uma rodar, os pesos são copiados por DMA
+     para uma área de staging na VRAM (do tamanho da maior delas), e o KV
+     cache delas fica na VRAM, então o contexto é mantido. O resultado é
+     idêntico, token a token, ao do modelo inteiro na VRAM.
+     - **Custo:** cada camada em RAM cruza a PCIe a cada token. Com o 27B
+       numa 5070 Ti (PCIe 4.0 x16, ~26 GB/s), 12 camadas em RAM fazem a
+       geração cair de 45 para 9 tok/s.
+     - **MoE:** os experts que não cabem vão para a RAM como sempre foram
+       (só os que o roteamento usa cruzam a PCIe). Camadas MoE inteiras em
+       RAM ainda não existem.
+   - `--alloc gpu`: desce a escada de fallback (veja abaixo).
 
 Tudo que ele decidiu aparece em `--stats`.
 
@@ -431,6 +451,7 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_MMQ_TC=64` ou `=128` | Força a largura da tile de tokens do MMQ. Padrão: 128 a partir de 128 tokens. |
 | `AIRUN_NO_MMQ_GLU=1` | Gate, up e SwiGLU do prefill em três lançamentos em vez de um. |
 | `AIRUN_ATTN_PV_F32=1` | O prefill soma P·V em fp32 também com contexto longo (a partir de 4096 chaves, o padrão é fp16 por tile de chaves, somado em fp32). |
+| `AIRUN_NO_SPLIT_WAVES=1` | O decode usa todas as divisões do cache que a posição permite, sem arredondar para ondas inteiras de blocos (veja `attention_active_splits`). |
 | `AIRUN_NO_FLASH2=1` | O prefill usa a flash attention WMMA antiga em vez da de `mma.sync` (head_dim 64/128). |
 | `AIRUN_NO_SPLIT_ATTN=1` | O decode usa o kernel de atenção de um bloco por head, sem dividir o contexto. |
 | `AIRUN_NO_FUSED_PROLOGUE=1` | q/k norm, RoPE e escrita no cache em lançamentos separados. |

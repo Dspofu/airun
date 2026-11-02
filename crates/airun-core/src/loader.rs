@@ -13,7 +13,7 @@ use airun_gguf::GgufFile;
 use crate::config::{Architecture, Config};
 use crate::error::{CoreError, Result};
 use crate::model::Model;
-use crate::plan::{Placement, PlacementRequest, SplitMode, WeightSizes, plan};
+use crate::plan::{AllocMode, Placement, PlacementRequest, SplitMode, WeightSizes, plan};
 use crate::runtime::Runtime;
 use crate::tokenizer::Tokenizer;
 
@@ -37,6 +37,10 @@ pub struct LoadOptions {
     /// Speculative decoding: tokens the model's MTP head drafts per step. 0
     /// leaves the head unloaded; ignored on files without one.
     pub draft: usize,
+    /// Where weights may live: only VRAM, VRAM then RAM, or airun's choice.
+    pub alloc: AllocMode,
+    /// The GPU filled first; None picks the fastest.
+    pub main_gpu: Option<i32>,
 }
 
 impl Default for LoadOptions {
@@ -52,6 +56,8 @@ impl Default for LoadOptions {
             reserve_bytes: 384 << 20,
             allow_fallback: true,
             draft: 0,
+            alloc: AllocMode::Auto,
+            main_gpu: None,
         }
     }
 }
@@ -114,6 +120,9 @@ pub fn load(
             expert_note = Some(format!("MoE expert cache: {slots} slots per layer"));
             Some(vec![slots; config.n_run_layers()])
         }
+        // --alloc gpu: no expert goes to RAM; a MoE that does not fit then
+        // gets a smaller context or the planner's error.
+        None if opts.alloc == AllocMode::Gpu => None,
         None => match plan_experts(&gguf, &config, &sizes, &devices, opts) {
             Some(p) => {
                 if let (Some(counts), SplitMode::Auto) = (p.counts, &opts.split) {
@@ -165,6 +174,8 @@ pub fn load(
             gpu_layers: opts.gpu_layers,
             reserve_bytes: reserve,
             allow_ctx_shrink: opts.allow_fallback,
+            alloc: opts.alloc,
+            main_gpu: opts.main_gpu,
         };
 
         let mut placement = match plan(&config, &sizes, &devices, &req) {
@@ -290,9 +301,14 @@ fn plan_experts(gguf: &GgufFile, config: &Config, sizes: &WeightSizes, devices: 
         SplitMode::Single(target) => devices.iter().filter(|d| d.ordinal == *target).collect(),
         _ => devices.iter().collect(),
     };
-    // The planner's order: fastest first, which takes the first layers.
+    // The planner's order: the main GPU (by default the fastest) first, which
+    // takes the first layers.
     used.sort_by(|a, b| b.perf_score().partial_cmp(&a.perf_score())
         .unwrap_or(std::cmp::Ordering::Equal).then(a.ordinal.cmp(&b.ordinal)));
+    if let Some(i) = opts.main_gpu.and_then(|m| used.iter().position(|d| d.ordinal == m)) {
+        let d = used.remove(i);
+        used.insert(0, d);
+    }
     let n_layers = config.n_run_layers();
     let state = |l: usize| match config.layer_kind(l) {
         crate::config::LayerKind::Attention => config.kv_bytes_per_layer(opts.ctx),

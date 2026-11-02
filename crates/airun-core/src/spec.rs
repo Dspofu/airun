@@ -260,7 +260,7 @@ impl Runtime {
         ops::rmsnorm(st.xb.as_mut_ptr(), st.x.as_ptr(), mtp.head_norm.as_ptr(), d, n, cfg.rms_eps, stream)?;
 
         let out_w = self.model.output_tensor();
-        ops::matvec(out_w.kernel_type(), out_w.data.as_ptr(), st.xb.offset_ptr((n - 1) * d),
+        ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr((n - 1) * d),
             sp.logits.as_mut_ptr(), d, cfg.vocab_size, 1, out_w.row_bytes, stream)?;
         ops::argmax(sp.logits.as_ptr(), cfg.vocab_size, sp.picks.offset_ptr(slot), sp.scratch.as_mut_ptr(),
             std::ptr::null_mut(), stream)?;

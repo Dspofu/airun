@@ -86,6 +86,9 @@ pub struct PerplexityArgs {
     #[arg(long, value_delimiter = ',')]
     pub tensor_split: Vec<f32>,
 
+    #[command(flatten)]
+    pub alloc: crate::run::AllocArgs,
+
     /// Keep the whole model on one GPU, by ordinal.
     #[arg(long)]
     pub single_gpu: Option<i32>,
@@ -108,6 +111,7 @@ pub fn run(args: PerplexityArgs) -> Result<()> {
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();
     run_args.single_gpu = args.single_gpu;
+    run_args.alloc = args.alloc.clone();
 
     let (mut runtime, report) = loader::load(&args.model, &run_args.load_options(), |_, _, _| {})
         .with_context(|| format!("failed to load {}", args.model.display()))?;
