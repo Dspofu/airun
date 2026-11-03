@@ -114,7 +114,36 @@ Agora:
 
 ---
 
-## 5. Documentação
+## 5. Web UI (`crates/airun-cli/src/webui.html`)
+
+Rewrite do chat embutido no `serve`:
+
+- **Scroll corrigido:** o `#log` nunca virava o container de scroll (o grid item
+  recusava encolher sem `min-height: 0`); a página crescia e cortava. Agora a
+  conversa rola dentro da área de chat e um botão `↓` aparece quando você
+  sobe. Verificado no browser: 30 mensagens, clientH 640 vs scrollH 3163,
+  `scrollTop` responde.
+- **Stats ao vivo durante a geração** (antes só no final, e no `run`, não na
+  UI): barra acima da mensagem com contador de tokens, tok/s,
+  time-to-first-token e tempo total; vira "done" ao terminar. Verificado:
+  2 → 7 → 12 → 20 tokens atualizando, "done 45 tokens · 4.0 tok/s · first
+  1388 ms".
+- **Controle de thinking:** pill no header (on/off) + **token budget** nas
+  configurações (envia `reasoning_budget_tokens` quando > 0; o servidor já
+  aceita o campo). O bloco de raciocínio mostra "Thought for N s / N tok" e
+  abre sozinho enquanto pensa, fecha quando a resposta começa (a menos que o
+  usuário toque).
+- **Limite na mensagem do usuário:** a bolha enviada era ilimitada; agora tem
+  teto de 420px com scroll próprio (o composer já tinha). Verificado: 1173
+  chars → 312px.
+- **Redesign:** tema escuro/claro automático, avatares, bolhas arredondadas,
+  ações no hover (Copy/Edit/Regenerate), painel de settings organizado, layout
+  mobile com botão Settings.
+- Mantidas: renderização de markdown com preview sandbox de HTML, edição de
+  mensagem com regeneração, Stop (Esc), configurações persistidas em
+  localStorage.
+
+## 6. Documentação
 
 - **`docs/FLAGS.md`**: `--draft` atualizado (dois comandos, requisito de greedy
   com o `--repeat-penalty 1.1` padrão, avisos).
@@ -149,10 +178,11 @@ crates/airun-core/src/lib.rs       # reexporta mtp_supported
 crates/airun-cli/src/serve.rs      # --draft + aviso + repasse para LoadOptions
 crates/airun-cli/src/run.rs        # texto do --draft (requisito de greedy)
 crates/airun-cli/src/main.rs       # help raiz (opções comuns + exemplos)
+crates/airun-cli/src/webui.html    # redesign + stats ao vivo + thinking + scroll
 docs/FLAGS.md                      # --draft atualizado
 README.md                          # NVFP4, correção, condição do decode
 AGENTS.md                          # armadilha #14 + MTP não-silencioso
-benchmarks/{gguf_tensors,meta_dump,nvfp4_magnitude}.py
+benchmarks/{gguf_tensors,meta_dump,nvfp4_magnitude,open_pr}.py
 ```
 
 ## Como verificar (checklist do revisor)
