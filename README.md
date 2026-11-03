@@ -69,6 +69,17 @@ Uma GPU, melhor de 3 rodadas alternadas, tok/s
 | geração com MTP, prompt 1 | **113,7** | 104,6 | +9% |
 | geração com MTP, prompt 2 | **94,9** | 91,7 | +3% |
 
+**Condição da vantagem no decode:** os números acima são de uma GPU (ou das
+duas, na seção de contexto longo) onde o 27B **cabe na VRAM** — o decode é
+limitado pela banda de memória, e o airun extrai mais dos matvecs quantizados
+e do pipeline de grafos. Quando o modelo **não cabe** (ex.: 27B num GPU de 8 GB),
+o gargalo muda: o airun mantém as camadas excedentes em RAM fixada e as lê pela
+PCIe a cada token, enquanto o llama.cpp as derrama nos núcleos da CPU. Nesse
+caso o llama.cpp fica à frente no decode (medido: 0,87 vs 0,4 t/s) e também no
+prefill (kernels de matmul denso mais otimizados). A vantagem do airun se
+aplica, portanto, a **decode com o modelo residente na VRAM** — o regime
+multi-GPU/longo-contexto acima e o MoE que cabe numa placa.
+
 ### Contexto longo
 
 Mesmo modelo dividido entre as duas GPUs (com 32k+ de contexto ele não cabe
@@ -223,6 +234,13 @@ pensamento no meio do stream e o modelo passa direto para a resposta.
 **Ainda não:** visão (`mmproj`), áudio, LoRA e rerank. O loader recusa um
 modelo que não suporta com uma mensagem explícita em vez de gerar lixo.
 
+**NVFP4 em duas convenções.** O encoder próprio é autocontido (o bloco carrega
+as escalas UE4M3 e não tem tensor-irmão). Arquivos NVFP4 de fora (vllm/NVIDIA)
+usam a convenção *global-scale*: cada peso tem um sidecar `<base>.scale` F32[1]
+(≈1e‑4) que o loader lê e aplica — sem ele, os pesos saem ~10⁴ maiores e o
+modelo degrada a NaN. As duas convenções funcionam; a escala é um no‑op nos
+outros formatos.
+
 ---
 
 ## Como ela é rápida
@@ -269,6 +287,10 @@ certo. Por isso:
 - **`AIRUN_MATVEC_F32=1 AIRUN_NO_FP4=1`** forçam o caminho exato em f32, que
   serve de referência: no Qwen3.8-27B o caminho normal fica a 0,01 dele em
   logprob, onde o llama.cpp se afasta 0,24 no mesmo prompt.
+- **NVFP4 global-scale (bug de 2026-11-03):** o selftest não lê bytes reais
+  nem sidecars, então um fator global em falta passa nele — o 27B vllm dava
+  perplexidade NaN e geração `!!!!` com o selftest verde. A métrica que pega
+  é a `airun perplexity` (NaN → 3.93 depois do fix).
 
 ---
 

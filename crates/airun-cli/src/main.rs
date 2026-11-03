@@ -22,7 +22,34 @@ use clap::{Parser, Subcommand};
     version,
     about = "Multi-modal LLM runtime for NVIDIA GPUs",
     long_about = "airun runs GGUF models on NVIDIA GPUs with its own CUDA kernels, \
-                  converts and quantizes checkpoints, and serves an OpenAI-compatible API."
+                  converts and quantizes checkpoints, and serves an OpenAI-compatible API.",
+    after_long_help = "Common options (full list for each command: `airun <COMMAND> --help`):
+  run, bench, perplexity, quantize
+      -c, --ctx-size <N>          context length in tokens (default 4096)
+          --kv-type <f16|q8_0|q4_0>  KV cache format; q4_0 fits ~3.6x more context
+      -b, --batch-size <N>        prompt tokens per forward pass (default 512)
+          --gpus <0,1>            CUDA ordinals to use
+          --alloc <auto|gpu|memory>  where the weights live
+          --main-gpu <N>          GPU filled first (and running the RAM layers)
+  run, serve
+          --draft <N>             MTP speculative decoding, drafts per step (run: 3, serve: 0)
+          --temp <T>              sampling temperature; 0 is greedy
+  run
+      -p, --prompt <TEXT>         the prompt (reads stdin when omitted)
+      -n, --predict <N>           maximum tokens to generate (default 256)
+  serve
+          --port <PORT>           HTTP port (default 8080)
+          --alias <NAME>          name advertised by /v1/models
+  convert
+          --hf <REPO>            Hugging Face repo, optional :QUANT suffix
+  quantize
+          --from <FILE> --to <FILE>  rewrite a GGUF at another precision
+
+Examples:
+  airun run model.gguf -p \"Hello\" -n 128
+  airun serve model.gguf --port 8080 --draft 3 --kv-type q4_0
+  airun bench model.gguf --decode 128 --decode-at 512
+  airun perplexity model.gguf --worst 10"
 )]
 struct Cli {
     #[command(subcommand)]

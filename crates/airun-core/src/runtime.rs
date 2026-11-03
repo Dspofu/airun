@@ -895,6 +895,9 @@ impl Runtime {
             let m = ROWS.min(n - r0);
             ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr(r0 * cfg.n_embd),
                 buf.as_mut_ptr(), cfg.n_embd, cfg.vocab_size, m, out_w.row_bytes, &st.stream)?;
+            if out_w.global_scale != 1.0 {
+                ops::scale(buf.as_mut_ptr(), out_w.global_scale, m * cfg.vocab_size, &st.stream)?;
+            }
             buf.copy_to_host(&mut host[..m * cfg.vocab_size], &st.stream)?;
             st.stream.synchronize()?;
             for i in 0..m {
@@ -1413,6 +1416,9 @@ impl Runtime {
             out_w.row_bytes,
             &st.stream,
         )?;
+        if out_w.global_scale != 1.0 {
+            ops::scale(logits.as_mut_ptr(), out_w.global_scale, cfg.vocab_size, &st.stream)?;
+        }
 
         if std::env::var("AIRUN_TRACE_LAYERS").is_ok_and(|v| v.trim() == "sum") {
             let norm = st.xb.to_vec(&st.stream)?;
@@ -1565,12 +1571,18 @@ impl Runtime {
                     let mut down_done = false;
                     // Prefill takes gate, up and SwiGLU as one integer tensor-core
                     // launch where it can (see matvec_mmq_async_kernel's GLU).
-                    let glu = n > 1 && !matvec_f32_forced() && same_shape(&[gate, up])
+                    // The fused launches write silu(Wg·x)⊙(Wu·x) directly, so they
+                    // cannot apply a per-tensor scale afterwards (silu is not
+                    // scale-linear). Only fuse when neither projection carries a
+                    // global scale; otherwise the separate path scales gate and
+                    // up before the SwiGLU.
+                    let no_scale = gate.global_scale == 1.0 && up.global_scale == 1.0;
+                    let glu = n > 1 && no_scale && !matvec_f32_forced() && same_shape(&[gate, up])
                         && !fp4_prefill(gate, n, &st.q8act)
                         && ops::matvec_supports_q8(gate.kernel_type())
                         && ops::mmq_glu_supported(gate.kernel_type(), gate.ptr(),
                             up.ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
-                    if n == 1 && same_shape(&[gate, up]) && !q8_decode(gate) {
+                    if n == 1 && no_scale && same_shape(&[gate, up]) && !q8_decode(gate) {
                         // Decode: gate, up and SwiGLU in one launch, bit-identical.
                         ops::matvec_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
                             st.xb.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, gate.row_bytes,
@@ -2472,6 +2484,13 @@ impl Runtime {
         sampler: &mut Sampler,
         mut on_token: impl FnMut(u32, &str) -> bool,
     ) -> Result<GenerationStats> {
+        if self.speculates() && !(sampler.is_pure_greedy() && !gpu_argmax_disabled()) {
+            eprintln!(
+                "note: speculative decoding (--draft) is off for this generation: it \
+                 needs pure greedy sampling (temperature 0 and no repeat/presence/\
+                 frequency penalties; --repeat-penalty 1.0)."
+            );
+        }
         if sampler.is_pure_greedy() && !gpu_argmax_disabled() && self.speculates() {
             return self.generate_spec(prompt, max_tokens, &mut on_token);
         }
@@ -2989,6 +3008,7 @@ fn matvec_reuse(
             q8.fp4_valid.set(true);
         }
         ops::matmul_nvfp4(w.ptr(), w.row_bytes, buf.as_ptr(), out.as_mut_ptr(), w.k, w.rows, n, stream)?;
+        apply_global_scale(w, out, n, stream)?;
         return Ok(());
     }
     let batch_q8 = n < 64 || ops::mmq_supported();
@@ -3009,6 +3029,7 @@ fn matvec_reuse(
             w.row_bytes,
             stream,
         )?;
+        apply_global_scale(w, out, n, stream)?;
         return Ok(());
     }
     ops::matvec(
@@ -3022,5 +3043,18 @@ fn matvec_reuse(
         w.row_bytes,
         stream,
     )?;
+    apply_global_scale(w, out, n, stream)?;
+    Ok(())
+}
+
+/// NVFP4 weights are stored ~1e-4 of their true magnitude; the per-tensor
+/// global scale (see `GpuTensor::global_scale`, read from the file's
+/// `<base>.scale` sidecar) restores it. Without it the dequant is thousands
+/// of times too large and the hidden states overflow to NaN. A no-op for every
+/// non-NVFP4 weight, whose scale is 1.0.
+fn apply_global_scale(w: &GpuTensor, out: &DeviceBuffer<f32>, n: usize, stream: &Stream) -> Result<()> {
+    if w.global_scale != 1.0 {
+        ops::scale(out.as_mut_ptr(), w.global_scale, n * w.rows, stream)?;
+    }
     Ok(())
 }

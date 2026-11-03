@@ -86,6 +86,16 @@ pub struct ServeArgs {
     #[arg(short = 'b', long, default_value_t = 512)]
     pub batch_size: usize,
 
+    /// Speculative decoding with the model's own MTP head: tokens drafted per
+    /// step (0 turns it off). Engages on a request only when it decodes
+    /// greedily: temperature 0 and no repeat/presence/frequency penalties
+    /// (this command's default --repeat-penalty is 1.1, which disables it;
+    /// start with --repeat-penalty 1.0 to use it). The text is identical to
+    /// plain decoding. Files without a usable MTP head ignore it (a note is
+    /// printed at load).
+    #[arg(long, default_value_t = 0)]
+    pub draft: usize,
+
     /// CUDA ordinals to use.
     #[arg(long, value_delimiter = ',')]
     pub gpus: Vec<i32>,
@@ -404,6 +414,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     run_args.single_gpu = args.single_gpu;
     run_args.alloc = args.alloc.clone();
     run_args.vram_reserve = args.vram_reserve;
+    run_args.draft = args.draft;
 
     eprintln!("loading {}", args.model.display());
     let (runtime, report) = loader::load(&args.model, &run_args.load_options(), |stage, d, t| {

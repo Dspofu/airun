@@ -66,8 +66,12 @@ pub struct RunArgs {
     pub batch_size: usize,
 
     /// Speculative decoding with the model's own MTP head: tokens drafted per
-    /// step (0 turns it off). Greedy decoding only (--temp 0); the output is the
-    /// same text plain decoding writes. Ignored for files without an MTP head.
+    /// step (0 turns it off). Speeds up greedy decoding only, so it engages
+    /// when the sampler is pure greedy: --temp 0 AND no penalties (this
+    /// command defaults to --repeat-penalty 1.1, which disables it; pass
+    /// --repeat-penalty 1.0 to use it). The text is identical to plain
+    /// decoding. Files without a usable MTP head ignore it (a note is
+    /// printed).
     #[arg(long, default_value_t = 3)]
     pub draft: usize,
 

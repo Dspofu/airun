@@ -380,6 +380,20 @@ rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
     `1 + 0.1 ln(fator)`; tratar o fator como escala linear muda o modelo mesmo
     em contexto curto. `RopeParams` em `ops.rs`, espelho em `airun.cuh`.
 
+14. **NVFP4 existe em duas convenções; o loader lê as duas (2026-11-03).**
+    O encoder do airun é *autocontido*: o bloco carrega só as quatro escalas
+    UE4M3 (item 10) e não tem tensor-irmão. Mas os arquivos NVFP4 de fora
+    (vllm/NVIDIA — ex. o Qwen3.8-27B "Cold Fusion") usam a convenção
+    *global-scale*: cada peso NVFP4 tem um sidecar `<base>.scale` F32[1]
+    (≈1e-4) e o dequant por bloco sai ~10⁴ pequeno sem ele. O loader lê o
+    sidecar e aplica em `GpuTensor::global_scale` (epílogo de escala em todo
+    matvec; nas fusões GLU o scale desliga a fusão, porque SiLU não é
+    linear-escala). Sem isso o 27B vllm dava **NaN** (perplexidade NaN,
+    geração `!!!!`) e o selftest passava — o selftest usa pesos sintéticos no
+    layout do próprio kernel, nunca lê bytes reais nem aplica o sidecar.
+    Diagnóstico: dequantizar os bytes reais com e sem o `.scale` e ver qual
+    dá magnitude de peso sensata (`benchmarks/nvfp4_magnitude.py`).
+
 ## 7. Híbridos SSM/MoE — corrigidos em 2026-09-26
 
 **A saída está correta agora.** Dois bugs se mascaravam um ao outro:
@@ -686,8 +700,9 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
 3. **KV cache paginado** para múltiplas sequências concorrentes. Hoje o
    servidor serializa requisições porque o cache é uma sequência só.
 
-4. **MTP — feito para o qwen35 denso (2026-10-31).** `--draft N` (padrão 3)
-   carrega `blk.{n_run}` como cabeça de rascunho e decodifica especulativamente
+4. **MTP — feito para o qwen35 denso (2026-10-31).** `--draft N` (padrão 3 no
+   `run`, 0 no `serve` — a flag existe nos dois desde 2026-11-03) carrega
+   `blk.{n_run}` como cabeça de rascunho e decodifica especulativamente
    quando a amostragem é gulosa pura (`--temp 0 --repeat-penalty 1`). A saída
    segue o decode normal, mas **não é garantidamente idêntica**: o verify roda
    lotes de 2–4 tokens em outros kernels (`matvec_q8_multi`, ordem de soma
@@ -704,6 +719,14 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
    grafos ligados. 27B NVFP4 numa 5070 Ti: 93.8–113.6 tok/s contra 49 sem MTP
    (llama.cpp com draft-mtp, mesmos prompts: 91.6–104.2).
    Falta: cabeça MTP dos MoE (35B-A3B), amostragem não gulosa.
+
+   **Ativação não silenciosa (2026-11-03):** `--draft` só engaja com amostragem
+   gulosa pura (`temp 0` e nenhuma penalidade — `run`/`serve` têm
+   `--repeat-penalty 1.1` por padrão, o que desliga). Quando o usuário pede
+   `--draft` mas a geração não vai especular, o runtime imprime uma `note:`
+   explicando o porquê (mesma no load, quando o arquivo não tem cabeça MTP
+   utilizável). Antes essa queda era silenciosa: o usuário passava
+   `--draft 3 --temp 0`, não recebia especulação e não sabia por quê.
 
 5. **Template Jinja.** O GGUF traz `tokenizer.chat_template`, que hoje é
    armazenado mas não avaliado; usamos ChatML embutido.

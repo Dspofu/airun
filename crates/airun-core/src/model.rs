@@ -31,6 +31,12 @@ pub struct GpuTensor {
     pub expert_stride: usize,
     pub n_experts: usize,
     pub device: i32,
+    /// Per-tensor NVFP4 global scale, read from the file's one-element
+    /// `<base>.scale` sidecar next to `<base>.weight`. NVFP4 weights are
+    /// stored as tiny per-block values that only become real weights once
+    /// multiplied by it; without it the dequant is thousands of times too
+    /// large and the hidden states overflow to NaN. 1.0 for every other type.
+    pub global_scale: f32,
     /// Set when the weights stay in RAM (`--alloc auto|memory` with a model the
     /// GPUs cannot hold): `data` is empty and the kernels read the copy the
     /// runtime stages into VRAM right before the layer runs.
@@ -515,6 +521,7 @@ impl Model {
                     expert_stride: 0,
                     n_experts: 1,
                     device: out_dev,
+                    global_scale: token_embd.global_scale,
                     ram: None,
                 }
             } else {
@@ -856,8 +863,24 @@ fn describe_packed(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Confi
         expert_stride: 0,
         n_experts: 1,
         device,
+        global_scale: global_scale_of(gguf, name),
         ram: None,
     })
+}
+
+/// The per-tensor NVFP4 global scale, stored in these files as a one-element
+/// `<base>.scale` F32 sidecar next to `<base>.weight` (the per-block scales
+/// alone are ~1e-4 of the true weight magnitude). 1.0 when the file carries
+/// no sidecar, which is every non-NVFP4 model.
+fn global_scale_of(gguf: &GgufFile, name: &str) -> f32 {
+    let Some(base) = name.strip_suffix(".weight") else { return 1.0 };
+    let Some(info) = gguf.tensor(&format!("{base}.scale")) else { return 1.0 };
+    if info.n_elements() != 1 {
+        return 1.0;
+    }
+    let Ok(bytes) = gguf.tensor_bytes(info) else { return 1.0 };
+    let mut v = vec![0f32; 1];
+    airun_gguf::dequant::dequantize(info.ty, bytes, 1, &mut v).map(|_| v[0]).unwrap_or(1.0)
 }
 
 fn load_packed(
@@ -967,6 +990,7 @@ fn load_cached(
         expert_stride,
         n_experts,
         device,
+        global_scale: global_scale_of(gguf, name),
         ram: None,
     })
 }

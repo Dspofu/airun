@@ -101,6 +101,20 @@ pub fn load(
         sizes.other = sizes.other.saturating_sub(t.nbytes);
     }
     let load_mtp = opts.draft > 0 && crate::model::mtp_supported(&config);
+    if opts.draft > 0 && !load_mtp {
+        let reason = if config.nextn_predict_layers == 0 {
+            "the file has no MTP head"
+        } else if config.moe.is_some() {
+            "its MTP head is a MoE block, which is not wired up yet"
+        } else {
+            "its MTP head is not a single dense attention block"
+        };
+        eprintln!(
+            "note: --draft {} is ignored: {reason}. Speculative decoding needs a \
+             file whose MTP head is a single dense attention block (greedy only).",
+            opts.draft
+        );
+    }
     if load_mtp {
         // The head and its own KV cache sit with the output projection.
         sizes.output += sizes.per_layer.get(config.n_run_layers()).copied().unwrap_or(0)

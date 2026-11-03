@@ -17,7 +17,7 @@ pub mod tokenizer;
 pub use config::{Architecture, Config};
 pub use error::{CoreError, Result};
 pub use loader::{LoadOptions, LoadReport, apply_chat_template, load};
-pub use model::Model;
+pub use model::{Model, mtp_supported};
 pub use plan::{AllocMode, Placement, PlacementRequest, Shard, SplitMode, WeightSizes};
 pub use runtime::{GenerationStats, Runtime, StopReason};
 pub use sample::{ProbsSink, ReasoningBudget, Sampler, SamplingParams, TokenProbs};
