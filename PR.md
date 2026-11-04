@@ -171,6 +171,7 @@ Rewrite do chat embutido no `serve`:
 ## Arquivos alterados
 
 ```
+build.ps1                            # novo: build dedicado/universal com selftest
 crates/airun-core/src/model.rs     # GpuTensor.global_scale + global_scale_of
 crates/airun-core/src/runtime.rs   # epílogo de escala + fusões GLU + avisos
 crates/airun-core/src/loader.rs    # aviso no load quando --draft é ignorado
