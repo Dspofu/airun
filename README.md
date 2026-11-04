@@ -137,6 +137,9 @@ residentes.
 ```powershell
 git clone https://github.com/<você>/airun
 cd airun
+.\build.ps1                          # detecta a GPU e compila só para ela
+# ou manualmente:
+$env:AIRUN_CUDA_ARCHS = "86"        # 75, 80, 86, 89 ou 120
 cargo build --release
 .\target\release\airun.exe gpu        # o que foi detectado
 .\target\release\airun.exe selftest   # cada kernel contra a referência CPU
@@ -145,6 +148,9 @@ cargo build --release
 O `build.rs` acha o CUDA e o compilador host sozinho. Por padrão compila para
 RTX 20 até 50, o que leva alguns minutos; durante o desenvolvimento, compile só
 para a sua placa com `$env:AIRUN_CUDA_ARCHS="120"` (ou 75, 80, 86, 89).
+`build.ps1` automatiza isso e aceita `-Arch 120`, `-All` (universal, para
+distribuir), `-NoGpu`, `-Debug` e `-SkipCheck`; ao final roda `gpu` e
+`selftest` para confirmar.
 
 ### Gerar texto
 
