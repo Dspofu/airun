@@ -133,6 +133,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_matvec_q8(args.device, &stream, &mut report)?;
     test_mmq_glu(args.device, &stream, &mut report)?;
     test_matmul_fp4(args.device, &stream, &mut report)?;
+    test_matmul_fp4_glu(args.device, &stream, &mut report)?;
     test_matvec_batch(args.device, &stream, &mut report)?;
 
     println!("\n== elementwise and norms ==");
@@ -626,6 +627,52 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
 /// values the MMA saw, in f64; the quantization itself is checked separately
 /// against its rounding bound. Rows and tokens that do not fill a 128 x 128
 /// tile, and 0x7F run scales (ggml's zero, the hardware's NaN), included.
+/// The fused FP4 gate/up/SwiGLU launch against two FP4 matmuls and the
+/// SwiGLU after them: the same tensor-core sums, so only the epilogue's exp
+/// may differ. 200 rows: the last 64-row tile is partial.
+fn test_matmul_fp4_glu(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    if !ops::fp4_supported() {
+        return Ok(());
+    }
+    const ROWS: usize = 200;
+    const K: usize = 512;
+    let row_bytes = K / 64 * 36;
+    for n_tokens in [100usize, 300] {
+        let mut rng = Rng::new(0x61F4_0000 + n_tokens as u64);
+        let mut wg = Vec::new();
+        let mut wu = Vec::new();
+        for _ in 0..ROWS {
+            wg.extend_from_slice(&random_blocks(&mut rng, GgmlType::NVFP4, K / 64));
+            wu.extend_from_slice(&random_blocks(&mut rng, GgmlType::NVFP4, K / 64));
+        }
+        let x = rng.floats(n_tokens * K);
+        let d_g = DeviceBuffer::<u8>::from_slice(device, &wg, stream)?;
+        let d_u = DeviceBuffer::<u8>::from_slice(device, &wu, stream)?;
+        ops::nvfp4_sanitize(d_g.as_mut_ptr(), wg.len() / 36, stream)?;
+        ops::nvfp4_sanitize(d_u.as_mut_ptr(), wu.len() / 36, stream)?;
+        let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+        let d_q = DeviceBuffer::<u8>::new(device, ops::nvfp4_act_bytes(n_tokens, K))?;
+        ops::quantize_act_nvfp4(d_x.as_ptr(), d_q.as_mut_ptr(), n_tokens, K, stream)?;
+        let (yg, yu, yf) = (DeviceBuffer::<f32>::new(device, n_tokens * ROWS)?,
+            DeviceBuffer::<f32>::new(device, n_tokens * ROWS)?, DeviceBuffer::<f32>::new(device, n_tokens * ROWS)?);
+        ops::matmul_nvfp4(d_g.as_ptr(), row_bytes, d_q.as_ptr(), yg.as_mut_ptr(), K, ROWS, n_tokens, stream)?;
+        ops::matmul_nvfp4(d_u.as_ptr(), row_bytes, d_q.as_ptr(), yu.as_mut_ptr(), K, ROWS, n_tokens, stream)?;
+        ops::matmul_nvfp4_glu(d_g.as_ptr(), d_u.as_ptr(), row_bytes, d_q.as_ptr(), yf.as_mut_ptr(), K, ROWS,
+            n_tokens, stream)?;
+        let (g, u, f) = (yg.to_vec(stream)?, yu.to_vec(stream)?, yf.to_vec(stream)?);
+        let want: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
+        // Random scales can overflow g * u on both sides; those must agree,
+        // and the error is measured over the rest.
+        let same_inf = (0..f.len()).all(|i| want[i].is_finite() == f[i].is_finite());
+        let ok: Vec<usize> = (0..f.len()).filter(|&i| want[i].is_finite()).collect();
+        let range = ok.iter().fold(0f32, |m, &i| m.max(want[i].abs())).max(1e-12);
+        let err = ok.iter().fold(0f32, |m, &i| m.max((want[i] - f[i]).abs())) / range;
+        report.case(&format!("matmul NVFP4 gate/up/SwiGLU fused, {n_tokens} tokens"),
+            format!("max error {err:.2e} of range, against unfused ({} finite)", ok.len()), same_inf && err <= 1e-5);
+    }
+    Ok(())
+}
+
 fn test_matmul_fp4(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
     if !ops::fp4_supported() {
         return Ok(());

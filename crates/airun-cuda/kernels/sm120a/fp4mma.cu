@@ -234,8 +234,13 @@ __device__ __forceinline__ void cp16(void* smem, const void* gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
 }
 
+// GLU: the tile's rows 0..63 are rows of w (an FFN gate) and 64..127 the same
+// rows of w2 (up); the block writes silu(gate) * up for its 64 rows -- the
+// SwiGLU in the epilogue. Writing gate and up out and reading both back for
+// the down projection's quantization was ~6% of a 27B prefill.
+template <bool GLU>
 __global__ __launch_bounds__(256, 1) void matmul_nvfp4_kernel(
-    const uint8_t* __restrict__ w, const size_t row_bytes,
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ w2, const size_t row_bytes,
     const block_nvfp4* __restrict__ xq, const float* __restrict__ xs,
     float* __restrict__ y, const int K, const int n_rows, const int n_tokens) {
 #ifdef AIRUN_FP4_MMA
@@ -245,7 +250,7 @@ __global__ __launch_bounds__(256, 1) void matmul_nvfp4_kernel(
     const int lane = tid % 32;
     const int g = lane >> 2;
     const int t = lane & 3;
-    const int brow = blockIdx.y * 128;
+    const int brow = blockIdx.y * (GLU ? 64 : 128);
     const int btok = blockIdx.x * 128;
     const int wrow = (warp % 2) * 64;
     const int wtok = (warp / 2) * 32;
@@ -262,9 +267,10 @@ __global__ __launch_bounds__(256, 1) void matmul_nvfp4_kernel(
             const int op = task / (128 * 9);
             const int r = (task / 9) % 128;
             const int p = task % 9;
-            const uint8_t* src = op == 0
-                ? w + (size_t)min(brow + r, n_rows - 1) * row_bytes
-                : (const uint8_t*)xq + (size_t)min(btok + r, n_tokens - 1) * x_row_bytes;
+            const uint8_t* src;
+            if (op != 0) src = (const uint8_t*)xq + (size_t)min(btok + r, n_tokens - 1) * x_row_bytes;
+            else if (GLU) src = (r < 64 ? w : w2) + (size_t)min(brow + (r & 63), n_rows - 1) * row_bytes;
+            else src = w + (size_t)min(brow + r, n_rows - 1) * row_bytes;
             cp16(base + op * 128 * FP4_ROW + r * FP4_ROW + p * 16, src + off + p * 16);
         }
         asm volatile("cp.async.commit_group;\n" ::);
@@ -314,6 +320,42 @@ __global__ __launch_bounds__(256, 1) void matmul_nvfp4_kernel(
         }
     }
 
+    if constexpr (GLU) {
+        // The up warp of each pair (odd warps: rows 64..127) hands its sums to
+        // the gate warp through shared memory, in the order both hold them.
+        __syncthreads();   // the pipeline's buffers are free now
+        float* xch = (float*)fp4_smem + (warp / 2) * (64 * 32);
+        if (warp & 1) {
+#pragma unroll
+            for (int m = 0; m < 4; ++m)
+#pragma unroll
+                for (int n = 0; n < 4; ++n)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) xch[((m * 4 + n) * 4 + i) * 32 + lane] = acc[m][n][i];
+        }
+        __syncthreads();
+        if (warp & 1) return;
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const int tok = btok + wtok + n * 8 + t * 2 + c;
+                if (tok >= n_tokens) continue;
+                const float s = xs[tok];
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int r = brow + m * 16 + g + 8 * h;
+                        const float gv = acc[m][n][h * 2 + c] * s;
+                        const float uv = xch[((m * 4 + n) * 4 + h * 2 + c) * 32 + lane] * s;
+                        if (r < n_rows) y[(size_t)tok * n_rows + r] = gv / (1.0f + __expf(-gv)) * uv;
+                    }
+                }
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
 #pragma unroll
@@ -405,9 +447,26 @@ airun_status airun_matmul_nvfp4(const void* w, uint64_t row_bytes, const void* x
     const float* scales = (const float*)((const uint8_t*)xq + (size_t)n_tokens * (k / 64) * sizeof(block_nvfp4));
     const dim3 grid((n_tokens + 127) / 128, (n_rows + 127) / 128);
     const int smem = 2 * FP4_STAGE;
-    cudaFuncSetAttribute((const void*)matmul_nvfp4_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    matmul_nvfp4_kernel<<<grid, 256, smem, stream>>>((const uint8_t*)w, (size_t)row_bytes, blocks, scales,
-                                                  (float*)y, k, n_rows, n_tokens);
+    cudaFuncSetAttribute((const void*)matmul_nvfp4_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    matmul_nvfp4_kernel<false><<<grid, 256, smem, stream>>>((const uint8_t*)w, nullptr, (size_t)row_bytes, blocks,
+                                                         scales, (float*)y, k, n_rows, n_tokens);
+    AIRUN_CHECK_LAUNCH();
+}
+
+// y = silu(w x) * (w2 x): an FFN's gate, up and SwiGLU in one launch.
+airun_status airun_matmul_nvfp4_glu(const void* w, const void* w2, uint64_t row_bytes, const void* xq, void* y,
+                                    int32_t k, int32_t n_rows, int32_t n_tokens, cudaStream_t stream) {
+    if (n_tokens <= 0 || n_rows <= 0) return AIRUN_OK;
+    if (k % 256 != 0 || row_bytes % 16 != 0 || (uintptr_t)w % 16 != 0 || (uintptr_t)w2 % 16 != 0
+        || (uintptr_t)xq % 16 != 0)
+        return (airun_status)cudaErrorInvalidValue;
+    const block_nvfp4* blocks = (const block_nvfp4*)xq;
+    const float* scales = (const float*)((const uint8_t*)xq + (size_t)n_tokens * (k / 64) * sizeof(block_nvfp4));
+    const dim3 grid((n_tokens + 127) / 128, (n_rows + 63) / 64);
+    const int smem = 2 * FP4_STAGE;
+    cudaFuncSetAttribute((const void*)matmul_nvfp4_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    matmul_nvfp4_kernel<true><<<grid, 256, smem, stream>>>((const uint8_t*)w, (const uint8_t*)w2, (size_t)row_bytes,
+                                                        blocks, scales, (float*)y, k, n_rows, n_tokens);
     AIRUN_CHECK_LAUNCH();
 }
 

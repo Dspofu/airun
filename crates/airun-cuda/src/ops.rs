@@ -22,6 +22,8 @@ unsafe extern "C" {
         stream: ffi::Stream) -> Status;
     fn airun_quantize_glu_nvfp4(gate: *const c_void, up: *const c_void, out: *mut c_void, n_tokens: i32,
         k: i32, stream: ffi::Stream) -> Status;
+    fn airun_matmul_nvfp4_glu(w: *const c_void, w2: *const c_void, row_bytes: u64, xq: *const c_void,
+        y: *mut c_void, k: i32, n_rows: i32, n_tokens: i32, stream: ffi::Stream) -> Status;
     fn airun_matmul_nvfp4(w: *const c_void, row_bytes: u64, xq: *const c_void, y: *mut c_void,
         k: i32, n_rows: i32, n_tokens: i32, stream: ffi::Stream) -> Status;
     fn airun_nvfp4_sanitize(w: *mut c_void, n_blocks: i64, stream: ffi::Stream) -> Status;
@@ -484,6 +486,28 @@ pub fn matmul_nvfp4(w: *const c_void, row_bytes: usize, xq: *const c_void, y: *m
     #[cfg(not(airun_cuda))]
     {
         let _ = (w, xq, y, n_rows, n_tokens, stream);
+        Err(CudaError::NotBuiltWithCuda)
+    }
+}
+
+/// `y[t][row] = silu(Wg[row] . x[t]) * (Wu[row] . x[t])` on the FP4 tensor
+/// cores: an FFN's gate, up and SwiGLU in one launch ([`matmul_nvfp4`] rules).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_nvfp4_glu(wg: *const c_void, wu: *const c_void, row_bytes: usize, xq: *const c_void, y: *mut c_void,
+    k: usize, n_rows: usize, n_tokens: usize, stream: &Stream) -> Result<()> {
+    if k % 256 != 0 || row_bytes != k / 64 * 36 {
+        return Err(bad_arg(format!("NVFP4 matmul: K {k} must divide by 256 and rows be {} bytes", k / 64 * 36)));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: wg and wu hold n_rows rows of row_bytes; xq the quantized
+    // n_tokens rows; y n_tokens * n_rows floats.
+    unsafe {
+        ffi::check(airun_matmul_nvfp4_glu(wg, wu, row_bytes as u64, xq, y, k as i32, n_rows as i32,
+            n_tokens as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (wg, wu, xq, y, n_rows, n_tokens, stream);
         Err(CudaError::NotBuiltWithCuda)
     }
 }

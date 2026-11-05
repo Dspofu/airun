@@ -1805,6 +1805,18 @@ impl Runtime {
                         ops::matvec_q8_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
                             st.q8act.buf.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, n,
                             gate.row_bytes, stream)?;
+                    } else if no_scale && same_shape(&[gate, up]) && fp4_prefill(gate, n, &st.q8act)
+                        && fp4_prefill(down, n, &st.q8act) && !fp4_glu_disabled() {
+                        // Gate, up and SwiGLU in one FP4 launch (silu(g) * u in
+                        // its epilogue); the down projection quantizes that.
+                        let buf = st.q8act.fp4.as_ref().expect("checked by fp4_prefill");
+                        st.q8act.valid.set(false);
+                        st.q8act.fp4_valid.set(false);
+                        ops::quantize_act_nvfp4(st.xb.as_ptr(), buf.as_mut_ptr(), n, gate.k, stream)?;
+                        ops::matmul_nvfp4_glu(gate.ptr(), up.ptr(), gate.row_bytes, buf.as_ptr(),
+                            st.gate.as_mut_ptr(), gate.k, gate.rows, n, stream)?;
+                        matvec(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
+                        down_done = true;
                     } else if fp4_prefill(gate, n, &st.q8act) && fp4_prefill(down, n, &st.q8act) {
                         // The SwiGLU goes into the down projection's quantization.
                         matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
@@ -3067,6 +3079,13 @@ fn copy_rows(dst: &DeviceBuffer<f32>, src: &DeviceBuffer<f32>, len: usize, strea
 /// build that have them (see ops::fp4_supported; AIRUN_NO_FP4=1 opts out).
 /// The activation is then 4-bit, as in llama.cpp's Blackwell path; decode and
 /// small batches keep 8-bit activations.
+/// AIRUN_NO_FP4_GLU=1 runs an NVFP4 FFN's gate and up as two FP4 matmuls with
+/// the SwiGLU in the down projection's quantization, as before the fused one.
+fn fp4_glu_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("AIRUN_NO_FP4_GLU").is_ok_and(|v| v.trim() != "0"))
+}
+
 fn fp4_prefill(w: &GpuTensor, n: usize, q8: &QAct) -> bool {
     n >= 32 && q8.fp4.is_some() && w.kernel_type().0 == 40 && w.k % 256 == 0 && !matvec_f32_forced()
 }

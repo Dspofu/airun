@@ -148,7 +148,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=airun_kernels");
     println!("cargo:rustc-link-lib=static=airun_fp4");
 
-    // Where cudart lives: libd on Windows; lib64, or the targets/ tree of
+    // Where cudart lives: lib/x64 on Windows; lib64, or the targets/ tree of
     // a distribution package, on Linux.
     for dir in [cuda.join("lib").join("x64"), cuda.join("lib64"), cuda.join("targets").join("x86_64-linux").join("lib"),
         cuda.join("lib")] {
