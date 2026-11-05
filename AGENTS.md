@@ -805,3 +805,19 @@ dp4a (decode), com o mesmo resultado; `fp4_supported()` decide por GPU
 - **Decode GQA lê V direto do cache f16** (sem passar pela memória
   compartilhada): 128k, 27B em 5060 Ti + 3060, 12,4 -> 13,4 tok/s. O
   limite agora é a ocupação: o tile de K deixa 4 warps por SM.
+
+## Onde o tempo vai (2026-11-05, Nsight Systems 2026.3)
+
+O `nsys` em `C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.3.2\target-windows-x64\`
+perfila as RTX 50 (o Nsight Compute 2022.4 não). Decode só aparece kernel a
+kernel com `AIRUN_NO_GRAPH=1 AIRUN_NO_DECODE_PIPELINE=1`.
+`nsys profile -t cuda -o x airun.exe bench ...` e depois
+`nsys stats -r cuda_gpu_kern_sum -f csv -o x x.nsys-rep`.
+
+27B NVFP4, uma 5060 Ti:
+- **Decode:** `matvec_q8_wide<NVFP4>` 83% (~388 GB/s, 87% da banda), cabeça
+  de saída Q5_K 5% (~95% da banda), delta-net 2%, atenção 1,3% a 1k. Já está
+  no limite da memória; só ler menos bytes ajuda (MTP, KV/pesos menores).
+- **Prefill:** `matmul_nvfp4` 57% (~190 TFLOPS, metade do pico FP4),
+  `delta_rule_reg` 19% (recorrência token a token), quantização das
+  ativações para FP4 8%, `add_rmsnorm` 4%, atenção 2% a 2k.
