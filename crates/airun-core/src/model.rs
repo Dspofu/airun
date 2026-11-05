@@ -681,7 +681,7 @@ impl Model {
         // whose header and tensors disagree would otherwise produce garbage.
         validate_shapes(&config, &layers, &token_embd)?;
 
-        let mtp = if load_mtp && mtp_supported(&config) {
+        let mtp = if load_mtp && mtp_supported(gguf.as_ref(), &config) {
             let m = load_mtp_weights(gguf, &config, out_dev, stream_for(out_dev)?)?;
             total_bytes += layer_bytes(&m.layer) + m.eh_proj.bytes() as u64;
             Some(m)
@@ -791,8 +791,20 @@ fn tensor_info<'a>(gguf: &'a GgufFile, name: &str, arch: &str) -> Result<&'a Ten
 /// Whether this file's MTP head is one the runtime can draft with: a single
 /// head whose block is attention with a dense feed-forward (Qwen3.5/3.8
 /// dense). The MoE heads of the A3B models are not wired up yet.
-pub fn mtp_supported(config: &Config) -> bool {
-    config.nextn_predict_layers == 1 && config.moe.is_none() && config.is_hybrid()
+/// A file runs MTP speculative decoding when it declares exactly one draft
+/// head (`nextn_predict_layers == 1`), the head is a layer the runtime can
+/// execute (a hybrid block — dense hybrids and MoE hybrids both qualify), and
+/// the head's tensors are actually present in the file. That last check
+/// matters: some converters keep the `nextn_predict_layers` metadata while
+/// stripping the head weights (block_count == n_layer, no `nextn.*` tensors),
+/// and loading would then fail on a missing `blk.{n_layer}` tensor. The
+/// `nextn.eh_proj` input projection is the head's signature tensor.
+pub fn mtp_supported(gguf: &GgufFile, config: &Config) -> bool {
+    config.nextn_predict_layers == 1
+        && config.is_hybrid()
+        && gguf
+            .tensor(&format!("blk.{}.nextn.eh_proj.weight", config.n_layers))
+            .is_some()
 }
 
 fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &Stream) -> Result<MtpWeights> {

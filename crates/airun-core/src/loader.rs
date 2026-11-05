@@ -100,7 +100,7 @@ pub fn load(
     if let Some(t) = config.ple.as_ref().and_then(|_| gguf.tensor("per_layer_token_embd.weight")) {
         sizes.other = sizes.other.saturating_sub(t.nbytes);
     }
-    let load_mtp = opts.draft > 0 && crate::model::mtp_supported(&config);
+    let load_mtp = opts.draft > 0 && crate::model::mtp_supported(gguf.as_ref(), &config);
     if opts.draft > 0 && !load_mtp {
         let reason = if config.nextn_predict_layers == 0 {
             "the file has no MTP head"
