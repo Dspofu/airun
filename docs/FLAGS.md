@@ -23,7 +23,7 @@ Estas são as flags que decidem **o que vai para qual GPU**.
 
 | Flag | Padrão | O que faz |
 |---|---|---|
-| `-c`, `--ctx-size <N>` | `4096` | Tamanho do contexto em tokens. É o principal controle de VRAM: o KV cache cresce linearmente com ele. Limitado ao contexto de treino do modelo. |
+| `-c`, `--ctx-size <N>` | automático | Tamanho do contexto em tokens. É o principal controle de VRAM: o KV cache cresce linearmente com ele. Limitado ao contexto de treino do modelo. Sem a flag, `run` e `serve` usam o maior contexto que as GPUs comportam com todos os pesos na VRAM (no mínimo 4096), nas GPUs que o modelo precisa a 4096 — um modelo que cabe numa placa não é espalhado em duas só por contexto. Se os pesos nem cabem (MoE com experts em RAM), fica 4096. `bench` e `perplexity` usam 4096. |
 | `-b`, `--batch-size <N>` | `512` | Tokens por forward pass durante a ingestão do prompt. Maior = prefill mais rápido, mais VRAM de scratch. Não afeta a geração. |
 | `--gpus <lista>` | todas | Ordinais CUDA a usar, ex.: `--gpus 0,1`. **Atenção:** ordinal CUDA não é o índice do `nvidia-smi`. Rode `airun gpu` para ver a correspondência. |
 | `--tensor-split <fracoes>` | — | Proporção manual de camadas por GPU, ex.: `--tensor-split 0.7,0.3`. Uma entrada por GPU selecionada. Desliga o modo automático. |
@@ -35,7 +35,10 @@ Estas são as flags que decidem **o que vai para qual GPU**.
 | `--kv-type <tipo>` | `f16` | Formato do KV cache: `f16`, `q8_0` ou `q4_0`. Os quantizados cabem 2x e 3,6x mais contexto na mesma VRAM; no 35B custam +0,001 (q8_0) e +0,02 (q4_0) nats de perda. Vale também para `perplexity`. |
 | `--expert-cache <N>` | todos | Só MoE: mantém N experts por camada na VRAM e lê os demais do GGUF sob demanda, sem requantizar. Resultado idêntico ao modelo residente; a velocidade depende da taxa de acerto e do disco. Vale também para `perplexity`. |
 | *(automático)* | todos | MoE que não cabe nas GPUs sem `--expert-cache`: o airun escolhe quantos experts por camada ficam na VRAM (mede o link PCIe de cada GPU; GPU de link lento recebe só camadas inteiras) e põe o resto em RAM fixada, lida pela GPU. `AIRUN_EXPERTS=stream` volta à leitura do GGUF. |
-| `--draft <N>` | `run`: `3` · `serve`: `0` | Decodificação especulativa com a cabeça MTP do próprio modelo (Qwen3.5/3.8 densos): N tokens rascunhados por passo, verificados de uma vez. Só com amostragem gulosa pura (`--temp 0` e nenhuma penalidade — o `--repeat-penalty 1.1` padrão desliga; passe `--repeat-penalty 1.0`); o texto é idêntico ao do decode normal. `0` desliga e não carrega a cabeça (~240 MB a menos). Quando o `--draft` é pedido mas a geração não vai especular (amostragem não gulosa, ou arquivo sem cabeça MTP utilizável — as cabeças MoE ainda não estão ligadas), o airun imprime uma `note:` explicando o porquê. |
+| `--mtp <arquivo>` | — | A cabeça MTP num arquivo próprio (`mtp-<nome>.gguf`, como o `convert_hf_to_gguf.py --mtp` do llama.cpp grava ao lado de um modelo convertido com `--no-mtp`). Sem a flag, um modelo sem cabeça procura um `mtp-*.gguf` do mesmo modelo na pasta dele (arquitetura, largura, vocabulário e profundidade conferidos). As cópias de embedding/saída do arquivo não são carregadas: a cabeça usa as do modelo. No 27B: texto idêntico ao do arquivo único, mesma velocidade. |
+| `--mmproj <arquivo>` | — | O codificador de visão (`mmproj-*.gguf`) que deixa o modelo ver imagens. Hoje: o projetor `qwen3vl_merger` (Qwen3.5/3.8). Roda numa GPU (a com mais memória livre depois do modelo); a VRAM dele (pesos + a maior imagem) é reservada antes do plano, então o contexto automático já desconta. |
+| `--image-max-tokens <N>` | `1024` | Máximo de tokens por imagem (cada um cobre 32 x 32 pixels; imagens maiores são reduzidas). O llama.cpp aceita até 4096: mais tokens leem detalhes menores e pedem mais VRAM. |
+| `--draft <N>` | `run`: `3` em densos, desligado em MoE · `serve`: `0` | Decodificação especulativa com a cabeça MTP do próprio modelo (Qwen3.5/3.8, densos e MoE): N tokens rascunhados por passo, verificados de uma vez. Só com amostragem gulosa pura (`--temp 0` e nenhuma penalidade — o `--repeat-penalty 1.1` padrão desliga; passe `--repeat-penalty 1.0`). O texto segue o decode normal, mas não é garantidamente idêntico: o verify soma em outra ordem, e num quase-empate o argmax pode virar. No 27B denso numa 5060 Ti: 26 → 68 tok/s. Nos MoE fica desligado por padrão porque mediu mais lento (35B-A3B: 115 → 91 tok/s; verificar 4 tokens acorda muito mais experts); `--draft 3` liga. `0` desliga e não carrega a cabeça. Quando o `--draft` é pedido mas a geração não vai especular, o airun imprime uma `note:` explicando o porquê. |
 | *(automático)* | MoE com experts em RAM | Perfil de roteamento: a airun conta quais experts cada camada usa e grava em `%LOCALAPPDATA%\airun\profiles\` (ou `~/.cache/airun/profiles/`); na carga seguinte os mais usados já começam na VRAM. `AIRUN_EXPERT_PROFILE=<arquivo>` muda o lugar, `AIRUN_EXPERT_PROFILE=off` desliga. |
 | *(automático)* | MoE com experts em RAM | No decode, os experts que faltam na VRAM são copiados num stream paralelo enquanto os residentes calculam. `AIRUN_MOE_OVERLAP=0` volta a um stream só. |
 | *(automático)* | MoE, sm_80+ | Lotes de 64+ tokens (prompt) calculam os experts em tensor cores (fp16, acumulação f32). `AIRUN_MOE_MMA=0` volta aos kernels f32. |
@@ -50,11 +53,17 @@ Sem `--tensor-split` nem `--single-gpu`, o planner:
 3. **Se couber numa GPU só, usa uma GPU só** — a principal (`--main-gpu`, ou
    a mais rápida), mesmo havendo outras livres. Atravessar PCIe custa mais do
    que a segunda placa ganha, especialmente sem P2P.
-4. Se não couber, enche a principal primeiro e passa à seguinte só o que
-   sobrar, em faixas contíguas de camadas. No decode as placas trabalham uma
-   depois da outra, então uma camada numa placa com metade da banda custa o
-   dobro. Com o 27B numa 5070 Ti + 5060 Ti, trocar a divisão pela VRAM livre
-   (metade em cada) por esta levou o decode de 33,7 para 43,0 tok/s. Em
+4. Se não couber, depende de as GPUs serem iguais ou não (pela nota de
+   desempenho de cada uma; até 10% de diferença conta como igual):
+   - **GPUs diferentes:** enche a mais rápida primeiro e passa à seguinte só o
+     que sobrar, em faixas contíguas de camadas. No decode as placas trabalham
+     uma depois da outra, então uma camada numa placa com metade da banda custa
+     o dobro. Com o 27B numa 5070 Ti + 5060 Ti, trocar a divisão pela VRAM
+     livre (metade em cada) por esta levou o decode de 33,7 para 43,0 tok/s.
+   - **GPUs iguais:** divide as camadas por igual. No decode dá no mesmo (as
+     camadas custam igual em qualquer uma), e no prefill as duas trabalham em
+     paralelo: 27B em 2× 5060 Ti, prompt de 4096 de 1769 para 3353 t/s, decode
+     igual (26,4). Em
    `--alloc auto` uma GPU que não é necessária fica de fora; em `memory`
    todas as de `--gpus` recebem camadas.
 5. Se nem todas as GPUs juntas comportam o modelo:
@@ -121,6 +130,21 @@ temperatura antes mudaria o que o top-p seleciona, e rodar top-p antes do top-k
 tornaria o top-k inócuo. Todo filtro preserva **pelo menos um** candidato — um
 filtro que esvazia o conjunto vira uma troca silenciosa de amostrador.
 
+### Imagens
+
+| Flag | Padrão | Descrição |
+|---|---|---|
+| `--image <arquivo>` | — | Uma imagem (PNG, JPEG ou WebP) para o prompt; repita para várias. Precisa de `--mmproj`. Ponha `<__media__>` no prompt onde cada uma vai; sem marcador, elas vão antes do texto. |
+
+```powershell
+airun run modelo.gguf --mmproj mmproj-BF16.gguf --image foto.jpg -p "O que tem nesta imagem?" --temp 0
+```
+
+O redimensionamento, a ordem dos patches, a RoPE 2D do codificador e as
+posições M-RoPE do texto seguem o `tools/mtmd` do llama.cpp; a mesma imagem
+gera a mesma descrição. Com imagem no prompt o MTP fica desligado naquela
+geração.
+
 ### Saída
 
 | Flag | Padrão | O que faz |
@@ -157,7 +181,7 @@ não há flags de servidor para eles.
 | `--host <ip>` | `127.0.0.1` | Endereço de bind. Use `0.0.0.0` para expor na rede. |
 | `--port <N>` | `8080` | Porta. |
 | `--api-key <chave>` | — | Exige `Authorization: Bearer <chave>`. Também lida da variável `AIRUN_API_KEY`. **Sem esta flag não há autenticação nenhuma** — não use `--host 0.0.0.0` sem ela. |
-| `--served-model-name <nome>` (ou `--alias`) | nome do arquivo | Nome reportado em `/v1/models`. |
+| `--served-model-name <nome>` (ou `--alias`) | `general.name` do GGUF | Nome reportado em `/v1/models`. Sem a flag, vem dos metadados do arquivo (`general.name`, ou `general.basename` quando o nome é um marcador vazio como "model"); sem nenhum dos dois, o nome do arquivo. |
 | `--default-max-tokens <N>` | `512` | Limite das requisições OpenAI que não especificam um. O `/completion` nativo gera até o fim, como o llama-server. |
 | `--reasoning-format <deepseek\|none>` | `deepseek` | Onde vai o pensamento (`<think>`) das respostas de chat: em `reasoning_content` (padrão do llama-server) ou no `content`. O `reasoning_format` da requisição tem prioridade. |
 | `--repeat-penalty <f>` | `1.1` | Penalidade multiplicativa em tokens recentes quando a requisição não pede uma. `1.0` desliga. |
@@ -205,6 +229,16 @@ prompt 884 tok (869 cached, 15 new)  prefill 1285 ms (11.7 tok/s)  decode 1 tok 
 | `/v1/models` | GET | Requer autenticação. |
 | `/v1/chat/completions` | POST | Suporta `stream: true` (SSE). |
 | `/v1/completions` | POST | Suporta `stream: true` (SSE). |
+| `/v1/stream/{id}?from=N` | GET | Stream replay (como o llama-server): relê os bytes SSE de uma geração feita com o cabeçalho `X-Conversation-Id: {id}` a partir do byte N, e segue ao vivo até ela acabar. A geração continua mesmo se o cliente cair (aba fechada, rede); guarda os últimos 4 MiB e expira 5 min depois de terminar. |
+| `/v1/streams/lookup` | POST | `{"conversation_ids": [...]}`: estado das sessões desses ids (`is_done`, `total_bytes`, ...). Só responde por ids que o cliente já conhece. |
+| `/v1/stream/{id}` | DELETE | O "parar" do usuário: cancela a geração (aqui a GPU para também; no llama-server ela termina sozinha) e descarta o buffer. 204 sempre. |
+
+**Imagens (com `--mmproj`):** partes `image_url` (OpenAI, `{"url": "data:image/png;base64,..."}`),
+`input_image` (Responses), blocos `image` com fonte base64 (Anthropic) e
+`multimodal_data` (lista de base64 para os `<__media__>` do prompt do
+`/completion`). URLs http(s) não são baixadas pelo servidor: mande a imagem
+inline. A mesma imagem nos turnos seguintes de um chat não roda o
+codificador de novo e vem do cache.
 
 Campos aceitos: `messages`, `prompt`, `max_tokens`, `max_completion_tokens`,
 `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `top_n_sigma`, `seed`,
@@ -396,8 +430,7 @@ kernel.**
 Existem porque várias ambiguidades de layout produzem tensores da **mesma
 forma**: nenhuma validação as distingue, só a saída do modelo. Cada uma liga a
 interpretação alternativa; meça a diferença com `airun perplexity`, não olhando
-o texto gerado. Todas as escolhas atuais foram medidas de novo depois da correção de 2026-09-26 e são as melhores —
-veja a tabela em `tasks.md`.
+o texto gerado. Todas as escolhas atuais foram medidas de novo depois da correção de 2026-09-26 e são as melhores.
 
 | Variável | Interpretação alternativa que liga |
 |---|---|

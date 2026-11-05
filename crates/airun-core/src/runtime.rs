@@ -256,6 +256,12 @@ struct DeviceState {
     positions: DeviceBuffer<i32>,
     tokens: DeviceBuffer<i32>,
     logits: Option<DeviceBuffer<f32>>,
+    /// What the text's rotation positions lag its KV slots by: the positions
+    /// images saved (see RopeParams::shift). One i32, read by the kernels, so
+    /// captured graphs follow it.
+    rope_shift: DeviceBuffer<i32>,
+    /// An image chunk's (t, row, col) rotation positions, [3][batch].
+    mpos: DeviceBuffer<i32>,
 
     /// Activation quantized to 8-bit groups, plus whether its contents match
     /// the input of the current matvec group. Sized for the widest matvec
@@ -319,6 +325,19 @@ pub struct Runtime {
     skip_logits: bool,
     /// The MTP draft head's state, once speculative decoding has run.
     spec: Option<spec::Spec>,
+    /// Images a prompt may name by their sentinel ids (see [`ImageInput`]).
+    images: Vec<std::sync::Arc<ImageInput>>,
+    /// While an image chunk runs: its row count, so RoPE reads the chunk's
+    /// (t, row, col) positions; and that its embeddings are already in place
+    /// of the token lookup.
+    image_rows: Option<usize>,
+    embeds_ready: bool,
+    /// Rotation positions the cached images saved (each takes max(rows,
+    /// cols) positions for rows * cols slots): the text's position is its slot
+    /// minus this. Mirrored into every shard's `rope_shift`.
+    rope_shift: i32,
+    /// (first slot, slots, shift before it) of every cached image, to rewind.
+    image_spans: Vec<(usize, usize, i32)>,
     /// Drafts per speculative step (see `set_draft`); 0 decodes plainly.
     draft: usize,
     /// Forward passes since the mapped experts were last rebalanced.
@@ -403,6 +422,7 @@ impl Runtime {
             let dev = shard.device;
             device::set_device(dev)?;
             let stream = Stream::new(dev)?;
+            let rope_shift = DeviceBuffer::zeroed(dev, 1, &stream)?;
 
             let mut layer_states = Vec::with_capacity(shard.layers.len());
             for &l in &shard.layers {
@@ -605,6 +625,8 @@ impl Runtime {
                 up: DeviceBuffer::new(dev, b * ffn_width.max(1))?,
                 positions: DeviceBuffer::new(dev, b)?,
                 tokens: DeviceBuffer::new(dev, b)?,
+                rope_shift,
+                mpos: DeviceBuffer::new(dev, 3 * b)?,
                 logits: if shard.hosts_output {
                     Some(DeviceBuffer::new(dev, cfg.vocab_size)?)
                 } else {
@@ -652,6 +674,11 @@ impl Runtime {
             defer: false,
             skip_logits: false,
             spec: None,
+            images: Vec::new(),
+            image_rows: None,
+            embeds_ready: false,
+            rope_shift: 0,
+            image_spans: Vec::new(),
             draft: 0,
             since_rebalance: 0,
             rebalances: 0,
@@ -684,6 +711,12 @@ impl Runtime {
         (stream.0 + mh, stream.1 + mm)
     }
 
+    /// Tokens per forward pass this runtime was built for, which the planner
+    /// may have lowered from the batch asked for.
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
     pub fn n_past(&self) -> usize {
         self.n_past
     }
@@ -697,6 +730,8 @@ impl Runtime {
     pub fn reset(&mut self) {
         self.n_past = 0;
         self.history.clear();
+        self.image_spans.clear();
+        let _ = self.set_rope_shift(0);
         for st in &self.states {
             if device::set_device(st.device).is_err() {
                 continue;
@@ -720,6 +755,10 @@ impl Runtime {
     /// back, so a conversation resumes without replaying its prompt --
     /// llama-server's slot save and restore.
     pub fn save_state(&self) -> Result<Vec<u8>> {
+        if !self.image_spans.is_empty() {
+            return Err(CoreError::Other(
+                "a conversation holding images cannot be saved yet; send the images again after a restore".into()));
+        }
         let mut out = Vec::new();
         out.extend_from_slice(STATE_MAGIC);
         for v in self.state_fingerprint() {
@@ -1330,7 +1369,7 @@ impl Runtime {
             // With hyper-connections the embedding lands in xb and is copied
             // into every stream.
             let dst = if cfg.hc.is_some() { st.xb.as_mut_ptr() } else { st.x.as_mut_ptr() };
-            ops::embed(
+            if !self.embeds_ready { ops::embed(
                 embd.kernel_type(),
                 dst,
                 self.model.embedding_ptr(st.device)?,
@@ -1341,6 +1380,11 @@ impl Runtime {
                 embd.rows,
                 &st.stream,
             )?;
+            // An NVFP4 table with a global-scale sidecar: the gathered rows
+            // are its stored magnitude until scaled.
+            if embd.global_scale != 1.0 {
+                ops::scale(dst, embd.global_scale, n * cfg.n_embd, &st.stream)?;
+            } }
             if let Some(h) = &cfg.hc {
                 hc::hc_expand(st.x.as_mut_ptr(), st.xb.as_ptr(), n, h.count, cfg.n_embd, &st.stream)?;
             }
@@ -1445,6 +1489,161 @@ impl Runtime {
     ///
     /// One token is always left to replay, because the logits come out of a
     /// forward pass and a prompt entirely in cache would produce none.
+    /// The RoPE parameters shard `si` runs with: the model's, positioned by
+    /// the shard's shift and, during an image chunk, its 3D positions.
+    fn rope_for(&self, si: usize, cfg: &Config) -> ops::RopeParams {
+        let st = &self.states[si];
+        cfg.rope.positioned(st.rope_shift.as_ptr() as u64, self.image_rows.map(|n| (st.mpos.as_ptr() as u64, n)))
+    }
+
+    fn set_rope_shift(&mut self, shift: i32) -> Result<()> {
+        self.rope_shift = shift;
+        for st in &mut self.states {
+            device::set_device(st.device)?;
+            st.rope_shift.copy_from_host(&[shift], &st.stream)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this model can take image embeddings: its RoPE has the M-RoPE
+    /// sections that place an image's rows and columns.
+    pub fn takes_images(&self) -> bool {
+        self.model.config.rope.sections.iter().any(|&s| s > 0)
+    }
+
+    /// Registers an image's embeddings (`nx * ny` rows of `n_embd`, row-major
+    /// over the merged patch grid) and returns the sentinel ids a prompt
+    /// carries in its place, between the model's vision start and end tokens.
+    /// The ids come from the embeddings' hash, so the same image in the next
+    /// turn of a chat is recognized in the cache and not run again.
+    pub fn register_image(&mut self, embeds: Vec<f32>, nx: usize, ny: usize) -> Result<Vec<u32>> {
+        let n_embd = self.model.config.n_embd;
+        if embeds.len() != nx * ny * n_embd {
+            return Err(CoreError::Other(format!(
+                "image embeddings of {} floats do not make {nx} x {ny} rows of {n_embd}; the mmproj file does not \
+                 belong to this model (its projection width must equal the model's)", embeds.len())));
+        }
+        if !self.takes_images() {
+            return Err(CoreError::Other(format!(
+                "{} has no M-RoPE sections (rope.dimension_sections), so it cannot place image tokens; use the \
+                 vision model's own GGUF", self.model.config.arch_name)));
+        }
+        let mut h: u64 = 0xcbf29ce484222325;
+        for v in &embeds {
+            for b in v.to_bits().to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        let ids: Vec<u32> = (0..(nx * ny) as u64)
+            .map(|i| IMAGE_TOKEN_BASE | ((h ^ i.wrapping_mul(0x9E3779B97F4A7C15)) as u32 & !IMAGE_TOKEN_BASE))
+            .collect();
+        if !self.images.iter().any(|im| im.ids == ids) {
+            self.images.push(std::sync::Arc::new(ImageInput { ids: ids.clone(), embeds, nx, ny }));
+            // Keep the recent ones: a chat names the same few images turn after turn.
+            if self.images.len() > 16 {
+                self.images.remove(0);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Whether the image these ids stand for is still registered.
+    pub fn has_image(&self, ids: &[u32]) -> bool {
+        self.images.iter().any(|im| im.ids == ids)
+    }
+
+    /// Runs `prompt[from..]` up to the end of its last image (text in chunks,
+    /// images through [`Self::prefill_image`]) and returns where it stopped;
+    /// `from` itself when the rest has no image.
+    fn prefill_images(&mut self, prompt: &[u32], from: usize) -> Result<usize> {
+        let Some(last) = prompt.iter().rposition(|&t| is_image_token(t)) else { return Ok(from) };
+        let end = last + 1;
+        let mut done = from;
+        while done < end {
+            if is_image_token(prompt[done]) {
+                let run = prompt[done..].iter().take_while(|&&t| is_image_token(t)).count();
+                let ids = &prompt[done..done + run];
+                let img = self.images.iter().find(|im| im.ids.as_slice() == ids).cloned().ok_or_else(||
+                    CoreError::Other("the prompt names an image that is not registered (register_image)".into()))?;
+                self.prefill_image(&img)?;
+                done += run;
+            } else {
+                let text = prompt[done..end].iter().take_while(|&&t| !is_image_token(t)).count();
+                let mut i = 0;
+                while i < text {
+                    let take = (text - i).min(self.max_batch);
+                    self.step(&prompt[done + i..done + i + take])?;
+                    i += take;
+                }
+                done += text;
+            }
+        }
+        Ok(done)
+    }
+
+    /// Where a cached prefix may end: not inside an image.
+    fn image_safe_prefix(prompt: &[u32], cached: usize) -> usize {
+        let mut c = cached;
+        while c > 0 && c < prompt.len() && is_image_token(prompt[c]) && is_image_token(prompt[c - 1]) {
+            c -= 1;
+        }
+        c
+    }
+
+    /// Runs an image's embeddings at the next cache slots. Its tokens rotate
+    /// by (t, t + row, t + col), t the next text position, as Qwen-VL places
+    /// them; the text after it continues at t + max(rows, cols).
+    fn prefill_image(&mut self, img: &ImageInput) -> Result<()> {
+        let n = img.nx * img.ny;
+        let n_embd = self.model.config.n_embd;
+        if self.n_past + n > self.ctx {
+            return Err(CoreError::Other(format!(
+                "the image's {n} tokens do not fit: the conversation would reach {} of a {} context; raise \
+                 --ctx-size or send a smaller image", self.n_past + n, self.ctx)));
+        }
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+        let start_slot = self.n_past;
+        let before = self.rope_shift;
+        let t0 = self.n_past as i32 - self.rope_shift;
+        let mut i0 = 0;
+        while i0 < n {
+            let len = (n - i0).min(self.max_batch);
+            let mut mpos = vec![0i32; 3 * len];
+            for i in 0..len {
+                let g = i0 + i;
+                mpos[i] = t0;
+                mpos[len + i] = t0 + (g / img.nx) as i32;
+                mpos[2 * len + i] = t0 + (g % img.nx) as i32;
+            }
+            for st in &self.states {
+                device::set_device(st.device)?;
+                st.mpos.copy_from_host_at(0, &mpos, &st.stream)?;
+            }
+            {
+                let st = &self.states[0];
+                device::set_device(st.device)?;
+                let dst = if self.model.config.hc.is_some() { &st.xb } else { &st.x };
+                dst.copy_from_host_at(0, &img.embeds[i0 * n_embd..(i0 + len) * n_embd], &st.stream)?;
+            }
+            let positions: Vec<i32> = (0..len).map(|i| (self.n_past + i) as i32).collect();
+            let ids = vec![0i32; len];
+            self.embeds_ready = true;
+            self.image_rows = Some(len);
+            let r = self.queue_forward(&ids, &positions);
+            self.embeds_ready = false;
+            self.image_rows = None;
+            r?;
+            self.n_past += len;
+            self.history.extend_from_slice(&img.ids[i0..i0 + len]);
+            self.rebalance_experts()?;
+            i0 += len;
+        }
+        self.image_spans.push((start_slot, n, before));
+        self.set_rope_shift(before + n as i32 - img.nx.max(img.ny) as i32)
+    }
+
     pub fn reusable_prefix(&self, tokens: &[u32]) -> usize {
         let limit = tokens.len().saturating_sub(1);
         let common = self
@@ -1474,6 +1673,20 @@ impl Runtime {
             !self.model.config.is_hybrid() || n == self.history.len(),
             "a hybrid's recurrent state cannot be rewound to an arbitrary point"
         );
+        // An image is all or nothing: a cut inside one drops it whole.
+        let mut n = n;
+        while let Some(&(start, len, before)) = self.image_spans.last() {
+            if start + len <= n {
+                break;
+            }
+            n = n.min(start);
+            self.image_spans.pop();
+            let _ = self.set_rope_shift(before);
+        }
+        if n == 0 {
+            self.reset();
+            return;
+        }
         self.n_past = n;
         self.history.truncate(n);
     }
@@ -1841,8 +2054,10 @@ impl Runtime {
         let stream = &st.stream;
 
         // Decode runs q, k and v as one launch (same f32 kernel, same result).
+        // matvec3 writes q, k and v with no epilogue, so a global scale
+        // (NVFP4 sidecar) sends them through matvec, which applies it.
         let fused_qkv = n == 1 && !cfg.attn_output_gate && same_shape(&[&a.q, &a.k, &a.v])
-            && !q8_decode(&a.q);
+            && !q8_decode(&a.q) && [&a.q, &a.k, &a.v].iter().all(|t| t.global_scale == 1.0);
         if cfg.attn_output_gate {
             // The q projection packs a gate next to each head's queries; they
             // interleave per head rather than sitting in two blocks.
@@ -1925,7 +2140,7 @@ impl Runtime {
                 a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
                 kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.as_ptr(),
                 n, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
-                (!rope_off).then_some((rope_dim, cfg.rope, rope_interleaved)),
+                (!rope_off).then_some((rope_dim, self.rope_for(si, cfg), rope_interleaved)),
                 cfg.kv_type, stream,
             )?;
         } else {
@@ -1962,7 +2177,7 @@ impl Runtime {
                     cfg.n_head,
                     cfg.head_dim,
                     rope_dim,
-                    cfg.rope,
+                    self.rope_for(si, cfg),
                     rope_interleaved,
                     stream,
                 )?;
@@ -1973,7 +2188,7 @@ impl Runtime {
                     cfg.n_head_kv,
                     cfg.head_dim,
                     rope_dim,
-                    cfg.rope,
+                    self.rope_for(si, cfg),
                     rope_interleaved,
                     stream,
                 )?;
@@ -2500,7 +2715,8 @@ impl Runtime {
                  frequency penalties; --repeat-penalty 1.0)."
             );
         }
-        if sampler.is_pure_greedy() && !gpu_argmax_disabled() && self.speculates() {
+        let has_images = prompt.iter().any(|&t| is_image_token(t));
+        if sampler.is_pure_greedy() && !gpu_argmax_disabled() && self.speculates() && !has_images {
             return self.generate_spec(prompt, max_tokens, &mut on_token);
         }
         let start = std::time::Instant::now();
@@ -2509,8 +2725,10 @@ impl Runtime {
         // request repeats the whole transcript and appends one turn, so this is
         // the difference between replaying thousands of tokens per message and
         // replaying the last few.
-        let cached = self.reusable_prefix(prompt);
+        let cached = Self::image_safe_prefix(prompt, self.reusable_prefix(prompt));
         self.rewind_to(cached);
+        let cached = self.n_past.min(cached);
+        let cached = self.prefill_images(prompt, cached)?;
 
         // Greedy decoding picks each token on the GPU (see forward_argmax);
         // anything else samples from logits copied to pinned host memory.
@@ -2533,7 +2751,8 @@ impl Runtime {
 
         let decode_start = std::time::Instant::now();
         let mut generated = 0usize;
-        let mut history: Vec<u32> = prompt.to_vec();
+        // Penalties look at real tokens only, not an image's sentinels.
+        let mut history: Vec<u32> = prompt.iter().copied().filter(|&t| !is_image_token(t)).collect();
         // Streaming has to decode across tokens, not per token: a character can
         // straddle two of them, and decoding each alone would destroy it.
         let mut decoder = self.tokenizer.stream_decoder();
@@ -2641,6 +2860,24 @@ pub enum StopReason {
     ContextFull,
     /// The callback asked to stop -- a stop sequence, or a client that hung up.
     Cancelled,
+}
+
+/// Sentinel ids at and above this stand for image tokens in a prompt: no
+/// vocabulary comes near 2^31.
+pub const IMAGE_TOKEN_BASE: u32 = 0x8000_0000;
+
+pub fn is_image_token(t: u32) -> bool {
+    t & IMAGE_TOKEN_BASE != 0
+}
+
+/// An image's embeddings in the text model's width, row-major over its
+/// merged patch grid of `nx` columns and `ny` rows, and the sentinel ids
+/// that stand for them in a prompt.
+pub struct ImageInput {
+    pub ids: Vec<u32>,
+    pub embeds: Vec<f32>,
+    pub nx: usize,
+    pub ny: usize,
 }
 
 /// Timings for one generation call.

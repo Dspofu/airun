@@ -137,7 +137,8 @@ residentes.
 ```powershell
 git clone https://github.com/<você>/airun
 cd airun
-.\build.ps1                          # detecta a GPU e compila só para ela
+.\build.ps1                          # Windows: detecta as GPUs e compila só para elas
+./build.sh                           # Linux: o mesmo, com --arch, --all, --no-gpu, --debug, --skip-check
 # ou manualmente:
 $env:AIRUN_CUDA_ARCHS = "86"        # 75, 80, 86, 89 ou 120
 cargo build --release
@@ -148,9 +149,16 @@ cargo build --release
 O `build.rs` acha o CUDA e o compilador host sozinho. Por padrão compila para
 RTX 20 até 50, o que leva alguns minutos; durante o desenvolvimento, compile só
 para a sua placa com `$env:AIRUN_CUDA_ARCHS="120"` (ou 75, 80, 86, 89).
-`build.ps1` automatiza isso e aceita `-Arch 120`, `-All` (universal, para
-distribuir), `-NoGpu`, `-Debug` e `-SkipCheck`; ao final roda `gpu` e
-`selftest` para confirmar.
+`build.ps1` (Windows) e `build.sh` (Linux) automatizam isso e aceitam
+`-Arch 120` / `--arch 120`, `-All` / `--all` (universal, para distribuir),
+`-NoGpu`, `-Debug` e `-SkipCheck`; ao final rodam `gpu` e o `selftest` em cada
+GPU para confirmar.
+
+**GPUs de gerações diferentes no mesmo PC** (ex.: RTX 3060 + RTX 5060 Ti): o
+script detecta todas e compila para a união das arquiteturas (`86,120`); cada
+placa roda o código da sua. À mão: `AIRUN_CUDA_ARCHS="86,120"`. Os kernels
+NVFP4 de tensor core FP4 só existem nas RTX 50 e só entram se `120` estiver na
+lista; nas outras placas o NVFP4 roda no caminho int8, com o mesmo resultado.
 
 ### Gerar texto
 
@@ -183,6 +191,25 @@ print(r.choices[0].message.content)
 
 ---
 
+### Contexto longo com código de verdade
+
+27B NVFP4 numa RTX 5060 Ti + RTX 3060 (arquiteturas diferentes no mesmo PC),
+prompts tirados de 1 MB de código C++/CUDA do llama.cpp, tok/s:
+
+| Teste | airun | llama.cpp b11760 | |
+|---|---:|---:|---:|
+| prompt de 8k | **1150** | 1079 | +7% |
+| prompt de 32k | **1039** | 987 | +5% |
+| prompt de 64k | **910** | 874 | +4% |
+| prompt de 128k | **745** | 712 | +5% |
+| geração @ 8k | **22,4** | 20,1 | +12% |
+| geração @ 64k | **16,9** | 16,4 | +3% |
+| geração @ 128k | 13,4 | 13,5 | empate |
+
+Um pedido real de ponta a ponta (o `ggml-cuda.cu` inteiro, 61.634 tokens, e
+uma pergunta sobre ele) com MTP: prompt a 899 tok/s, resposta a 19,8 tok/s
+com 95% dos rascunhos aceitos.
+
 ## A API
 
 Rotas, campos e respostas seguem os do `llama-server`, para que o web UI dele,
@@ -204,6 +231,10 @@ ao llama-server b11760.
 | `/slots/0?action=save\|restore\|erase` | Salva e retoma o cache de uma conversa (`--slot-save-path`) |
 | `/v1/chat/completions/control` | Encerra o raciocínio de uma geração em andamento |
 | `/health`, `/props`, `/v1/models`, `/slots` | Estado e metadados |
+| `/v1/stream/{id}`, `/v1/streams/lookup` | Stream replay: a geração sobrevive ao cliente cair e é relida de onde parou |
+
+**Imagens:** com `--mmproj`, o chat aceita imagens nos formatos da OpenAI, da
+Responses e da Anthropic (data URL / base64), e o `run` aceita `--image`.
 
 **Amostragem:** a cadeia inteira do llama.cpp, na mesma ordem: penalidades,
 DRY, top-n-sigma, top-k, typical, top-p, min-p, XTC, temperatura dinâmica e

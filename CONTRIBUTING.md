@@ -46,7 +46,8 @@ verificado do projeto, o mapa do código e as armadilhas que já custaram dias.
 
 ```powershell
 # Durante o desenvolvimento, compile só para a sua GPU (minutos a menos):
-.\build.ps1                          # detecta a GPU e compila (e roda o selftest)
+.\build.ps1                          # detecta as GPUs e compila (e roda o selftest em cada uma)
+./build.sh                           # o mesmo no Linux
 # ou manualmente:
 $env:AIRUN_CUDA_ARCHS = "120"     # 75, 80, 86, 89 ou 120
 cargo build --release

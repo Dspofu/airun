@@ -143,6 +143,11 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     println!("\n== attention ==");
     test_attention(args.device, &stream, &mut report)?;
 
+    println!("\n== vision encoder and image positions ==");
+    test_layernorm(args.device, &stream, &mut report)?;
+    test_vision_attention(args.device, &stream, &mut report)?;
+    test_mrope(args.device, &stream, &mut report)?;
+
     println!("\n== gated delta net (hybrid layers) ==");
     test_causal_conv1d(args.device, &stream, &mut report)?;
     test_l2norm(args.device, &stream, &mut report)?;
@@ -812,6 +817,152 @@ fn test_rmsnorm(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
         format!("max_abs {abs:.3e}  max_rel {rel:.3e}"),
         rel <= 1e-4,
     );
+    Ok(())
+}
+
+fn test_layernorm(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const N: usize = 1152;
+    const ROWS: usize = 7;
+    const EPS: f32 = 1e-6;
+    let mut rng = Rng::new(0x1A_7000);
+    let x: Vec<f32> = rng.floats(ROWS * N).iter().map(|v| v * 3.0 + 0.5).collect();
+    let w = rng.floats(N);
+    let b = rng.floats(N);
+    let mut cpu = vec![0f32; ROWS * N];
+    for r in 0..ROWS {
+        let row = &x[r * N..(r + 1) * N];
+        let mean = row.iter().map(|&v| v as f64).sum::<f64>() / N as f64;
+        let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / N as f64;
+        let inv = 1.0 / (var + EPS as f64).sqrt();
+        for i in 0..N {
+            cpu[r * N + i] = ((row[i] as f64 - mean) * inv) as f32 * w[i] + b[i];
+        }
+    }
+    let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+    let d_w = DeviceBuffer::<f32>::from_slice(device, &w, stream)?;
+    let d_b = DeviceBuffer::<f32>::from_slice(device, &b, stream)?;
+    let d_o = DeviceBuffer::<f32>::new(device, ROWS * N)?;
+    airun_cuda::vision::layernorm(d_o.as_mut_ptr(), d_x.as_ptr(), d_w.as_ptr(), d_b.as_ptr(), ROWS, N, EPS, stream)?;
+    let gpu = d_o.to_vec(stream)?;
+    let (abs, rel) = compare(&cpu, &gpu);
+    report.case("layernorm (bias)", format!("max_abs {abs:.3e}  max_rel {rel:.3e}"), abs <= 1e-4);
+    Ok(())
+}
+
+/// The ViT's attention as the encoder runs it: fused QKV split with the 2D
+/// rotary embedding, heads padded to 32, the causal kernel with every query
+/// at the last position (= full attention), padding dropped. Against plain
+/// full attention on the CPU.
+fn test_vision_attention(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const N: usize = 24;
+    const H: usize = 2;
+    const HD: usize = 8;
+    const HDP: usize = 32;
+    const BASE: f32 = 10_000.0;
+    let mut rng = Rng::new(0x71_5100);
+    let qkv = rng.floats(N * 3 * H * HD);
+    let pos_y: Vec<i32> = (0..N as i32).map(|i| (i / 4) % 3).collect();
+    let pos_x: Vec<i32> = (0..N as i32).map(|i| i % 5).collect();
+    let w = H * HD;
+    let rot = |v: &[f32], t: usize| -> Vec<f32> {
+        let (half, quarter) = (HD / 2, HD / 4);
+        let mut o = v.to_vec();
+        for j in 0..half {
+            let p = if j < quarter { pos_y[t] } else { pos_x[t] } as f32;
+            let theta = p * BASE.powf(-2.0 * (j % quarter) as f32 / half as f32);
+            let (sn, c) = theta.sin_cos();
+            o[j] = v[j] * c - v[j + half] * sn;
+            o[j + half] = v[j] * sn + v[j + half] * c;
+        }
+        o
+    };
+    let scale = 1.0 / (HD as f32).sqrt();
+    let mut cpu = vec![0f32; N * w];
+    for h in 0..H {
+        let q: Vec<Vec<f32>> = (0..N).map(|t| rot(&qkv[t * 3 * w + h * HD..][..HD], t)).collect();
+        let k: Vec<Vec<f32>> = (0..N).map(|t| rot(&qkv[t * 3 * w + w + h * HD..][..HD], t)).collect();
+        // The cache is f16; round K and V the way the kernel stores them.
+        let f16 = |v: f32| half::f16::from_f32(v).to_f32();
+        let v: Vec<&[f32]> = (0..N).map(|t| &qkv[t * 3 * w + 2 * w + h * HD..][..HD]).collect();
+        for t in 0..N {
+            let s: Vec<f32> = (0..N).map(|j| q[t].iter().zip(&k[j]).map(|(a, b)| a * f16(*b)).sum::<f32>() * scale)
+                .collect();
+            let m = s.iter().cloned().fold(f32::MIN, f32::max);
+            let e: Vec<f32> = s.iter().map(|x| (x - m).exp()).collect();
+            let z: f32 = e.iter().sum();
+            for d in 0..HD {
+                cpu[t * w + h * HD + d] = (0..N).map(|j| e[j] / z * f16(v[j][d])).sum();
+            }
+        }
+    }
+    let d_qkv = DeviceBuffer::<f32>::from_slice(device, &qkv, stream)?;
+    let d_py = DeviceBuffer::<i32>::from_slice(device, &pos_y, stream)?;
+    let d_px = DeviceBuffer::<i32>::from_slice(device, &pos_x, stream)?;
+    let d_last = DeviceBuffer::<i32>::from_slice(device, &vec![N as i32 - 1; N], stream)?;
+    let d_q = DeviceBuffer::<f32>::new(device, N * H * HDP)?;
+    let d_k = DeviceBuffer::<u16>::new(device, N * H * HDP)?;
+    let d_v = DeviceBuffer::<u16>::new(device, N * H * HDP)?;
+    let d_a = DeviceBuffer::<f32>::new(device, N * H * HDP)?;
+    let d_o = DeviceBuffer::<f32>::new(device, N * w)?;
+    airun_cuda::vision::vision_qkv(d_q.as_mut_ptr(), d_k.as_mut_ptr(), d_v.as_mut_ptr(), d_qkv.as_ptr(),
+        d_py.as_ptr(), d_px.as_ptr(), N, H, HD, HDP, BASE, stream)?;
+    ops::attention(d_a.as_mut_ptr(), d_q.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_last.as_ptr(), N, H, H, HDP, N,
+        scale, 0, ops::KvType::F16, stream)?;
+    airun_cuda::vision::vision_unpad(d_o.as_mut_ptr(), d_a.as_ptr(), N * H, HD, HDP, stream)?;
+    let gpu = d_o.to_vec(stream)?;
+    let (abs, rel) = compare(&cpu, &gpu);
+    report.case("vision attention (2D rope, full)", format!("max_abs {abs:.3e}  max_rel {rel:.3e}"), abs <= 2e-3);
+    Ok(())
+}
+
+/// The text model's RoPE with an image's (t, row, col) positions spread over
+/// the pairs by the interleaved M-RoPE sections, and with the shift text
+/// after an image runs at.
+fn test_mrope(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const N: usize = 6;
+    const HEADS: usize = 2;
+    const HD: usize = 64;
+    let sections = [11, 11, 10];
+    let mut rng = Rng::new(0x3D_0E00);
+    let x = rng.floats(N * HEADS * HD);
+    let mut rp = ops::RopeParams::plain(10_000_000.0, 1.0);
+    rp.sections = sections;
+    let mpos: Vec<i32> = [vec![40; N], (0..N as i32).map(|i| 40 + i / 3).collect(), (0..N as i32).map(|i| 40 + i % 3)
+        .collect()].concat();
+    let slots: Vec<i32> = (100..100 + N as i32).collect();
+    let axis = |pair: usize| if pair % 3 == 1 && pair < 3 * sections[1] as usize { 1 }
+        else if pair % 3 == 2 && pair < 3 * sections[2] as usize { 2 } else { 0 };
+    let cpu = |pos: &dyn Fn(usize, usize) -> i32| -> Vec<f32> {
+        let mut o = x.clone();
+        for t in 0..N {
+            for h in 0..HEADS {
+                let b = (t * HEADS + h) * HD;
+                for i in 0..HD / 2 {
+                    let (c, s) = rp.cos_sin(i, HD, pos(t, i));
+                    let (x0, x1) = (x[b + i], x[b + i + HD / 2]);
+                    o[b + i] = x0 * c - x1 * s;
+                    o[b + i + HD / 2] = x0 * s + x1 * c;
+                }
+            }
+        }
+        o
+    };
+    let d_pos = DeviceBuffer::<i32>::from_slice(device, &slots, stream)?;
+    let d_m = DeviceBuffer::<i32>::from_slice(device, &mpos, stream)?;
+    let d_shift = DeviceBuffer::<i32>::from_slice(device, &[37], stream)?;
+    let run = |p: ops::RopeParams| -> Result<Vec<f32>> {
+        let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+        ops::rope(d_x.as_mut_ptr(), d_pos.as_ptr(), N, HEADS, HD, HD, p, false, stream)?;
+        Ok(d_x.to_vec(stream)?)
+    };
+    let img = run(rp.positioned(d_shift.as_ptr() as u64, Some((d_m.as_ptr() as u64, N))))?;
+    let want = cpu(&|t, i| mpos[axis(i) * N + t]);
+    let (abs, rel) = compare(&want, &img);
+    report.case("rope: image positions (M-RoPE)", format!("max_abs {abs:.3e}  max_rel {rel:.3e}"), abs <= 1e-4);
+    let txt = run(rp.positioned(d_shift.as_ptr() as u64, None))?;
+    let want = cpu(&|t, _| slots[t] - 37);
+    let (abs, rel) = compare(&want, &txt);
+    report.case("rope: text after an image (shift)", format!("max_abs {abs:.3e}  max_rel {rel:.3e}"), abs <= 1e-4);
     Ok(())
 }
 

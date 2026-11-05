@@ -48,9 +48,10 @@ pub struct RunArgs {
     pub predict: usize,
 
     // --- memory and placement ---
-    /// Context length in tokens.
-    #[arg(short = 'c', long, default_value_t = 4096)]
-    pub ctx_size: usize,
+    /// Context length in tokens. Default: the largest the GPUs hold with
+    /// every weight in VRAM (at least 4096), on the GPUs the model needs.
+    #[arg(short = 'c', long)]
+    pub ctx_size: Option<usize>,
 
     /// Resident experts per layer; stream cache misses from the GGUF without re-quantizing.
     #[arg(long)]
@@ -66,14 +67,36 @@ pub struct RunArgs {
     pub batch_size: usize,
 
     /// Speculative decoding with the model's own MTP head: tokens drafted per
-    /// step (0 turns it off). Speeds up greedy decoding only, so it engages
-    /// when the sampler is pure greedy: --temp 0 AND no penalties (this
-    /// command defaults to --repeat-penalty 1.1, which disables it; pass
-    /// --repeat-penalty 1.0 to use it). The text is identical to plain
-    /// decoding. Files without a usable MTP head ignore it (a note is
-    /// printed).
-    #[arg(long, default_value_t = 3)]
-    pub draft: usize,
+    /// step (0 turns it off; default 3 on dense models, off on MoE models,
+    /// where it measured slower). Engages only when the sampler is pure
+    /// greedy: --temp 0 AND no penalties (this command defaults to
+    /// --repeat-penalty 1.1, which disables it; pass --repeat-penalty 1.0).
+    /// The drafts are verified by the model itself, so the text is the
+    /// model's greedy text, but the verify runs a small batch: on a near-tie
+    /// it can pick the other token than one-at-a-time decoding. Files
+    /// without a usable MTP head ignore it (a note is printed).
+    #[arg(long)]
+    pub draft: Option<usize>,
+
+    /// The MTP head in a file of its own (mtp-*.gguf, as llama.cpp's
+    /// converter writes with --mtp). Default: the model's own head, or an
+    /// mtp-*.gguf of the same model in the model's folder.
+    #[arg(long, value_name = "FILE")]
+    pub mtp: Option<PathBuf>,
+
+    /// The vision encoder (mmproj-*.gguf) that lets the model see images.
+    #[arg(long, value_name = "FILE")]
+    pub mmproj: Option<PathBuf>,
+
+    /// An image for the prompt (PNG, JPEG or WebP); repeat for several. Put
+    /// <__media__> in the prompt where each goes, or they go before it.
+    #[arg(long, value_name = "FILE", requires = "mmproj")]
+    pub image: Vec<PathBuf>,
+
+    /// Most tokens one image may take (each is a 32 x 32 pixel area; larger
+    /// images are scaled down). More reads finer detail and needs more VRAM.
+    #[arg(long, default_value_t = 1024)]
+    pub image_max_tokens: usize,
 
     /// CUDA ordinals to use, comma separated. Defaults to every supported GPU.
     #[arg(long, value_delimiter = ',')]
@@ -164,9 +187,13 @@ impl RunArgs {
             system: None,
             raw: true,
             predict: 128,
-            ctx_size: 4096,
+            ctx_size: Some(4096),
             batch_size: 512,
-            draft: 0,
+            draft: Some(0),
+            mtp: None,
+            mmproj: None,
+            image: Vec::new(),
+            image_max_tokens: 1024,
             gpus: Vec::new(),
             tensor_split: Vec::new(),
             single_gpu: None,
@@ -208,7 +235,8 @@ impl RunArgs {
         };
 
         LoadOptions {
-            ctx: self.ctx_size,
+            ctx: self.ctx_size.unwrap_or(4096),
+            ctx_auto: self.ctx_size.is_none(),
             batch: self.batch_size,
             gpus: self.gpus.clone(),
             split,
@@ -218,6 +246,7 @@ impl RunArgs {
             reserve_bytes: self.vram_reserve << 20,
             allow_fallback: !self.no_fallback,
             draft: self.draft,
+            mtp_file: self.mtp.clone(),
             alloc: self.alloc.alloc,
             main_gpu: self.alloc.main_gpu,
         }
@@ -258,7 +287,13 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     let quiet = args.quiet;
     let mut last_stage = String::new();
-    let (mut runtime, report) = loader::load(&args.model, &args.load_options(), |stage, done, total| {
+    let mut opts = args.load_options();
+    if let Some(mm) = &args.mmproj {
+        opts.reserve_bytes += crate::media::vision_reserve(mm, args.image_max_tokens)?;
+    }
+    let images: Vec<airun_core::vision::Rgb> =
+        args.image.iter().map(|p| crate::media::read_image(p)).collect::<Result<_>>()?;
+    let (mut runtime, report) = loader::load(&args.model, &opts, |stage, done, total| {
         if quiet {
             return;
         }
@@ -288,13 +323,32 @@ pub fn run(args: RunArgs) -> Result<()> {
         eprint!("{}", report.placement.report());
     }
 
+    let mut image_ids = Vec::new();
+    if let Some(mm) = &args.mmproj {
+        let t = std::time::Instant::now();
+        let vision = crate::media::load_vision(mm, &runtime, args.image_max_tokens)?;
+        for img in &images {
+            image_ids.push(crate::media::encode_image(&vision, &mut runtime, img)?);
+        }
+        if !quiet && !images.is_empty() {
+            let n: usize = image_ids.iter().map(Vec::len).sum();
+            eprintln!("{} image(s) -> {n} tokens in {:.0} ms (vision on GPU {})", images.len(),
+                t.elapsed().as_secs_f64() * 1000.0, vision.device);
+        }
+    }
+    // Images without a marker go before the text.
+    let mut prompt_text = prompt_text;
+    let marked = prompt_text.matches(crate::media::MARKER).count();
+    if marked == 0 && !image_ids.is_empty() {
+        prompt_text = format!("{}{prompt_text}", format!("{}\n", crate::media::MARKER).repeat(image_ids.len()));
+    }
     let full_prompt = if args.raw {
         prompt_text
     } else {
         apply_chat_template(args.system.as_deref(), &prompt_text, None)
     };
 
-    let tokens = runtime.tokenizer.encode(&full_prompt, true);
+    let tokens = crate::media::tokenize(&runtime, &full_prompt, &image_ids, true)?;
     if !quiet {
         eprintln!("prompt: {} tokens\n", tokens.len());
     }

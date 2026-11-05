@@ -62,13 +62,15 @@ pub struct ServeArgs {
     #[arg(long, env = "AIRUN_API_KEY")]
     pub api_key: Option<String>,
 
-    /// Name reported by /v1/models and echoed in responses.
+    /// Name reported by /v1/models and echoed in responses. Default: the
+    /// model's name in the file's metadata (general.name), else the file name.
     #[arg(long, alias = "alias")]
     pub served_model_name: Option<String>,
 
-    /// Context length in tokens.
-    #[arg(short = 'c', long, default_value_t = 4096)]
-    pub ctx_size: usize,
+    /// Context length in tokens. Default: the largest the GPUs hold with
+    /// every weight in VRAM (at least 4096), on the GPUs the model needs.
+    #[arg(short = 'c', long)]
+    pub ctx_size: Option<usize>,
 
     /// Resident experts per layer; stream cache misses from the GGUF without re-quantizing.
     #[arg(long)]
@@ -90,11 +92,27 @@ pub struct ServeArgs {
     /// step (0 turns it off). Engages on a request only when it decodes
     /// greedily: temperature 0 and no repeat/presence/frequency penalties
     /// (this command's default --repeat-penalty is 1.1, which disables it;
-    /// start with --repeat-penalty 1.0 to use it). The text is identical to
-    /// plain decoding. Files without a usable MTP head ignore it (a note is
-    /// printed at load).
+    /// start with --repeat-penalty 1.0 to use it). The drafts are verified by
+    /// the model, but in a small batch: on a near-tie the text can differ
+    /// from one-at-a-time decoding. Files without a usable MTP head ignore
+    /// it (a note is printed at load).
     #[arg(long, default_value_t = 0)]
     pub draft: usize,
+
+    /// The MTP head in a file of its own (mtp-*.gguf). Default: the model's
+    /// own head, or an mtp-*.gguf of the same model in the model's folder.
+    #[arg(long, value_name = "FILE")]
+    pub mtp: Option<PathBuf>,
+
+    /// The vision encoder (mmproj-*.gguf): chat requests may then carry
+    /// images (OpenAI image_url / input_image data URLs, Anthropic base64
+    /// image blocks, /completion's multimodal_data).
+    #[arg(long, value_name = "FILE")]
+    pub mmproj: Option<PathBuf>,
+
+    /// Most tokens one image may take (a 32 x 32 pixel area each).
+    #[arg(long, default_value_t = 1024)]
+    pub image_max_tokens: usize,
 
     /// CUDA ordinals to use.
     #[arg(long, value_delimiter = ',')]
@@ -177,6 +195,12 @@ struct SlotInfo {
 
 struct AppState {
     runtime: Mutex<Runtime>,
+    /// The vision encoder, with --mmproj.
+    vision: Option<std::sync::Mutex<airun_core::vision::VisionModel>>,
+    /// Images already encoded, by a hash of their file bytes: a chat sends
+    /// the same image every turn, and its tokens are found again without
+    /// running the encoder (while the runtime still has them registered).
+    image_memo: std::sync::Mutex<Vec<(u64, Vec<u32>)>>,
     model_name: String,
     api_key: Option<String>,
     default_max_tokens: usize,
@@ -414,10 +438,17 @@ pub fn run(args: ServeArgs) -> Result<()> {
     run_args.single_gpu = args.single_gpu;
     run_args.alloc = args.alloc.clone();
     run_args.vram_reserve = args.vram_reserve;
-    run_args.draft = args.draft;
+    run_args.draft = Some(args.draft);
+    run_args.mtp = args.mtp.clone();
+    run_args.mmproj = args.mmproj.clone();
+    run_args.image_max_tokens = args.image_max_tokens;
 
     eprintln!("loading {}", args.model.display());
-    let (runtime, report) = loader::load(&args.model, &run_args.load_options(), |stage, d, t| {
+    let mut load_opts = run_args.load_options();
+    if let Some(mm) = &args.mmproj {
+        load_opts.reserve_bytes += crate::media::vision_reserve(mm, args.image_max_tokens)?;
+    }
+    let (runtime, report) = loader::load(&args.model, &load_opts, |stage, d, t| {
         if t > 0 && d % 64 == 0 {
             eprint!("\r{stage}: {d}/{t}   ");
         }
@@ -425,10 +456,20 @@ pub fn run(args: ServeArgs) -> Result<()> {
     .with_context(|| format!("failed to load {}", args.model.display()))?;
     eprintln!("\r{}", report.config.summary());
     eprint!("{}", report.placement.report());
+    let vision = match &args.mmproj {
+        Some(mm) => {
+            let v = crate::media::load_vision(mm, &runtime, args.image_max_tokens)?;
+            eprintln!("vision encoder: {} on GPU {} (up to {} tokens per image)", mm.display(), v.device,
+                args.image_max_tokens);
+            Some(std::sync::Mutex::new(v))
+        }
+        None => None,
+    };
 
-    let model_name = args.served_model_name.clone().unwrap_or_else(|| {
-        args.model.file_stem().and_then(|s| s.to_str()).unwrap_or("airun").to_string()
-    });
+    // --alias, else the name the file's metadata gives, else the file name.
+    let model_name = args.served_model_name.clone()
+        .or_else(|| (report.config.name != "unnamed").then(|| report.config.name.clone()))
+        .unwrap_or_else(|| args.model.file_stem().and_then(|s| s.to_str()).unwrap_or("airun").to_string());
     let ctx = runtime.ctx();
     let cfg = &report.config;
 
@@ -519,7 +560,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         "model_alias": model_name,
         "model_ftype": ftype,
         "model_path": model_path,
-        "modalities": { "vision": false, "video": false, "audio": false },
+        "modalities": { "vision": vision.is_some(), "video": false, "audio": false },
         "endpoint_slots": true,
         "endpoint_props": false,
         "endpoint_metrics": false,
@@ -573,7 +614,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
             "aliases": [model_name],
             "tags": [],
             "object": "model",
-            "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
+            "architecture": { "input_modalities": if vision.is_some() { json!(["text", "image"]) } else { json!(["text"]) },
+                              "output_modalities": ["text"] },
             "created": created,
             "owned_by": "airun",
             "meta": {
@@ -584,6 +626,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
     });
 
     let state = Arc::new(AppState {
+        vision,
+        image_memo: std::sync::Mutex::new(Vec::new()),
         runtime: Mutex::new(runtime),
         model_name: model_name.clone(),
         api_key: args.api_key.clone(),
@@ -651,6 +695,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/apply-template", post(apply_template))
+        .route("/v1/stream/{conv_id}", get(stream_replay).delete(stream_stop))
+        .route("/v1/streams/lookup", post(streams_lookup))
+        .layer(axum::middleware::from_fn(crate::replay::tee))
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -660,12 +707,13 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // loading happens on the main thread, before any async machinery starts.
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
+        crate::replay::spawn_gc();
         let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("could not bind {addr}"))?;
         eprintln!("\nairun serving {model_name} on http://{addr}");
         eprintln!("  web ui:         http://{addr}/");
         eprintln!("  authentication: {auth}");
         eprintln!("  endpoints: /v1/chat/completions /v1/responses /v1/messages /v1/completions /completion /infill /tokenize \
-                   /detokenize /apply-template /v1/models /props /slots /health");
+                   /detokenize /apply-template /v1/models /props /slots /health /v1/stream/{{id}}");
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -734,6 +782,78 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
         None => Err(api_error(StatusCode::UNAUTHORIZED,
             "Missing bearer token. Send `Authorization: Bearer <key>`.", "authentication_error")),
     }
+}
+
+// --- stream replay (see replay.rs) -------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct ReplayQuery {
+    from: Option<String>,
+}
+
+/// GET /v1/stream/{conv_id}?from=N: the buffered SSE bytes from N, then the
+/// live ones until the generation ends.
+async fn stream_replay(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(conv_id): Path<String>,
+                       Query(q): Query<ReplayQuery>) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    let Some(session) = crate::replay::get(&conv_id) else {
+        return api_error(StatusCode::NOT_FOUND,
+            "Stream not found or expired (a finished stream is kept for 5 minutes); send the request again",
+            "not_found_error");
+    };
+    let from = match q.from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => 0,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return api_error(StatusCode::BAD_REQUEST,
+                format!("Invalid 'from' offset {s:?}: pass the number of bytes already received"),
+                "invalid_request_error"),
+        },
+    };
+    if from < session.dropped_bytes() {
+        return api_error(StatusCode::BAD_REQUEST,
+            "Stream offset lost: only the last 4 MiB of a stream are kept; send the request again",
+            "invalid_request_error");
+    }
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(crate::replay::reader(session, from))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// POST /v1/streams/lookup {"conversation_ids": [...]}: the sessions of ids
+/// the caller already knows.
+async fn streams_lookup(State(state): State<Arc<AppState>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    let req = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let ids: Vec<String> = req["conversation_ids"].as_array().map(|a| a.iter()
+        .filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from).collect()).unwrap_or_default();
+    let found: Vec<Value> = crate::replay::lookup(&ids).iter().map(|s| json!({
+        "conversation_id": s.id,
+        "is_done": s.is_done(),
+        "total_bytes": s.total_bytes(),
+        "started_at": s.started_at,
+        "completed_at": s.completed_at(),
+    })).collect();
+    Json(Value::Array(found)).into_response()
+}
+
+/// DELETE /v1/stream/{conv_id}: the user's Stop. Cancels the generation and
+/// drops its buffer; 204 even when there was nothing to stop.
+async fn stream_stop(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(conv_id): Path<String>) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    crate::replay::cancel(&conv_id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// The body as JSON, or llama-server's 400 when it is not.
@@ -1406,9 +1526,15 @@ async fn native_completion(State(state): State<Arc<AppState>>, headers: HeaderMa
         return e;
     }
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
+    let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
+    let images = request_images(&req);
     let (prompt_text, tokens) = {
         let rt = state.runtime.lock().await;
         match req.get("prompt") {
+            Some(Value::String(s)) if !images.is_empty() => match crate::media::tokenize(&rt, s, &images, true) {
+                Ok(t) => (s.clone(), t),
+                Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("{e:#}"), "invalid_request_error"),
+            },
             Some(Value::String(s)) => (s.clone(), rt.tokenizer.encode(s, true)),
             // Token ids, or a mix of ids and strings, as llama-server takes.
             Some(Value::Array(a)) if a.iter().all(|x| x.is_u64() || x.is_string()) && !a.is_empty() => {
@@ -1678,6 +1804,166 @@ async fn oai_completions(State(state): State<Arc<AppState>>, headers: HeaderMap,
 // --- chat: prompts and the generation all chat APIs share --------------------------
 
 /// The chat prompt for a request, and whether it leaves a `<think>` block open.
+// --- images (see media.rs) ---------------------------------------------------
+
+/// Where a request's images are kept once encoded: the runtime's sentinel ids
+/// of each, in prompt order.
+const IMAGES_KEY: &str = "__airun_images";
+
+/// Encodes every image the request carries and puts the marker text in its
+/// place, so the format converters and the chat template see text; the ids
+/// go under IMAGES_KEY. Image parts: OpenAI `image_url` ({url} or a string)
+/// and Responses `input_image` (image_url) with a data: URL, Anthropic
+/// `image` with a base64 source, and /completion's `multimodal_data` (base64
+/// strings for the prompt's <__media__> markers).
+async fn attach_images(state: &AppState, mut req: Value) -> Result<Value, Response> {
+    let mut found: Vec<Vec<u8>> = Vec::new();
+    let mut err: Option<String> = None;
+    fn walk(v: &mut Value, found: &mut Vec<Vec<u8>>, err: &mut Option<String>) {
+        match v {
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, found, err)),
+            Value::Object(o) => {
+                let ty = o.get("type").and_then(Value::as_str).unwrap_or("");
+                if matches!(ty, "image_url" | "input_image" | "image") {
+                    let src = match ty {
+                        "image" => o.get("source").map(|s| {
+                            let data = s.get("data").and_then(Value::as_str).unwrap_or("");
+                            match s.get("type").and_then(Value::as_str) {
+                                Some("url") => s.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+                                _ => format!("data:;base64,{data}"),
+                            }
+                        }),
+                        _ => o.get("image_url").and_then(|u| u.as_str().map(str::to_string)
+                            .or_else(|| u.get("url").and_then(Value::as_str).map(str::to_string))),
+                    };
+                    match src.as_deref().map(decode_data_url) {
+                        Some(Ok(bytes)) => found.push(bytes),
+                        Some(Err(e)) => *err = Some(e),
+                        None => *err = Some(format!("an {ty} part has no image data")),
+                    }
+                    *v = json!({ "type": "text", "text": crate::media::MARKER });
+                    return;
+                }
+                o.values_mut().for_each(|x| walk(x, found, err));
+            }
+            _ => {}
+        }
+    }
+    for key in ["messages", "input"] {
+        if let Some(m) = req.get_mut(key) {
+            walk(m, &mut found, &mut err);
+        }
+    }
+    if let Some(Value::Array(mm)) = req.get("multimodal_data") {
+        for d in mm {
+            // Bare base64, as llama-server takes it, or a whole data: URL.
+            let url = |s: &str| if s.starts_with("data:") { s.to_string() } else { format!("data:;base64,{s}") };
+            match d.as_str().map(|s| decode_data_url(&url(s))) {
+                Some(Ok(b)) => found.push(b),
+                Some(Err(e)) => err = Some(e),
+                None => err = Some("multimodal_data holds base64 strings".into()),
+            }
+        }
+    }
+    if let Some(e) = err {
+        return Err(api_error(StatusCode::BAD_REQUEST, e, "invalid_request_error"));
+    }
+    if found.is_empty() {
+        return Ok(req);
+    }
+    let Some(vision) = &state.vision else {
+        return Err(api_error(StatusCode::BAD_REQUEST,
+            "this server has no vision encoder: start it with --mmproj <mmproj-*.gguf> to send images",
+            "invalid_request_error"));
+    };
+    let mut rt = state.runtime.lock().await;
+    let mut ids = Vec::new();
+    for bytes in &found {
+        let key = bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+        let known = state.image_memo.lock().unwrap_or_else(|e| e.into_inner()).iter()
+            .find(|(k, ids)| *k == key && rt.has_image(ids)).map(|(_, ids)| ids.clone());
+        if let Some(enc) = known {
+            ids.push(json!(enc));
+            continue;
+        }
+        let img = crate::media::decode_image(bytes)
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("{e:#}"), "invalid_request_error"))?;
+        let v = vision.lock().unwrap_or_else(|e| e.into_inner());
+        let enc = tokio::task::block_in_place(|| crate::media::encode_image(&v, &mut rt, &img))
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"), "server_error"))?;
+        let mut memo = state.image_memo.lock().unwrap_or_else(|e| e.into_inner());
+        memo.push((key, enc.clone()));
+        if memo.len() > 32 {
+            memo.remove(0);
+        }
+        ids.push(json!(enc));
+    }
+    req[IMAGES_KEY] = Value::Array(ids);
+    Ok(req)
+}
+
+/// The encoded images [`attach_images`] left in the request.
+fn request_images(req: &Value) -> Vec<Vec<u32>> {
+    req.get(IMAGES_KEY).and_then(Value::as_array).map(|a| a.iter().map(|ids| ids.as_array()
+        .map(|v| v.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default())
+        .collect()).unwrap_or_default()
+}
+
+/// Keeps the images across a format conversion.
+fn carry_images(from: &Value, to: &mut Value) {
+    if let Some(ids) = from.get(IMAGES_KEY) {
+        to[IMAGES_KEY] = ids.clone();
+    }
+}
+
+/// The bytes of a `data:[type];base64,...` URL.
+fn decode_data_url(url: &str) -> Result<Vec<u8>, String> {
+    let Some(rest) = url.strip_prefix("data:") else {
+        return Err(if url.starts_with("http://") || url.starts_with("https://") {
+            "image URLs are not fetched by the server; send the image inline as a data: URL \
+             (data:image/png;base64,...)".into()
+        } else {
+            "the image is not a data: URL; send data:image/png;base64,... (or jpeg/webp)".into()
+        });
+    };
+    let Some((meta, data)) = rest.split_once(',') else { return Err("the data: URL has no ',' before its data".into()) };
+    if !meta.ends_with(";base64") && !meta.is_empty() {
+        return Err("the data: URL is not base64 (expected ;base64,)".into());
+    }
+    base64_decode(data).ok_or_else(|| "the image's base64 data is malformed".into())
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 fn chat_prompt(state: &AppState, req: &Value) -> Result<(String, bool), Response> {
     let Some(messages) = req.get("messages").filter(|m| m.as_array().is_some_and(|a| !a.is_empty())) else {
         return Err(api_error(StatusCode::BAD_REQUEST, "'messages' is required", "invalid_request_error"));
@@ -1767,7 +2053,11 @@ impl ChatJob {
 /// alternatives per token.
 async fn chat_job(state: &AppState, req: &Value, n_probs: Option<usize>) -> Result<ChatJob, Response> {
     let (prompt, opened) = chat_prompt(state, req)?;
-    let tokens = state.runtime.lock().await.tokenizer.encode(&prompt, true);
+    let tokens = {
+        let rt = state.runtime.lock().await;
+        crate::media::tokenize(&rt, &prompt, &request_images(req), true)
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("{e:#}"), "invalid_request_error"))?
+    };
     let max = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).or_else(|| req.get("n_predict"))
         .and_then(Value::as_u64).map_or(state.default_max_tokens, |m| m as usize);
     let mut spec = state.spec_from(req, false, tokens, Some(max), n_probs)?;
@@ -1859,6 +2149,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap
         return e;
     }
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
+    let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
     let n_probs = req.get("logprobs").and_then(Value::as_bool).unwrap_or(false)
         .then(|| req.get("top_logprobs").and_then(Value::as_u64).unwrap_or(0) as usize);
     let job = match chat_job(&state, &req, n_probs).await { Ok(j) => j, Err(e) => return e };
@@ -2129,7 +2420,9 @@ async fn responses(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
         return e;
     }
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
-    let chat = match responses_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
+    let mut chat = match responses_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    carry_images(&req, &mut chat);
     let job = match chat_job(&state, &chat, None).await { Ok(j) => j, Err(e) => return e };
     let model = req.get("model").and_then(Value::as_str).map_or_else(|| state.model_name.clone(), str::to_owned);
     let id = completion_id("resp_");
@@ -2266,7 +2559,9 @@ async fn responses_input_tokens(State(state): State<Arc<AppState>>, headers: Hea
         return e;
     }
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
-    let chat = match responses_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
+    let mut chat = match responses_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    carry_images(&req, &mut chat);
     match count_chat_tokens(&state, &chat).await {
         Ok(n) => Json(json!({ "input_tokens": n, "object": "response.input_tokens" })).into_response(),
         Err(e) => e,
@@ -2370,7 +2665,9 @@ async fn anthropic_messages(State(state): State<Arc<AppState>>, headers: HeaderM
         return e;
     }
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
-    let chat = match anthropic_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
+    let mut chat = match anthropic_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    carry_images(&req, &mut chat);
     let job = match chat_job(&state, &chat, None).await { Ok(j) => j, Err(e) => return e };
     let model = req.get("model").and_then(Value::as_str).map_or_else(|| state.model_name.clone(), str::to_owned);
     let id = completion_id("msg_");
@@ -2492,7 +2789,9 @@ async fn anthropic_count_tokens(State(state): State<Arc<AppState>>, headers: Hea
         return e;
     }
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
-    let chat = match anthropic_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
+    let mut chat = match anthropic_to_chat(&req) { Ok(c) => c, Err(e) => return e };
+    carry_images(&req, &mut chat);
     match count_chat_tokens(&state, &chat).await {
         Ok(n) => Json(json!({ "input_tokens": n })).into_response(),
         Err(e) => e,

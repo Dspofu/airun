@@ -13,6 +13,7 @@ pub mod plan;
 pub mod runtime;
 pub mod sample;
 pub mod tokenizer;
+pub mod vision;
 
 pub use config::{Architecture, Config};
 pub use error::{CoreError, Result};

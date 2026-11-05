@@ -6,7 +6,9 @@ mod convert;
 mod gpu;
 mod inspect;
 mod perplexity;
+mod media;
 mod quantize;
+mod replay;
 mod run;
 mod selftest;
 mod tokenize;
@@ -24,26 +26,27 @@ use clap::{Parser, Subcommand};
     long_about = "airun runs GGUF models on NVIDIA GPUs with its own CUDA kernels, \
                   converts and quantizes checkpoints, and serves an OpenAI-compatible API.",
     after_long_help = "Common options (full list for each command: `airun <COMMAND> --help`):
-  run, bench, perplexity, quantize
-      -c, --ctx-size <N>          context length in tokens (default 4096)
+  run, serve, bench, perplexity
+      -c, --ctx-size <N>          context length in tokens (run/serve default: the most
+                                  the GPUs hold with every weight in VRAM, at least 4096)
           --kv-type <f16|q8_0|q4_0>  KV cache format; q4_0 fits ~3.6x more context
       -b, --batch-size <N>        prompt tokens per forward pass (default 512)
           --gpus <0,1>            CUDA ordinals to use
           --alloc <auto|gpu|memory>  where the weights live
           --main-gpu <N>          GPU filled first (and running the RAM layers)
   run, serve
-          --draft <N>             MTP speculative decoding, drafts per step (run: 3, serve: 0)
+          --draft <N>             MTP speculative decoding, drafts per step
+                                  (run: 3 on dense models, off on MoE; serve: 0)
           --temp <T>              sampling temperature; 0 is greedy
   run
       -p, --prompt <TEXT>         the prompt (reads stdin when omitted)
       -n, --predict <N>           maximum tokens to generate (default 256)
   serve
           --port <PORT>           HTTP port (default 8080)
-          --alias <NAME>          name advertised by /v1/models
-  convert
-          --hf <REPO>            Hugging Face repo, optional :QUANT suffix
-  quantize
-          --from <FILE> --to <FILE>  rewrite a GGUF at another precision
+          --alias <NAME>          name advertised by /v1/models (default: the
+                                  model's general.name metadata)
+  convert <DIR> -o <FILE>         safetensors checkpoint to GGUF (--type F16, Q8_0, ...)
+  quantize <IN> <OUT>             rewrite a GGUF at another precision (--type Q4_K, ...)
 
 Examples:
   airun run model.gguf -p \"Hello\" -n 128

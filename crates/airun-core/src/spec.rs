@@ -526,7 +526,13 @@ impl Runtime {
             }
             self.stage_h(true, take - 1)?;
             self.save_pending(take - 1)?;
-            self.mtp_run(&chunk, pos0)?;
+            // Queued, not waited on: its pick is not needed, and a wait here
+            // would stop the first GPU from starting the next chunk while the
+            // last one finishes this one (27B on two GPUs, 61k-token prompt:
+            // 615 -> see AGENTS.md).
+            let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+            let pos: Vec<i32> = (0..chunk.len()).map(|i| (pos0 + i) as i32).collect();
+            self.mtp_queue(&ids, &pos)?;
         }
         self.spec.as_mut().expect("set up above").synced = true;
         let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;

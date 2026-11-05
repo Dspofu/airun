@@ -211,7 +211,7 @@ impl KernelType {
     }
 }
 
-fn bad_arg(what: impl Into<String>) -> CudaError {
+pub(crate) fn bad_arg(what: impl Into<String>) -> CudaError {
     CudaError::Runtime {
         code: -1,
         name: "AIRUN_BAD_ARG".into(),
@@ -666,12 +666,31 @@ pub struct RopeParams {
     pub mscale: f32,
     pub corr_lo: f32,
     pub corr_hi: f32,
+    /// Device address of an i32 subtracted from the KV slot to get the
+    /// rotation position (text after an image), or 0. An address, not a
+    /// pointer, so the parameters stay Send; see airun.cuh.
+    pub shift: u64,
+    /// Device address of [3][n_tok] i32 (t, row, col) positions for an
+    /// image's tokens, split over the rotary pairs by `sections`, or 0.
+    pub mpos: u64,
+    pub n_tok: i32,
+    /// Interleaved M-RoPE sections, in rotary pairs (`rope.dimension_sections`).
+    pub sections: [i32; 3],
 }
 
 impl RopeParams {
     /// Unscaled RoPE, or linear position interpolation when `freq_scale < 1`.
     pub fn plain(base: f32, freq_scale: f32) -> Self {
-        Self { base, freq_scale, ext_factor: 0.0, mscale: 1.0, corr_lo: 0.0, corr_hi: 0.0 }
+        Self { base, freq_scale, ext_factor: 0.0, mscale: 1.0, corr_lo: 0.0, corr_hi: 0.0, shift: 0, mpos: 0,
+               n_tok: 0, sections: [0; 3] }
+    }
+
+    /// These parameters with the rotation position taken from `shift` and,
+    /// for an image's tokens, `mpos` (see the fields).
+    pub fn positioned(mut self, shift: u64, mpos: Option<(u64, usize)>) -> Self {
+        self.shift = shift;
+        (self.mpos, self.n_tok) = mpos.map_or((0, 0), |(p, n)| (p, n as i32));
+        self
     }
 
     /// YaRN over `rope_dim` rotary dimensions trained at `orig_ctx` positions.
@@ -696,6 +715,7 @@ impl RopeParams {
             mscale: attn_factor * (1.0 + 0.1 * factor.ln()),
             corr_lo: lo,
             corr_hi: hi,
+            ..Self::plain(base, 1.0)
         }
     }
 

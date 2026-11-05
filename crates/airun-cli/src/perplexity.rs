@@ -104,7 +104,7 @@ pub fn run(args: PerplexityArgs) -> Result<()> {
     };
 
     let mut run_args = RunArgs::bench_defaults(args.model.clone());
-    run_args.ctx_size = args.ctx_size;
+    run_args.ctx_size = Some(args.ctx_size);
     run_args.expert_cache = args.expert_cache;
     run_args.kv_type = args.kv_type;
     run_args.batch_size = if args.batched { args.chunk.max(1) } else { 1 };

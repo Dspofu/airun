@@ -54,6 +54,7 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
     let mut jobs = Vec::new();
     let mut in_bytes = 0u64;
     let mut out_bytes = 0u64;
+    let mut kept_for_block = 0usize;
 
     for t in src.tensors() {
         if !dequant::can_decode(t.ty) {
@@ -66,16 +67,14 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
             );
         }
 
-        let to = choose_type(&t.name, t.dims.len(), t.ty, target, args.pure);
+        let mut to = choose_type(&t.name, t.dims.len(), t.ty, target, args.pure);
         let n = t.n_elements();
-        let row_len = t.row_size();
-        let block = to.layout().unwrap().elements;
-        if row_len % block != 0 {
-            bail!(
-                "tensor {:?} has rows of {row_len}, which is not a multiple of the {to} \
-                 block size {block}. Pick a type with a smaller block, such as Q8_0.",
-                t.name
-            );
+        // Rows shorter than the target's block (a hybrid's 4-tap ssm_conv1d
+        // under Q4_K's 256) stay as stored, which by construction fits them;
+        // llama-quantize does the same.
+        if t.row_size() % to.layout().unwrap().elements != 0 {
+            to = t.ty;
+            kept_for_block += 1;
         }
 
         in_bytes += t.nbytes;
@@ -89,6 +88,9 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
         });
     }
 
+    if kept_for_block > 0 {
+        eprintln!("note: {kept_for_block} tensor(s) with rows shorter than the {target} block keep their stored type");
+    }
     println!(
         "{} -> {}\n  {} tensors, {} -> {} ({:.1}% of the original)",
         args.input.display(),

@@ -118,7 +118,29 @@ typedef struct {
     float mscale;
     float corr_lo;
     float corr_hi;
+    // Where the rotation angle's position comes from. By default it is the
+    // token's KV-cache slot; after an image (whose tokens take max(rows, cols)
+    // positions, not rows * cols) the text continues at slot - *shift. While
+    // an image's own tokens run, mpos holds their (t, row, col) positions as
+    // [3][n_tok], and each rotary pair takes one of them by the interleaved
+    // M-RoPE sections (Qwen3-VL / Qwen3.5: ggml's GGML_ROPE_TYPE_IMROPE).
+    const int32_t* shift;   // device scalar, or null for 0
+    const int32_t* mpos;    // [3][n_tok], or null
+    int32_t n_tok;
+    int32_t sections[3];    // rotary pairs per axis (t, row, col)
 } airun_rope_params;
+
+// The position rotary pair `pair` of `token` turns by; `slot` is the token's
+// KV-cache position.
+__device__ __forceinline__ int rope_position(const airun_rope_params& p, int pair, int token, int slot) {
+    if (p.mpos) {
+        int axis = 0;
+        if (pair % 3 == 1 && pair < 3 * p.sections[1]) axis = 1;
+        else if (pair % 3 == 2 && pair < 3 * p.sections[2]) axis = 2;
+        return p.mpos[axis * p.n_tok + token];
+    }
+    return p.shift ? slot - *p.shift : slot;
+}
 
 // The accurate sincosf, not __sincosf: at a million positions the angle of the
 // fastest pair reaches 1e6 rad, where the intrinsic's range reduction fails.

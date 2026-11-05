@@ -21,6 +21,9 @@ use crate::tokenizer::Tokenizer;
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub ctx: usize,
+    /// No context was asked for: use the largest the GPUs hold with every
+    /// weight in VRAM (see auto_ctx), `ctx` being the floor.
+    pub ctx_auto: bool,
     pub batch: usize,
     /// GPUs to use. Empty means every supported device.
     pub gpus: Vec<i32>,
@@ -35,8 +38,13 @@ pub struct LoadOptions {
     /// Allow the loader to shrink context/batch to make the model fit.
     pub allow_fallback: bool,
     /// Speculative decoding: tokens the model's MTP head drafts per step. 0
-    /// leaves the head unloaded; ignored on files without one.
-    pub draft: usize,
+    /// leaves the head unloaded; ignored on files without one. None decides
+    /// by model: DEFAULT_DRAFT on dense models, off on MoE ones (see load).
+    pub draft: Option<usize>,
+    /// The MTP head in a file of its own (llama.cpp's `convert --mtp` writes
+    /// `mtp-<name>.gguf` next to a model converted with `--no-mtp`). None
+    /// looks for one next to the model when the model has no head.
+    pub mtp_file: Option<std::path::PathBuf>,
     /// Where weights may live: only VRAM, VRAM then RAM, or airun's choice.
     pub alloc: AllocMode,
     /// The GPU filled first; None picks the fastest.
@@ -47,6 +55,7 @@ impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             ctx: 4096,
+            ctx_auto: false,
             batch: 512,
             gpus: Vec::new(),
             split: SplitMode::Auto,
@@ -55,12 +64,17 @@ impl Default for LoadOptions {
             kv_type: Default::default(),
             reserve_bytes: 384 << 20,
             allow_fallback: true,
-            draft: 0,
+            draft: Some(0),
+            mtp_file: None,
             alloc: AllocMode::Auto,
             main_gpu: None,
         }
     }
 }
+
+/// Drafts per step when `--draft` is not given, on dense models with an MTP
+/// head (80% accepted on Qwen3.8-27B; 26 -> 68 tok/s on an RTX 5060 Ti).
+pub const DEFAULT_DRAFT: usize = 3;
 
 /// What the loader did, for reporting.
 pub struct LoadReport {
@@ -100,27 +114,52 @@ pub fn load(
     if let Some(t) = config.ple.as_ref().and_then(|_| gguf.tensor("per_layer_token_embd.weight")) {
         sizes.other = sizes.other.saturating_sub(t.nbytes);
     }
-    let load_mtp = opts.draft > 0 && crate::model::mtp_supported(gguf.as_ref(), &config);
-    if opts.draft > 0 && !load_mtp {
+    // MTP on a MoE model measured slower than plain decoding: verifying 4
+    // tokens wakes far more experts than decoding 1 (Qwen3.8-35B-A3B on an
+    // RTX 5060 Ti, 64% of drafts accepted: 115 -> 91 tok/s), so it is off
+    // there unless asked for.
+    let draft_wanted = opts.draft != Some(0);
+    let mtp_src = if draft_wanted { mtp_source(path, &gguf, &config, opts.mtp_file.as_deref())? } else { None };
+    let draft = match opts.draft {
+        Some(d) => d,
+        None if config.moe.is_some() => {
+            if mtp_src.is_some() {
+                eprintln!("note: the MTP head is off by default on MoE models (it decodes slower there); \
+                           --draft 3 turns it on");
+            }
+            0
+        }
+        None => DEFAULT_DRAFT,
+    };
+    let mtp_src = mtp_src.filter(|_| draft > 0);
+    let load_mtp = mtp_src.is_some();
+    if draft > 0 && !load_mtp && opts.draft.is_some() {
         let reason = if config.nextn_predict_layers == 0 {
-            "the file has no MTP head"
-        } else if config.moe.is_some() {
-            "its MTP head is a MoE block, which is not wired up yet"
+            "the file has no MTP head, and no mtp-*.gguf for it sits next to it (--mtp names one)"
+        } else if config.nextn_predict_layers != 1 {
+            "the file declares more than one MTP head"
+        } else if !config.is_hybrid() {
+            "MTP heads run on Qwen3.5/3.8 hybrid models only"
         } else {
-            "its MTP head is not a single dense attention block"
+            "the file declares an MTP head but does not carry its weights"
         };
-        eprintln!(
-            "note: --draft {} is ignored: {reason}. Speculative decoding needs a \
-             file whose MTP head is a single dense attention block (greedy only).",
-            opts.draft
-        );
+        eprintln!("note: --draft {draft} is ignored: {reason}.");
     }
+    let head_bytes = mtp_src.as_ref().map_or(0, |src| crate::model::mtp_head_bytes(src, &config));
+    let auto;
+    let opts = if opts.ctx_auto {
+        let ctx = auto_ctx(&config, &sizes, &devices, opts, load_mtp.then_some(head_bytes));
+        auto = LoadOptions { ctx, ..opts.clone() };
+        &auto
+    } else {
+        opts
+    };
     if load_mtp {
         // The head and its own KV cache sit with the output projection.
-        sizes.output += sizes.per_layer.get(config.n_run_layers()).copied().unwrap_or(0)
-            + config.kv_bytes_per_layer(opts.ctx);
+        sizes.output += head_bytes + config.kv_bytes_per_layer(opts.ctx);
     }
     let mut split = opts.split.clone();
+    let mut device_order: Vec<i32> = Vec::new();
     let mut expert_note = None;
     let expert_slots: Option<Vec<usize>> = match opts.expert_cache {
         Some(slots) => {
@@ -141,6 +180,7 @@ pub fn load(
             Some(p) => {
                 if let (Some(counts), SplitMode::Auto) = (p.counts, &opts.split) {
                     split = SplitMode::Manual(counts);
+                    device_order = p.order;
                 }
                 expert_note = Some(p.note);
                 Some(p.slots)
@@ -190,6 +230,7 @@ pub fn load(
             allow_ctx_shrink: opts.allow_fallback,
             alloc: opts.alloc,
             main_gpu: opts.main_gpu,
+            device_order: device_order.clone(),
         };
 
         let mut placement = match plan(&config, &sizes, &devices, &req) {
@@ -245,7 +286,7 @@ pub fn load(
             streams.push((shard.device, Stream::new(shard.device)?));
         }
 
-        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_slots.as_deref(), profile.as_ref(), load_mtp, |d, t| {
+        let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_slots.as_deref(), profile.as_ref(), mtp_src.as_ref(), |d, t| {
             progress("uploading weights", d, t)
         });
 
@@ -274,7 +315,7 @@ pub fn load(
         let weight_bytes = model.total_bytes;
         let placement_out = model.placement.clone();
         let mut runtime = Runtime::new(model, tokenizer, streams, batch)?;
-        runtime.set_draft(opts.draft);
+        runtime.set_draft(draft);
 
         return Ok((
             runtime,
@@ -289,11 +330,167 @@ pub fn load(
     }
 }
 
+/// Where the MTP head comes from: the model file when it carries one, else
+/// `--mtp`'s file, else the one `mtp-*.gguf` next to the model that belongs
+/// to it. A file of its own must be the same model: architecture, width,
+/// vocabulary and trunk depth.
+fn mtp_source(path: &Path, gguf: &std::sync::Arc<GgufFile>, config: &Config, explicit: Option<&Path>)
+              -> Result<Option<std::sync::Arc<GgufFile>>> {
+    if let Some(file) = explicit {
+        let side = GgufFile::open(file).map_err(|e| CoreError::Other(format!(
+            "--mtp {}: {e}. Pass the mtp-*.gguf written for this model (llama.cpp: convert_hf_to_gguf.py --mtp)",
+            file.display())))?;
+        return match mtp_mismatch(config, &side) {
+            None => {
+                eprintln!("MTP head: {}", file.display());
+                Ok(Some(std::sync::Arc::new(side)))
+            }
+            Some(why) => Err(CoreError::Other(format!(
+                "--mtp {} does not fit this model: {why}. Use the mtp-*.gguf converted from the same checkpoint",
+                file.display()))),
+        };
+    }
+    if crate::model::mtp_supported(gguf.as_ref(), config) {
+        return Ok(Some(std::sync::Arc::clone(gguf)));
+    }
+    if !config.is_hybrid() {
+        return Ok(None);
+    }
+    let Some(dir) = path.parent() else { return Ok(None) };
+    let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }) else {
+        return Ok(None);
+    };
+    let mut found: Vec<(std::path::PathBuf, GgufFile)> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !name.starts_with("mtp-") || !name.ends_with(".gguf") || p == path {
+            continue;
+        }
+        if let Ok(side) = GgufFile::open(&p) {
+            if mtp_mismatch(config, &side).is_none() {
+                found.push((p, side));
+            }
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => {
+            let (p, side) = found.pop().unwrap();
+            eprintln!("MTP head: {} (found next to the model; --mtp picks another, --draft 0 skips it)", p.display());
+            Ok(Some(std::sync::Arc::new(side)))
+        }
+        _ => {
+            let names: Vec<String> = found.iter()
+                .map(|(p, _)| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+            eprintln!("note: several MTP heads fit this model ({}); --mtp <file> picks one", names.join(", "));
+            Ok(None)
+        }
+    }
+}
+
+/// Why `side` cannot be this model's MTP head, or None when it can.
+fn mtp_mismatch(config: &Config, side: &GgufFile) -> Option<String> {
+    let arch = side.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("?");
+    if arch != config.arch_name {
+        return Some(format!("it is a {arch} file and the model is {}", config.arch_name));
+    }
+    let c = match Config::from_gguf(side) {
+        Ok(c) => c,
+        Err(e) => return Some(format!("it is not a model file airun reads ({e})")),
+    };
+    if c.arch_name != config.arch_name {
+        return Some(format!("it is a {} file and the model is {}", c.arch_name, config.arch_name));
+    }
+    if c.n_embd != config.n_embd || c.vocab_size != config.vocab_size {
+        return Some(format!("width {} / vocabulary {} against the model's {} / {}",
+            c.n_embd, c.vocab_size, config.n_embd, config.vocab_size));
+    }
+    if c.nextn_predict_layers != 1 {
+        return Some(format!("it declares {} MTP heads, and airun runs exactly one", c.nextn_predict_layers));
+    }
+    if c.n_run_layers() != config.n_run_layers() {
+        return Some(format!("its head follows {} layers and the model has {}", c.n_run_layers(), config.n_run_layers()));
+    }
+    if !crate::model::mtp_head_present(side, config) {
+        return Some(format!("it has no blk.{}.nextn.eh_proj tensor", config.n_run_layers()));
+    }
+    None
+}
+
+/// The context to use when none was asked for: the largest the GPUs hold
+/// with every weight still in VRAM, up to what the model was trained for.
+///
+/// The GPUs are the ones the model takes at the default context (`opts.ctx`):
+/// a model that fits one card stays on it, since spreading it over a second
+/// for context would slow every token. When the weights do not fit the
+/// GPUs even then (a MoE whose experts go to RAM), the default stays: each
+/// gigabyte of KV cache would push weights out of VRAM.
+fn auto_ctx(config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &LoadOptions,
+            mtp_head: Option<u64>) -> usize {
+    let base = opts.ctx;
+    let sizes_at = |ctx: usize| {
+        let mut s = sizes.clone();
+        if let Some(head) = mtp_head {
+            s.output += head + config.kv_bytes_per_layer(ctx);
+        }
+        s
+    };
+    let req_at = |ctx: usize, split: SplitMode| PlacementRequest {
+        ctx,
+        batch: opts.batch,
+        split,
+        gpu_layers: None,
+        reserve_bytes: opts.reserve_bytes,
+        allow_ctx_shrink: false,
+        alloc: AllocMode::Gpu,
+        main_gpu: opts.main_gpu,
+        device_order: Vec::new(),
+    };
+    let Ok(at_base) = plan(config, &sizes_at(base), devices, &req_at(base, opts.split.clone())) else {
+        return base;
+    };
+    // Plus any GPU as fast as those: across equal cards a split costs only
+    // the handoff, each card running its share of the layers at the same
+    // speed (two RTX 5060 Ti: the 27B goes from 4k to the context both hold).
+    let slowest = devices.iter().filter(|d| at_base.devices().contains(&d.ordinal))
+        .map(|d| d.perf_score()).fold(f64::INFINITY, f64::min);
+    let used: Vec<Device> = devices.iter()
+        .filter(|d| at_base.devices().contains(&d.ordinal) || d.perf_score() >= 0.9 * slowest)
+        .cloned().collect();
+    let split = match used.as_slice() {
+        [one] => SplitMode::Single(one.ordinal),
+        _ => opts.split.clone(),
+    };
+    // Same GPUs, and no smaller prefill batch than the default context got.
+    let fits = |ctx: usize| plan(config, &sizes_at(ctx), &used, &req_at(ctx, split.clone()))
+        .is_ok_and(|p| p.ctx == ctx && p.batch >= at_base.batch);
+    let cap = config.train_ctx.max(base);
+    let (mut lo, mut hi) = (base, cap);
+    if fits(hi) {
+        lo = hi;
+    } else {
+        while hi - lo > 256 {
+            let mid = (lo + (hi - lo) / 2) / 256 * 256;
+            if mid <= lo {
+                break;
+            }
+            if fits(mid) { lo = mid } else { hi = mid }
+        }
+    }
+    if lo > base {
+        eprintln!("context: {lo} tokens, the most the GPUs hold with every weight in VRAM (-c sets it)");
+    }
+    lo
+}
+
 /// How a MoE model too big for the GPUs is spread: expert slots per layer,
 /// and (when it decides the split) layers per device in the planner's order.
 struct ExpertPlan {
     slots: Vec<usize>,
     counts: Option<Vec<f32>>,
+    /// The device order `counts` is in, which the planner must follow.
+    order: Vec<i32>,
     note: String,
 }
 
@@ -341,11 +538,20 @@ fn plan_experts(gguf: &GgufFile, config: &Config, sizes: &WeightSizes, devices: 
         return None;
     }
 
-    let slow: Vec<bool> = if used.len() > 1 {
+    let mut slow: Vec<bool> = if used.len() > 1 {
         used.iter().map(|d| measure_h2d_gbps(d.ordinal).is_some_and(|g| g < SLOW_LINK_GBPS)).collect()
     } else {
         vec![false]
     };
+    // Slow-link GPUs take the last layers, so they go last in the order the
+    // planner lays layers out in. On two identical cards the performance
+    // order falls back to the ordinal, and a slow-link card at ordinal 0 used
+    // to get the first layers with the last layers' expert counts: Qwen4 on
+    // two RTX 5060 Ti failed to load, one card 7 GiB over.
+    let mut paired: Vec<(&Device, bool)> = used.iter().copied().zip(slow.iter().copied()).collect();
+    paired.sort_by_key(|&(_, s)| s);
+    used = paired.iter().map(|&(d, _)| d).collect();
+    slow = paired.iter().map(|&(_, s)| s).collect();
     // Whole layers for the slow-link GPUs, taken from the end, where the
     // planner puts its last devices; the output head sits with the last one.
     let mut counts = vec![0usize; used.len()];
@@ -396,6 +602,7 @@ fn plan_experts(gguf: &GgufFile, config: &Config, sizes: &WeightSizes, devices: 
     Some(ExpertPlan {
         slots,
         counts: (whole > 0).then(|| counts.iter().map(|&c| c as f32).collect()),
+        order: used.iter().map(|d| d.ordinal).collect(),
         note,
     })
 }

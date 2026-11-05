@@ -33,6 +33,7 @@ streams e lançar *nossos* kernels.
 | Kernels CUDA (matvec f32/dp4a/tensor-core, attention, rope, rmsnorm, swiglu, embed, kv) | 226/226 no selftest |
 | Runtime Qwen3 denso | gera texto coerente |
 | Multi-GPU (split por camada) | validado com 2 placas |
+| GPUs de gerações diferentes (build `86,120`) | validado: 5060 Ti + 3060, selftest nas duas, texto idêntico ao de uma placa |
 | Planner de VRAM | testado, com fallback automático |
 | API no formato do llama-server (OpenAI chat/completions/responses, Anthropic messages, nativa, infill, SSE, auth, reasoning, tool calls, logprobs) | 56/56 em `tests/api_conformance.py` |
 | Amostragem (top-k/p, min-p, typical, top-n-sigma, 3 penalidades, logit_bias, DRY, XTC, dynatemp, mirostat 1/2) | testada |
@@ -310,7 +311,12 @@ rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
 2. **Estas GPUs não têm P2P.** `cudaDeviceCanAccessPeer` retorna 0. Cópias
    entre GPUs passam pela RAM. Por isso o planner prefere uma GPU só quando o
    modelo cabe e, quando não cabe, enche a mais rápida primeiro
-   (`fill_fastest_first`, em `plan.rs`). Dividir pela VRAM livre punha metade
+   (`fill_fastest_first`, em `plan.rs`) — salvo quando as GPUs são gêmeas
+   (nota de desempenho a até 10%): aí divide por igual (`split_by_fraction`
+   filtrado por `fits_budgets`), o que dobra o prefill e não muda o decode.
+   O `plan_experts` também ordena as GPUs lentas por último e passa essa
+   ordem ao planner (`PlacementRequest.device_order`), sem supor que o
+   ordinal mais alto é o mais lento. Dividir pela VRAM livre punha metade
    do 27B na 5060 Ti, que tem metade da banda da 5070 Ti. Como o decode roda as
    placas em série, isso custava 28%: decode @16 em 33,7 contra 43,0 tok/s e
    @32k em 28,9 contra 37,1. No decode o split custa: no 1.7B, 94 t/s contra
@@ -718,7 +724,14 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
    leitura, onde antes o host esperava cada passo da cabeça. Só com uma GPU e
    grafos ligados. 27B NVFP4 numa 5070 Ti: 93.8–113.6 tok/s contra 49 sem MTP
    (llama.cpp com draft-mtp, mesmos prompts: 91.6–104.2).
-   Falta: cabeça MTP dos MoE (35B-A3B), amostragem não gulosa.
+   **MoE (2026-11-05):** a cabeça dos MoE carrega pelo mesmo caminho de
+   experts (`load_mtp_weights` monta `FfnWeights::Moe`). Funciona, mas é mais
+   lenta: 35B-A3B numa 5060 Ti 115 → 91 tok/s com 64% aceitos, porque o
+   verify de 4 tokens acorda muito mais experts. Por isso `--draft` sem valor
+   (`LoadOptions.draft = None`) é `DEFAULT_DRAFT` em denso e 0 em MoE.
+   A cabeça é o bloco `n_run_layers()` (o `block_count` a conta); o bug antigo
+   procurava `blk.{n_layers}` e nunca a achava. 27B numa 5060 Ti: 26,4 → 68,4.
+   Falta: amostragem não gulosa.
 
    **Ativação não silenciosa (2026-11-03):** `--draft` só engaja com amostragem
    gulosa pura (`temp 0` e nenhuma penalidade — `run`/`serve` têm
@@ -743,3 +756,52 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
 - Todo bloco `unsafe` precisa de um comentário `// SAFETY:` justificando.
 - Testes verificam comportamento, não implementação. Prefira testes que
   falhariam se a lógica estivesse errada, não só se ela mudasse.
+
+## NVFP4 fora do Blackwell (2026-11-05)
+
+Sem os tensor cores FP4 (sm_120a), o NVFP4 roda no MMQ int8 (prefill) e no
+dp4a (decode), com o mesmo resultado; `fp4_supported()` decide por GPU
+(`cudaGetDevice`), então num PC misto cada placa usa o seu caminho.
+
+- RTX 3060, Qwen3-1.7B NVFP4 (convertido pelo `airun quantize`), quente:
+  prefill 128/512/2048 em 6826/8031/7423 t/s, decode 226 tok/s. llama.cpp
+  b11760, mesmo arquivo e placa: pp512 5983, pp2048 6248, tg128 195.
+- 27B numa 5060 Ti: o caminho int8 dá 889 t/s no prefill de 512, igual ao
+  Q4_K do mesmo modelo (864), contra 2016 com FP4. Não há gargalo próprio
+  do formato.
+- Varredura no 3060 (`AIRUN_MMQ_TC=64`, `AIRUN_NO_MMQ_STREAMK`,
+  `AIRUN_NO_MMQ_SPLIT`): os padrões já são os melhores. A primeira medição
+  de cada sessão sai ~8% abaixo (clock da placa subindo); compare só depois
+  de uma rodada de aquecimento.
+- O Nsight Compute 2022.4 instalado perfila a 3060 (sm_86), não as RTX 50.
+
+## Visão, MTP em arquivo próprio, stream replay (2026-11-05)
+
+- **Visão** (`crates/airun-core/src/vision.rs`, `kernels/vision.cu`): o ViT do
+  `qwen3vl_merger` como o `tools/mtmd/models/qwen3vl.cpp` do llama.cpp. Roda
+  nos kernels do texto: matmuls BF16, a atenção do KV cache com toda query na
+  última posição (= atenção cheia) e as cabeças de 72 completadas com zeros
+  até 96; FFN de 4304 completado até 4352 (k % 64 do WMMA). Selftest: seção
+  "vision encoder and image positions".
+- **Posições de imagem no texto:** `airun_rope_params` ganhou `shift` (um i32
+  na GPU por shard; o texto depois de uma imagem roda em slot - shift, e os
+  grafos CUDA seguem o valor) e `mpos` (as posições (t, linha, coluna) dos
+  tokens da imagem, distribuídas pelas seções do M-RoPE intercalado). Sem
+  imagem o shift é 0 e tudo é bit-idêntico ao de antes.
+- **Imagens no prompt** são ids sentinela >= 2^31 (`IMAGE_TOKEN_BASE`), vindos
+  do hash dos embeddings (`Runtime::register_image`), então o
+  `reusable_prefix` reconhece a mesma imagem no turno seguinte. `generate`
+  roda as imagens por `prefill_images`; com imagem o MTP fica desligado.
+  `save_state` recusa conversas com imagem.
+- **MTP em arquivo próprio:** `loader::mtp_source` (`--mtp`, ou um
+  `mtp-*.gguf` compatível na pasta do modelo). `Model::load` recebe de onde ler
+  a cabeça.
+- **Stream replay** (`crates/airun-cli/src/replay.rs`): um middleware copia o
+  SSE de pedidos com `X-Conversation-Id` para a sessão e consome a geração
+  sem o cliente; `DELETE` derruba o corpo e a geração para no próximo token.
+- **MTP no prefill não espera mais a cabeça** a cada lote (`mtp_queue` no
+  lugar de `mtp_run`): o `synchronize` impedia a primeira GPU de começar o
+  lote seguinte. 27B em duas GPUs, prompt de 61k: 615 -> 899 tok/s.
+- **Decode GQA lê V direto do cache f16** (sem passar pela memória
+  compartilhada): 128k, 27B em 5060 Ti + 3060, 12,4 -> 13,4 tok/s. O
+  limite agora é a ocupação: o tile de K deixa 4 warps por SM.

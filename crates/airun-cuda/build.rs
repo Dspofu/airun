@@ -85,13 +85,20 @@ fn main() {
             "--use_fast_math",
             "-std=c++17",
             "--extended-lambda",
-            "-Xcompiler",
-            "/EHsc",
-            // MSVC releases move faster than CUDA's supported-compiler table; the
-            // C++ we generate is plain enough that the check is not worth a hard stop.
+            // Host compilers release faster than CUDA's supported-compiler table;
+            // the C++ we generate is plain enough that the check is not worth a
+            // hard stop.
             "-allow-unsupported-compiler",
             "-diag-suppress=177", // unused function: kernels are selected per type
         ]);
+        if cfg!(windows) {
+            // MSVC's C++ exception model (gcc and clang need no flag).
+            cmd.args(["-Xcompiler", "/EHsc"]);
+        } else {
+            // Static libraries linked into a Rust binary, which is position
+            // independent by default on Linux.
+            cmd.args(["-Xcompiler", "-fPIC"]);
+        }
         cmd.arg("-I").arg(&kernels_dir);
         if let Some(ccbin) = host_compiler_dir() {
             cmd.arg("-ccbin").arg(&ccbin);
@@ -107,7 +114,7 @@ fn main() {
 
     let mut cmd = base();
     cmd.arg("-lib");
-    cmd.arg("-o").arg(out_dir.join("airun_kernels.lib"));
+    cmd.arg("-o").arg(out_dir.join(static_lib("airun_kernels")));
     for arch in &archs {
         cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
     }
@@ -125,7 +132,7 @@ fn main() {
     // the list it is built empty and reports itself unsupported.
     let mut fp4 = base();
     fp4.arg("-lib");
-    fp4.arg("-o").arg(out_dir.join("airun_fp4.lib"));
+    fp4.arg("-o").arg(out_dir.join(static_lib("airun_fp4")));
     if archs.iter().any(|a| a == "120") {
         fp4.arg("-gencode=arch=compute_120a,code=sm_120a");
         fp4.arg("-DAIRUN_FP4_BUILT=1");
@@ -141,13 +148,28 @@ fn main() {
     println!("cargo:rustc-link-lib=static=airun_kernels");
     println!("cargo:rustc-link-lib=static=airun_fp4");
 
-    let lib_dir = cuda.join("lib").join("x64");
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    // Where cudart lives: libd on Windows; lib64, or the targets/ tree of
+    // a distribution package, on Linux.
+    for dir in [cuda.join("lib").join("x64"), cuda.join("lib64"), cuda.join("targets").join("x86_64-linux").join("lib"),
+        cuda.join("lib")] {
+        if dir.is_dir() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
     println!("cargo:rustc-link-lib=dylib=cudart");
+    if !cfg!(windows) {
+        // The kernels' host code is C++; MSVC links its runtime on its own.
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 
     println!("cargo:rustc-cfg=airun_cuda");
     println!("cargo:cuda_path={}", cuda.display());
     println!("cargo:archs={}", archs.join(","));
+}
+
+/// A static library's file name as the platform's linker looks for it.
+fn static_lib(name: &str) -> String {
+    if cfg!(windows) { format!("{name}.lib") } else { format!("lib{name}.a") }
 }
 
 fn target() -> String {

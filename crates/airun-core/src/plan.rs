@@ -84,6 +84,9 @@ pub struct PlacementRequest {
     /// The GPU filled first and the one that runs layers kept in RAM. None:
     /// the fastest.
     pub main_gpu: Option<i32>,
+    /// An exact device order, overriding the performance order and
+    /// `main_gpu` (the MoE expert plan, whose layer counts are in its order).
+    pub device_order: Vec<i32>,
 }
 
 impl Default for PlacementRequest {
@@ -97,6 +100,7 @@ impl Default for PlacementRequest {
             allow_ctx_shrink: true,
             alloc: AllocMode::Auto,
             main_gpu: None,
+            device_order: Vec::new(),
         }
     }
 }
@@ -400,6 +404,9 @@ pub fn plan(
         let d = ordered.remove(i);
         ordered.insert(0, d);
     }
+    if !req.device_order.is_empty() {
+        ordered.sort_by_key(|d| req.device_order.iter().position(|&o| o == d.ordinal).unwrap_or(usize::MAX));
+    }
 
     let budgets: BTreeMap<i32, u64> = ordered
         .iter()
@@ -551,12 +558,19 @@ fn try_place(
                 }
                 (b < req.batch && fits(d, b)).then_some((d, b))
             });
+            // ...unless another card is as fast: then a split keeps the full
+            // batch at no decode cost (each card runs its layers at the same
+            // speed) and the prefill pipelines across both. Two RTX 5060 Ti on
+            // the 27B: a 4k prompt at 3163 tok/s split, 1769 on one card at
+            // the halved batch, decode 26.4 against 26.5.
+            let twin = fastest.is_some_and(|f| ordered.iter().skip(1)
+                .any(|d| d.perf_score() >= 0.9 * f.perf_score() && f.perf_score() >= 0.9 * d.perf_score()));
             // With a main GPU named, "the fastest" means it.
             let single = if fastest.is_some_and(|d| fits(d, req.batch)) {
                 fastest
             } else if req.main_gpu.is_some() {
                 None
-            } else if let Some((d, b)) = shrunk {
+            } else if let Some((d, b)) = shrunk.filter(|_| !twin) {
                 batch = b;
                 notes.push(format!("prefill batch reduced to {b} so the model stays on the fastest GPU"));
                 Some(d)
@@ -589,8 +603,20 @@ fn try_place(
                 // half the 27B on a 5060 Ti that has half a 5070 Ti's
                 // bandwidth. A pipelined prefill also wins: its pace is the
                 // slower shard's, and the slow card now holds the least.
-                match fill_fastest_first(ordered, &budgets, &layer_cost, sizes, cfg, batch,
-                    req.alloc != AllocMode::Memory) {
+                //
+                // Between cards of the same speed it is the other way round:
+                // decode costs the same wherever a layer runs, and the prefill
+                // pipeline goes at the pace of the busier card, so the layers
+                // are shared in proportion to free VRAM. Filling the first of
+                // two RTX 5060 Ti left the second the output head alone: a
+                // 4k prompt at 1936 tok/s, against 3163 split in halves.
+                let best = ordered.iter().map(|d| d.perf_score()).fold(0.0, f64::max);
+                let twins = ordered.iter().all(|d| d.perf_score() >= 0.9 * best);
+                let balanced = (twins && req.alloc != AllocMode::Memory)
+                    .then(|| split_by_fraction(ordered, &caps, sum, n_layers))
+                    .filter(|a| fits_budgets(a, &budgets, &layer_cost, sizes, cfg, batch));
+                match balanced.or_else(|| fill_fastest_first(ordered, &budgets, &layer_cost, sizes, cfg, batch,
+                    req.alloc != AllocMode::Memory)) {
                     Some(a) => {
                         notes.push(format!(
                             "model exceeds any single GPU; filling GPU {} ({}) first",
@@ -750,6 +776,29 @@ fn fill_fastest_first(
         out.push((d.ordinal, next - start));
     }
     None
+}
+
+/// Whether a layer assignment (counts per GPU, in layer order) fits
+/// each GPU's budget, the first holding the embedding and the last the
+/// output head.
+fn fits_budgets(
+    assignment: &[(i32, usize)],
+    budgets: &BTreeMap<i32, u64>,
+    layer_cost: &[u64],
+    sizes: &WeightSizes,
+    cfg: &Config,
+    batch: usize,
+) -> bool {
+    let mut next = 0;
+    let last = assignment.len().saturating_sub(1);
+    assignment.iter().enumerate().all(|(i, &(ordinal, count))| {
+        let layers: u64 = layer_cost[next..next + count].iter().sum();
+        next += count;
+        let used = layers + scratch_bytes(cfg, batch, i == last)
+            + if i == 0 { sizes.embedding } else { 0 }
+            + if i == last { sizes.output + sizes.other } else { 0 };
+        used <= budgets.get(&ordinal).copied().unwrap_or(0)
+    })
 }
 
 /// VRAM to stage the largest of `ram_layers` (plus room for the per-tensor
@@ -962,6 +1011,27 @@ mod tests {
         assert!(fast.budget_bytes - fast.total_bytes() < layer,
             "the fast card has room for another layer: {:?}",
             p.shards.iter().map(|s| s.layers.len()).collect::<Vec<_>>());
+    }
+
+    /// Two cards of the same speed share the layers evenly (decode costs
+    /// the same anywhere, and the prefill pipeline needs both busy); a fast
+    /// and a slow card fill the fast one first. Both sides measured: two
+    /// RTX 5060 Ti on the 27B, a 4k prompt at 3353 tok/s split in halves
+    /// against 1936 filling one; a 5070 Ti + 5060 Ti, decode at 43.0 tok/s
+    /// filling the fast one against 33.7 split in halves.
+    #[test]
+    fn equal_gpus_split_evenly_unequal_ones_fill_the_fast_one() {
+        let cfg = config(40);
+        let sz = sizes(40, 500); // ~19.5 GiB
+        let twins = vec![device(0, 15, 36, 128), device(1, 15, 36, 128)];
+        let p = plan(&cfg, &sz, &twins, &PlacementRequest::default()).unwrap();
+        let l = layers(&p);
+        assert_eq!(l.len(), 2);
+        assert!(l[0].abs_diff(l[1]) <= 2, "equal cards should split evenly: {l:?}");
+        let mixed = vec![device(0, 15, 70, 256), device(1, 15, 36, 128)];
+        let p = plan(&cfg, &sz, &mixed, &PlacementRequest::default()).unwrap();
+        let l = layers(&p);
+        assert!(l[0] > l[1] + 10, "the fast card should be filled first: {l:?}");
     }
 
     fn layers(p: &Placement) -> Vec<usize> {

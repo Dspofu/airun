@@ -17,6 +17,7 @@ pub mod hybrid;
 pub mod ops;
 pub mod qsa;
 pub mod stream;
+pub mod vision;
 
 pub use buffer::{DeviceBuffer, PinnedBuffer};
 pub use ops::KernelType;

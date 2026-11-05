@@ -122,7 +122,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     anyhow::ensure!(args.runs > 0 && args.batch_size > 0 && args.ctx_size > 0 && args.decode > 0,
         "runs, batch-size, ctx-size and decode must be positive; pass values greater than zero");
     let mut run_args = RunArgs::bench_defaults(args.model.clone());
-    run_args.ctx_size = args.ctx_size;
+    run_args.ctx_size = Some(args.ctx_size);
     run_args.expert_cache = args.expert_cache;
     run_args.kv_type = args.kv_type;
     // A benchmark at a silently reduced context is not the requested test.
@@ -134,6 +134,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     let (mut runtime, report) = loader::load(&args.model, &run_args.load_options(), |_, _, _| {})
         .with_context(|| format!("failed to load {}", args.model.display()))?;
+    // The planner may have lowered the prompt batch to keep the model on one
+    // GPU; chunking by the one asked for would then overrun the runtime.
+    let batch = runtime.max_batch().min(args.batch_size);
 
     if !args.json {
         println!("{}", report.config.summary());
@@ -189,7 +192,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             // back. Reading every chunk's would synchronize between chunks
             // and keep a split model's GPUs from overlapping them.
             while fed < prompt.len() {
-                let take = (prompt.len() - fed).min(args.batch_size);
+                let take = (prompt.len() - fed).min(batch);
                 if fed + take < prompt.len() {
                     runtime.prefill_chunk(&prompt[fed..fed + take])?;
                 } else {
@@ -228,7 +231,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         for i in 0..(args.warmup + args.runs) {
             runtime.reset();
             if args.forward_only {
-                for chunk in prompt.chunks(args.batch_size) { runtime.forward(chunk)?; }
+                for chunk in prompt.chunks(batch) { runtime.forward(chunk)?; }
                 let start = std::time::Instant::now();
                 for _ in 0..args.decode { runtime.forward(&[filler])?; }
                 if i >= args.warmup { samples.push(start.elapsed().as_secs_f64() * 1000.0); }
@@ -276,7 +279,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 "parameters_summary": report.config.summary(),
                 "weight_bytes": report.weight_bytes,
                 "load_ms": report.load_ms,
-                "batch": args.batch_size,
+                "batch": batch,
                 "expert_cache_slots": args.expert_cache,
                 "kv_type": args.kv_type.name(),
                 "expert_cache_stats": runtime.expert_cache_stats(),

@@ -441,7 +441,9 @@ impl Model {
         streams: &[(i32, Stream)],
         expert_slots: Option<&[usize]>,
         profile: Option<&crate::expert_profile::ExpertProfile>,
-        load_mtp: bool,
+        // Where the MTP head is read from: the model file, a file of its own
+        // (see loader::mtp_source), or None to leave it out.
+        mtp_src: Option<&Arc<GgufFile>>,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Self> {
         let stream_for = |dev: i32| -> Result<&Stream> {
@@ -681,8 +683,8 @@ impl Model {
         // whose header and tensors disagree would otherwise produce garbage.
         validate_shapes(&config, &layers, &token_embd)?;
 
-        let mtp = if load_mtp && mtp_supported(gguf.as_ref(), &config) {
-            let m = load_mtp_weights(gguf, &config, out_dev, stream_for(out_dev)?)?;
+        let mtp = if let Some(src) = mtp_src {
+            let m = load_mtp_weights(src, &config, out_dev, stream_for(out_dev)?)?;
             total_bytes += layer_bytes(&m.layer) + m.eh_proj.bytes() as u64;
             Some(m)
         } else {
@@ -793,18 +795,29 @@ fn tensor_info<'a>(gguf: &'a GgufFile, name: &str, arch: &str) -> Result<&'a Ten
 /// dense). The MoE heads of the A3B models are not wired up yet.
 /// A file runs MTP speculative decoding when it declares exactly one draft
 /// head (`nextn_predict_layers == 1`), the head is a layer the runtime can
-/// execute (a hybrid block — dense hybrids and MoE hybrids both qualify), and
-/// the head's tensors are actually present in the file. That last check
-/// matters: some converters keep the `nextn_predict_layers` metadata while
-/// stripping the head weights (block_count == n_layer, no `nextn.*` tensors),
-/// and loading would then fail on a missing `blk.{n_layer}` tensor. The
+/// execute (a hybrid block: dense and MoE hybrids both qualify, the MoE head
+/// running through the same expert path as the other layers), and the head's
+/// tensors are actually present in the file. That last check matters: some
+/// converters keep the `nextn_predict_layers` metadata while stripping the
+/// head weights, and loading would then fail on a missing tensor. The
 /// `nextn.eh_proj` input projection is the head's signature tensor.
+///
+/// The head is block `n_run_layers()`: `block_count` counts it, so it is the
+/// last block, not one past it.
 pub fn mtp_supported(gguf: &GgufFile, config: &Config) -> bool {
-    config.nextn_predict_layers == 1
-        && config.is_hybrid()
-        && gguf
-            .tensor(&format!("blk.{}.nextn.eh_proj.weight", config.n_layers))
-            .is_some()
+    config.nextn_predict_layers == 1 && config.is_hybrid() && mtp_head_present(gguf, config)
+}
+
+/// Bytes of the MTP head's own tensors (block `n_run_layers()`) in `src`; a
+/// head file's copies of the embedding and output are not loaded.
+pub fn mtp_head_bytes(src: &GgufFile, config: &Config) -> u64 {
+    let prefix = format!("blk.{}.", config.n_run_layers());
+    src.tensors().iter().filter(|t| t.name.starts_with(&prefix)).map(|t| t.nbytes).sum()
+}
+
+/// Whether the file carries the MTP head's weights (see [`mtp_supported`]).
+pub fn mtp_head_present(gguf: &GgufFile, config: &Config) -> bool {
+    gguf.tensor(&format!("blk.{}.nextn.eh_proj.weight", config.n_run_layers())).is_some()
 }
 
 fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &Stream) -> Result<MtpWeights> {
@@ -823,10 +836,32 @@ fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &St
             indexer: None,
         }),
         ffn_norm: load_f32(gguf, &name(&format!("{}.weight", config.ffn_norm_name)), dev, stream)?,
-        ffn: FfnWeights::Dense {
-            gate: load_packed(gguf, &name("ffn_gate.weight"), dev, stream, config)?,
-            up: load_packed(gguf, &name("ffn_up.weight"), dev, stream, config)?,
-            down: load_packed(gguf, &name("ffn_down.weight"), dev, stream, config)?,
+        // A MoE model's head is a MoE block too; its experts all stay on the
+        // GPU (the planner counted the whole head with the output device).
+        ffn: if config.moe.is_some() {
+            let shared = if gguf.tensor(&name("ffn_gate_shexp.weight")).is_some() {
+                Some(SharedExpert {
+                    router: load_packed(gguf, &name("ffn_gate_inp_shexp.weight"), dev, stream, config)?,
+                    gate: load_packed(gguf, &name("ffn_gate_shexp.weight"), dev, stream, config)?,
+                    up: load_packed(gguf, &name("ffn_up_shexp.weight"), dev, stream, config)?,
+                    down: load_packed(gguf, &name("ffn_down_shexp.weight"), dev, stream, config)?,
+                })
+            } else {
+                None
+            };
+            FfnWeights::Moe {
+                router: load_packed(gguf, &name("ffn_gate_inp.weight"), dev, stream, config)?,
+                gate_exps: load_packed(gguf, &name("ffn_gate_exps.weight"), dev, stream, config)?,
+                up_exps: load_packed(gguf, &name("ffn_up_exps.weight"), dev, stream, config)?,
+                down_exps: load_packed(gguf, &name("ffn_down_exps.weight"), dev, stream, config)?,
+                shared,
+            }
+        } else {
+            FfnWeights::Dense {
+                gate: load_packed(gguf, &name("ffn_gate.weight"), dev, stream, config)?,
+                up: load_packed(gguf, &name("ffn_up.weight"), dev, stream, config)?,
+                down: load_packed(gguf, &name("ffn_down.weight"), dev, stream, config)?,
+            }
         },
         hc: None,
         ple: None,
@@ -991,6 +1026,14 @@ fn load_cached(
         (data, None)
     };
 
+    let global_scale = global_scale_of(gguf, name);
+    if n_experts > 1 && global_scale != 1.0 {
+        return Err(CoreError::Other(format!(
+            "{name} is an NVFP4 expert stack with a per-tensor global scale (a `.scale` sidecar), which the \
+             MoE kernels do not apply yet; convert the file without the sidecar (airun's own NVFP4 encoder \
+             writes self-contained blocks) or use another quantization of the model")));
+    }
+
     Ok(GpuTensor {
         data,
         host_experts,
@@ -1002,7 +1045,7 @@ fn load_cached(
         expert_stride,
         n_experts,
         device,
-        global_scale: global_scale_of(gguf, name),
+        global_scale,
         ram: None,
     })
 }

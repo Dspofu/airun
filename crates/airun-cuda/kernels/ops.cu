@@ -171,7 +171,7 @@ __global__ void rope_kernel(
     if (i >= half) return;
 
     float sin_t, cos_t;
-    rope_cos_sin(rp, i, rope_dim, positions[token], &cos_t, &sin_t);
+    rope_cos_sin(rp, i, rope_dim, rope_position(rp, i, token, positions[token]), &cos_t, &sin_t);
 
     float* base = x + ((size_t)token * n_heads + head) * head_dim;
     const int lo = interleaved ? (2 * i) : i;
@@ -442,7 +442,7 @@ __global__ void qk_norm_rope_store_kernel(
         }
         if (pair >= 0) {
             float sin_t, cos_t;
-            rope_cos_sin(rp, pair, rope_dim, pos, &cos_t, &sin_t);
+            rope_cos_sin(rp, pair, rope_dim, rope_position(rp, pair, token, pos), &cos_t, &sin_t);
             const float x0 = first ? row[i] : row[other];
             const float x1 = first ? row[other] : row[i];
             x = first ? x0 * cos_t - x1 * sin_t : x0 * sin_t + x1 * cos_t;
@@ -853,21 +853,45 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
             for (int i = 0; i < DP; ++i) { acc[h][i][0] *= corr; acc[h][i][1] *= corr; }
             ps[h * GQA_TILE + lane] = p;
         }
-        __syncwarp();   // every lane is done reading K before V overwrites it
+        __syncwarp();   // every lane is done reading K, and ps is written
 
-        gqa_stage<D, KV>(tile, vbase, row_bytes, t0, n, lane, idx);
-        __syncwarp();
-        for (int j = 0; j < n; ++j) {
-            const half* vr = tile + j * LD;
+        // An f16 V row is read straight from the cache: lane l takes halves
+        // 2l + 64i, so each i is one coalesced 128-byte load across the warp,
+        // with nothing to stage. Staging it through shared memory as K is
+        // made the warp wait out each tile's load before using any of it.
+        if constexpr (KV == KV_F16) {
+#pragma unroll 4
+            for (int j = 0; j < n; ++j) {
+                const half* vr = (const half*)(vbase + (size_t)(idx ? idx[t0 + j] : t0 + j) * row_bytes);
+                float2 v[DP];
 #pragma unroll
-            for (int i = 0; i < DP; ++i) {
-                const float2 v = __half22float2(*(const half2*)&vr[2 * lane + 64 * i]);
+                for (int i = 0; i < DP; ++i) v[i] = __half22float2(__ldg((const half2*)&vr[2 * lane + 64 * i]));
 #pragma unroll
-                for (int h = 0; h < GQA_MAX; ++h) {
-                    if (h >= G) continue;
-                    const float pj = ps[h * GQA_TILE + j];
-                    acc[h][i][0] = fmaf(pj, v.x, acc[h][i][0]);
-                    acc[h][i][1] = fmaf(pj, v.y, acc[h][i][1]);
+                for (int i = 0; i < DP; ++i) {
+#pragma unroll
+                    for (int h = 0; h < GQA_MAX; ++h) {
+                        if (h >= G) continue;
+                        const float pj = ps[h * GQA_TILE + j];
+                        acc[h][i][0] = fmaf(pj, v[i].x, acc[h][i][0]);
+                        acc[h][i][1] = fmaf(pj, v[i].y, acc[h][i][1]);
+                    }
+                }
+            }
+        } else {
+            gqa_stage<D, KV>(tile, vbase, row_bytes, t0, n, lane, idx);
+            __syncwarp();
+            for (int j = 0; j < n; ++j) {
+                const half* vr = tile + j * LD;
+#pragma unroll
+                for (int i = 0; i < DP; ++i) {
+                    const float2 v = __half22float2(*(const half2*)&vr[2 * lane + 64 * i]);
+#pragma unroll
+                    for (int h = 0; h < GQA_MAX; ++h) {
+                        if (h >= G) continue;
+                        const float pj = ps[h * GQA_TILE + j];
+                        acc[h][i][0] = fmaf(pj, v.x, acc[h][i][0]);
+                        acc[h][i][1] = fmaf(pj, v.y, acc[h][i][1]);
+                    }
                 }
             }
         }

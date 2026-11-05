@@ -188,6 +188,17 @@ impl PleConfig {
     }
 }
 
+/// The model's name from the file's metadata: `general.name`, unless it is a
+/// converter's placeholder ("Ours", "model", ...), then `general.basename`.
+/// None when neither says anything; callers fall back to the file name.
+pub fn model_name(gguf: &GgufFile) -> Option<String> {
+    let get = |k: &str| gguf.metadata().get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let placeholder = |s: &str| s.len() < 3
+        || ["ours", "model", "unknown", "unnamed", "default", "test", "none"].contains(&s.to_ascii_lowercase().as_str());
+    get("general.name").filter(|n| !placeholder(n)).or_else(|| get("general.basename").filter(|n| !placeholder(n)))
+        .map(str::to_string)
+}
+
 /// Everything the forward pass needs to know about a model's shape.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -341,7 +352,15 @@ impl Config {
             .and_then(|v| v.as_usize())
             .unwrap_or(4096);
 
-        let rope = Self::rope_params(gguf, &arch_name, rope_dim)?;
+        let mut rope = Self::rope_params(gguf, &arch_name, rope_dim)?;
+        // Interleaved M-RoPE sections (Qwen3-VL / Qwen3.5): how an image
+        // token's (t, row, col) positions split over the rotary pairs. Text
+        // has all three equal, so it rotates as plain RoPE either way.
+        if let Some(sec) = Self::arch_key(gguf, &arch_name, "rope.dimension_sections").and_then(|v| v.as_array()).and_then(|a| a.as_i64_vec()) {
+            for (i, v) in sec.iter().take(3).enumerate() {
+                rope.sections[i] = *v as i32;
+            }
+        }
 
         let sliding_window = Self::arch_key(gguf, &arch_name, "attention.sliding_window")
             .and_then(|v| v.as_usize())
@@ -460,12 +479,7 @@ impl Config {
         let cfg = Config {
             architecture,
             arch_name,
-            name: gguf
-                .metadata()
-                .get("general.name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unnamed")
-                .to_string(),
+            name: model_name(gguf).unwrap_or_else(|| "unnamed".to_string()),
             n_layers,
             n_embd,
             n_head,
