@@ -328,6 +328,15 @@ rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
    234 t/s numa placa só, com o contexto vazio. No prefill as GPUs se sobrepõem (veja
    "Prefill com contexto longo" acima) e o split quase não perde. Nunca
    sincronize um stream pelo host entre shards: isso põe as GPUs em série.
+   **Atualizado (2026-11-05):** entre GPUs desiguais, sem `--main-gpu` e com
+   saída não amarrada, o planner usa `fill_fastest_last`. A mais rápida fica
+   com a SAÍDA e as últimas camadas, e a lenta com as primeiras camadas e o
+   embedding. A saída é lida inteira a cada token (e de novo a cada rascunho
+   do MTP); o embedding só é consultado por linha. Qwen3.8-27B NVFP4 com
+   lm_head BF16 de 2,5 GB, 5070 Ti + 5060, MTP 3, `-c 131072`: 44,1 → 52,2
+   tok/s (`run`); `serve` 34–36 → 43–47. Com o contexto automático (262k) o
+   layout novo não cabe (a 5070 Ti teria saída + KV) e o planner volta ao
+   antigo.
 
 3. **CUDA 13 removeu campos de `cudaDeviceProp`** (`memoryClockRate`). Nunca
    faça bind direto dessa struct do Rust — use o shim em `kernels/device.cu`.
@@ -726,8 +735,10 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
    `advance_graphed` roda commit + cabeça sobre as linhas do verify + os k
    rascunhos encadeados (o pick de cada passo vira o token do seguinte no
    device) como um CUDA graph por contagem aceita m: um lançamento e uma
-   leitura, onde antes o host esperava cada passo da cabeça. Só com uma GPU e
-   grafos ligados. 27B NVFP4 numa 5070 Ti: 93.8–113.6 tok/s contra 49 sem MTP
+   leitura, onde antes o host esperava cada passo da cabeça. Com grafos
+   ligados; em várias GPUs os grafos da cabeça e do advance são capturados
+   no stream da GPU de saída e só o `commit` (que mexe em todas) fica fora
+   (2026-11-05). O verify continua sem grafo em várias GPUs. 27B NVFP4 numa 5070 Ti: 93.8–113.6 tok/s contra 49 sem MTP
    (llama.cpp com draft-mtp, mesmos prompts: 91.6–104.2).
    **MoE (2026-11-05):** a cabeça dos MoE carrega pelo mesmo caminho de
    experts (`load_mtp_weights` monta `FfnWeights::Moe`). Funciona, mas é mais
@@ -858,7 +869,18 @@ seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
 - `crates/airun-cli/src/progress.rs`: a carga do modelo mostra etapa,
   porcentagem, camadas, GiB e tempo restante (numa linha que se redesenha num
   terminal; a cada 25% num log). `run`, `serve`, `bench` e `perplexity`.
-- `crates/airun-cli/src/reasoning.rs`: níveis none/low/medium/high/max. O
+  Com várias GPUs, cada uma tem a sua linha ("GPU 1 RTX 5060, layers 0..15"),
+  que fica na tela com "ok" quando termina. Os rótulos vêm de
+  `loader::upload_labels`. Os GiB da barra são o tamanho do arquivo vezes a
+  fração de passos (não os bytes reais de cada GPU); o plano impresso depois
+  tem os valores certos.
+- `/props` traz `details` (contexto de treino e iniciado, KV, camadas por
+  GPU/RAM, MoE com especialistas ativos/total, RoPE, MTP, notas do planner),
+  e o painel de configurações da web UI mostra tudo isso.
+- `crates/airun-cli/src/reasoning.rs`: níveis none/low/medium/high/xhigh/max
+  (xhigh = 32768 tokens; antes era sinônimo de max). A web UI mostra
+  desligado/padrão/baixo/médio/alto/muito alto/máximo; "padrão" não manda
+  nível (vale o `--reasoning-effort` do servidor, senão o template). O
   `serve` tenta o nível no template (Qwen3.8 aceita low, medium, xhigh) e, se
   o template não o lê ou recusa o nome, usa o orçamento de pensamento.
 - **`run` não pensava** com Qwen3.5/3.8: o prompt ChatML puro não abria o

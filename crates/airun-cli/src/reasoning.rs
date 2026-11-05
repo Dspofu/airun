@@ -19,6 +19,7 @@ pub const LEVELS: &[(&str, Level)] = &[
     ("low", Level::Budget(Some(1024))),
     ("medium", Level::Budget(Some(4096))),
     ("high", Level::Budget(Some(16384))),
+    ("xhigh", Level::Budget(Some(32768))),
     ("max", Level::Budget(None)),
 ];
 
@@ -27,7 +28,8 @@ pub fn parse(effort: &str) -> Option<Level> {
     let e = effort.trim().to_ascii_lowercase();
     let e = match e.as_str() {
         "off" | "minimal" | "disabled" | "false" | "0" => "none",
-        "xhigh" | "unlimited" | "on" | "true" | "auto" => "max",
+        "very_high" | "very-high" => "xhigh",
+        "unlimited" | "on" | "true" | "auto" => "max",
         other => other,
     };
     LEVELS.iter().find(|(n, _)| *n == e).map(|&(_, l)| l)
@@ -67,7 +69,8 @@ mod tests {
     fn levels_and_their_aliases() {
         assert_eq!(parse("LOW"), Some(Level::Budget(Some(1024))));
         assert_eq!(parse("minimal"), Some(Level::Off));
-        assert_eq!(parse("xhigh"), Some(Level::Budget(None)));
+        assert_eq!(parse("xhigh"), Some(Level::Budget(Some(32768))));
+        assert_eq!(parse("max"), Some(Level::Budget(None)));
         assert_eq!(parse("huge"), None);
         assert_eq!(parse_switch("auto"), Ok(None));
         assert_eq!(parse_switch("off"), Ok(Some(false)));

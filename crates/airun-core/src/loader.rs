@@ -293,8 +293,13 @@ pub fn load(
             streams.push((shard.device, Stream::new(shard.device)?));
         }
 
+        // Steps of Model::load: embedding, output norm, output, then one per
+        // layer. On more than one GPU the stage names where the layers go, so
+        // the load shows each GPU taking its share.
+        let labels = upload_labels(&placement, config.n_run_layers());
         let attempt = Model::load(&gguf, config.clone(), placement.clone(), &streams, expert_slots.as_deref(), profile.as_ref(), mtp_src.as_ref(), |d, t| {
-            progress("uploading weights", d, t)
+            let stage = labels.get(d.min(labels.len().saturating_sub(1))).map_or("uploading weights", |s| s.as_str());
+            progress(stage, d, t)
         });
 
         let mut model = match attempt {
@@ -630,6 +635,36 @@ fn measure_h2d_gbps(ordinal: i32) -> Option<f64> {
     }
     stream.synchronize().ok()?;
     Some(3.0 * BYTES as f64 / t.elapsed().as_secs_f64() / 1e9)
+}
+
+/// The progress stage after each of Model::load's steps (index = steps done):
+/// "uploading weights" on one GPU; on several, the embedding/output steps and
+/// then, per layer, the GPU it goes to ("-> GPU 1 RTX 5060, layers 52..63"),
+/// or RAM for layers kept there.
+fn upload_labels(placement: &Placement, n_run: usize) -> Vec<String> {
+    let total = n_run + 3;
+    if placement.shards.len() < 2 {
+        return vec!["uploading weights".to_string(); total + 1];
+    }
+    let label = |l: usize| -> String {
+        let Some(s) = placement.shards.iter().find(|s| s.layers.contains(&l)) else {
+            return "uploading weights".to_string();
+        };
+        let range = |v: &[usize]| match (v.first(), v.last()) {
+            (Some(a), Some(b)) => format!("{a}..{b}"),
+            _ => String::new(),
+        };
+        if s.ram_layers.contains(&l) {
+            format!("-> RAM via GPU {}, layers {}", s.device, range(&s.ram_layers))
+        } else {
+            let vram: Vec<usize> = s.layers.iter().copied().filter(|x| !s.ram_layers.contains(x)).collect();
+            let name = s.device_name.trim_start_matches("NVIDIA ").trim_start_matches("GeForce ");
+            format!("-> GPU {} {name}, layers {}", s.device, range(&vram))
+        }
+    };
+    (0..=total)
+        .map(|d| if d < 3 { "embedding + output".to_string() } else { label((d - 3).min(n_run.saturating_sub(1))) })
+        .collect()
 }
 
 /// The next smaller configuration to try, or `None` when out of options.

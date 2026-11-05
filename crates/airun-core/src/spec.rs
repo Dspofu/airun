@@ -172,7 +172,7 @@ impl Runtime {
     /// rows already in `spec.h`. Leaves the head's normed output rows in xb of
     /// the output device and returns the greedy pick after the last row.
     fn mtp_run(&mut self, tokens: &[u32], pos0: usize) -> Result<u32> {
-        if tokens.len() == 1 && self.states.len() == 1 && !graphs_disabled() {
+        if tokens.len() == 1 && !graphs_disabled() {
             return self.mtp_run_graphed(tokens[0], pos0);
         }
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -185,8 +185,10 @@ impl Runtime {
 
     /// A one-row head step (each draft after the first) as a captured graph:
     /// ~80 small launches and a readback, which issued one by one were a third
-    /// of the step.
+    /// of the step. The head lives on the output device, so this is captured
+    /// on its stream even when the model is split across GPUs.
     fn mtp_run_graphed(&mut self, token: u32, pos: usize) -> Result<u32> {
+        let si = self.states.len() - 1;
         let mut mg = match self.spec.as_mut().expect("set up by spec_init").mgraph.take() {
             Some(mg) => mg,
             None => VerifyGraph {
@@ -197,23 +199,23 @@ impl Runtime {
         };
         mg.tokens.as_mut_slice()[0] = token as i32;
         mg.positions.as_mut_slice()[0] = pos as i32;
-        device::set_device(self.states[0].device)?;
+        device::set_device(self.states[si].device)?;
         let built = if mg.graph.is_none() {
             // SAFETY of the capture: everything queued lives in `self` or `mg`,
             // and `mg` goes back into `self.spec` below.
-            airun_cuda::Graph::begin_capture(&self.states[0].stream)?;
+            airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
             let queued = self.mtp_queue(mg.tokens.as_slice(), mg.positions.as_slice());
-            let ended = airun_cuda::Graph::end_capture(&self.states[0].stream);
+            let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
             queued.and_then(|_| Ok(ended?)).map(|g| mg.graph = Some(g))
         } else {
             Ok(())
         };
         let launched = built.and_then(|_| {
-            Ok(mg.graph.as_ref().expect("graph was just built").launch(&self.states[0].stream)?)
+            Ok(mg.graph.as_ref().expect("graph was just built").launch(&self.states[si].stream)?)
         });
         self.spec.as_mut().expect("set up by spec_init").mgraph = Some(mg);
         launched?;
-        self.states[0].stream.synchronize()?;
+        self.states[si].stream.synchronize()?;
         Ok(self.sp().picks_host.as_slice()[0] as u32)
     }
 
@@ -298,41 +300,55 @@ impl Runtime {
         for i in 0..m + k {
             g.positions.as_mut_slice()[i] = (pos0 + i) as i32;
         }
-        device::set_device(self.states[0].device)?;
+        // Everything after the commit runs on the output device, where the
+        // head lives. With one GPU the commit goes into the graph too; split
+        // across GPUs it touches every device, so it is queued on their own
+        // streams first (no wait: each stream orders it before its next pass).
+        let si = self.states.len() - 1;
+        let with_commit = si == 0;
+        if !with_commit {
+            self.commit(m)?;
+        }
+        device::set_device(self.states[si].device)?;
         let built = if g.graph.is_none() {
             // SAFETY of the capture: everything queued lives in `self` or `g`,
             // and `g` goes back into `self.spec` below.
-            airun_cuda::Graph::begin_capture(&self.states[0].stream)?;
-            let queued = self.queue_advance(m, g.tokens.as_slice(), g.positions.as_slice());
-            let ended = airun_cuda::Graph::end_capture(&self.states[0].stream);
+            airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
+            let queued = self.queue_advance(m, g.tokens.as_slice(), g.positions.as_slice(), with_commit);
+            let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
             queued.and_then(|_| Ok(ended?)).map(|gr| g.graph = Some(gr))
         } else {
             Ok(())
         };
         let launched = built.and_then(|_| {
-            Ok(g.graph.as_ref().expect("graph was just built").launch(&self.states[0].stream)?)
+            Ok(g.graph.as_ref().expect("graph was just built").launch(&self.states[si].stream)?)
         });
         self.spec.as_mut().expect("set up by spec_init").agraphs[m - 1] = Some(g);
         launched?;
-        self.states[0].stream.synchronize()?;
+        self.states[si].stream.synchronize()?;
         Ok(self.sp().picks_host.as_slice()[..k].iter().map(|&t| t as u32).collect())
     }
 
-    fn queue_advance(&mut self, m: usize, toks: &[i32], positions: &[i32]) -> Result<()> {
+    /// The advance on the output device's stream; `with_commit` includes the
+    /// delta-net commit, which is only capturable when that is the one device.
+    fn queue_advance(&mut self, m: usize, toks: &[i32], positions: &[i32], with_commit: bool) -> Result<()> {
         let k = self.draft;
         let d = self.model.config.n_embd;
         let row = d * std::mem::size_of::<f32>();
-        self.commit(m)?;
+        let si = self.states.len() - 1;
+        if with_commit {
+            self.commit(m)?;
+        }
         self.stage_h(false, m)?;
         self.save_pending(m - 1)?;
         {
-            let st = &self.states[0];
+            let st = &self.states[si];
             st.tokens.copy_from_host_at(0, toks, &st.stream)?;
             st.positions.copy_from_host_at(0, &positions[..m], &st.stream)?;
         }
         self.mtp_body(m, 0)?;
         for i in 1..k {
-            let st = &self.states[0];
+            let st = &self.states[si];
             let sp = self.sp();
             let last = if i == 1 { m - 1 } else { 0 };
             ops::copy_2d(sp.h.as_mut_ptr(), row, st.xb.offset_ptr(last * d), row, row, 1, &st.stream)?;
@@ -340,7 +356,7 @@ impl Runtime {
             st.positions.copy_from_host_at(0, &positions[m - 1 + i..m + i], &st.stream)?;
             self.mtp_body(1, i)?;
         }
-        let st = &self.states[0];
+        let st = &self.states[si];
         let sp = self.spec.as_mut().expect("set up by spec_init");
         sp.picks.copy_to_host(&mut sp.picks_host.as_mut_slice()[..k], &st.stream)?;
         Ok(())
@@ -664,7 +680,7 @@ impl Runtime {
 
                 let t1 = std::time::Instant::now();
                 let room = k.min(self.ctx.saturating_sub(p + committed + 1));
-                if ended.is_none() && room == k && k > 0 && self.states.len() == 1 && !graphs_disabled() {
+                if ended.is_none() && room == k && k > 0 && !graphs_disabled() {
                     let mut toks = input[1..committed].to_vec();
                     toks.push(next);
                     drafts = self.advance_graphed(&toks, p + 1)?;

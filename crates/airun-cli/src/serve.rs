@@ -177,7 +177,7 @@ pub struct ServeArgs {
     pub reasoning: String,
 
     /// Default reasoning level: none, low (1024 thinking tokens), medium
-    /// (4096), high (16384) or max (unlimited). A request's
+    /// (4096), high (16384), xhigh (32768) or max (unlimited). A request's
     /// `reasoning_effort` (or Responses' `reasoning.effort`) wins; an
     /// explicit budget wins over both.
     #[arg(long, value_name = "LEVEL", value_parser = crate::reasoning::parse_arg)]
@@ -537,6 +537,59 @@ pub fn run(args: ServeArgs) -> Result<()> {
         .map(|(t, _)| t).unwrap_or_default();
     let model_path = args.model.display().to_string();
 
+    // What the settings panel shows about the model and where it runs: the
+    // file's architecture, how this server started it, and the memory plan.
+    let placement = &report.placement;
+    let range = |v: &[usize]| match (v.first(), v.last()) {
+        (Some(a), Some(b)) => json!({ "first": a, "last": b, "count": v.len() }),
+        _ => Value::Null,
+    };
+    let details = json!({
+        "file": model_path,
+        "file_bytes": size,
+        "params": n_params,
+        "ftype": ftype,
+        "weight_bytes": report.weight_bytes,
+        "load_ms": report.load_ms,
+        "train_ctx": cfg.train_ctx,
+        "ctx": ctx,
+        "batch": placement.batch,
+        "parallel": args.parallel.max(1),
+        "kv_type": cfg.kv_type.name(),
+        "layers": cfg.n_run_layers(),
+        "attention_layers": cfg.n_attention_layers(),
+        "linear_layers": cfg.ssm.as_ref().map(|_| cfg.n_run_layers() - cfg.n_attention_layers()),
+        "n_embd": cfg.n_embd,
+        "n_head": cfg.n_head,
+        "n_head_kv": cfg.n_head_kv,
+        "head_dim": cfg.head_dim,
+        "ffn": cfg.ffn_len,
+        "vocab": cfg.vocab_size,
+        "rope_base": cfg.rope.base,
+        "rope_scale": (cfg.rope.freq_scale != 1.0).then(|| 1.0 / cfg.rope.freq_scale),
+        "sliding_window": (cfg.sliding_window > 0).then_some(cfg.sliding_window),
+        "tied_embeddings": cfg.tied_embeddings,
+        "moe": cfg.moe.as_ref().map(|m| json!({
+            "experts": m.n_experts, "active": m.n_experts_used, "expert_ffn": m.expert_ff,
+            "shared_ffn": (m.shared_expert_ff > 0).then_some(m.shared_expert_ff),
+        })),
+        "mtp": {
+            "head": runtime.model.mtp.is_some(),
+            "draft": if runtime.model.mtp.is_some() { args.draft } else { 0 },
+        },
+        "gpus": placement.shards.iter().map(|s| {
+            let vram: Vec<usize> = s.layers.iter().copied().filter(|l| !s.ram_layers.contains(l)).collect();
+            json!({
+                "device": s.device, "name": s.device_name,
+                "layers": range(&vram), "ram_layers": range(&s.ram_layers),
+                "embedding": s.hosts_embedding, "output": s.hosts_output,
+                "weight_bytes": s.weight_bytes, "kv_bytes": s.kv_bytes, "scratch_bytes": s.scratch_bytes,
+                "budget_bytes": s.budget_bytes, "ram_bytes": s.ram_bytes,
+            })
+        }).collect::<Vec<_>>(),
+        "notes": placement.notes.iter().chain(report.fallbacks.iter()).collect::<Vec<_>>(),
+    });
+
     let pieces: Arc<Vec<Vec<u8>>> = Arc::new((0..runtime.tokenizer.vocab_size() as u32)
         .map(|id| runtime.tokenizer.piece_bytes(id)).collect());
     let eog: Arc<Vec<u32>> = Arc::new({
@@ -623,6 +676,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         "gpus": report.placement.devices(),
         "auth_required": args.api_key.is_some(),
         "thinking": thinking.supported,
+        "details": details,
     });
     let created = now();
     let models = json!({

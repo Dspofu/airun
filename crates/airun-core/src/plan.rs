@@ -615,8 +615,26 @@ fn try_place(
                 let balanced = (twins && req.alloc != AllocMode::Memory)
                     .then(|| split_by_fraction(ordered, &caps, sum, n_layers))
                     .filter(|a| fits_budgets(a, &budgets, &layer_cost, sizes, cfg, batch));
-                match balanced.or_else(|| fill_fastest_first(ordered, &budgets, &layer_cost, sizes, cfg, batch,
-                    req.alloc != AllocMode::Memory)) {
+                // Between unequal cards the fastest takes the end of the model:
+                // the output head is read whole every token (and once more per
+                // MTP draft), while the embedding at the start is only gathered
+                // from. Qwen3.8-27B NVFP4 (2.5 GB BF16 head) on 5070 Ti + 5060,
+                // MTP 3, 128k context: 44.1 -> 52.2 tok/s. A tied head needs
+                // the table on both ends, so those keep the old order.
+                let fast_last = (!twins && req.main_gpu.is_none() && req.alloc != AllocMode::Memory
+                    && !cfg.tied_embeddings)
+                    .then(|| fill_fastest_last(ordered, &budgets, &layer_cost, sizes, cfg, batch))
+                    .flatten();
+                let fast_last_used = fast_last.is_some();
+                match balanced.or(fast_last).or_else(|| fill_fastest_first(ordered, &budgets, &layer_cost, sizes, cfg,
+                    batch, req.alloc != AllocMode::Memory)) {
+                    Some(a) if fast_last_used => {
+                        notes.push(format!(
+                            "model exceeds any single GPU; GPU {} (the fastest) holds the output head and the \
+                             last layers, the others the first layers and the embedding",
+                            ordered[0].ordinal));
+                        a
+                    }
                     Some(a) => {
                         notes.push(format!(
                             "model exceeds any single GPU; filling GPU {} ({}) first",
@@ -774,6 +792,46 @@ fn fill_fastest_first(
             next += 1;
         }
         out.push((d.ordinal, next - start));
+    }
+    None
+}
+
+/// Contiguous layer runs filled from the END of the model: the fastest GPU in
+/// `ordered` takes the output head and as many of the last layers as fit, the
+/// next the layers before those, and so on; whichever GPU can hold everything
+/// left (with the embedding) takes it and ends the split. Returned in layer
+/// order (slowest GPU first). None if the GPUs run out.
+fn fill_fastest_last(
+    ordered: &[&Device],
+    budgets: &BTreeMap<i32, u64>,
+    layer_cost: &[u64],
+    sizes: &WeightSizes,
+    cfg: &Config,
+    batch: usize,
+) -> Option<Vec<(i32, usize)>> {
+    let mut end = layer_cost.len(); // layers 0..end are still unplaced
+    let mut out = Vec::with_capacity(ordered.len());
+    for (i, d) in ordered.iter().enumerate() {
+        let budget = budgets.get(&d.ordinal).copied().unwrap_or(0);
+        let head = if i == 0 { sizes.output + sizes.other } else { 0 };
+        let scratch = scratch_bytes(cfg, batch, i == 0);
+        let rest: u64 = layer_cost[..end].iter().sum();
+        if head + scratch + rest + sizes.embedding <= budget {
+            out.push((d.ordinal, end));
+            out.reverse();
+            return Some(out);
+        }
+        if i + 1 == ordered.len() {
+            return None;
+        }
+        // Keep layer 0 for a later GPU: it holds the embedding.
+        let mut used = head + scratch;
+        let stop = end;
+        while end > 1 && used + layer_cost[end - 1] <= budget {
+            used += layer_cost[end - 1];
+            end -= 1;
+        }
+        out.push((d.ordinal, stop - end));
     }
     None
 }
@@ -1037,6 +1095,37 @@ mod tests {
 
     fn layers(p: &Placement) -> Vec<usize> {
         p.shards.iter().map(|s| s.layers.len()).collect()
+    }
+
+    /// An untied model over a fast and a slow card: the fast one takes the
+    /// output head and the last layers, and is full; the slow one the first
+    /// layers and the embedding, so it holds less than filling from the start
+    /// left it (the head it no longer reads every token is bigger than the
+    /// embedding it took instead).
+    #[test]
+    fn unequal_gpus_put_the_output_head_on_the_fast_one() {
+        let mut cfg = config(40);
+        cfg.tied_embeddings = false;
+        let mut sz = sizes(40, 400); // ~15.6 GiB of layers
+        sz.output = 2500 << 20;
+        let devs = vec![device(0, 16, 70, 256), device(1, 8, 36, 128)];
+        let p = plan(&cfg, &sz, &devs, &PlacementRequest::default()).unwrap();
+
+        assert_eq!(p.shards.len(), 2);
+        let (slow, fast) = (&p.shards[0], &p.shards[1]);
+        assert_eq!((slow.device, fast.device), (1, 0), "slow card first in layer order");
+        assert!(slow.hosts_embedding && fast.hosts_output);
+        assert_eq!(*fast.layers.last().unwrap(), 39);
+        assert_eq!(slow.layers[0], 0);
+        assert!(fast.total_bytes() <= fast.budget_bytes && slow.total_bytes() <= slow.budget_bytes);
+        let layer = (400u64 << 20) + fast.kv_bytes / fast.layers.len() as u64;
+        assert!(fast.budget_bytes - fast.total_bytes() < layer, "the fast card has room for another layer");
+
+        // --main-gpu keeps the old order: the named card from layer 0.
+        let req = PlacementRequest { main_gpu: Some(0), ..Default::default() };
+        let p = plan(&cfg, &sz, &devs, &req).unwrap();
+        assert_eq!(p.shards[0].device, 0);
+        assert!(p.shards[1].hosts_output);
     }
 
     /// Two GPUs are enough: the third is left out instead of taking a layer

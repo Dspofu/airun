@@ -104,7 +104,7 @@ pub struct RunArgs {
     pub reasoning: String,
 
     /// How long the model may think: none, low (1024 tokens), medium (4096),
-    /// high (16384) or max (unlimited). Past it `</think>` is forced and the
+    /// high (16384), xhigh (32768) or max (unlimited). Past it `</think>` is forced and the
     /// model answers.
     #[arg(long, value_name = "LEVEL", value_parser = crate::reasoning::parse_arg)]
     pub reasoning_effort: Option<String>,

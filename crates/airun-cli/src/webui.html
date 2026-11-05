@@ -185,7 +185,11 @@ details.think.live > summary { color: var(--think); }
 .field textarea { min-height: 70px; resize: vertical; }
 .field .note { font-size: 12px; color: var(--faint); margin-top: 3px; }
 .info { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; font-size: 13px; }
-.info span:nth-child(odd) { color: var(--faint); }
+.info .k { color: var(--faint); }
+.info { word-break: break-word; }
+.info .info-h { grid-column: 1 / -1; margin: 10px 0 2px; font-weight: 600; color: var(--text); }
+.info .info-h:first-child { margin-top: 0; }
+.info .info-note { grid-column: 1 / -1; color: var(--faint); font-size: 12px; }
 .panel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .preview .panel { width: min(1100px, 100%); height: 85vh; display: flex; flex-direction: column; }
 .preview iframe { flex: 1; border: 0; background: #fff; border-radius: 0 0 16px 16px; }
@@ -227,10 +231,13 @@ details.think.live > summary { color: var(--think); }
     <div class="think-ctl" id="thinkCtl" hidden>
       <button class="ibtn on" id="thinkBtn" title="Pensar antes de responder" data-icon="brain"></button>
       <select id="effort" title="Quanto o modelo pode pensar">
-        <option value="low">pouco</option>
-        <option value="medium">médio</option>
-        <option value="high">bastante</option>
-        <option value="max" selected>sem limite</option>
+        <option value="none">desligado</option>
+        <option value="default" selected title="O que o servidor ou o modelo usam por padrão">padrão</option>
+        <option value="low" title="até 1.024 tokens de pensamento">baixo</option>
+        <option value="medium" title="até 4.096 tokens de pensamento">médio</option>
+        <option value="high" title="até 16.384 tokens de pensamento">alto</option>
+        <option value="xhigh" title="até 32.768 tokens de pensamento">muito alto</option>
+        <option value="max" title="sem limite de tokens de pensamento">máximo</option>
       </select>
     </div>
   </header>
@@ -257,7 +264,7 @@ details.think.live > summary { color: var(--think); }
   <div class="panel">
     <div class="panel-head"><span>Configurações</span><button class="ibtn" id="closeSettings" title="Fechar" data-icon="x"></button></div>
     <div class="panel-body">
-      <h4>Modelo</h4>
+      <h4>Informações</h4>
       <div class="info" id="info"></div>
       <h4>Pensamento</h4>
       <div class="field">
@@ -378,15 +385,25 @@ function newChat() {
 
 // --- settings -----------------------------------------------------------------
 const CONTROLS = ["effort", "thinkBudget", "temp", "top_p", "top_k", "min_p", "rep", "maxTok", "seed", "sys", "apiKey"];
-let thinking = true;
+// The thinking level is the "effort" select; "none" is off. The brain button
+// toggles between off and the last level that was on.
+let lastOn = "default";
+const thinkingOn = () => $("effort").value !== "none";
 function loadSettings() {
   let s = {};
   try { s = JSON.parse(localStorage.getItem(SETTINGS) || "{}"); } catch (_) {}
   for (const id of CONTROLS) if (s[id] !== undefined) $(id).value = s[id];
-  if (s.thinking !== undefined) thinking = s.thinking;
+  if (!$("effort").value) $("effort").value = "default"; // a value this version no longer has
+  if (s.lastOn) lastOn = s.lastOn;
+  // Settings saved before the levels had "off": a separate on/off switch.
+  if (s.thinking === false && s.effortV2 === undefined) {
+    if ($("effort").value !== "none") lastOn = $("effort").value;
+    $("effort").value = "none";
+  }
 }
 function saveSettings() {
-  const s = { thinking };
+  if (thinkingOn()) lastOn = $("effort").value;
+  const s = { lastOn, effortV2: true };
   for (const id of CONTROLS) s[id] = $(id).value;
   try { localStorage.setItem(SETTINGS, JSON.stringify(s)); } catch (_) {}
 }
@@ -394,15 +411,17 @@ function syncLabels() {
   const fix = { temp: 2, top_p: 2, top_k: 0, min_p: 2, rep: 2 };
   for (const [id, d] of Object.entries(fix)) $(id + "V").textContent = (+$(id).value).toFixed(d);
   $("thinkBudgetV").textContent = +$("thinkBudget").value > 0 ? $("thinkBudget").value : "∞";
-  $("thinkBtn").classList.toggle("on", thinking);
-  $("thinkBtn").title = thinking ? "Pensando antes de responder (clique para desligar)" : "Sem pensar (clique para ligar)";
-  $("effort").disabled = !thinking;
+  $("thinkBtn").classList.toggle("on", thinkingOn());
+  $("thinkBtn").title = thinkingOn() ? "Pensando antes de responder (clique para desligar)" : "Sem pensar (clique para ligar)";
 }
 for (const id of CONTROLS) {
   $(id).addEventListener("input", () => { syncLabels(); saveSettings(); });
   $(id).addEventListener("change", () => { syncLabels(); saveSettings(); });
 }
-$("thinkBtn").addEventListener("click", () => { thinking = !thinking; syncLabels(); saveSettings(); });
+$("thinkBtn").addEventListener("click", () => {
+  $("effort").value = thinkingOn() ? "none" : (lastOn === "none" ? "default" : lastOn);
+  syncLabels(); saveSettings();
+});
 
 // --- markdown -----------------------------------------------------------------
 // Everything the model writes is escaped first; only the tags built here reach
@@ -674,10 +693,18 @@ function requestBody(c) {
     top_k: +$("top_k").value, min_p: +$("min_p").value, repeat_penalty: +$("rep").value,
   };
   if (props.thinking) {
-    body.chat_template_kwargs = { enable_thinking: thinking };
+    // "padrão" sends nothing: the server's --reasoning-effort, else the
+    // template's own default, decides. Any other level is explicit.
+    const level = $("effort").value;
     const budget = +$("thinkBudget").value;
-    if (thinking && budget > 0) body.reasoning_budget_tokens = budget;
-    else if (thinking && $("effort").value !== "max") body.reasoning_effort = $("effort").value;
+    if (level === "none") {
+      body.chat_template_kwargs = { enable_thinking: false };
+      body.reasoning_effort = "none";
+    } else {
+      if (level !== "default") body.chat_template_kwargs = { enable_thinking: true };
+      if (budget > 0) body.reasoning_budget_tokens = budget;
+      else if (level !== "default") body.reasoning_effort = level;
+    }
   }
   const seed = $("seed").value.trim();
   if (seed !== "" && !Number.isNaN(+seed)) body.seed = +seed;
@@ -995,6 +1022,72 @@ $("clearChats").addEventListener("click", () => {
   save(true); renderSidebar(); renderChat();
 });
 
+// --- model details (settings panel) ---------------------------------------------
+const num = (n) => Number(n).toLocaleString("pt-BR");
+const gib = (b) => (b / 2 ** 30).toLocaleString("pt-BR", { maximumFractionDigits: 2 }) + " GiB";
+const mib = (b) => b >= 2 ** 30 ? gib(b) : Math.round(b / 2 ** 20) + " MiB";
+const params = (n) => n >= 1e9 ? (n / 1e9).toLocaleString("pt-BR", { maximumFractionDigits: 1 }) + " B"
+                               : (n / 1e6).toLocaleString("pt-BR", { maximumFractionDigits: 0 }) + " M";
+const span = (r) => r ? (r.first === r.last ? `${r.first}` : `${r.first}–${r.last}`) + ` (${r.count})` : "";
+
+function modelInfo(p) {
+  const d = p.details || {};
+  const sections = [];
+  const sec = (title, rows) => {
+    const ok = rows.filter(([, v]) => v !== undefined && v !== null && v !== "" && v !== false);
+    if (ok.length) sections.push(`<span class="info-h">${esc(title)}</span>` +
+      ok.map(([k, v]) => `<span class="k">${esc(k)}</span><span>${esc(String(v))}</span>`).join(""));
+  };
+  sec("Modelo", [
+    ["nome", p.model], ["arquitetura", p.arch],
+    ["parâmetros", d.params ? params(d.params) : ""],
+    ["quantização", d.ftype], ["arquivo", d.file_bytes ? gib(d.file_bytes) : ""],
+    ["pesos carregados", d.weight_bytes ? gib(d.weight_bytes) : ""],
+  ]);
+  const trainNote = d.train_ctx && d.ctx > d.train_ctx ? " (acima do treino)" : "";
+  sec("Contexto", [
+    ["de treino", d.train_ctx ? num(d.train_ctx) + " tokens" : ""],
+    ["iniciado", (d.ctx || p.ctx) ? num(d.ctx || p.ctx) + " tokens" + trainNote : ""],
+    ["cache KV", d.kv_type], ["lote (prefill)", d.batch ? num(d.batch) : ""],
+    ["requisições paralelas", d.parallel > 1 ? d.parallel : ""],
+  ]);
+  const layers = d.layers ?? p.n_layers;
+  const hybrid = d.linear_layers ? ` (${d.linear_layers} lineares + ${d.attention_layers} de atenção)` : "";
+  const moe = d.moe;
+  sec("Arquitetura", [
+    ["camadas", layers !== undefined ? layers + hybrid : ""],
+    ["dimensão", d.n_embd ? num(d.n_embd) : ""],
+    ["cabeças de atenção", d.n_head ? `${d.n_head} (${d.n_head_kv} KV, GQA ${d.n_head / d.n_head_kv}×), dim ${d.head_dim}` : ""],
+    ["FFN", moe ? "" : (d.ffn ? num(d.ffn) : "")],
+    ["especialistas (MoE)", moe ? `${moe.active} ativos de ${moe.experts} por token` : ""],
+    ["FFN do especialista", moe ? num(moe.expert_ffn) + (moe.shared_ffn ? ` + compartilhado ${num(moe.shared_ffn)}` : "") : ""],
+    ["vocabulário", d.vocab ? num(d.vocab) : ""],
+    ["RoPE", d.rope_base ? `base ${num(d.rope_base)}` + (d.rope_scale ? `, escala ${d.rope_scale.toFixed(1)}×` : "") : ""],
+    ["janela deslizante", d.sliding_window ? num(d.sliding_window) : ""],
+  ]);
+  const where = (d.gpus || []).map((g) => {
+    const parts = [];
+    if (g.layers) parts.push("camadas " + span(g.layers));
+    if (g.embedding) parts.push("+embed");
+    if (g.output) parts.push("+saída");
+    const mem = `pesos ${mib(g.weight_bytes)} · KV ${mib(g.kv_bytes)} · ${mib(g.weight_bytes + g.kv_bytes + g.scratch_bytes)} de ${mib(g.budget_bytes)}`;
+    const rows = [[`GPU ${g.device}`, `${g.name.replace(/^NVIDIA (GeForce )?/, "")}: ${parts.join(" ")}`], ["", mem]];
+    if (g.ram_layers) rows.push(["RAM", `camadas ${span(g.ram_layers)}, ${mib(g.ram_bytes)} (lidas pela GPU ${g.device})`]);
+    return rows;
+  }).flat();
+  if (!where.length && p.gpus) where.push(["GPUs", p.gpus.join(", ")]);
+  sec("Onde está", where);
+  sec("Servidor", [
+    ["MTP (especulativo)", d.mtp ? (d.mtp.draft > 0 ? `${d.mtp.draft} rascunhos por passo` : (d.mtp.head ? "cabeça presente, desligado (--draft)" : "")) : ""],
+    ["raciocínio", p.thinking ? "sim" : "não"], ["visão", p.vision ? "sim" : "não"],
+    ["autenticação", p.auth_required ? "chave de API" : "aberta"],
+    ["carregado em", d.load_ms ? (d.load_ms / 1000).toFixed(1) + " s" : ""],
+  ]);
+  if ((d.notes || []).length) sections.push(`<span class="info-h">Notas</span>` +
+    d.notes.map((n) => `<span class="info-note">${esc(n)}</span>`).join(""));
+  return sections.join("");
+}
+
 // --- server ---------------------------------------------------------------------
 async function connect() {
   try {
@@ -1008,11 +1101,7 @@ async function connect() {
     $("thinkCtl").hidden = !props.thinking;
     $("attach").hidden = !props.vision;
     $("maxTok").max = props.ctx || 131072;
-    const rows = [["modelo", props.model], ["arquitetura", props.arch], ["camadas", props.n_layers],
-      ["contexto", props.ctx], ["GPUs", (props.gpus || []).join(", ")], ["raciocínio", props.thinking ? "sim" : "não"],
-      ["visão", props.vision ? "sim" : "não"], ["autenticação", props.auth_required ? "chave de API" : "aberta"]];
-    $("info").innerHTML = rows.filter(([, v]) => v !== undefined && v !== null && v !== "")
-      .map(([k, v]) => `<span>${esc(k)}</span><span>${esc(String(v))}</span>`).join("");
+    $("info").innerHTML = modelInfo(props);
     if (!chat()?.turns.length) renderChat();
   } catch (_) {
     $("status").className = "status err";
