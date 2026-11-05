@@ -1,467 +1,422 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-BR">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>airun</title>
 <style>
+:root {
+  --bg: #0f1115; --side: #14171d; --surface: #1a1e26; --surface-2: #222733; --line: #2c3240;
+  --text: #e7e9ee; --muted: #9aa2b1; --faint: #6b7385; --accent: #7c8cff; --accent-soft: rgba(124,140,255,.14);
+  --think: #b69cff; --think-soft: rgba(182,156,255,.10); --ok: #3ecf8e; --err: #ff6b6b;
+  --user: #262c3a; --code: #12151b; --shadow: 0 8px 30px rgba(0,0,0,.35);
+}
+@media (prefers-color-scheme: light) {
   :root {
-    --bg: #0b0d10;
-    --surface: #12151a;
-    --surface-2: #191d25;
-    --surface-3: #21262f;
-    --line: #272d38;
-    --line-soft: #1f2530;
-    --text: #e9ecf2;
-    --muted: #97a1b3;
-    --faint: #6b7488;
-    --accent: #6c9cff;
-    --accent-soft: rgba(108,156,255,.14);
-    --think: #a78bfa;
-    --think-soft: rgba(167,139,250,.12);
-    --user: #1b2534;
-    --user-line: #2b3a4f;
-    --warn: #fbbf24;
-    --err: #f87171;
-    --ok: #34d399;
-    --shadow: 0 1px 0 rgba(255,255,255,.02), 0 8px 24px rgba(0,0,0,.35);
-    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+    --bg: #ffffff; --side: #f6f7f9; --surface: #ffffff; --surface-2: #f1f3f6; --line: #e3e6eb;
+    --text: #1d2129; --muted: #5d6573; --faint: #8b93a1; --accent: #4f5ff0; --accent-soft: rgba(79,95,240,.10);
+    --think: #6d4fd8; --think-soft: rgba(109,79,216,.07); --user: #eef1f6; --code: #f6f8fa;
+    --shadow: 0 8px 30px rgba(20,25,40,.12);
   }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #f5f7fa; --surface: #ffffff; --surface-2: #f0f3f8; --surface-3: #e7ecf3;
-      --line: #dce2ea; --line-soft: #e6ebf2;
-      --text: #14181f; --muted: #5c6675; --faint: #8a94a6;
-      --accent: #2f6fed; --accent-soft: rgba(47,111,237,.10);
-      --think: #7c3aed; --think-soft: rgba(124,58,237,.08);
-      --user: #eef2f8; --user-line: #d5deeb;
-      --shadow: 0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.08);
-    }
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--bg); color: var(--text);
-    font: 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    /* two columns; minmax(0,1fr) lets the chat shrink instead of forcing width */
-    display: grid; grid-template-columns: minmax(0,1fr) 300px;
-    height: 100vh; overflow: hidden;
-  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+       display: grid; grid-template-columns: 270px 1fr; overflow: hidden; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+.icon { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; stroke-width: 2;
+        stroke-linecap: round; stroke-linejoin: round; }
+.ibtn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px;
+        border-radius: 8px; color: var(--muted); transition: background .12s, color .12s; }
+.ibtn:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+.ibtn:disabled { opacity: .35; cursor: default; }
+.ibtn.on { color: var(--accent); }
 
-  /* --- main column ------------------------------------------------------- */
-  /* min-height:0 is the fix: without it the grid item refuses to shrink and
-     #log never becomes the scroll container (the page just grows and cuts). */
-  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+/* --- sidebar --- */
+#side { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column;
+        min-height: 0; z-index: 20; }
+.side-top { display: flex; align-items: center; gap: 8px; padding: 14px 12px 8px; }
+.brand { font-weight: 800; font-size: 18px; letter-spacing: -.3px; flex: 1; padding-left: 4px; }
+.brand span { color: var(--accent); }
+.newchat { display: flex; align-items: center; gap: 8px; margin: 4px 12px 10px; padding: 9px 12px;
+           border: 1px solid var(--line); border-radius: 10px; background: var(--surface); font-weight: 600; }
+.newchat:hover { border-color: var(--accent); }
+.search { margin: 0 12px 8px; position: relative; }
+.search input { width: 100%; padding: 7px 10px 7px 32px; border-radius: 8px; border: 1px solid var(--line);
+                background: var(--surface); color: var(--text); font: inherit; font-size: 13.5px; outline: none; }
+.search input:focus { border-color: var(--accent); }
+.search .icon { position: absolute; left: 9px; top: 8px; width: 15px; height: 15px; color: var(--faint); }
+#chats { flex: 1; overflow-y: auto; padding: 4px 8px 8px; }
+.group { font-size: 11.5px; font-weight: 700; color: var(--faint); text-transform: uppercase;
+         letter-spacing: .5px; padding: 12px 8px 4px; }
+.chat { display: flex; align-items: center; gap: 4px; padding: 7px 8px; border-radius: 8px; cursor: pointer;
+        color: var(--muted); font-size: 14px; }
+.chat:hover { background: var(--surface-2); color: var(--text); }
+.chat.active { background: var(--accent-soft); color: var(--text); }
+.chat .title { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.chat .ibtn { width: 26px; height: 26px; visibility: hidden; }
+.chat:hover .ibtn, .chat.active .ibtn { visibility: visible; }
+.chat .dotlive { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.side-foot { border-top: 1px solid var(--line); padding: 10px 12px; display: flex; align-items: center; gap: 8px;
+             font-size: 13px; color: var(--muted); }
+.side-foot .model { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.status { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.status.ok { background: var(--ok); } .status.err { background: var(--err); }
 
-  header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 12px 18px; border-bottom: 1px solid var(--line-soft);
-    background: linear-gradient(180deg, var(--surface), var(--bg));
-  }
-  .brand { font-weight: 700; font-size: 16px; letter-spacing: .3px; }
-  .brand span { color: var(--accent); }
-  .model {
-    font-family: var(--mono); font-size: 12px; color: var(--muted);
-    background: var(--surface-2); border: 1px solid var(--line);
-    padding: 3px 9px; border-radius: 999px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 34vw;
-  }
-  .spacer { flex: 1; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
-  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-  .dot.err { background: var(--err); box-shadow: 0 0 8px var(--err); }
+/* --- main --- */
+main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+header { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--line);
+         min-height: 52px; }
+#menu { display: none; }
+#chatTitle { flex: 1; font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.think-ctl { display: flex; align-items: center; gap: 2px; border: 1px solid var(--line); border-radius: 10px;
+             padding: 2px; }
+.think-ctl select { background: transparent; color: var(--text); border: 0; font: inherit; font-size: 13px;
+                    padding: 4px 4px 4px 2px; outline: none; cursor: pointer; }
+.think-ctl select:disabled { opacity: .4; }
+.think-ctl select option { background: var(--surface); }
+#log { flex: 1; overflow-y: auto; position: relative; }
+#wrap { max-width: 800px; margin: 0 auto; padding: 24px 20px 40px; }
+.empty { text-align: center; margin-top: 18vh; color: var(--muted); }
+.empty .logo { font-size: 40px; font-weight: 800; color: var(--text); letter-spacing: -1px; }
+.empty .logo span { color: var(--accent); }
+.empty p { font-size: 13.5px; }
+kbd { font: 12px ui-monospace, monospace; padding: 1px 6px; border: 1px solid var(--line); border-radius: 5px;
+      background: var(--surface-2); }
 
-  .pill {
-    display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none;
-    font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 999px;
-    border: 1px solid var(--line); background: var(--surface-2); color: var(--muted);
-    transition: all .12s;
-  }
-  .pill .ico { font-size: 13px; }
-  .pill.on { border-color: var(--think); color: var(--text); background: var(--think-soft); }
-  .pill input { display: none; }
+.msg { margin: 0 0 22px; }
+.msg.user { display: flex; flex-direction: column; align-items: flex-end; }
+.msg.user .body { background: var(--user); padding: 10px 14px; border-radius: 16px 16px 4px 16px;
+                  max-width: 85%; white-space: pre-wrap; word-wrap: break-word; }
+.msg .imgs { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-bottom: 6px; }
+.msg .imgs img { max-width: 220px; max-height: 180px; border-radius: 10px; border: 1px solid var(--line);
+                 object-fit: cover; cursor: zoom-in; }
+.msg.assistant .body { word-wrap: break-word; }
+.msg.error .body { color: var(--err); background: rgba(255,107,107,.08); border: 1px solid rgba(255,107,107,.3);
+                   padding: 10px 14px; border-radius: 10px; }
+.actions { display: flex; align-items: center; gap: 2px; margin-top: 4px; opacity: 0; transition: opacity .15s; }
+.msg:hover .actions, .msg.last .actions { opacity: 1; }
+.actions .ibtn { width: 28px; height: 28px; }
+.actions .icon { width: 16px; height: 16px; }
+.stats { font-size: 12px; color: var(--faint); margin-left: 6px; }
+.edit-box { width: min(100%, 640px); }
+.edit-box textarea { width: 100%; min-height: 80px; border-radius: 12px; border: 1px solid var(--accent);
+                     background: var(--surface); color: var(--text); font: inherit; padding: 10px 12px;
+                     resize: vertical; outline: none; }
+.edit-box .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.btn { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); font-weight: 600; font-size: 13.5px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 
-  button {
-    font: inherit; font-weight: 600; cursor: pointer; border-radius: 10px;
-    border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
-    padding: 9px 14px; white-space: nowrap; transition: all .12s;
-  }
-  button:hover:not(:disabled) { border-color: var(--accent); }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
-  button.danger { border-color: var(--err); color: var(--err); background: transparent; }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  button.small { padding: 5px 10px; font-size: 12px; font-weight: 600; }
-  select.small { font: inherit; font-size: 12px; font-weight: 600; padding: 4px 8px; border-radius: 10px;
-    border: 1px solid var(--line); background: var(--surface-2); color: var(--text); cursor: pointer; }
-  select.small:disabled { opacity: .45; cursor: not-allowed; }
+/* markdown */
+.body p { margin: 0 0 .7em; } .body p:last-child { margin-bottom: 0; }
+.body h1, .body h2, .body h3, .body h4 { margin: 1.1em 0 .5em; line-height: 1.3; }
+.body h1 { font-size: 1.4em; } .body h2 { font-size: 1.25em; } .body h3 { font-size: 1.1em; }
+.body ul, .body ol { margin: 0 0 .7em; padding-left: 1.5em; }
+.body li { margin: .2em 0; }
+.body a { color: var(--accent); }
+.body blockquote { margin: 0 0 .7em; padding: 2px 14px; border-left: 3px solid var(--line); color: var(--muted); }
+.body code { font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; background: var(--surface-2);
+             padding: 1px 5px; border-radius: 5px; }
+.body hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+.body table { border-collapse: collapse; margin: 0 0 .8em; font-size: 14px; display: block; overflow-x: auto; }
+.body th, .body td { border: 1px solid var(--line); padding: 5px 10px; }
+.body th { background: var(--surface-2); }
+.codeblock { margin: 0 0 .8em; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--code); }
+.codehead { display: flex; align-items: center; gap: 2px; padding: 3px 4px 3px 12px; border-bottom: 1px solid var(--line);
+            font-size: 12px; color: var(--faint); }
+.codehead .lang { flex: 1; }
+.codehead .ibtn { width: 28px; height: 26px; } .codehead .icon { width: 15px; height: 15px; }
+.codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; }
+.codeblock pre code { background: none; padding: 0; }
+.cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
 
-  /* --- the log: the scroll container ------------------------------------- */
-  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 24px 18px 8px; }
-  .wrap { max-width: 780px; margin: 0 auto; }
+/* reasoning */
+details.think { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--think-soft); }
+details.think > summary { list-style: none; cursor: pointer; padding: 7px 12px; font-size: 13px; color: var(--muted);
+                          display: flex; align-items: center; gap: 8px; user-select: none; }
+details.think > summary::-webkit-details-marker { display: none; }
+details.think > summary .icon { width: 15px; height: 15px; color: var(--think); }
+details.think[open] > summary { border-bottom: 1px solid var(--line); }
+details.think.live > summary { color: var(--think); }
+.think-body { padding: 8px 14px 10px; font-size: 13.5px; color: var(--muted); white-space: pre-wrap; max-height: 360px;
+              overflow-y: auto; }
 
-  .msg { margin-bottom: 22px; animation: rise .18s ease; }
-  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
-  .row { display: flex; gap: 12px; }
-  .row.user { flex-direction: row-reverse; }
-  .avatar {
-    flex: none; width: 30px; height: 30px; border-radius: 9px;
-    display: grid; place-items: center; font-size: 13px; font-weight: 700;
-    background: var(--surface-3); color: var(--muted); border: 1px solid var(--line);
-  }
-  .row.user .avatar { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
-  .col { min-width: 0; max-width: 100%; display: flex; flex-direction: column; }
-  .row.user .col { align-items: flex-end; }
+/* composer */
+.composer { padding: 0 20px 18px; }
+.box { max-width: 800px; margin: 0 auto; border: 1px solid var(--line); border-radius: 18px; background: var(--surface);
+       padding: 8px 8px 8px 14px; box-shadow: var(--shadow); }
+.box:focus-within { border-color: var(--accent); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips:not(:empty) { padding: 4px 0 8px; }
+.chip { position: relative; } .chip img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+.chip button { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%;
+               background: var(--surface-2); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; }
+.chip .icon { width: 12px; height: 12px; }
+.row-in { display: flex; align-items: flex-end; gap: 6px; }
+#input { flex: 1; border: 0; outline: none; resize: none; background: transparent; color: var(--text); font: inherit;
+         max-height: 240px; padding: 6px 0; }
+#send { background: var(--accent); color: #fff; border-radius: 10px; }
+#send:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+#send:disabled { background: var(--surface-2); color: var(--faint); opacity: 1; }
+.hint { max-width: 800px; margin: 6px auto 0; font-size: 12px; color: var(--faint); text-align: center; }
+#toBottom { position: sticky; bottom: 12px; left: 100%; margin-right: 16px; float: right; width: 36px; height: 36px;
+            border-radius: 50%; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
 
-  .bubble { padding: 11px 14px; border-radius: 14px; background: var(--surface-2);
-            border: 1px solid var(--line); overflow-wrap: anywhere; min-width: 0; }
-  .msg.user .bubble {
-    background: var(--user); border-color: var(--user-line);
-    white-space: pre-wrap; max-height: 420px; overflow-y: auto;  /* cap + own scroll */
-  }
-  .msg.error .bubble { border-color: var(--err); color: var(--err); white-space: pre-wrap; background: transparent; }
+/* settings + preview */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center;
+           justify-content: center; z-index: 50; padding: 16px; }
+.overlay[hidden] { display: none; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; width: min(560px, 100%);
+         max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow); }
+.panel-head { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line);
+              font-weight: 700; position: sticky; top: 0; background: var(--surface); }
+.panel-head span { flex: 1; }
+.panel-body { padding: 8px 18px 18px; }
+.panel h4 { margin: 16px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); }
+.field { margin: 0 0 12px; }
+.field label { display: flex; justify-content: space-between; font-size: 13.5px; margin-bottom: 4px; }
+.field label b { color: var(--accent); font-weight: 600; }
+.field input[type=range] { width: 100%; accent-color: var(--accent); }
+.field input[type=text], .field input[type=number], .field textarea, .field input[type=password] {
+  width: 100%; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2);
+  color: var(--text); font: inherit; font-size: 14px; outline: none; }
+.field textarea { min-height: 70px; resize: vertical; }
+.field .note { font-size: 12px; color: var(--faint); margin-top: 3px; }
+.info { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; font-size: 13px; }
+.info span:nth-child(odd) { color: var(--faint); }
+.panel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.preview .panel { width: min(1100px, 100%); height: 85vh; display: flex; flex-direction: column; }
+.preview iframe { flex: 1; border: 0; background: #fff; border-radius: 0 0 16px 16px; }
+.toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--surface-2);
+         border: 1px solid var(--line); padding: 8px 14px; border-radius: 10px; font-size: 13.5px; z-index: 60;
+         box-shadow: var(--shadow); }
 
-  .actions { display: flex; gap: 2px; margin-top: 6px; opacity: 0; transition: opacity .12s; }
-  .msg:hover .actions, .actions:focus-within { opacity: 1; }
-  .actions button { padding: 3px 8px; font-size: 12px; font-weight: 600; color: var(--muted);
-                    background: none; border-color: transparent; }
-  .actions button:hover:not(:disabled) { color: var(--text); border-color: var(--line); }
-  body.busy .actions button.needs-idle { display: none; }
-
-  .edit-box { width: 100%; min-height: 80px; resize: vertical; padding: 9px 11px; border-radius: 10px;
-              border: 1px solid var(--accent); background: var(--bg); color: var(--text); font: inherit; }
-  .edit-row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
-
-  /* --- live generation stats --------------------------------------------- */
-  .genbar {
-    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-    margin: 2px 0 16px; padding: 9px 13px; border-radius: 12px;
-    background: var(--surface); border: 1px solid var(--line);
-    font-family: var(--mono); font-size: 12px; color: var(--muted);
-  }
-  .genbar[hidden] { display: none; }
-  .genbar .live { display: inline-flex; align-items: center; gap: 7px; color: var(--accent); font-weight: 700; }
-  .genbar .live .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
-                         animation: pulse 1s ease-in-out infinite; }
-  @keyframes pulse { 50% { opacity: .25; transform: scale(.7); } }
-  .genbar b { color: var(--text); font-weight: 600; }
-  .genbar .sep { color: var(--faint); }
-
-  /* --- rendered markdown -------------------------------------------------- */
-  .md > :first-child { margin-top: 0; }
-  .md > :last-child { margin-bottom: 0; }
-  .md p { margin: 0 0 .7em; }
-  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 1.1em 0 .45em; line-height: 1.3; }
-  .md h1 { font-size: 1.45em; } .md h2 { font-size: 1.28em; } .md h3 { font-size: 1.12em; }
-  .md h4, .md h5, .md h6 { font-size: 1em; }
-  .md ul, .md ol { margin: 0 0 .7em; padding-left: 1.5em; }
-  .md li { margin: .2em 0; }
-  .md li > ul, .md li > ol { margin: .2em 0; }
-  .md blockquote { margin: 0 0 .7em; padding: 2px 12px; border-left: 3px solid var(--accent);
-                   color: var(--muted); }
-  .md hr { border: none; border-top: 1px solid var(--line); margin: 1em 0; }
-  .md a { color: var(--accent); }
-  .md code { font-family: var(--mono); font-size: .88em;
-             background: var(--surface-3); padding: 1px 5px; border-radius: 5px; }
-  .md table { border-collapse: collapse; margin: 0 0 .8em; display: block; overflow-x: auto;
-              max-width: 100%; }
-  .md th, .md td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; }
-  .md th { background: var(--surface-3); font-weight: 600; }
-
-  .codeblock { margin: .5em 0 .9em; border: 1px solid var(--line); border-radius: 10px;
-               overflow: hidden; background: var(--surface); }
-  .codehead { display: flex; align-items: center; gap: 6px; padding: 5px 7px 5px 12px;
-              border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 11px;
-              color: var(--muted); background: var(--surface-2); }
-  .codehead .lang { flex: 1; }
-  .codehead button { padding: 2px 8px; font-size: 11px; font-weight: 600; }
-  .codeblock pre { margin: 0; padding: 11px 13px; overflow-x: auto;
-                   font-family: var(--mono); font-size: 13px; line-height: 1.5; }
-  .codeblock pre code { background: none; padding: 0; font-size: inherit; white-space: pre; }
-
-  /* --- reasoning --------------------------------------------------------- */
-  details.think { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 12px;
-                  background: var(--surface); }
-  details.think > summary {
-    cursor: pointer; padding: 8px 12px; font-size: 12px; font-weight: 600;
-    color: var(--muted); list-style: none; user-select: none;
-    display: flex; align-items: center; gap: 8px;
-  }
-  details.think > summary::-webkit-details-marker { display: none; }
-  details.think > summary::before { content: "▸"; color: var(--think); }
-  details.think[open] > summary::before { content: "▾"; }
-  details.think.live > summary { color: var(--think); }
-  details.think .brain { margin-left: auto; font-size: 11px; color: var(--faint); font-weight: 500; }
-  .think-body { padding: 4px 14px 12px; font-size: 13.5px; color: var(--muted);
-                max-height: 320px; overflow-y: auto; border-top: 1px solid var(--line-soft); }
-
-  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2, start) infinite; }
-  @keyframes blink { to { visibility: hidden; } }
-
-  .empty { color: var(--muted); text-align: center; margin-top: 16vh; }
-  .empty .logo { font-size: 30px; font-weight: 800; color: var(--text); letter-spacing: .5px; }
-  .empty .logo span { color: var(--accent); }
-  .empty h2 { font-weight: 600; margin: 14px 0 6px; color: var(--text); font-size: 17px; }
-  .empty p { margin: 0; font-size: 13px; color: var(--faint); }
-  .empty kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2);
-              border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; color: var(--muted); }
-
-  /* --- composer ---------------------------------------------------------- */
-  footer { position: relative; border-top: 1px solid var(--line-soft); background: var(--surface); padding: 12px 18px 14px; }
-  .composer { max-width: 780px; margin: 0 auto; }
-  .inputrow { display: flex; gap: 10px; align-items: flex-end; }
-  textarea#input {
-    flex: 1; resize: none; min-height: 44px; max-height: 220px;
-    padding: 11px 14px; border-radius: 13px; border: 1px solid var(--line);
-    background: var(--surface-2); color: var(--text); font: inherit; outline: none;
-    transition: border-color .12s;
-  }
-  textarea#input:focus { border-color: var(--accent); }
-  textarea#input:disabled { opacity: .6; }
-  .sendcol { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
-  .hintbar { display: flex; justify-content: space-between; gap: 10px;
-             font-size: 11px; color: var(--faint); margin-top: 7px; padding: 0 2px; }
-  .hintbar kbd { font-family: var(--mono); background: var(--surface-2); border: 1px solid var(--line);
-                border-radius: 4px; padding: 0 5px; color: var(--muted); }
-
-  #toBottom {
-    position: absolute; left: 50%; transform: translateX(-50%); bottom: 100%;
-    margin-bottom: 10px;
-    width: 34px; height: 34px; border-radius: 50%; padding: 0;
-    display: grid; place-items: center; font-size: 15px;
-    background: var(--surface-3); border: 1px solid var(--line); color: var(--muted);
-    box-shadow: var(--shadow);
-  }
-  #toBottom[hidden] { display: none; }
-
-  /* --- html preview modal ------------------------------------------------- */
-  .modal { position: fixed; inset: 0; z-index: 20; background: rgba(0,0,0,.55);
-           display: flex; align-items: center; justify-content: center; padding: 24px; }
-  .modal[hidden] { display: none; }
-  .modal-box { width: min(1100px, 100%); height: min(760px, 100%); display: flex; flex-direction: column;
-               background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
-               box-shadow: var(--shadow); }
-  .modal-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px;
-                border-bottom: 1px solid var(--line); font-size: 13px; color: var(--muted); }
-  .modal-head .spacer { flex: 1; }
-  .modal iframe { flex: 1; border: 0; background: #fff; width: 100%; }
-
-  /* --- settings ---------------------------------------------------------- */
-  aside {
-    background: var(--surface); border-left: 1px solid var(--line-soft);
-    overflow-y: auto; padding: 16px; min-height: 0;
-  }
-  aside h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .9px;
-             color: var(--faint); margin: 20px 0 10px; }
-  aside h3:first-child { margin-top: 2px; }
-
-  .field { margin-bottom: 13px; }
-  .field label { display: flex; justify-content: space-between; align-items: baseline;
-                 font-size: 12px; color: var(--muted); margin-bottom: 5px; }
-  .field label b { color: var(--text); font-family: var(--mono); font-weight: 600; font-size: 12px; }
-  .field input[type=range] { width: 100%; accent-color: var(--accent); }
-  .field input[type=number], .field input[type=text], .field textarea.sys {
-    width: 100%; padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line);
-    background: var(--surface-2); color: var(--text); font: inherit; font-size: 13px; outline: none;
-  }
-  .field textarea.sys { min-height: 68px; resize: vertical; font-size: 13px; }
-  .field input:focus, .field textarea.sys:focus { border-color: var(--accent); }
-  .hint { font-size: 11px; color: var(--faint); margin-top: 4px; }
-
-  .info { font-family: var(--mono); font-size: 11px; color: var(--muted); }
-  .info div { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
-  .info div span:last-child { color: var(--text); text-align: right; }
-
-  #settingsBtn { display: none; }
-  #closeSettings { display: none; margin-top: 16px; width: 100%; }
-  @media (max-width: 820px) {
-    body { grid-template-columns: minmax(0,1fr); }
-    aside { display: none; }
-    aside.open { display: block; position: fixed; inset: 0; z-index: 10; }
-    #settingsBtn { display: inline-block; }
-    .actions { opacity: 1; }
-    .model { max-width: 40vw; }
-  }
+@media (max-width: 800px) {
+  body { grid-template-columns: 1fr; }
+  #side { position: fixed; inset: 0 auto 0 0; width: 280px; transform: translateX(-100%); transition: transform .2s; }
+  body.side-open #side { transform: none; box-shadow: var(--shadow); }
+  #menu { display: inline-flex; }
+  #wrap { padding: 18px 14px 30px; } .composer { padding: 0 10px 12px; }
+  .actions { opacity: 1; }
+}
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <div class="dot" id="dot"></div>
+
+<aside id="side">
+  <div class="side-top">
     <div class="brand">ai<span>run</span></div>
-    <div class="model" id="modelName">connecting…</div>
-    <div class="spacer"></div>
-    <label class="pill" id="thinkPill" hidden title="Let the model reason before answering">
-      <input type="checkbox" id="think" checked><span class="ico">✦</span> Thinking
-    </label>
-    <select id="effort" class="small" hidden title="How long the model may think: low 1k, medium 4k, high 16k tokens, max unlimited">
-      <option value="low">low</option>
-      <option value="medium">medium</option>
-      <option value="high">high</option>
-      <option value="max" selected>max</option>
-    </select>
-    <button class="small" id="settingsBtn">Settings</button>
-    <button class="small" id="newChat">New chat</button>
-  </header>
-
-  <div id="log">
-    <div class="wrap" id="wrap"></div>
+    <button class="ibtn" id="sideClose" title="Fechar" hidden data-icon="x"></button>
   </div>
-
-  <footer>
-    <button id="toBottom" hidden title="Scroll to latest">↓</button>
-    <div class="composer">
-      <div class="inputrow">
-        <textarea id="input" placeholder="Send a message…" rows="1"></textarea>
-        <div class="sendcol">
-          <button class="primary" id="send">Send</button>
-          <button class="danger" id="stop" hidden title="Stop (Esc)">Stop</button>
-        </div>
-      </div>
-      <div class="hintbar">
-        <span><kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> newline · <kbd>Esc</kbd> stop</span>
-      </div>
-    </div>
-  </footer>
-</main>
-
-<aside id="aside">
-  <h3>Model</h3>
-  <div class="info" id="info"></div>
-
-  <h3>Thinking</h3>
-  <div class="field">
-    <label for="thinkBudget">token budget <b id="thinkBudgetV">∞</b></label>
-    <input type="number" id="thinkBudget" min="0" max="32768" step="256" value="0">
-    <div class="hint">0 = unlimited. Caps how long the model may reason.</div>
+  <button class="newchat" id="newChat" title="Nova conversa (Ctrl+Shift+O)"><span data-icon="plus"></span>Nova conversa</button>
+  <div class="search"><span data-icon="search"></span><input id="search" placeholder="Buscar conversas"></div>
+  <div id="chats"></div>
+  <div class="side-foot">
+    <div class="status" id="status"></div>
+    <div class="model" id="modelName">conectando…</div>
+    <button class="ibtn" id="settingsBtn" title="Configurações" data-icon="settings"></button>
   </div>
-
-  <h3>Sampling</h3>
-  <div class="field">
-    <label for="temp">temperature <b id="tempV">0.7</b></label>
-    <input type="range" id="temp" min="0" max="2" step="0.05" value="0.7">
-    <div class="hint">0 is greedy and reproducible.</div>
-  </div>
-  <div class="field">
-    <label for="top_p">top_p <b id="top_pV">0.95</b></label>
-    <input type="range" id="top_p" min="0" max="1" step="0.01" value="0.95">
-  </div>
-  <div class="field">
-    <label for="top_k">top_k <b id="top_kV">40</b></label>
-    <input type="range" id="top_k" min="0" max="200" step="1" value="40">
-    <div class="hint">0 disables it.</div>
-  </div>
-  <div class="field">
-    <label for="min_p">min_p <b id="min_pV">0.05</b></label>
-    <input type="range" id="min_p" min="0" max="0.5" step="0.01" value="0.05">
-  </div>
-  <div class="field">
-    <label for="rep">repeat penalty <b id="repV">1.10</b></label>
-    <input type="range" id="rep" min="1" max="1.5" step="0.01" value="1.10">
-    <div class="hint">Sent as frequency_penalty = value − 1.</div>
-  </div>
-
-  <h3>Limits</h3>
-  <div class="field">
-    <label for="maxTok">max tokens</label>
-    <input type="number" id="maxTok" min="1" max="32768" value="2048">
-    <div class="hint">Reasoning counts against this too.</div>
-  </div>
-  <div class="field">
-    <label for="seed">seed</label>
-    <input type="text" id="seed" placeholder="random" inputmode="numeric">
-    <div class="hint">Fix it with temperature 0 for a repeatable answer.</div>
-  </div>
-
-  <h3>System prompt</h3>
-  <div class="field">
-    <textarea class="sys" id="sys" placeholder="(none)"></textarea>
-    <div class="hint">Applied from the next message on.</div>
-  </div>
-
-  <h3>Server</h3>
-  <div class="field">
-    <label for="apiKey">API key</label>
-    <input type="text" id="apiKey" placeholder="(none required)">
-  </div>
-  <button class="small" id="closeSettings">Close</button>
 </aside>
 
-<div class="modal" id="preview" hidden>
-  <div class="modal-box">
-    <div class="modal-head">
-      <span>HTML preview · sandboxed</span>
-      <div class="spacer"></div>
-      <button class="small" id="previewTab">Open in new tab</button>
-      <button class="small" id="previewClose">Close</button>
+<main>
+  <header>
+    <button class="ibtn" id="menu" title="Conversas" data-icon="menu"></button>
+    <div id="chatTitle">Nova conversa</div>
+    <div class="think-ctl" id="thinkCtl" hidden>
+      <button class="ibtn on" id="thinkBtn" title="Pensar antes de responder" data-icon="brain"></button>
+      <select id="effort" title="Quanto o modelo pode pensar">
+        <option value="low">pouco</option>
+        <option value="medium">médio</option>
+        <option value="high">bastante</option>
+        <option value="max" selected>sem limite</option>
+      </select>
     </div>
-    <iframe id="previewFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups"
-            referrerpolicy="no-referrer"></iframe>
+  </header>
+  <div id="log">
+    <div id="wrap"></div>
+    <button class="ibtn" id="toBottom" hidden title="Ir para o fim" data-icon="down"></button>
+  </div>
+  <div class="composer">
+    <div class="box">
+      <div class="chips" id="chips"></div>
+      <div class="row-in">
+        <button class="ibtn" id="attach" title="Anexar imagem" hidden data-icon="image"></button>
+        <input type="file" id="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+        <textarea id="input" rows="1" placeholder="Escreva uma mensagem…"></textarea>
+        <button class="ibtn" id="send" title="Enviar (Enter)" data-icon="send" disabled></button>
+        <button class="ibtn" id="stop" title="Parar (Esc)" data-icon="stop" hidden></button>
+      </div>
+    </div>
+    <div class="hint"><kbd>Enter</kbd> envia · <kbd>Shift+Enter</kbd> nova linha · <kbd>Esc</kbd> para · as conversas ficam salvas neste navegador</div>
+  </div>
+</main>
+
+<div class="overlay" id="settings" hidden>
+  <div class="panel">
+    <div class="panel-head"><span>Configurações</span><button class="ibtn" id="closeSettings" title="Fechar" data-icon="x"></button></div>
+    <div class="panel-body">
+      <h4>Modelo</h4>
+      <div class="info" id="info"></div>
+      <h4>Pensamento</h4>
+      <div class="field">
+        <label for="thinkBudget">limite exato de tokens <b id="thinkBudgetV">∞</b></label>
+        <input type="number" id="thinkBudget" min="0" max="65536" step="256" value="0">
+        <div class="note">0 = usa o nível escolhido no topo. Um valor aqui vale mais que o nível.</div>
+      </div>
+      <h4>Amostragem</h4>
+      <div class="field"><label for="temp">temperatura <b id="tempV"></b></label>
+        <input type="range" id="temp" min="0" max="2" step="0.05" value="0.7">
+        <div class="note">0 = sempre a mesma resposta; mais alto = mais variado.</div></div>
+      <div class="field"><label for="top_p">top-p <b id="top_pV"></b></label>
+        <input type="range" id="top_p" min="0" max="1" step="0.01" value="0.95"></div>
+      <div class="field"><label for="top_k">top-k <b id="top_kV"></b></label>
+        <input type="range" id="top_k" min="0" max="200" step="1" value="40"></div>
+      <div class="field"><label for="min_p">min-p <b id="min_pV"></b></label>
+        <input type="range" id="min_p" min="0" max="0.5" step="0.01" value="0.05"></div>
+      <div class="field"><label for="rep">penalidade de repetição <b id="repV"></b></label>
+        <input type="range" id="rep" min="1" max="1.5" step="0.01" value="1.1"></div>
+      <div class="field"><label for="maxTok">máximo de tokens na resposta</label>
+        <input type="number" id="maxTok" min="1" max="131072" value="4096"></div>
+      <div class="field"><label for="seed">semente</label>
+        <input type="text" id="seed" placeholder="aleatória" inputmode="numeric"></div>
+      <h4>Conversa</h4>
+      <div class="field"><label for="sys">mensagem de sistema</label>
+        <textarea id="sys" placeholder="(nenhuma)"></textarea></div>
+      <div class="field"><label for="apiKey">chave da API</label>
+        <input type="password" id="apiKey" placeholder="(não exigida)" autocomplete="off"></div>
+      <h4>Dados</h4>
+      <div class="panel-actions">
+        <button class="btn" id="exportChats">Exportar conversas</button>
+        <button class="btn" id="importChats">Importar</button>
+        <input type="file" id="importFile" accept="application/json" hidden>
+        <button class="btn" id="clearChats">Apagar todas</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay preview" id="preview" hidden>
+  <div class="panel">
+    <div class="panel-head"><span>Pré-visualização</span>
+      <button class="ibtn" id="previewTab" title="Abrir em nova aba" data-icon="external"></button>
+      <button class="ibtn" id="previewClose" title="Fechar" data-icon="x"></button></div>
+    <iframe id="previewFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups"></iframe>
   </div>
 </div>
 
 <script>
 "use strict";
-
 const $ = (id) => document.getElementById(id);
-const log = $("log"), wrap = $("wrap"), input = $("input");
 
-// The conversation. Assistant turns keep the raw text including <think>; the
-// server strips reasoning from earlier turns itself, like the chat template.
-let turns = [];          // {role, content, el}
-let controller = null;   // AbortController for the in-flight request
+// --- icons (Lucide-style strokes) ---------------------------------------------
+const ICONS = {
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+  menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  brain: '<path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04Z"/>',
+  send: '<path d="M12 19V5M5 12l7-7 7 7"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  refresh: '<path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M8 16H3v5"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+  trash: '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>',
+  down: '<path d="M12 5v14M5 12l7 7 7-7"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
+  external: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  spark: '<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>',
+};
+const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ""}</svg>`;
+function paintIcons(root = document) {
+  root.querySelectorAll("[data-icon]").forEach((el) => {
+    if (!el.querySelector("svg")) el.insertAdjacentHTML("afterbegin", icon(el.dataset.icon));
+  });
+}
+
+// --- storage: conversations and settings live in this browser ------------------
+const STORE = "airun.chats.v1", SETTINGS = "airun.settings.v2";
+let db = { chats: [], current: null };
 let props = {};
+let controller = null;
+let streamingChat = null;
+let attached = [];   // data URLs waiting in the composer
 
-// --- settings ---------------------------------------------------------------
-const CONTROLS = ["think", "effort", "thinkBudget", "temp", "top_p", "top_k", "min_p", "rep",
-                  "maxTok", "seed", "sys", "apiKey"];
+function load() {
+  try { db = JSON.parse(localStorage.getItem(STORE)) || db; } catch (_) {}
+  if (!Array.isArray(db.chats)) db = { chats: [], current: null };
+}
+let saveTimer = null;
+function save(now) {
+  clearTimeout(saveTimer);
+  const write = () => {
+    try { localStorage.setItem(STORE, JSON.stringify(db)); }
+    catch (_) {
+      // Over the browser's quota: keep the text, drop the oldest images.
+      for (const c of db.chats.slice().sort((a, b) => a.updated - b.updated))
+        for (const t of c.turns) if (t.images?.length) { t.images = []; t.imagesDropped = true; }
+      try { localStorage.setItem(STORE, JSON.stringify(db)); toast("Espaço do navegador cheio: imagens antigas foram descartadas."); }
+      catch (_) { toast("Não foi possível salvar a conversa (espaço do navegador cheio)."); }
+    }
+  };
+  if (now) write(); else saveTimer = setTimeout(write, 300);
+}
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const chat = () => db.chats.find((c) => c.id === db.current) || null;
 
+function newChat() {
+  const c = { id: uid(), title: "Nova conversa", created: Date.now(), updated: Date.now(), turns: [] };
+  db.chats.unshift(c);
+  db.current = c.id;
+  save();
+  return c;
+}
+
+// --- settings -----------------------------------------------------------------
+const CONTROLS = ["effort", "thinkBudget", "temp", "top_p", "top_k", "min_p", "rep", "maxTok", "seed", "sys", "apiKey"];
+let thinking = true;
 function loadSettings() {
-  let saved = {};
-  try { saved = JSON.parse(localStorage.getItem("airun.settings") || "{}"); } catch (_) {}
-  for (const id of CONTROLS) {
-    if (saved[id] === undefined || saved[id] === null) continue;
-    if ($(id).type === "checkbox") $(id).checked = !!saved[id]; else $(id).value = saved[id];
-  }
-  syncLabels();
+  let s = {};
+  try { s = JSON.parse(localStorage.getItem(SETTINGS) || "{}"); } catch (_) {}
+  for (const id of CONTROLS) if (s[id] !== undefined) $(id).value = s[id];
+  if (s.thinking !== undefined) thinking = s.thinking;
 }
 function saveSettings() {
-  const out = {};
-  for (const id of CONTROLS) out[id] = $(id).type === "checkbox" ? $(id).checked : $(id).value;
-  try { localStorage.setItem("airun.settings", JSON.stringify(out)); } catch (_) {}
+  const s = { thinking };
+  for (const id of CONTROLS) s[id] = $(id).value;
+  try { localStorage.setItem(SETTINGS, JSON.stringify(s)); } catch (_) {}
 }
 function syncLabels() {
-  $("tempV").textContent  = (+$("temp").value).toFixed(2);
-  $("top_pV").textContent = (+$("top_p").value).toFixed(2);
-  $("top_kV").textContent = $("top_k").value;
-  $("min_pV").textContent = (+$("min_p").value).toFixed(2);
-  $("repV").textContent   = (+$("rep").value).toFixed(2);
-  $("thinkBudgetV").textContent = (+$("thinkBudget").value > 0 ? $("thinkBudget").value : "∞");
-  $("thinkPill").classList.toggle("on", $("think").checked);
-  $("effort").disabled = !$("think").checked;
+  const fix = { temp: 2, top_p: 2, top_k: 0, min_p: 2, rep: 2 };
+  for (const [id, d] of Object.entries(fix)) $(id + "V").textContent = (+$(id).value).toFixed(d);
+  $("thinkBudgetV").textContent = +$("thinkBudget").value > 0 ? $("thinkBudget").value : "∞";
+  $("thinkBtn").classList.toggle("on", thinking);
+  $("thinkBtn").title = thinking ? "Pensando antes de responder (clique para desligar)" : "Sem pensar (clique para ligar)";
+  $("effort").disabled = !thinking;
 }
 for (const id of CONTROLS) {
   $(id).addEventListener("input", () => { syncLabels(); saveSettings(); });
   $(id).addEventListener("change", () => { syncLabels(); saveSettings(); });
 }
+$("thinkBtn").addEventListener("click", () => { thinking = !thinking; syncLabels(); saveSettings(); });
 
-// --- markdown ---------------------------------------------------------------
+// --- markdown -----------------------------------------------------------------
 // Everything the model writes is escaped first; only the tags built here reach
-// innerHTML, so model output cannot inject markup into this page. HTML the
-// model writes is shown as code and can be previewed in a sandboxed frame.
-
+// innerHTML. HTML the model writes is shown as code and can be previewed in a
+// sandboxed frame.
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
                     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-
 function inline(src) {
   const codes = [];
   let s = src.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return "\u0000" + (codes.length - 1) + "\u0000"; });
   s = esc(s);
   s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) =>
-    /^(https?:|mailto:)/i.test(url)
-      ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>` : m);
-  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<]+[^\s<.,;:!?)\]'"])/g,
-    '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+    /^(https?:|mailto:)/i.test(url) ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>` : m);
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<]+[^\s<.,;:!?)\]'"])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
   s = s.replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^\w])__(?=\S)([\s\S]*?\S)__(?!\w)/g, "$1<strong>$2</strong>");
   s = s.replace(/(^|[^*\w])\*(?=[^\s*])([^*\n]*?[^\s*])\*(?!\*)/g, "$1<em>$2</em>");
@@ -469,37 +424,28 @@ function inline(src) {
   s = s.replace(/~~(?=\S)([\s\S]*?\S)~~/g, "<del>$1</del>");
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${esc(codes[+i])}</code>`);
 }
-
 const FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)/;
 const LIST = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 const TABLE_SEP = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
 const HTML_LANGS = new Set(["html", "htm", "xhtml", "svg"]);
-
-function isHtml(lang, code) {
-  return HTML_LANGS.has(lang.toLowerCase()) || /^\s*(<!doctype html|<html[\s>]|<svg[\s>])/i.test(code);
-}
-
+const isHtml = (lang, code) => HTML_LANGS.has(lang.toLowerCase()) || /^\s*(<!doctype html|<html[\s>]|<svg[\s>])/i.test(code);
+const codeStore = [];
 function codeBlock(lang, code) {
+  const id = codeStore.push(code) - 1;
   const preview = isHtml(lang, code)
-    ? '<button class="small" data-act="preview">Preview</button>' +
-      '<button class="small" data-act="open">Open</button>' : "";
-  return `<div class="codeblock"><div class="codehead"><span class="lang">${esc(lang || "text")}</span>` +
-    `${preview}<button class="small" data-act="copy-code">Copy</button></div>` +
+    ? `<button class="ibtn" data-act="preview" data-code="${id}" title="Pré-visualizar">${icon("eye")}</button>` : "";
+  return `<div class="codeblock"><div class="codehead"><span class="lang">${esc(lang || "texto")}</span>${preview}` +
+    `<button class="ibtn" data-act="copy-code" data-code="${id}" title="Copiar código">${icon("copy")}</button></div>` +
     `<pre><code>${esc(code)}</code></pre></div>`;
 }
-
 function splitRow(line) {
   let l = line.trim();
   if (l.startsWith("|")) l = l.slice(1);
   if (l.endsWith("|") && !l.endsWith("\\|")) l = l.slice(0, -1);
   return l.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
 }
-
-function blockStart(line) {
-  return FENCE.test(line) || /^ {0,3}#{1,6}\s/.test(line) || /^\s*>/.test(line) ||
-         LIST.test(line) || /^\s*([-*_])(\s*\1){2,}\s*$/.test(line);
-}
-
+const blockStart = (line) => FENCE.test(line) || /^ {0,3}#{1,6}\s/.test(line) || /^\s*>/.test(line) ||
+  LIST.test(line) || /^\s*([-*_])(\s*\1){2,}\s*$/.test(line);
 function markdown(src) {
   const lines = src.replace(/\r\n?/g, "\n").split("\n");
   const out = [];
@@ -507,582 +453,604 @@ function markdown(src) {
   while (i < lines.length) {
     const line = lines[i];
     if (!line.trim()) { i++; continue; }
-
     const fence = line.match(FENCE);
     if (fence) {
       const mark = fence[1], body = [];
       i++;
-      while (i < lines.length && !new RegExp("^ {0,3}" + mark[0] + "{" + mark.length + ",}\\s*$").test(lines[i])) {
-        body.push(lines[i++]);
-      }
+      while (i < lines.length && !new RegExp("^ {0,3}" + mark[0] + "{" + mark.length + ",}\\s*$").test(lines[i])) body.push(lines[i++]);
       i++;
       out.push(codeBlock(fence[2] || "", body.join("\n")));
       continue;
     }
-
     const h = line.match(/^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
     if (h) { out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); i++; continue; }
-
     if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { out.push("<hr>"); i++; continue; }
-
     if (/^\s*>/.test(line)) {
       const body = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) body.push(lines[i++].replace(/^\s*> ?/, ""));
       out.push(`<blockquote>${markdown(body.join("\n"))}</blockquote>`);
       continue;
     }
-
     if (line.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1])) {
       const head = splitRow(line);
-      const align = splitRow(lines[i + 1]).map((c) =>
-        c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : "");
+      const align = splitRow(lines[i + 1]).map((c) => c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : "");
       i += 2;
       const rows = [];
       while (i < lines.length && lines[i].includes("|") && lines[i].trim()) rows.push(splitRow(lines[i++]));
       const cell = (tag, c, k) => `<${tag}${align[k] ? ` style="text-align:${align[k]}"` : ""}>${inline(c)}</${tag}>`;
       out.push("<table><thead><tr>" + head.map((c, k) => cell("th", c, k)).join("") + "</tr></thead><tbody>" +
-        rows.map((r) => "<tr>" + head.map((_, k) => cell("td", r[k] || "", k)).join("") + "</tr>").join("") +
-        "</tbody></table>");
+        rows.map((r) => "<tr>" + head.map((_, k) => cell("td", r[k] || "", k)).join("") + "</tr>").join("") + "</tbody></table>");
       continue;
     }
-
     const li = line.match(LIST);
     if (li) {
-      const indent = li[1].length;
-      const ordered = /\d/.test(li[2]);
-      const start = ordered ? parseInt(li[2], 10) : 1;
+      const indent = li[1].length, ordered = /\d/.test(li[2]), start = ordered ? parseInt(li[2], 10) : 1;
       const items = [];
       while (i < lines.length) {
         const m = lines[i].match(LIST);
-        if (m && m[1].length === indent && /\d/.test(m[2]) === ordered) {
-          items.push([m[3]]);
-          i++;
-        } else if (items.length && lines[i].trim() &&
-                   (lines[i].match(/^\s*/)[0].length > indent || !blockStart(lines[i]))) {
-          items[items.length - 1].push(lines[i].slice(Math.min(indent + 2, lines[i].match(/^\s*/)[0].length)));
-          i++;
+        if (m && m[1].length === indent && /\d/.test(m[2]) === ordered) { items.push([m[3]]); i++; }
+        else if (items.length && lines[i].trim() && (lines[i].match(/^\s*/)[0].length > indent || !blockStart(lines[i]))) {
+          items[items.length - 1].push(lines[i].slice(Math.min(indent + 2, lines[i].match(/^\s*/)[0].length))); i++;
         } else if (!lines[i].trim() && i + 1 < lines.length &&
-                   (lines[i + 1].match(/^\s*/)[0].length > indent ||
-                    (lines[i + 1].match(LIST) || [])[1]?.length === indent)) {
-          i++;
-        } else {
-          break;
-        }
+                   (lines[i + 1].match(/^\s*/)[0].length > indent || (lines[i + 1].match(LIST) || [])[1]?.length === indent)) i++;
+        else break;
       }
-      const tag = ordered ? "ol" : "ul";
-      const attr = ordered && start !== 1 ? ` start="${start}"` : "";
-      out.push(`<${tag}${attr}>` + items.map((it) => {
-        const [first, ...rest] = it;
-        const nested = rest.length ? markdown(rest.join("\n")) : "";
-        return `<li>${inline(first)}${nested}</li>`;
-      }).join("") + `</${tag}>`);
+      const tag = ordered ? "ol" : "ul", attr = ordered && start !== 1 ? ` start="${start}"` : "";
+      out.push(`<${tag}${attr}>` + items.map(([first, ...rest]) =>
+        `<li>${inline(first)}${rest.length ? markdown(rest.join("\n")) : ""}</li>`).join("") + `</${tag}>`);
       continue;
     }
-
     const para = [];
     while (i < lines.length && lines[i].trim() && !blockStart(lines[i]) &&
-           !(lines[i].includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]))) {
-      para.push(lines[i++]);
-    }
+           !(lines[i].includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]))) para.push(lines[i++]);
     if (!para.length) para.push(lines[i++]);
     out.push(`<p>${para.map((l) => inline(l.trim())).join("<br>")}</p>`);
   }
   return out.join("");
 }
 
-// --- reasoning --------------------------------------------------------------
-
+// The reply as reasoning (inside <think>) and answer.
 function splitThink(raw) {
-  const open = raw.indexOf("<think>");
-  const close = raw.indexOf("</think>");
-  if (close !== -1 && (open === -1 || open < close)) {
-    const from = open === -1 ? 0 : open + 7;
-    return { think: raw.slice(from, close).trim(), answer: raw.slice(close + 8).replace(/^\s+/, ""), live: false };
-  }
-  if (open !== -1 && !raw.slice(0, open).trim()) {
-    return { think: raw.slice(open + 7).replace(/^\s+/, ""), answer: "", live: true };
-  }
+  const open = raw.indexOf("<think>"), close = raw.indexOf("</think>");
+  if (close !== -1 && (open === -1 || open < close))
+    return { think: raw.slice(open === -1 ? 0 : open + 7, close).trim(), answer: raw.slice(close + 8).replace(/^\s+/, ""), live: false };
+  if (open !== -1 && !raw.slice(0, open).trim()) return { think: raw.slice(open + 7).replace(/^\s+/, ""), answer: "", live: true };
   return { think: null, answer: raw, live: false };
 }
 
-// --- messages ---------------------------------------------------------------
+// --- rendering ----------------------------------------------------------------
+const wrap = $("wrap"), log = $("log");
 
-function showEmpty() {
-  wrap.innerHTML = '<div class="empty" id="empty"><div class="logo">ai<span>run</span></div>' +
-    '<h2>Nothing yet</h2>' +
-    '<p><kbd>Enter</kbd> sends · <kbd>Shift+Enter</kbd> new line · <kbd>Esc</kbd> stops a reply</p></div>';
+function renderSidebar() {
+  const q = $("search").value.trim().toLowerCase();
+  const list = db.chats.filter((c) => !q || c.title.toLowerCase().includes(q) ||
+    c.turns.some((t) => (t.content || "").toLowerCase().includes(q)));
+  list.sort((a, b) => b.updated - a.updated);
+  const day = 864e5, now = Date.now(), groups = [["Hoje", day], ["Últimos 7 dias", 7 * day], ["Últimos 30 dias", 30 * day], ["Mais antigas", Infinity]];
+  let html = "", g = -1;
+  for (const c of list) {
+    const age = now - c.updated;
+    const k = groups.findIndex(([, max]) => age < max);
+    if (k !== g) { g = k; html += `<div class="group">${groups[k][0]}</div>`; }
+    html += `<div class="chat${c.id === db.current ? " active" : ""}" data-id="${c.id}">` +
+      (c.pending ? '<span class="dotlive" title="Gerando"></span>' : "") +
+      `<span class="title">${esc(c.title)}</span>` +
+      `<button class="ibtn" data-act="rename" title="Renomear">${icon("edit")}</button>` +
+      `<button class="ibtn" data-act="delete" title="Apagar">${icon("trash")}</button></div>`;
+  }
+  $("chats").innerHTML = html || '<div class="group" style="text-transform:none">Nenhuma conversa ainda</div>';
 }
 
-function actionButton(label, act, needsIdle) {
-  const b = document.createElement("button");
-  b.textContent = label;
-  b.dataset.act = act;
-  if (needsIdle) b.className = "needs-idle";
-  return b;
+function renderChat() {
+  const c = chat();
+  $("chatTitle").textContent = c ? c.title : "Nova conversa";
+  wrap.innerHTML = "";
+  codeStore.length = 0;
+  if (!c || !c.turns.length) {
+    wrap.innerHTML = '<div class="empty"><div class="logo">ai<span>run</span></div>' +
+      `<p>${esc(props.model || "")}</p><p>Pergunte qualquer coisa.</p></div>`;
+    return;
+  }
+  c.turns.forEach((t, i) => wrap.appendChild(messageEl(t, i)));
+  markLast();
+  log.scrollTop = log.scrollHeight;
 }
 
-function addMessage(role, text) {
-  $("empty")?.remove();
-  const msg = document.createElement("div");
-  msg.className = "msg " + role;
-  const row = document.createElement("div");
-  row.className = "row " + (role === "user" ? "user" : "assistant");
-  const av = document.createElement("div");
-  av.className = "avatar";
-  av.textContent = role === "user" ? "you" : "✦";
-  const col = document.createElement("div");
-  col.className = "col";
-  const b = document.createElement("div");
-  b.className = "bubble";
-  col.appendChild(b);
-  row.append(av, col);
-  msg.appendChild(row);
+function markLast() {
+  const msgs = wrap.querySelectorAll(".msg");
+  msgs.forEach((m, i) => m.classList.toggle("last", i === msgs.length - 1));
+}
 
-  if (role === "assistant") {
-    const think = document.createElement("details");
-    think.className = "think";
-    think.hidden = true;
-    think.innerHTML = '<summary><span class="tlabel">Reasoning</span><span class="brain"></span></summary><div class="think-body md"></div>';
-    // "toggle" also fires for changes made by code; only a click is a choice.
-    think.addEventListener("toggle", () => {
-      if (think.dataset.auto) delete think.dataset.auto; else think.dataset.touched = "1";
-    });
-    const answer = document.createElement("div");
-    answer.className = "answer md";
-    b.append(think, answer);
+function messageEl(t, index) {
+  const el = document.createElement("div");
+  el.className = "msg " + t.role;
+  el.dataset.index = index;
+  if (t.role === "user") {
+    if (t.images?.length) el.insertAdjacentHTML("beforeend", '<div class="imgs">' +
+      t.images.map((src) => `<img src="${src}" alt="imagem" data-act="zoom">`).join("") + "</div>");
+    const b = document.createElement("div");
+    b.className = "body";
+    b.textContent = t.content + (t.imagesDropped ? "\n(imagens não guardadas)" : "");
+    el.appendChild(b);
+    el.insertAdjacentHTML("beforeend", '<div class="actions">' +
+      `<button class="ibtn" data-act="copy" title="Copiar">${icon("copy")}</button>` +
+      `<button class="ibtn" data-act="edit" title="Editar e reenviar">${icon("edit")}</button></div>`);
+  } else if (t.role === "error") {
+    el.innerHTML = `<div class="body"></div><div class="actions"><button class="ibtn" data-act="regen" title="Tentar de novo">${icon("refresh")}</button></div>`;
+    el.querySelector(".body").textContent = t.content;
   } else {
-    b.textContent = text;
+    el.innerHTML = '<div class="body"></div><div class="actions">' +
+      `<button class="ibtn" data-act="copy" title="Copiar resposta">${icon("copy")}</button>` +
+      `<button class="ibtn" data-act="regen" title="Gerar de novo">${icon("refresh")}</button>` +
+      `<span class="stats"></span></div>`;
+    renderAssistant(el, t.content, t.stats, false);
   }
-
-  if (role !== "error") {
-    const acts = document.createElement("div");
-    acts.className = "actions";
-    acts.append(actionButton("Copy", "copy"));
-    if (role === "user") acts.append(actionButton("Edit", "edit", true));
-    if (role === "assistant") acts.append(actionButton("Regenerate", "regen", true));
-    col.appendChild(acts);
-  }
-  wrap.appendChild(msg);
-  return msg;
+  return el;
 }
 
-function renderAssistant(msg, raw, state) {
-  const { think, answer, live } = splitThink(raw);
-  const t = msg.querySelector("details.think");
-  const a = msg.querySelector(".answer");
+function renderAssistant(el, raw, stats, live) {
+  const body = el.querySelector(".body");
+  const { think, answer, live: thinkingNow } = splitThink(raw);
+  const wasOpen = body.querySelector("details.think")?.open;
+  let html = "";
   if (think !== null) {
-    t.hidden = false;
-    t.querySelector(".think-body").innerHTML = markdown(think) || "<p>…</p>";
-    t.classList.toggle("live", live && state.streaming);
-    const secs = state.thinkEnd ? ((state.thinkEnd - state.thinkStart) / 1000).toFixed(1) : null;
-    t.querySelector(".tlabel").textContent =
-      live && state.streaming ? "Thinking…" :
-      live && state.stopped ? `Stopped while thinking (${secs} s)` :
-      secs ? `Thought for ${secs} s` : "Reasoning";
-    const budget = (+$("thinkBudget").value > 0 ? $("thinkBudget").value : null);
-    t.querySelector(".brain").textContent =
-      (state.thinkTokens ? state.thinkTokens + " tok" : "") +
-      (budget ? " / " + budget : "");
-    // Open while thinking, fold once the answer starts, unless the user chose.
-    const want = live && state.streaming;
-    if (!t.dataset.touched && t.open !== want) {
-      t.dataset.auto = "1";
-      t.open = want;
-    }
-  } else {
-    t.hidden = true;
+    const secs = stats?.thinkMs ? ` por ${(stats.thinkMs / 1000).toFixed(1)}s` : "";
+    const label = thinkingNow && live ? "Pensando…" : `Pensou${secs}`;
+    html += `<details class="think${thinkingNow && live ? " live" : ""}"${wasOpen || (thinkingNow && live) ? " open" : ""}>` +
+      `<summary>${icon("brain")}${label}</summary><div class="think-body">${esc(think)}</div></details>`;
   }
-  a.innerHTML = markdown(answer);
-  a.classList.toggle("cursor", state.streaming && !live);
-  if (state.streaming && live) t.querySelector(".think-body").classList.add("cursor");
-  else t.querySelector(".think-body").classList.remove("cursor");
-}
-
-function atBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
-
-// --- live stats -------------------------------------------------------------
-
-const genbar = () => {
-  let g = $("genbar");
-  if (!g) {
-    g = document.createElement("div");
-    g.id = "genbar";
-    g.className = "genbar";
-    g.hidden = true;
+  html += `<div class="answer${live && !thinkingNow ? " cursor" : ""}">${markdown(answer)}</div>`;
+  body.innerHTML = html;
+  if (live && thinkingNow) {
+    const tb = body.querySelector(".think-body");
+    if (tb) tb.scrollTop = tb.scrollHeight;
   }
-  return g;
-};
-
-function showGenbar(state, live) {
-  const g = genbar();
-  const tps = state.genMs > 0 ? (state.nChunks - 1) / (state.genMs / 1000) : 0;
-  const parts = [
-    `<span class="live"><span class="pulse"></span>${live ? "generating" : "done"}</span>`,
-    `<span><b>${state.nChunks}</b> tokens</span>`,
-    tps > 0 ? `<span class="sep">·</span><span><b>${tps.toFixed(1)}</b> tok/s</span>` : "",
-    state.ttft ? `<span class="sep">·</span><span>first <b>${state.ttft.toFixed(0)}</b> ms</span>` : "",
-    `<span class="sep">·</span><span><b>${(state.elapsed / 1000).toFixed(1)}</b> s</span>`,
-  ].filter(Boolean);
-  g.innerHTML = parts.join("");
-  g.hidden = false;
+  const st = el.querySelector(".stats");
+  if (st) st.textContent = stats?.tps ? `${stats.tokens} tokens · ${stats.tps.toFixed(1)} tok/s` + (stats.stopped ? " · interrompida" : "") : "";
 }
 
-// --- generation -------------------------------------------------------------
-
-function busy(on) {
-  document.body.classList.toggle("busy", on);
-  $("send").hidden = on;
-  $("stop").hidden = !on;
-  input.disabled = on;
-  if (!on) input.focus();
+function toast(text) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = text;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3200);
 }
+
+// --- sending ------------------------------------------------------------------
+const input = $("input");
+function syncComposer() {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 240) + "px";
+  $("send").disabled = !!controller || (!input.value.trim() && !attached.length);
+  $("send").hidden = !!controller;
+  $("stop").hidden = !controller;
+}
+input.addEventListener("input", syncComposer);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (!$("preview").hidden) $("preview").hidden = true;
+    else if (!$("settings").hidden) $("settings").hidden = true;
+    else if (controller) stop();
+  }
+  if (e.key.toLowerCase() === "o" && e.ctrlKey && e.shiftKey) { e.preventDefault(); startNew(); }
+});
 
 function submit() {
   const text = input.value.trim();
-  if (!text || controller) return;
-  input.value = ""; input.style.height = "auto";
-  const el = addMessage("user", text);
-  turns.push({ role: "user", content: text, el });
-  log.scrollTop = log.scrollHeight;
-  generate();
+  if (controller || (!text && !attached.length)) return;
+  let c = chat();
+  if (!c) c = newChat();
+  c.turns.push({ role: "user", content: text, images: attached.slice() });
+  if (c.title === "Nova conversa") c.title = (text || "Imagem").replace(/\s+/g, " ").slice(0, 48);
+  attached = [];
+  renderChips();
+  input.value = "";
+  syncComposer();
+  c.updated = Date.now();
+  save(true);
+  renderSidebar();
+  renderChat();
+  generate(c);
 }
 
-async function generate() {
-  const msg = addMessage("assistant", "");
-  const turn = { role: "assistant", content: "", el: msg };
-  const state = {
-    streaming: true, stopped: false,
-    thinkStart: performance.now(), thinkEnd: null,
-    nChunks: 0, ttft: null, t0: performance.now(), elapsed: 0, genMs: 0,
-  };
-  // The live stats bar sits just above the message being generated.
-  const bar = genbar();
-  bar.hidden = false;
-  wrap.insertBefore(bar, msg);
-  renderAssistant(msg, "", state);
-  showGenbar(state, true);
-  log.scrollTop = log.scrollHeight;
-  busy(true);
-
+function requestBody(c) {
   const messages = [];
   const sys = $("sys").value.trim();
   if (sys) messages.push({ role: "system", content: sys });
-  for (const t of turns) messages.push({ role: t.role, content: t.content });
-
-  const thinking = $("think").checked;
+  for (const t of c.turns) {
+    if (t.role === "error") continue;
+    if (t.role === "user" && t.images?.length) {
+      messages.push({ role: "user", content: [{ type: "text", text: t.content },
+        ...t.images.map((url) => ({ type: "image_url", image_url: { url } }))] });
+    } else messages.push({ role: t.role, content: t.content });
+  }
   const body = {
-    model: props.model || "airun",
-    messages,
-    stream: true,
-    max_tokens: +$("maxTok").value || 2048,
-    temperature: +$("temp").value,
-    top_p: +$("top_p").value,
-    top_k: +$("top_k").value,
-    min_p: +$("min_p").value,
-    frequency_penalty: Math.max(0, +$("rep").value - 1),
-    enable_thinking: thinking,
-    chat_template_kwargs: { enable_thinking: thinking },
+    model: props.model || "airun", messages, stream: true,
+    max_tokens: +$("maxTok").value || 4096, temperature: +$("temp").value, top_p: +$("top_p").value,
+    top_k: +$("top_k").value, min_p: +$("min_p").value, repeat_penalty: +$("rep").value,
   };
-  // An explicit budget wins over the level; "max" sends nothing.
-  const budget = +$("thinkBudget").value;
-  if (thinking && budget > 0) body.reasoning_budget_tokens = budget;
-  else if (thinking && $("effort").value !== "max") body.reasoning_effort = $("effort").value;
+  if (props.thinking) {
+    body.chat_template_kwargs = { enable_thinking: thinking };
+    const budget = +$("thinkBudget").value;
+    if (thinking && budget > 0) body.reasoning_budget_tokens = budget;
+    else if (thinking && $("effort").value !== "max") body.reasoning_effort = $("effort").value;
+  }
   const seed = $("seed").value.trim();
   if (seed !== "" && !Number.isNaN(+seed)) body.seed = +seed;
+  return body;
+}
 
-  const headers = { "Content-Type": "application/json" };
+function headers(extra) {
+  const h = { "Content-Type": "application/json", ...extra };
   const key = $("apiKey").value.trim();
-  if (key) headers["Authorization"] = "Bearer " + key;
+  if (key) h["Authorization"] = "Bearer " + key;
+  return h;
+}
 
+// Reads an SSE stream of chat chunks, calling `each(reasoning, content)` per delta.
+async function readSse(res, each) {
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const frames = buf.split("\n\n");
+    buf = frames.pop();
+    for (const frame of frames) for (const line of frame.split("\n")) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      let j;
+      try { j = JSON.parse(payload); } catch (_) { continue; }
+      if (j.error) throw new Error(j.error.message || "erro no servidor");
+      const d = j.choices?.[0]?.delta || {};
+      if (d.reasoning_content || d.content) each(d.reasoning_content || "", d.content || "");
+    }
+  }
+}
+
+// Streams the reply into the chat's last turn. `resume` reads a generation the
+// server kept going while this page was closed (stream replay) instead.
+async function generate(c, resume) {
+  const turn = resume ? c.turns[c.turns.length - 1] : { role: "assistant", content: "", stats: {} };
+  if (!resume) c.turns.push(turn);
+  const index = c.turns.length - 1;
+  let el = wrap.querySelector(`.msg[data-index="${index}"]`);
+  if (db.current === c.id && !el) {
+    wrap.querySelector(".empty")?.remove();
+    el = messageEl(turn, index);
+    wrap.appendChild(el);
+    markLast();
+    log.scrollTop = log.scrollHeight;
+  }
+  c.pending = { started: Date.now() };
+  save(true);
+  renderSidebar();
   controller = new AbortController();
-  let acc = "", firstTokenAt = null, pending = false;
-  // The server streams the thinking as reasoning_content (llama-server's
-  // shape); it is put back in <think> form, which the rest of the page splits.
-  let reasoning = "", content = "";
+  streamingChat = c.id;
+  syncComposer();
 
-  // Re-rendering markdown per chunk is wasted work; once per frame is enough.
+  let reasoning = "", content = "", tokens = 0, first = null, thinkEnd = null;
+  const t0 = performance.now();
+  if (resume) {
+    const s = splitThink(turn.content || "");
+    reasoning = s.think || ""; content = s.answer || "";
+  }
+  let queued = false, finished = false;
   const paint = () => {
-    if (pending) return;
-    pending = true;
+    if (queued) return;
+    queued = true;
     requestAnimationFrame(() => {
-      pending = false;
-      const stick = atBottom();
-      renderAssistant(msg, acc, state);
-      if (state.streaming) {
-        state.elapsed = performance.now() - state.t0;
-        state.genMs = firstTokenAt ? performance.now() - firstTokenAt : 0;
-        showGenbar(state, true);
-      }
+      queued = false;
+      if (finished) return;
+      const view = db.current === c.id ? wrap.querySelector(`.msg[data-index="${index}"]`) : null;
+      if (!view) return;
+      const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+      renderAssistant(view, turn.content, turn.stats, true);
       if (stick) log.scrollTop = log.scrollHeight;
     });
   };
-
   try {
-    const res = await fetch("./v1/chat/completions", {
-      method: "POST", headers, body: JSON.stringify(body), signal: controller.signal,
-    });
+    let res;
+    if (resume) {
+      res = await fetch(`./v1/stream/${encodeURIComponent(c.id)}?from=0`, { headers: headers(), signal: controller.signal });
+      reasoning = ""; content = "";
+    } else {
+      res = await fetch("./v1/chat/completions", {
+        method: "POST", headers: headers({ "X-Conversation-Id": c.id }),
+        body: JSON.stringify(requestBody(c)), signal: controller.signal,
+      });
+    }
     if (!res.ok) {
       let detail = "HTTP " + res.status;
       try { const j = await res.json(); if (j?.error?.message) detail = j.error.message; } catch (_) {}
       throw new Error(detail);
     }
-
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const frames = buf.split("\n\n");
-      buf = frames.pop();
-      for (const frame of frames) {
-        for (const line of frame.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (payload === "[DONE]") continue;
-          let j;
-          try { j = JSON.parse(payload); } catch (_) { continue; }
-          if (j.error) throw new Error(j.error.message || "server error");
-          const delta = j.choices?.[0]?.delta || {};
-          const thought = delta.reasoning_content, piece = delta.content;
-          if (!thought && !piece) continue;
-          if (firstTokenAt === null) { firstTokenAt = performance.now(); state.ttft = firstTokenAt - state.t0; }
-          state.nChunks++;
-          if (thought) { reasoning += thought; state.thinkTokens = (state.thinkTokens || 0) + 1; }
-          if (piece) { content += piece; state.answerTokens = (state.answerTokens || 0) + 1; }
-          acc = reasoning ? "<think>\n" + reasoning + (content ? "\n</think>\n\n" + content : "") : content;
-          if (state.thinkEnd === null && acc.includes("</think>")) state.thinkEnd = performance.now();
-          paint();
-        }
-      }
-    }
+    await readSse(res, (r, p) => {
+      if (first === null) first = performance.now();
+      tokens++;
+      reasoning += r; content += p;
+      if (p && reasoning && thinkEnd === null) thinkEnd = performance.now();
+      turn.content = reasoning ? "<think>\n" + reasoning + (content ? "\n</think>\n\n" + content : "") : content;
+      paint();
+      save();
+    });
   } catch (e) {
     if (e.name === "AbortError") {
-      state.stopped = true;
+      turn.stats = { ...turn.stats, stopped: true };
+      // The user's stop: end the generation on the server too.
+      fetch(`./v1/stream/${encodeURIComponent(c.id)}`, { method: "DELETE", headers: headers() }).catch(() => {});
+    } else if (!turn.content) {
+      c.turns[index] = { role: "error", content: String(e.message || e) };
     } else {
-      msg.remove();
-      genbar().hidden = true;
-      const err = addMessage("error", String(e.message || e));
-      err.querySelector(".bubble").textContent = String(e.message || e);
-      controller = null;
-      busy(false);
-      return;
+      turn.stats = { ...turn.stats, stopped: true };
     }
   }
-
-  controller = null;
-  state.streaming = false;
-  if (state.thinkEnd === null && splitThink(acc).think !== null) state.thinkEnd = performance.now();
-  state.elapsed = performance.now() - state.t0;
-  state.genMs = firstTokenAt ? state.elapsed - state.ttft : 0;
-  renderAssistant(msg, acc, state);
-
-  if (!acc) {
-    msg.remove();
-    genbar().hidden = true;
-  } else {
-    turn.content = acc;
-    turns.push(turn);
-    showGenbar(state, false);
+  finished = true;
+  const ms = performance.now() - (first ?? t0);
+  if (c.turns[index] === turn) {
+    if (!turn.content) c.turns.splice(index, 1);
+    else turn.stats = { ...turn.stats, tokens, tps: tokens && ms > 0 ? tokens / (ms / 1000) : 0,
+                        thinkMs: reasoning ? (thinkEnd ?? performance.now()) - (first ?? t0) : 0 };
   }
-  busy(false);
+  delete c.pending;
+  c.updated = Date.now();
+  controller = null;
+  streamingChat = null;
+  save(true);
+  renderSidebar();
+  if (db.current === c.id) renderChat();
+  syncComposer();
 }
 
 function stop() { controller?.abort(); }
 
-// Drops turn `index` and everything after it, in the transcript and on screen.
-function truncateAt(index) {
-  for (const t of turns.slice(index)) t.el.remove();
-  turns = turns.slice(0, index);
-  wrap.querySelectorAll(".msg.error").forEach((e) => e.remove());
-  genbar().hidden = true;
-}
-
-function startEdit(turnIndex) {
-  const turn = turns[turnIndex];
-  const bubble = turn.el.querySelector(".bubble");
-  if (bubble.querySelector(".edit-box")) return;
-  const box = document.createElement("textarea");
-  box.className = "edit-box";
-  box.value = turn.content;
-  const row = document.createElement("div");
-  row.className = "edit-row";
-  const cancel = document.createElement("button");
-  cancel.className = "small"; cancel.textContent = "Cancel";
-  const save = document.createElement("button");
-  save.className = "small primary"; save.textContent = "Send";
-  row.append(cancel, save);
-  bubble.textContent = "";
-  bubble.append(box, row);
-  box.focus();
-  box.setSelectionRange(box.value.length, box.value.length);
-
-  const restore = () => { bubble.textContent = turn.content; };
-  const commit = () => {
-    const text = box.value.trim();
-    if (!text || controller) return;
-    truncateAt(turnIndex);
-    const el = addMessage("user", text);
-    turns.push({ role: "user", content: text, el });
-    generate();
-  };
-  cancel.addEventListener("click", restore);
-  save.addEventListener("click", commit);
-  box.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(); }
-    if (e.key === "Escape") { e.preventDefault(); restore(); }
+// --- images -------------------------------------------------------------------
+// Downscaled in the page (1024 px on the long side, JPEG) so a chat with images
+// still fits the browser's storage; the server resizes again for the model.
+function readImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const s = Math.min(1, 1024 / Math.max(img.width, img.height));
+      const cv = document.createElement("canvas");
+      cv.width = Math.round(img.width * s); cv.height = Math.round(img.height * s);
+      cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+      URL.revokeObjectURL(img.src);
+      resolve(cv.toDataURL("image/jpeg", 0.88));
+    };
+    img.onerror = () => reject(new Error("não foi possível ler a imagem"));
+    img.src = URL.createObjectURL(file);
   });
 }
+function renderChips() {
+  $("chips").innerHTML = attached.map((src, i) =>
+    `<div class="chip"><img src="${src}" alt=""><button data-rm="${i}" title="Remover">${icon("x")}</button></div>`).join("");
+  syncComposer();
+}
+async function addFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    if (!props.vision) { toast("Este servidor não tem visão: inicie com --mmproj para mandar imagens."); return; }
+    try { attached.push(await readImage(f)); } catch (e) { toast(e.message); }
+  }
+  renderChips();
+}
+$("attach").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
+$("chips").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-rm]");
+  if (b) { attached.splice(+b.dataset.rm, 1); renderChips(); }
+});
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => { e.preventDefault(); if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files); });
 
-// --- clipboard and preview --------------------------------------------------
-
-async function copyText(text, button) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (_) {
+// --- actions --------------------------------------------------------------------
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); }
+  catch (_) {
     const t = document.createElement("textarea");
-    t.value = text; t.style.position = "fixed"; t.style.opacity = "0";
-    document.body.appendChild(t); t.select();
-    try { document.execCommand("copy"); } catch (_) {}
-    t.remove();
+    t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove();
   }
-  if (button) {
-    const old = button.textContent;
-    button.textContent = "Copied";
-    setTimeout(() => { button.textContent = old; }, 1200);
-  }
+  if (btn) { btn.innerHTML = icon("check"); setTimeout(() => { btn.innerHTML = icon("copy"); }, 1200); }
 }
-
 let previewHtml = "";
-
-function openPreview(html) {
-  previewHtml = html;
-  $("previewFrame").srcdoc = html;
-  $("preview").hidden = false;
-}
-
-function openInTab(html) {
-  const page = '<!doctype html><meta charset="utf-8"><title>airun preview</title>' +
-    '<style>html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%}</style>' +
-    '<iframe sandbox="allow-scripts allow-forms allow-modals allow-popups" srcdoc="' +
-    esc(html) + '"></iframe>';
-  const url = URL.createObjectURL(new Blob([page], { type: "text/html" }));
-  window.open(url, "_blank", "noopener");
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
-}
-
-// --- events -----------------------------------------------------------------
-
-$("send").addEventListener("click", submit);
-$("stop").addEventListener("click", stop);
-
-input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
-});
-input.addEventListener("input", () => {
-  input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, 220) + "px";
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key !== "Escape") return;
-  if (!$("preview").hidden) { $("preview").hidden = true; return; }
-  if (controller) { e.preventDefault(); stop(); }
-});
-
-log.addEventListener("scroll", () => {
-  $("toBottom").hidden = atBottom();
-});
-$("toBottom").addEventListener("click", () => { log.scrollTop = log.scrollHeight; });
+function openPreview(html) { previewHtml = html; $("previewFrame").srcdoc = html; $("preview").hidden = false; }
 
 wrap.addEventListener("click", (e) => {
-  const btn = e.target.closest("button[data-act]");
-  if (!btn) return;
-  const msg = btn.closest(".msg");
-  const index = turns.findIndex((t) => t.el === msg);
-  const act = btn.dataset.act;
+  const b = e.target.closest("[data-act]");
+  if (!b) return;
+  const c = chat();
+  const msg = b.closest(".msg");
+  const index = msg ? +msg.dataset.index : -1;
+  const act = b.dataset.act;
+  if (act === "copy-code") return copyText(codeStore[+b.dataset.code], b);
+  if (act === "preview") return openPreview(codeStore[+b.dataset.code]);
+  if (act === "zoom") return openPreview(`<body style="margin:0;background:#111;display:grid;place-items:center;height:100vh"><img src="${b.src}" style="max-width:100%;max-height:100%"></body>`);
+  if (!c || index < 0) return;
+  const t = c.turns[index];
+  if (act === "copy") return copyText(t.role === "assistant" ? splitThink(t.content).answer : t.content, b);
+  if (controller) return;
+  if (act === "regen") {
+    // Back to the user turn before it, and ask again.
+    let k = index;
+    while (k > 0 && c.turns[k].role !== "user") k--;
+    c.turns.splice(k + 1);
+    renderChat();
+    generate(c);
+  }
+  if (act === "edit") startEdit(c, index, msg);
+});
 
-  if (act === "copy-code" || act === "preview" || act === "open") {
-    const code = btn.closest(".codeblock").querySelector("code").textContent;
-    if (act === "copy-code") copyText(code, btn);
-    else if (act === "preview") openPreview(code);
-    else openInTab(code);
+function startEdit(c, index, msg) {
+  const t = c.turns[index];
+  const box = document.createElement("div");
+  box.className = "edit-box";
+  box.innerHTML = '<textarea></textarea><div class="row"><button class="btn" data-x="cancel">Cancelar</button>' +
+    '<button class="btn primary" data-x="send">Enviar</button></div>';
+  const ta = box.querySelector("textarea");
+  ta.value = t.content;
+  msg.querySelector(".body").replaceWith(box);
+  msg.querySelector(".actions")?.remove();
+  ta.focus();
+  box.addEventListener("click", (e) => {
+    const x = e.target.closest("[data-x]")?.dataset.x;
+    if (x === "cancel") renderChat();
+    if (x === "send" && ta.value.trim()) {
+      t.content = ta.value.trim();
+      c.turns.splice(index + 1);
+      c.updated = Date.now();
+      save(true);
+      renderChat();
+      generate(c);
+    }
+  });
+  ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); box.querySelector('[data-x="send"]').click(); } });
+}
+
+$("chats").addEventListener("click", (e) => {
+  const row = e.target.closest(".chat");
+  if (!row) return;
+  const c = db.chats.find((x) => x.id === row.dataset.id);
+  const act = e.target.closest("[data-act]")?.dataset.act;
+  if (act === "rename") {
+    const name = prompt("Nome da conversa", c.title);
+    if (name && name.trim()) { c.title = name.trim().slice(0, 80); save(true); renderSidebar(); if (c.id === db.current) $("chatTitle").textContent = c.title; }
     return;
   }
-  if (index < 0) return;
-  if (act === "copy") {
-    const t = turns[index];
-    copyText(t.role === "assistant" ? splitThink(t.content).answer : t.content, btn);
-  } else if (act === "edit" && !controller) {
-    startEdit(index);
-  } else if (act === "regen" && !controller) {
-    truncateAt(index);
-    generate();
+  if (act === "delete") {
+    if (streamingChat === c.id) stop();
+    if (!confirm(`Apagar "${c.title}"?`)) return;
+    db.chats = db.chats.filter((x) => x.id !== c.id);
+    if (db.current === c.id) db.current = db.chats[0]?.id || null;
+    save(true); renderSidebar(); renderChat();
+    return;
   }
-});
-
-$("previewClose").addEventListener("click", () => { $("preview").hidden = true; });
-$("previewTab").addEventListener("click", () => openInTab(previewHtml));
-$("preview").addEventListener("click", (e) => { if (e.target === $("preview")) $("preview").hidden = true; });
-
-$("newChat").addEventListener("click", () => {
-  stop();
-  turns = [];
-  showEmpty();
-  genbar().hidden = true;
+  db.current = c.id;
+  save();
+  renderSidebar();
+  renderChat();
+  document.body.classList.remove("side-open");
   input.focus();
 });
+$("search").addEventListener("input", renderSidebar);
 
-$("settingsBtn").addEventListener("click", () => {
-  $("aside").classList.add("open");
-  $("closeSettings").style.display = "";
+function startNew() {
+  if (chat() && !chat().turns.length) { input.focus(); return; }
+  db.current = null;
+  renderSidebar();
+  renderChat();
+  document.body.classList.remove("side-open");
+  input.focus();
+}
+$("newChat").addEventListener("click", startNew);
+$("send").addEventListener("click", submit);
+$("stop").addEventListener("click", stop);
+$("menu").addEventListener("click", () => document.body.classList.add("side-open"));
+$("sideClose").addEventListener("click", () => document.body.classList.remove("side-open"));
+$("settingsBtn").addEventListener("click", () => { $("settings").hidden = false; });
+$("closeSettings").addEventListener("click", () => { $("settings").hidden = true; });
+$("settings").addEventListener("click", (e) => { if (e.target === $("settings")) $("settings").hidden = true; });
+$("previewClose").addEventListener("click", () => { $("preview").hidden = true; });
+$("preview").addEventListener("click", (e) => { if (e.target === $("preview")) $("preview").hidden = true; });
+$("previewTab").addEventListener("click", () => {
+  const w = window.open();
+  if (w) { w.document.open(); w.document.write(previewHtml); w.document.close(); }
 });
-$("closeSettings").addEventListener("click", () => {
-  $("aside").classList.remove("open");
-  $("closeSettings").style.display = "none";
+log.addEventListener("scroll", () => { $("toBottom").hidden = log.scrollHeight - log.scrollTop - log.clientHeight < 200; });
+$("toBottom").addEventListener("click", () => { log.scrollTop = log.scrollHeight; });
+
+$("exportChats").addEventListener("click", () => {
+  const blob = new Blob([JSON.stringify(db, null, 1)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "airun-conversas.json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+$("importChats").addEventListener("click", () => $("importFile").click());
+$("importFile").addEventListener("change", async (e) => {
+  try {
+    const data = JSON.parse(await e.target.files[0].text());
+    const known = new Set(db.chats.map((c) => c.id));
+    const add = (data.chats || []).filter((c) => c && c.id && Array.isArray(c.turns) && !known.has(c.id));
+    db.chats.push(...add);
+    save(true); renderSidebar();
+    toast(`${add.length} conversa(s) importada(s).`);
+  } catch (_) { toast("Arquivo inválido."); }
+  e.target.value = "";
+});
+$("clearChats").addEventListener("click", () => {
+  if (!confirm("Apagar todas as conversas deste navegador?")) return;
+  db = { chats: [], current: null };
+  save(true); renderSidebar(); renderChat();
 });
 
-// --- server info ------------------------------------------------------------
-
+// --- server ---------------------------------------------------------------------
 async function connect() {
   try {
     const res = await fetch("./props");
     if (!res.ok) throw new Error("HTTP " + res.status);
     props = await res.json();
-
-    $("dot").className = "dot ok";
-    $("modelName").textContent = props.model || "";
-    $("maxTok").max = props.ctx || 32768;
-    $("thinkPill").hidden = !props.thinking;
-    $("effort").hidden = !props.thinking;
-
-    const rows = [
-      ["arch", props.arch],
-      ["layers", props.n_layers],
-      ["context", props.ctx],
-      ["vocab", props.vocab_size],
-      ["gpus", (props.gpus || []).join(", ") || "-"],
-      ["reasoning", props.thinking ? "yes" : "no"],
-      ["auth", props.auth_required ? "api key" : "open"],
-    ];
-    $("info").innerHTML = "";
-    for (const [k, v] of rows) {
-      if (v === undefined || v === null || v === "") continue;
-      const d = document.createElement("div");
-      const a = document.createElement("span"); a.textContent = k;
-      const b = document.createElement("span"); b.textContent = String(v);
-      d.append(a, b);
-      $("info").appendChild(d);
-    }
-  } catch (e) {
-    $("dot").className = "dot err";
-    $("modelName").textContent = "server unreachable";
+    props.vision = !!props.modalities?.vision;
+    $("status").className = "status ok";
+    $("modelName").textContent = props.model || "modelo";
+    $("modelName").title = props.model || "";
+    $("thinkCtl").hidden = !props.thinking;
+    $("attach").hidden = !props.vision;
+    $("maxTok").max = props.ctx || 131072;
+    const rows = [["modelo", props.model], ["arquitetura", props.arch], ["camadas", props.n_layers],
+      ["contexto", props.ctx], ["GPUs", (props.gpus || []).join(", ")], ["raciocínio", props.thinking ? "sim" : "não"],
+      ["visão", props.vision ? "sim" : "não"], ["autenticação", props.auth_required ? "chave de API" : "aberta"]];
+    $("info").innerHTML = rows.filter(([, v]) => v !== undefined && v !== null && v !== "")
+      .map(([k, v]) => `<span>${esc(k)}</span><span>${esc(String(v))}</span>`).join("");
+    if (!chat()?.turns.length) renderChat();
+  } catch (_) {
+    $("status").className = "status err";
+    $("modelName").textContent = "servidor fora do ar";
+    setTimeout(connect, 3000);
   }
 }
 
-showEmpty();
+// A reply that was still coming when the page closed: the server kept it going
+// (stream replay); read it back.
+async function resumePending() {
+  for (const c of db.chats) {
+    if (!c.pending) continue;
+    let alive = false;
+    try {
+      const r = await fetch("./v1/streams/lookup", { method: "POST", headers: headers(),
+        body: JSON.stringify({ conversation_ids: [c.id] }) });
+      alive = r.ok && (await r.json()).some((s) => s.conversation_id === c.id);
+    } catch (_) {}
+    const last = c.turns[c.turns.length - 1];
+    if (alive && last?.role === "assistant" && !controller) { await generate(c, true); }
+    else { delete c.pending; if (last?.role === "assistant" && !last.content) c.turns.pop(); save(true); }
+  }
+  renderSidebar();
+}
+
+window.addEventListener("resize", () => { $("sideClose").hidden = window.innerWidth > 800; syncComposer(); });
+window.addEventListener("load", syncComposer);
+paintIcons();
+load();
 loadSettings();
-connect();
+syncLabels();
+if (db.current && !chat()) db.current = null;
+renderSidebar();
+renderChat();
+syncComposer();
+$("sideClose").hidden = window.innerWidth > 800;
+connect().then(resumePending);
 input.focus();
 </script>
 </body>
