@@ -821,3 +821,29 @@ kernel com `AIRUN_NO_GRAPH=1 AIRUN_NO_DECODE_PIPELINE=1`.
 - **Prefill:** `matmul_nvfp4` 57% (~190 TFLOPS, metade do pico FP4),
   `delta_rule_reg` 19% (recorrência token a token), quantização das
   ativações para FP4 8%, `add_rmsnorm` 4%, atenção 2% a 2k.
+
+## Delta-net do prefill em blocos, nos tensor cores (2026-11-05)
+
+`kernels/delta_chunk.cu`: a forma WY do gated delta rule (como o
+`chunk_gated_delta_rule` do flash-linear-attention) em blocos de 64 tokens.
+Um passo paralelo por (cabeça, bloco) monta W, U, Q e K decaídos e o Q K^T
+mascarado; um passo sequencial por (cabeça, 32 colunas) percorre os blocos.
+Produtos em bf16 com acumulação fp32 (WMMA, sm_80+); o estado fica em fp32.
+Entra quando o lote tem 64+ tokens e cabeças de 128; decode e verify do MTP
+seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
+
+- 27B numa 5060 Ti: prefill 512 2020 -> 2192 t/s, 2048 1987 -> 2157 (+8,5%).
+  35B-A3B nas duas GPUs: 1856 -> 1990, 2666 -> 2845 (+7%).
+- Perplexidade (16k tokens de código, `--chunk 1024 --batched`) igual: 2,00
+  no 27B, 2,06 no 35B. Selftest: 0,5% da faixa contra a recorrência em f64.
+- O texto guloso pode virar num quase-empate (não é mais bit-idêntico ao
+  decode token a token); a resposta de 61k tokens continuou certa.
+- O llama.cpp b11760 usa a recorrência aqui ("TODO: chunked kernel").
+- **Medição:** os tempos de kernel do `nsys` enganaram nesse kernel (davam o
+  bloco como mais lento); decida pelo `bench` alternando com a variável.
+- **Tentativas que não ganharam** (recorrência reorganizada): carregar k/q em
+  tiles de 4 ou 16 tokens (-3%), uma coluna por warp com redução por shuffle
+  (-7%), 4 fatias de 32 em vez de 8 de 16 (-2,5%). Matmul FP4 com estágios de
+  2 blocos e 4 buffers (cópias de 8 bytes): -26%.
+- O GPU 0 também desenha a tela: outro programa usando a GPU derrubou o
+  prefill de 2018 para ~1650 numa rodada. Compare sempre no mesmo momento.

@@ -480,6 +480,7 @@ e duas sessões separadas variam ~15%.
 | Variável | Efeito |
 |---|---|
 | `AIRUN_NO_MMQ_STREAMK=1` | O MMQ assíncrono volta à grade de tiles inteiros (com split-K onde ela ocupa mal a GPU). Com stream-K as últimas tiles são divididas em fatias de K iguais entre todos os SMs: prefill de 128 tokens no Qwen3-4B de 2767 para 3269 t/s. |
+| `AIRUN_NO_DELTA_CHUNK=1` | O prefill das camadas delta-net volta à recorrência token a token. Por padrão, lotes de 64+ tokens usam a forma em blocos nos tensor cores (bf16, acumulação fp32): +8,5% de prefill no 27B, +7% no 35B, perplexidade igual. |
 | `AIRUN_NO_MMQ_SPLIT=1` | Sem split-K no MMQ (onde o stream-K não roda: kernel síncrono, Q6_K). |
 | `AIRUN_MMQ_TC=64` ou `=128` | Força a largura da tile de tokens do MMQ. Padrão: 128 a partir de 128 tokens. |
 | `AIRUN_NO_MMQ_GLU=1` | Gate, up e SwiGLU do prefill em três lançamentos em vez de um. |

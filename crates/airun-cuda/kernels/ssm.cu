@@ -706,6 +706,11 @@ airun_status airun_delta_gates(
     AIRUN_CHECK_LAUNCH();
 }
 
+int32_t airun_delta_chunk_ok(int32_t n_tokens, int32_t head_k_dim, int32_t head_v_dim, int32_t keep_state);
+airun_status airun_delta_chunk(void* state, const void* q, const void* k, const void* v, const void* decay,
+                               const void* beta, void* out, int32_t n_tokens, int32_t n_k_heads,
+                               int32_t n_v_heads, cudaStream_t stream);
+
 airun_status airun_delta_rule(
     void* state, const void* q, const void* k, const void* v,
     const void* decay, const void* beta, void* out,
@@ -714,6 +719,9 @@ airun_status airun_delta_rule(
 
     if (n_tokens <= 0) return AIRUN_OK;
     if (n_k_heads <= 0 || n_v_heads <= 0 || n_v_heads % n_k_heads != 0) return AIRUN_ERR_BAD_ARG;
+    // A prompt goes through the chunked form on tensor cores (delta_chunk.cu).
+    if (airun_delta_chunk_ok(n_tokens, head_k_dim, head_v_dim, keep_state))
+        return airun_delta_chunk(state, q, k, v, decay, beta, out, n_tokens, n_k_heads, n_v_heads, stream);
     if (head_v_dim > 1024 || head_k_dim > 1024) return AIRUN_ERR_BAD_ARG;
 
     // The dk-parallel form needs the key dim to split evenly and the thread

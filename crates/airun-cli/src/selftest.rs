@@ -153,6 +153,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_l2norm(args.device, &stream, &mut report)?;
     test_delta_gates(args.device, &stream, &mut report)?;
     test_delta_rule(args.device, &stream, &mut report)?;
+    test_delta_chunk(args.device, &stream, &mut report)?;
     test_delta_defer(args.device, &stream, &mut report)?;
     test_conv_oop(args.device, &stream, &mut report)?;
     test_delta_head_broadcast(args.device, &stream, &mut report)?;
@@ -1317,6 +1318,74 @@ fn test_delta_defer(device: i32, stream: &Stream, report: &mut Report) -> Result
     report.case("delta rule + conv: verify leaves state, commit replays it",
         format!("state untouched {untouched}, history untouched {hist_untouched}, outputs equal {same_out},                  committed state equal {same_state}"),
         untouched && hist_untouched && same_out && same_state);
+    Ok(())
+}
+
+/// The chunked delta rule (delta_chunk.cu), which a prompt of 64+ tokens with
+/// 128-wide heads takes, against the f64 recurrence: three full chunks and a
+/// partial one, q and k L2-normalized as the model feeds them, carrying a
+/// state in. bf16 tensor-core operands: held to 1% of the output's range.
+fn test_delta_chunk(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const N: usize = 211;
+    const KH: usize = 2;
+    const VH: usize = 4;
+    const D: usize = 128;
+    let mut rng = Rng::new(0xDC_0001);
+    let norm = |x: Vec<f32>| -> Vec<f32> {
+        x.chunks(D).flat_map(|r| {
+            let n = r.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            r.iter().map(move |v| v / n).collect::<Vec<_>>()
+        }).collect()
+    };
+    let q = norm(rng.floats(N * KH * D));
+    let k = norm(rng.floats(N * KH * D));
+    let v = rng.floats(N * VH * D);
+    let decay: Vec<f32> = (0..N * VH).map(|_| 0.6 + rng.unit().abs() * 0.399).collect();
+    let beta: Vec<f32> = (0..N * VH).map(|_| rng.unit().abs().max(0.01)).collect();
+    let s0: Vec<f32> = rng.floats(VH * D * D).iter().map(|x| x * 0.1).collect();
+
+    let mut st: Vec<f64> = s0.iter().map(|&x| x as f64).collect();
+    let mut cpu = vec![0f32; N * VH * D];
+    for t in 0..N {
+        for vh in 0..VH {
+            let kh = vh % KH;
+            let s = &mut st[vh * D * D..(vh + 1) * D * D];
+            let d = decay[t * VH + vh] as f64;
+            let b = beta[t * VH + vh] as f64;
+            let (qv, kv, vv) = (&q[(t * KH + kh) * D..][..D], &k[(t * KH + kh) * D..][..D], &v[(t * VH + vh) * D..][..D]);
+            s.iter_mut().for_each(|x| *x *= d);
+            let mut mem = vec![0f64; D];
+            for i in 0..D {
+                for j in 0..D {
+                    mem[j] += s[i * D + j] * kv[i] as f64;
+                }
+            }
+            for i in 0..D {
+                for j in 0..D {
+                    s[i * D + j] += kv[i] as f64 * (vv[j] as f64 - mem[j]) * b;
+                }
+            }
+            for i in 0..D {
+                for j in 0..D {
+                    cpu[(t * VH + vh) * D + j] += (s[i * D + j] * qv[i] as f64) as f32;
+                }
+            }
+        }
+    }
+    let up = |x: &[f32]| DeviceBuffer::<f32>::from_slice(device, x, stream);
+    let (d_q, d_k, d_v, d_d, d_b, d_s) = (up(&q)?, up(&k)?, up(&v)?, up(&decay)?, up(&beta)?, up(&s0)?);
+    let d_o = DeviceBuffer::<f32>::new(device, N * VH * D)?;
+    airun_cuda::hybrid::delta_rule(d_s.as_mut_ptr(), d_q.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_d.as_ptr(),
+        d_b.as_ptr(), d_o.as_mut_ptr(), N, KH, VH, D, D, stream)?;
+    let gpu = d_o.to_vec(stream)?;
+    let gpu_s = d_s.to_vec(stream)?;
+    let range = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
+    let (abs, _) = compare(&cpu, &gpu);
+    let cpu_s: Vec<f32> = st.iter().map(|&x| x as f32).collect();
+    let (sabs, _) = compare(&cpu_s, &gpu_s);
+    let (ro, rs) = (abs / range(&cpu), sabs / range(&cpu_s));
+    report.case("delta rule, chunked (tensor cores)",
+        format!("output err {ro:.2e} of range  state err {rs:.2e} of range"), ro <= 1e-2 && rs <= 1e-2);
     Ok(())
 }
 
