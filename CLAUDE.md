@@ -1,6 +1,7 @@
 # airun
 
-Engine de inferência de LLM escrita do zero em Rust + CUDA.
+Engine de inferência para modelos **Qwen** (Qwen3, Qwen3.5/3.8, Qwen3-Next,
+Qwen4), escrita do zero em Rust + CUDA.
 
 **Leia [AGENTS.md](AGENTS.md) antes de alterar qualquer coisa.** Ele tem o
 estado atual verificado, o mapa do código, as armadilhas conhecidas e o
@@ -30,10 +31,13 @@ $env:PATH="E:\rust\cargo\bin;$env:PATH"
 $env:AIRUN_CUDA_ARCHS="120"   # build rápido em dev; remova para a build final
 ```
 
-Hardware: RTX 5070 Ti + RTX 5060 Ti (ambas sm_120), CUDA 13.2, MSVC 2022.
+Hardware: RTX 5060 Ti + RTX 3060 (sm_120 + sm_86; às vezes 2× 5060 Ti ou
+5070 Ti), CUDA 13.x, MSVC 2022. Compile com `AIRUN_CUDA_ARCHS="86,120"` quando
+a 3060 estiver no PC.
 **Sem P2P entre as placas** — cópias entre GPUs passam pela RAM.
 
-Modelos de teste: `G:\modelsAI\gguf\` (GGUF) e `G:\modelsAI\origin\` (safetensors).
+Modelos de teste: `D:\modelsAI\gguf\` (Qwen3.8-27B NVFP4, 35B-A3B, Qwen4 Flash-Next,
+mmproj) e `E:\modelos IA\` (Qwen3-1.7B, Qwen3.5-9B e outros menores).
 
 ## Verificação
 
@@ -41,9 +45,10 @@ Modelos de teste: `G:\modelsAI\gguf\` (GGUF) e `G:\modelsAI\origin\` (safetensor
 cargo test --release
 cargo build --release
 .\target\release\airun.exe selftest
-.\target\release\airun.exe run G:\modelsAI\gguf\qwen3\Qwen3-1.7B-UD-Q8_K_XL.gguf -p "2+2?" -n 20 --temp 0
+.\target\release\airun.exe run "E:\modelos IA\qwen3\Qwen3-1.7B-UD-Q8_K_XL.gguf" -p "2+2?" -n 20 --temp 0
 ```
 
 ## Git
 
-Não há repositório ainda. Não rode `git commit` a menos que o usuário peça.
+Repositório git com `main`. Não rode `git commit` nem `git push` a menos que o
+usuário peça.

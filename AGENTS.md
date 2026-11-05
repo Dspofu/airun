@@ -23,29 +23,34 @@ streams e lançar *nossos* kernels.
 
 ## 2. Estado atual (verificado neste dispositivo)
 
+O airun é feito para a **família Qwen**. Arquiteturas (`general.architecture`):
+
+| Arquitetura | Modelos | Estado |
+|---|---|---|
+| `qwen35` | Qwen3.5 / Qwen3.8 densos híbridos (ex.: 27B) | foco principal: MTP, visão, `--parallel`, NVFP4 |
+| `qwen35moe` | Qwen3.5 / Qwen3.8 MoE (ex.: 35B-A3B) | completo (MTP desligado por padrão) |
+| `qwen4exp` | Qwen4 Flash-Next (hyper-connections, PLE, QSA) | completo, sem `--parallel` |
+| `qwen3next`, `qwen3nextmoe` | Qwen3-Next | mesmo bloco híbrido |
+| `qwen3` | Qwen3 denso | completo |
+| `qwen2`, `llama` | mesmo formato de bloco | funciona, pouco testado |
+| `qwen3moe` | Qwen3-30B-A3B / 235B | **não** (o loader recusa com mensagem) |
+
 | Componente | Estado |
 |---|---|
-| Leitura GGUF (v1–v3) | funciona |
-| 17 decodificadores de quantização | **bit-exatos** vs. referência CPU |
-| 12 quantizadores (escrita) | round-trip testado |
-| Escrita GGUF | round-trip testado |
-| Leitura safetensors (multi-shard) | funciona |
-| Kernels CUDA (matvec f32/dp4a/tensor-core, attention, rope, rmsnorm, swiglu, embed, kv) | 226/226 no selftest |
-| Runtime Qwen3 denso | gera texto coerente |
-| Multi-GPU (split por camada) | validado com 2 placas |
-| GPUs de gerações diferentes (build `86,120`) | validado: 5060 Ti + 3060, selftest nas duas, texto idêntico ao de uma placa |
-| Planner de VRAM | testado, com fallback automático |
-| API no formato do llama-server (OpenAI chat/completions/responses, Anthropic messages, nativa, infill, SSE, auth, reasoning, tool calls, logprobs) | 56/56 em `tests/api_conformance.py` |
-| Amostragem (top-k/p, min-p, typical, top-n-sigma, 3 penalidades, logit_bias, DRY, XTC, dynatemp, mirostat 1/2) | testada |
-| Geração restrita (GBNF, JSON schema, `response_format`) | testada; saída idêntica à do llama-server |
-| Conversão HF → GGUF | Qwen3-8B convertido e executado |
-| Benchmark | funciona |
+| Leitura GGUF (v1–v3) e safetensors | funciona |
+| Decodificadores de quantização | bit-exatos contra a referência CPU |
+| Quantizadores (escrita) | round-trip testado |
+| Kernels CUDA | 282 casos no selftest (276 numa Ampere, sem os de FP4) |
+| Multi-GPU, inclusive de gerações diferentes (build `86,120`) | validado (2× 5060 Ti; 5060 Ti + 3060) |
+| Planner de VRAM | testado, com fallback e contexto automático |
+| API no formato do llama-server | 56/56 em `tests/api_conformance.py` |
+| Amostragem e geração restrita (GBNF, JSON schema) | testadas |
+| MTP (especulativo), também com temperatura | 27B: 26 → 68 tok/s guloso, 25,7 → 47,2 a temp 0,7 |
+| Visão (`mmproj` qwen3vl_merger) | lê texto em imagem como o llama.cpp |
+| `serve --parallel` | 4 pedidos: 2,2x o throughput, respostas iguais às de um por vez |
+| Stream replay, níveis de raciocínio, barra de carga | testados |
 
-**Arquiteturas suportadas hoje:** `qwen3`, `qwen2`, `llama` (decoders densos),
-`qwen35` / `qwen35moe` (híbridos SSM/atenção + MoE — veja a seção 7).
-
-**Não suportado ainda** (o loader recusa com mensagem clara):
-- `clip` (mmproj) — encoder de visão.
+**Ainda não:** `qwen3moe`, áudio, LoRA, rerank, vídeo, Qwen3-VL com deepstack.
 
 ---
 

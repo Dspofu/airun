@@ -5,6 +5,11 @@ Rust + CUDA, e algumas regras existem porque um erro aqui raramente trava: ele
 produz texto *quase* certo. Este guia diz o que é aceito, como montar o
 ambiente e como provar que uma mudança está correta e é mais rápida.
 
+O escopo é a **família Qwen** (arquiteturas `qwen3`, `qwen35`, `qwen35moe`,
+`qwen3next` e `qwen4exp`; a lista completa está no [README](README.md#para-quais-modelos)).
+Suporte a outra arquitetura é bem-vindo, desde que venha com perplexidade
+medida contra o llama.cpp.
+
 Antes de mexer em código, leia o **[AGENTS.md](AGENTS.md)**. Ele tem o estado
 verificado do projeto, o mapa do código e as armadilhas que já custaram dias.
 

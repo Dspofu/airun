@@ -1,8 +1,8 @@
 <h1 align="center">airun</h1>
 
 <p align="center">
-  <b>Engine de inferência de LLMs para GPUs NVIDIA, escrita do zero em Rust + CUDA.</b><br>
-  Sem llama.cpp, sem ggml, sem PyTorch, sem cuBLAS. Cada kernel é deste projeto.
+  <b>Engine de inferência para modelos <u>Qwen</u> em GPUs NVIDIA, escrita do zero em Rust + CUDA.</b><br>
+  Sem llama.cpp, sem ggml, sem PyTorch, sem cuBLAS: todo kernel é deste projeto.
 </p>
 
 <p align="center">
@@ -13,113 +13,65 @@
 </p>
 
 ```powershell
-airun serve Qwen3.8-27B-NVFP4.gguf          # API no formato do llama-server, OpenAI e Anthropic
-airun run   Qwen3.8-27B-NVFP4.gguf -p "Explique o que é um kernel de GPU" -n 200
+airun run   Qwen3.8-27B-NVFP4.gguf -p "Explique o que é um kernel de GPU"
+airun serve Qwen3.8-27B-NVFP4.gguf          # API compatível com llama-server, OpenAI e Anthropic
 ```
+
+---
+
+## Para quais modelos
+
+O airun é feito para a **família Qwen**. O que decide se um arquivo roda é a
+arquitetura gravada nele (`general.architecture` no GGUF; `airun inspect
+modelo.gguf` mostra):
+
+| Arquitetura | Modelos | Situação |
+|---|---|---|
+| **`qwen35`** | **Qwen3.5 e Qwen3.8 densos** (ex.: Qwen3.8-27B) | **Foco principal.** Tudo funciona: MTP, visão, `--parallel`, NVFP4 |
+| **`qwen35moe`** | **Qwen3.5 e Qwen3.8 MoE** (ex.: Qwen3.8-35B-A3B) | Completo. MTP existe, mas vem desligado (fica mais lento em MoE) |
+| `qwen4exp` | Qwen4 Flash-Next | Completo, menos `--parallel` |
+| `qwen3next`, `qwen3nextmoe` | Qwen3-Next | Mesmo bloco do `qwen35` |
+| `qwen3` | Qwen3 denso (0.6B a 32B) | Completo (esses modelos não têm MTP nem visão) |
+| `qwen2`, `llama` | Modelos com o mesmo formato de bloco | Funcionam, mas são pouco testados |
+| `qwen3moe` | Qwen3-30B-A3B, Qwen3-235B-A22B | **Ainda não** |
+
+Os Qwen3.5/3.8/Next são **híbridos**: três de cada quatro camadas são
+"delta-net" (atenção linear, com um estado de tamanho fixo em vez de cache que
+cresce) e uma é atenção normal. É por isso que eles aguentam contextos de
+centenas de milhares de tokens com pouca VRAM, e é nessa arquitetura que o
+airun concentra as otimizações.
+
+Outras famílias (Gemma, Llama 3+, Mistral, DeepSeek, GLM…) **não são
+suportadas**: o airun recusa o arquivo com uma mensagem clara em vez de gerar
+texto errado.
 
 ---
 
 ## Destaques
 
-- **Mais rápida que o llama.cpp** no Qwen3.8-27B NVFP4 em todos os testes:
-  prompt de 512 a 131.072 tokens, geração com 16 a 131.072 de contexto e
-  decodificação especulativa com MTP. E
-  **mais rápida que o Strata e o llama.cpp** no Qwen4 Flash-Next (MoE de
-  78 GB numa máquina com 32 GB de VRAM). Com contexto longo, a vantagem chega
-  a +52% no prompt de 128k tokens e +15% na geração.
-- **Modelos maiores que a VRAM:** `--alloc auto` (o padrão) enche a GPU
-  principal, depois as outras, e só então usa a RAM para o que sobrou.
-  - **Modelo denso:** camadas inteiras ficam em RAM fixada e são copiadas
-    para a VRAM antes de rodar, com o contexto mantido e resultado idêntico.
-  - **MoE:** os experts menos usados ficam em RAM e são lidos pela PCIe,
-    guiados por um perfil de roteamento que a airun aprende e guarda por
-    modelo.
-  - **Outros modos:** `--alloc gpu` usa só a VRAM, e `--main-gpu` escolhe a
-    principal.
-- **API completa no formato do `llama-server`:** OpenAI (chat, completions,
-  responses), Anthropic (messages), `/completion` e `/infill` nativos,
-  tool calls, reasoning, logprobs, gramáticas GBNF e JSON schema, embeddings,
-  slots. Um cliente feito para o llama-server funciona sem mudança, e o teste
-  de conformidade confere isso chave a chave (56/56).
-- **Correção verificada, não presumida:** cada formato de quantização existe
-  em Rust (referência) e em CUDA, e `airun selftest` compara os dois (274
-  casos). No caminho normal os logprobs ficam a 0,01 do cálculo exato em f32.
-- **Um binário, sem Python:** carrega GGUF direto, converte safetensors,
-  quantiza, mede e serve.
-
----
-
-## Resultados
-
-Máquina: RTX 5070 Ti 16 GB (PCIe 4.0 x16) + RTX 5060 Ti 16 GB (PCIe 3.0 x4),
-64 GB de RAM, Windows 11, CUDA 13. As placas **não têm P2P**: o que cruza de
-uma para a outra passa pela RAM. Cada medição tem script, saída bruta e
-relatório em [`benchmarks/`](benchmarks/).
-
-### Qwen3.8-27B NVFP4 contra o llama.cpp
-
-Uma GPU, melhor de 3 rodadas alternadas, tok/s
-([`benchmarks/2026-11-01`](benchmarks/2026-11-01/RESULTADOS.md)):
-
-| Teste | airun | llama.cpp b11760 | |
-|---|---:|---:|---:|
-| prompt de 512 tokens | **3797** | 3472 | +9% |
-| prompt de 2048 tokens | **3690** | 3652 | +1% |
-| geração | **49,0** | 47,9 | +2% |
-| geração com MTP, prompt 1 | **113,7** | 104,6 | +9% |
-| geração com MTP, prompt 2 | **94,9** | 91,7 | +3% |
-
-**Condição da vantagem no decode:** os números acima são de uma GPU (ou das
-duas, na seção de contexto longo) onde o 27B **cabe na VRAM** — o decode é
-limitado pela banda de memória, e o airun extrai mais dos matvecs quantizados
-e do pipeline de grafos. Quando o modelo **não cabe** (ex.: 27B num GPU de 8 GB),
-o gargalo muda: o airun mantém as camadas excedentes em RAM fixada e as lê pela
-PCIe a cada token, enquanto o llama.cpp as derrama nos núcleos da CPU. Nesse
-caso o llama.cpp fica à frente no decode (medido: 0,87 vs 0,4 t/s) e também no
-prefill (kernels de matmul denso mais otimizados). A vantagem do airun se
-aplica, portanto, a **decode com o modelo residente na VRAM** — o regime
-multi-GPU/longo-contexto acima e o MoE que cabe numa placa.
-
-### Contexto longo
-
-Mesmo modelo dividido entre as duas GPUs (com 32k+ de contexto ele não cabe
-numa placa), lotes de prompt de 512, melhor de 2 rodadas, tok/s
-([`benchmarks/2026-11-01g`](benchmarks/2026-11-01g/RESULTADOS.md)):
-
-| Teste | airun | llama.cpp b11760 | |
-|---|---:|---:|---:|
-| prompt de 8k tokens | **3694** | 3496 | +6% |
-| prompt de 32k tokens | **3055** | 2862 | +7% |
-| prompt de 128k tokens | **2428** | 1597 | +52% |
-| geração @ 16 de contexto | **42,1** | 32,7 | +29% |
-| geração @ 32k | **37,4** | 29,1 | +29% |
-| geração @ 128k | **23,5** | 20,4 | +15% |
-
-No início da noite o prompt longo perdia de 28% a 37%
-([antes](benchmarks/2026-11-01e/RESULTADOS.md)). Três mudanças viraram o
-jogo:
-
-- **GPUs em paralelo no prefill:** as duas placas trabalham ao mesmo tempo,
-  cada uma num pedaço do prompt.
-- **Atenção do prefill:** subiu de 55 para 73 TFLOPS.
-- **O planner enche a GPU mais rápida primeiro,** em vez de dividir o modelo
-  ao meio entre uma placa rápida e uma com metade da banda.
-
-### Qwen4 Flash-Next (MoE, IQ3_S, 78 GB) contra Strata e llama.cpp
-
-Prompt de 792 tokens, 128 tokens gulosos, mesmo tamanho de bloco de prompt
-nos três motores, prompt / geração em tok/s
-([`benchmarks/2026-11-01d`](benchmarks/2026-11-01d/RESULTADOS.md)):
-
-| Bloco | airun | Strata 0.1.55 | llama.cpp |
-|---|---:|---:|---:|
-| 1024 | **449 / 39,4** | 427 / 33,9 | 36 / 9,9 |
-| 512 | **418 / 40,7** | 316 / 34,4 | 36 / 9,9 |
-
-O modelo não cabe nas duas GPUs juntas. O Strata calcula na CPU os experts que
-estão fora da VRAM; o llama.cpp os deixa na CPU (`--n-cpu-moe`). A airun os
-mantém em RAM fixada e a GPU os lê pela PCIe num stream paralelo ao dos experts
-residentes.
+- **Mais rápido que o llama.cpp** no Qwen3.8-27B NVFP4: no prompt, na geração,
+  com contexto de até 128 mil tokens e com decodificação especulativa (MTP).
+  No Qwen4 Flash-Next (78 GB, maior que a VRAM) também passa o Strata.
+- **MTP: o modelo rascunha os próximos tokens com a cabeça extra que ele já
+  traz,** e o modelo principal confere vários de uma vez. No 27B a geração
+  quase dobra (26 → 68 tok/s), com temperatura ou sem. A cabeça pode vir num
+  arquivo separado (`mtp-*.gguf`, como o llama.cpp gera).
+- **Visão:** com o `mmproj` do modelo, ele lê imagens (fotos, prints, páginas
+  com texto). Funciona no `run` e na API.
+- **Várias pessoas ao mesmo tempo** (`serve --parallel N`): cada conversa
+  guarda o próprio cache, e as que estão gerando avançam juntas. Com 4
+  pedidos simultâneos o servidor entrega 2,2 vezes mais tokens.
+- **Modelos maiores que a VRAM:** enche a GPU principal, depois as outras, e
+  só então usa a RAM. Num MoE, os experts menos usados ficam na RAM.
+- **API igual à do `llama-server`:** OpenAI (chat, completions, responses),
+  Anthropic (messages), rotas nativas do llama.cpp, tool calls, raciocínio,
+  gramáticas, JSON schema, embeddings, slots e stream replay. Clientes feitos
+  para o llama-server funcionam sem mudança (56 de 56 casos conferidos).
+- **Correção verificada:** cada formato de quantização existe em Rust (a
+  referência) e em CUDA, e `airun selftest` compara os dois (mais de 270
+  casos).
+- **Um binário, sem Python:** carrega GGUF, converte safetensors, quantiza,
+  mede e serve.
 
 ---
 
@@ -127,50 +79,50 @@ residentes.
 
 ### Requisitos
 
-- GPU NVIDIA com compute capability **7.5+** (RTX 20, 30, 40 ou 50)
-- CUDA Toolkit 12.x ou 13.x (RTX 50 precisa de 12.8+)
-- Rust 1.85+
+- GPU NVIDIA RTX 20, 30, 40 ou 50 (compute capability 7.5 ou mais)
+- CUDA Toolkit 12.x ou 13.x (as RTX 50 precisam do 12.8 ou mais novo)
+- Rust 1.85 ou mais novo
 - Windows: MSVC Build Tools 2022 · Linux: gcc ou clang
 
-### Build
+### Compilar
 
 ```powershell
 git clone https://github.com/<você>/airun
 cd airun
-.\build.ps1                          # Windows: detecta as GPUs e compila só para elas
-./build.sh                           # Linux: o mesmo, com --arch, --all, --no-gpu, --debug, --skip-check
-# ou manualmente:
-$env:AIRUN_CUDA_ARCHS = "86"        # 75, 80, 86, 89 ou 120
-cargo build --release
-.\target\release\airun.exe gpu        # o que foi detectado
-.\target\release\airun.exe selftest   # cada kernel contra a referência CPU
+.\build.ps1      # Windows
+./build.sh       # Linux
 ```
 
-O `build.rs` acha o CUDA e o compilador host sozinho. Por padrão compila para
-RTX 20 até 50, o que leva alguns minutos; durante o desenvolvimento, compile só
-para a sua placa com `$env:AIRUN_CUDA_ARCHS="120"` (ou 75, 80, 86, 89).
-`build.ps1` (Windows) e `build.sh` (Linux) automatizam isso e aceitam
-`-Arch 120` / `--arch 120`, `-All` / `--all` (universal, para distribuir),
-`-NoGpu`, `-Debug` e `-SkipCheck`; ao final rodam `gpu` e o `selftest` em cada
-GPU para confirmar.
+O script descobre as suas GPUs, compila só para elas e, no fim, roda o
+`selftest` em cada uma para confirmar que está tudo certo. Opções:
 
-**GPUs de gerações diferentes no mesmo PC** (ex.: RTX 3060 + RTX 5060 Ti): o
-script detecta todas e compila para a união das arquiteturas (`86,120`); cada
-placa roda o código da sua. À mão: `AIRUN_CUDA_ARCHS="86,120"`. Os kernels
-NVFP4 de tensor core FP4 só existem nas RTX 50 e só entram se `120` estiver na
-lista; nas outras placas o NVFP4 roda no caminho int8, com o mesmo resultado.
+| Windows | Linux | O que faz |
+|---|---|---|
+| `-Arch 120` | `--arch 120` | Compila para uma arquitetura escolhida (ou várias: `86,120`) |
+| `-All` | `--all` | Compila para RTX 20 até 50 (para distribuir o binário) |
+| `-NoGpu` | `--no-gpu` | Sem CUDA |
+| `-Debug` | `--debug` | Build de depuração |
+| `-SkipCheck` | `--skip-check` | Não roda o selftest no fim |
+
+**GPUs de gerações diferentes no mesmo PC** (ex.: RTX 3060 + RTX 5060 Ti)
+funcionam: o script compila para as duas, e cada placa roda o seu código.
+
+Para compilar à mão: `$env:AIRUN_CUDA_ARCHS = "120"` (ou `75`, `80`, `86`,
+`89`, ou uma lista) e `cargo build --release`.
 
 ### Gerar texto
 
 ```powershell
-airun run modelo.gguf -p "O que é RoPE?" -n 300 --temp 0
-Get-Content prompt.txt | airun run modelo.gguf -n 500 --stats   # prompt pela entrada padrão, com tempos
+airun run modelo.gguf -p "O que é RoPE?"
+airun run modelo.gguf -p "Resolva: 17 x 23" --reasoning-effort low     # pensa pouco
+airun run modelo.gguf --mmproj mmproj.gguf --image foto.jpg -p "O que tem na imagem?"
+Get-Content prompt.txt | airun run modelo.gguf --stats                   # prompt de um arquivo, com tempos
 ```
 
 ### Servir a API
 
 ```powershell
-airun serve modelo.gguf --port 8080 -c 32768 --api-key minha-chave
+airun serve modelo.gguf --port 8080 --api-key minha-chave
 ```
 
 Abra `http://localhost:8080/` para o chat embutido, ou use qualquer cliente
@@ -179,7 +131,7 @@ OpenAI, Anthropic ou llama.cpp:
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer minha-chave" -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Olá!"}],"max_tokens":200}'
+  -d '{"messages":[{"role":"user","content":"Olá!"}]}'
 ```
 
 ```python
@@ -189,60 +141,93 @@ r = client.chat.completions.create(model="airun", messages=[{"role": "user", "co
 print(r.choices[0].message.content)
 ```
 
+Sem `-c`, o contexto é o maior que cabe nas GPUs com todos os pesos na VRAM.
+
 ---
 
-### Contexto longo com código de verdade
+## Resultados
 
-27B NVFP4 numa RTX 5060 Ti + RTX 3060 (arquiteturas diferentes no mesmo PC),
-prompts tirados de 1 MB de código C++/CUDA do llama.cpp, tok/s:
+Cada medição tem script, saída bruta e relatório em [`benchmarks/`](benchmarks/).
+As GPUs destes testes **não têm P2P**: o que passa de uma placa para a outra
+vai pela RAM. Números em tokens por segundo.
+
+### Qwen3.8-27B NVFP4, uma GPU (RTX 5070 Ti)
+
+Melhor de 3 rodadas alternadas
+([`benchmarks/2026-11-01`](benchmarks/2026-11-01/RESULTADOS.md)):
 
 | Teste | airun | llama.cpp b11760 | |
 |---|---:|---:|---:|
-| prompt de 8k | **1150** | 1079 | +7% |
-| prompt de 32k | **1039** | 987 | +5% |
-| prompt de 64k | **910** | 874 | +4% |
-| prompt de 128k | **745** | 712 | +5% |
-| geração @ 8k | **22,4** | 20,1 | +12% |
-| geração @ 64k | **16,9** | 16,4 | +3% |
-| geração @ 128k | 13,4 | 13,5 | empate |
+| prompt de 512 tokens | **3797** | 3472 | +9% |
+| prompt de 2048 tokens | **3690** | 3652 | +1% |
+| geração | **49,0** | 47,9 | +2% |
+| geração com MTP | **113,7** | 104,6 | +9% |
 
-Um pedido real de ponta a ponta (o `ggml-cuda.cu` inteiro, 61.634 tokens, e
-uma pergunta sobre ele) com MTP: prompt a 899 tok/s, resposta a 19,8 tok/s
-com 95% dos rascunhos aceitos.
+### Contexto longo, código de verdade (RTX 5060 Ti + RTX 3060)
+
+O 27B dividido entre as duas placas, com prompts tirados de 1 MB de código
+C++/CUDA:
+
+| Teste | airun | llama.cpp b11760 | |
+|---|---:|---:|---:|
+| prompt de 8 mil tokens | **1150** | 1079 | +7% |
+| prompt de 32 mil | **1039** | 987 | +5% |
+| prompt de 128 mil | **745** | 712 | +5% |
+| geração com 8 mil de contexto | **22,4** | 20,1 | +12% |
+| geração com 128 mil de contexto | 13,4 | 13,5 | empate |
+
+Um pedido real (o arquivo `ggml-cuda.cu` inteiro, 61.634 tokens, mais uma
+pergunta sobre ele) leu o prompt a 899 tok/s e respondeu a 19,8 tok/s, com
+95% dos rascunhos do MTP aceitos. A resposta estava certa.
+
+### Qwen4 Flash-Next (MoE de 78 GB, maior que as duas GPUs juntas)
+
+Prompt de 792 tokens, prompt / geração
+([`benchmarks/2026-11-01d`](benchmarks/2026-11-01d/RESULTADOS.md)):
+
+| | airun | Strata 0.1.55 | llama.cpp |
+|---|---:|---:|---:|
+| prompt / geração | **418 / 40,7** | 316 / 34,4 | 36 / 9,9 |
+
+Os experts que não cabem na VRAM ficam na RAM; o airun os traz pela PCIe
+enquanto a GPU calcula os outros.
+
+### Quando o airun perde
+
+Quando o modelo **não cabe** na VRAM de jeito nenhum e camadas inteiras ficam
+na RAM (ex.: o 27B numa GPU de 8 GB), o llama.cpp é mais rápido: ele calcula
+essas camadas na CPU, e o airun as copia pela PCIe a cada token (medido: 0,87
+contra 0,4 tok/s). As vantagens acima valem com o modelo na VRAM.
+
+---
 
 ## A API
 
-Rotas, campos e respostas seguem os do `llama-server`, para que o web UI dele,
-os SDKs da OpenAI e da Anthropic e agentes que chamam ferramentas funcionem
-sem adaptação. [`tests/api_conformance.py`](tests/api_conformance.py) grava as
-respostas de dois servidores e as compara chave a chave: 56 de 56 casos iguais
-ao llama-server b11760.
+Rotas, campos e respostas seguem os do `llama-server`, então o web UI dele e
+os SDKs da OpenAI e da Anthropic funcionam sem adaptação.
+[`tests/api_conformance.py`](tests/api_conformance.py) compara as respostas
+com as do llama-server, campo a campo.
 
-| Rota | O quê |
+| Rota | Para quê |
 |---|---|
-| `/v1/chat/completions` | Chat OpenAI: stream, tool calls, `reasoning_content`, logprobs, `response_format` |
-| `/v1/responses` | OpenAI Responses API, com stream e chamadas de função |
-| `/v1/messages` | Anthropic Messages API: blocos `thinking`, `tool_use`, stream |
-| `/v1/completions`, `/completion` | Completions OpenAI e nativa do llama.cpp, com `n_probs` |
-| `/infill` | Preenchimento no meio (FIM) para código |
-| `/v1/embeddings`, `/embedding` | Embeddings do estado final, com pooling configurável (`--embeddings`) |
+| `/v1/chat/completions` | Chat da OpenAI: stream, tool calls, raciocínio, logprobs, saída em JSON |
+| `/v1/responses` | Responses API da OpenAI |
+| `/v1/messages` | Messages API da Anthropic |
+| `/v1/completions`, `/completion` | Completar texto (OpenAI e o formato nativo do llama.cpp) |
+| `/infill` | Completar código no meio de um arquivo (FIM) |
+| `/v1/embeddings`, `/embedding` | Embeddings (com `--embeddings`) |
 | `/tokenize`, `/detokenize`, `/apply-template` | Utilitários |
-| `…/input_tokens`, `/v1/messages/count_tokens` | Contagem de tokens de um pedido |
-| `/slots/0?action=save\|restore\|erase` | Salva e retoma o cache de uma conversa (`--slot-save-path`) |
-| `/v1/chat/completions/control` | Encerra o raciocínio de uma geração em andamento |
-| `/health`, `/props`, `/v1/models`, `/slots` | Estado e metadados |
-| `/v1/stream/{id}`, `/v1/streams/lookup` | Stream replay: a geração sobrevive ao cliente cair e é relida de onde parou |
+| `/v1/stream/{id}` | Reler uma geração que continuou depois que o cliente caiu |
+| `/slots`, `/health`, `/props`, `/v1/models` | Estado do servidor |
 
-**Imagens:** com `--mmproj`, o chat aceita imagens nos formatos da OpenAI, da
-Responses e da Anthropic (data URL / base64), e o `run` aceita `--image`.
-
-**Amostragem:** a cadeia inteira do llama.cpp, na mesma ordem: penalidades,
-DRY, top-n-sigma, top-k, typical, top-p, min-p, XTC, temperatura dinâmica e
-mirostat 1/2, com `logit_bias` e `seed`.
-
-**Saída restrita:** `grammar` (GBNF), `json_schema` e `response_format`. Num
-modelo que pensa antes de responder, a gramática espera o fim do pensamento e
-restringe só a resposta.
+- **Imagens:** com `--mmproj`, mande a imagem como data URL (OpenAI) ou base64
+  (Anthropic).
+- **Raciocínio:** `reasoning_effort` (`none`, `low`, `medium`, `high`, `max`)
+  controla quanto o modelo pensa; `reasoning_budget_tokens` dá o limite exato.
+- **Amostragem:** a mesma cadeia do llama.cpp (penalidades, DRY, top-k, top-p,
+  min-p, XTC, mirostat…), com `seed` e `logit_bias`.
+- **Saída restrita:** gramática GBNF, JSON schema ou `response_format`. Num
+  modelo que pensa antes de responder, a regra vale só para a resposta.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -252,82 +237,56 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
     "required": ["nome", "idade"]}}}}'
 ```
 
-**Raciocínio sob controle:** `reasoning_budget_tokens` limita quantos tokens o
-modelo pensa; com `reasoning_control: true`, um `POST` em `/control` encerra o
-pensamento no meio do stream e o modelo passa direto para a resposta.
-
 ---
 
-## Modelos e formatos
+## Formatos
 
 | | |
 |---|---|
-| **Arquiteturas** | `qwen3`, `qwen2`, `llama` (densos) · `qwen35`, `qwen35moe`, `qwen3next` (híbridos delta-net/atenção, MoE) · `qwen4exp` (Qwen4 Flash-Next: hyper-connections, PLE, atenção esparsa QSA) |
 | **Quantizações lidas** | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4, NVFP4 |
 | **Quantizações escritas** | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, NVFP4 |
-| **KV cache** | f16, q8_0, q4_0 (`--kv-type`) |
+| **KV cache** | f16, q8_0, q4_0 (`--kv-type`; q4_0 cabe ~3,6x mais contexto) |
 | **Entrada** | GGUF; safetensors do HuggingFace via `airun convert` |
+| **Visão** | `mmproj` dos Qwen3.5/3.8 (projetor `qwen3vl_merger`) |
 
-**Ainda não:** visão (`mmproj`), áudio, LoRA e rerank. O loader recusa um
-modelo que não suporta com uma mensagem explícita em vez de gerar lixo.
+**Ainda não:** áudio, LoRA, rerank, vídeo e a arquitetura `qwen3moe`.
 
-**NVFP4 em duas convenções.** O encoder próprio é autocontido (o bloco carrega
-as escalas UE4M3 e não tem tensor-irmão). Arquivos NVFP4 de fora (vllm/NVIDIA)
-usam a convenção *global-scale*: cada peso tem um sidecar `<base>.scale` F32[1]
-(≈1e‑4) que o loader lê e aplica — sem ele, os pesos saem ~10⁴ maiores e o
-modelo degrada a NaN. As duas convenções funcionam; a escala é um no‑op nos
-outros formatos.
+**NVFP4 vindo de outras ferramentas** (vllm, NVIDIA) guarda um fator de escala
+num arquivo ao lado de cada peso (`<nome>.scale`). O airun lê e aplica esse
+fator; sem ele, o modelo gera lixo.
 
 ---
 
-## Como ela é rápida
+## Por que é rápido
 
-- **NVFP4 em tensor cores FP4** nas RTX 50 (sm_120), com fallback exato nas
-  placas anteriores.
-- **Decode em grafos CUDA** encadeados: o passo seguinte entra na fila antes de
-  o host ler o token do passo atual, então a GPU não espera o host.
-- **Decodificação especulativa com a cabeça MTP** do próprio modelo.
-- **MoE agrupado em tensor cores** no prefill; no decode, os experts ausentes
-  são copiados num stream lateral enquanto os residentes calculam.
-- **Perfil de roteamento persistente:** os experts mais usados de cada modelo
-  começam na VRAM, e o rebalanceamento só troca com margem.
-- **Atenção esparsa QSA** do Qwen4: cada consulta lê os blocos de KV que o
-  indexador escolhe, em vez do cache inteiro.
-- **GPUs em pipeline no prefill:** com o modelo dividido, a primeira placa
-  processa o pedaço seguinte do prompt enquanto a segunda termina o atual.
-  A passagem entre elas é ordenada só por eventos CUDA, mesmo sem P2P.
-- **Flash attention própria** em `mma.sync`. Com contexto longo, P·V é
-  somado em fp16 por tile de chaves (no máximo 32 termos) e acumulado em
-  fp32, o que dá a taxa dupla do tensor core sem a imprecisão de guardar o
-  acumulador inteiro em fp16.
-- **Planejador de VRAM** que lê o tamanho exato de cada tensor do GGUF:
-  - **Uma GPU só** quando o modelo cabe nela, porque cruzar PCIe sem P2P custa
-    mais do que a segunda placa rende.
-  - **Quando não cabe, enche a GPU mais rápida primeiro.** O decode passa
-    pelas placas uma depois da outra, e a lenta deve ficar só com o resto.
-    Isso deu +28% no decode do 27B em relação a dividir pela VRAM livre.
-  - **Quando nem assim cabe,** reduz lote, contexto ou reserva, nessa ordem,
-    e diz o que mudou.
+- **NVFP4 nos tensor cores FP4** das RTX 50. Nas placas anteriores roda em
+  int8, com o mesmo resultado (e ainda à frente do llama.cpp).
+- **A delta-net dos Qwen3.5/3.8 em blocos nos tensor cores** durante o prompt,
+  em vez de token a token (+8% no prompt).
+- **Decode em grafos CUDA encadeados:** o próximo passo já está na fila antes
+  de o processador ler o token atual, então a GPU não fica esperando.
+- **MTP**, com temperatura ou sem.
+- **Várias GPUs trabalhando ao mesmo tempo no prompt:** a primeira placa já
+  começa o próximo pedaço enquanto a segunda termina o atual.
+- **Um planejador de VRAM** que lê o tamanho exato de cada tensor:
+  - se o modelo cabe numa GPU, usa uma só (passar pela PCIe sem P2P custa caro);
+  - se não cabe e as GPUs são diferentes, enche primeiro a mais rápida;
+  - se são iguais, divide por igual (o prompt fica quase duas vezes mais rápido);
+  - se nem assim cabe, reduz lote, contexto ou reserva, e avisa o que mudou.
 
 ---
 
-## Correção numérica
+## Como a correção é garantida
 
-Um layout de quantização errado não trava: ele produz texto que parece quase
-certo. Por isso:
+Um formato de quantização decodificado errado não trava o programa: ele gera
+texto que *parece* quase certo. Por isso:
 
-- **Cada formato existe duas vezes,** em Rust (CPU, legível) e em CUDA.
-  `airun selftest` compara os dois kernel a kernel (274 casos), com limites
-  de erro proporcionais a `sum|w*x|`, a medida certa para produtos escalares.
-- **`airun perplexity`** mede o modelo inteiro de ponta a ponta numa passagem
-  conhecida. É o que pega o erro sutil que o selftest não vê.
-- **`AIRUN_MATVEC_F32=1 AIRUN_NO_FP4=1`** forçam o caminho exato em f32, que
-  serve de referência: no Qwen3.8-27B o caminho normal fica a 0,01 dele em
-  logprob, onde o llama.cpp se afasta 0,24 no mesmo prompt.
-- **NVFP4 global-scale (bug de 2026-11-03):** o selftest não lê bytes reais
-  nem sidecars, então um fator global em falta passa nele — o 27B vllm dava
-  perplexidade NaN e geração `!!!!` com o selftest verde. A métrica que pega
-  é a `airun perplexity` (NaN → 3.93 depois do fix).
+- **Cada formato existe duas vezes:** em Rust, simples de ler (a referência),
+  e em CUDA. `airun selftest` compara os dois kernel a kernel.
+- **`airun perplexity`** mede o modelo inteiro num texto conhecido. Pega os
+  erros sutis que o selftest não vê.
+- **`AIRUN_MATVEC_F32=1 AIRUN_NO_FP4=1`** forçam o cálculo exato em f32. No
+  27B o caminho normal fica a 0,01 dele (em logprob); o llama.cpp fica a 0,24.
 
 ---
 
@@ -335,18 +294,18 @@ certo. Por isso:
 
 ```
 airun run         gerar texto
-airun serve       API HTTP no formato do llama-server (OpenAI + Anthropic + nativa)
-airun bench       medir prefill e decode, em várias profundidades de contexto
-airun perplexity  pontuar um texto conhecido (perda, perplexidade, top-1)
-airun inspect     descrever um GGUF: metadados, tensores, mistura de quantização
+airun serve       servidor HTTP (OpenAI + Anthropic + llama.cpp)
+airun bench       medir prompt e geração, em várias profundidades de contexto
+airun perplexity  medir a qualidade num texto conhecido
+airun inspect     descrever um GGUF: arquitetura, tensores, quantização
 airun tokenize    ver como o tokenizer divide um texto
 airun convert     safetensors (HuggingFace) -> GGUF
 airun quantize    GGUF -> GGUF em outra precisão
-airun gpu         listar GPUs, VRAM, P2P e geração
-airun selftest    validar os kernels GPU contra a referência CPU
+airun gpu         listar as GPUs, VRAM e P2P
+airun selftest    conferir os kernels da GPU contra a referência em Rust
 ```
 
-Todas as flags: **[docs/FLAGS.md](docs/FLAGS.md)**.
+Todas as opções: **[docs/FLAGS.md](docs/FLAGS.md)**.
 
 ---
 
@@ -354,26 +313,25 @@ Todas as flags: **[docs/FLAGS.md](docs/FLAGS.md)**.
 
 ```
 crates/
-  airun-gguf/   leitura e escrita de GGUF e safetensors; quantização de referência em Rust
-  airun-cuda/   os kernels CUDA (kernels/*.cu) e a camada Rust que os lança
-  airun-core/   tokenizer, planejador de VRAM, runtime, amostragem, gramáticas, MTP
-  airun-cli/    o binário airun: run, serve (API), bench, perplexity, convert...
+  airun-gguf/   leitura e escrita de GGUF e safetensors; quantização de referência
+  airun-cuda/   os kernels CUDA (kernels/*.cu) e o código Rust que os chama
+  airun-core/   tokenizer, planejador de VRAM, runtime, amostragem, gramáticas, MTP, visão
+  airun-cli/    o binário: run, serve, bench, perplexity, convert...
 tests/          conformidade da API contra o llama-server
 benchmarks/     cada medição publicada, com script e saída bruta
-docs/           referência de flags
+docs/           referência das opções
 ```
 
----
+## Documentação
 
-## Documentação e contribuição
-
-- **[docs/FLAGS.md](docs/FLAGS.md)**: cada flag de cada comando.
-- **[AGENTS.md](AGENTS.md)**: o estado verificado do projeto, o mapa do
-  código e as armadilhas conhecidas. Leia antes de mudar algo.
-- **[CONTRIBUTING.md](CONTRIBUTING.md)**: regras, ambiente, como verificar uma
-  mudança e como publicar um benchmark.
+- **[docs/FLAGS.md](docs/FLAGS.md):** todas as opções de todos os comandos.
+- **[AGENTS.md](AGENTS.md):** como o código está organizado, o que já foi
+  medido e as armadilhas conhecidas. Leia antes de mudar algo.
+- **[CONTRIBUTING.md](CONTRIBUTING.md):** regras, ambiente e como verificar
+  uma mudança.
 
 ## Licença
 
 [Apache 2.0](LICENSE). Os codebooks IQ vêm do ggml, e a seleção de blocos da
-QSA segue a do Strata, ambos sob MIT; os avisos estão em [NOTICE](NOTICE).
+atenção esparsa segue a do Strata, ambos sob MIT; os avisos estão em
+[NOTICE](NOTICE).
