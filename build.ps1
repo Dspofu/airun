@@ -87,9 +87,7 @@ switch ($mode) {
 }
 
 try {
-    # Daqui em diante os erros vêm dos códigos de saída: no PowerShell 5.1,
-    # "Stop" faria o progresso que o cargo escreve no stderr abortar o build
-    # quando a saída é redirecionada.
+    # Daqui em diante os erros vêm dos códigos de saída, não do stderr.
     $ErrorActionPreference = "Continue"
 
     # --- compila ------------------------------------------------------------
@@ -97,7 +95,11 @@ try {
     $cargoArgs = @("build")
     if (-not $Debug) { $cargoArgs += "--release" }
     Write-Host "`ncargo $($cargoArgs -join ' ') ..."
-    & cargo @cargoArgs
+    Write-Host "(a etapa airun-cuda compila os kernels CUDA e leva alguns minutos sem mostrar nada)"
+    # O cargo escreve o progresso no stderr, e o PowerShell 5.1 transforma cada
+    # linha de stderr em um erro vermelho "NativeCommandError". O cmd junta o
+    # stderr no stdout antes do PowerShell ver; o código de saída é o do cargo.
+    & cmd /c "cargo $($cargoArgs -join ' ') 2>&1"
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Build falhou. Veja o erro acima; 'cargo build -vv' mostra o comando do nvcc."
         exit 1

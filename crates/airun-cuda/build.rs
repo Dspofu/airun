@@ -112,27 +112,34 @@ fn main() {
         cmd
     };
 
-    let mut cmd = base();
-    cmd.arg("-lib");
-    cmd.arg("-o").arg(out_dir.join(static_lib("airun_kernels")));
-    for arch in &archs {
-        cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
-    }
+    // Each .cu is compiled to its own object in parallel, then the objects are
+    // archived. One nvcc call with every source compiles them one after the
+    // other on a single core, which kept the build parked at the airun-cuda
+    // step for minutes.
+    let mut gencode: Vec<String> = archs
+        .iter()
+        .map(|a| format!("-gencode=arch=compute_{a},code=sm_{a}"))
+        .collect();
     // A PTX copy of the newest target keeps future architectures loadable via JIT.
     if let Some(newest) = archs.last() {
-        cmd.arg(format!("-gencode=arch=compute_{newest},code=compute_{newest}"));
+        gencode.push(format!("-gencode=arch=compute_{newest},code=compute_{newest}"));
     }
+
+    let mut jobs: Vec<(PathBuf, PathBuf, Command)> = Vec::new();
     for src in &sources {
-        cmd.arg(src);
+        let obj = out_dir.join(object(src));
+        let mut cmd = base();
+        cmd.arg("-c").args(&gencode).arg("-o").arg(&obj).arg(src);
+        jobs.push((src.clone(), obj, cmd));
     }
-    run_nvcc(cmd, &nvcc);
 
     // Blackwell's FP4 tensor-core instructions exist only in the arch-specific
     // target, so their unit is built for compute_120a alone. Without sm_120 in
     // the list it is built empty and reports itself unsupported.
+    let fp4_src = kernels_dir.join("sm120a").join("fp4mma.cu");
+    let fp4_obj = out_dir.join(format!("sm120a_{}", object(&fp4_src)));
     let mut fp4 = base();
-    fp4.arg("-lib");
-    fp4.arg("-o").arg(out_dir.join(static_lib("airun_fp4")));
+    fp4.arg("-c");
     if archs.iter().any(|a| a == "120") {
         fp4.arg("-gencode=arch=compute_120a,code=sm_120a");
         fp4.arg("-DAIRUN_FP4_BUILT=1");
@@ -141,8 +148,16 @@ fn main() {
         fp4.arg(format!("-gencode=arch=compute_{a},code=sm_{a}"));
         fp4.arg("-DAIRUN_FP4_BUILT=0");
     }
-    fp4.arg(kernels_dir.join("sm120a").join("fp4mma.cu"));
-    run_nvcc(fp4, &nvcc);
+    fp4.arg("-o").arg(&fp4_obj).arg(&fp4_src);
+    jobs.push((fp4_src, fp4_obj.clone(), fp4));
+
+    let objects: Vec<PathBuf> = jobs.iter().map(|(_, obj, _)| obj.clone()).collect();
+    compile_parallel(jobs, &nvcc);
+
+    let (fp4_objs, kernel_objs): (Vec<PathBuf>, Vec<PathBuf>) =
+        objects.into_iter().partition(|o| *o == fp4_obj);
+    archive(base(), &out_dir.join(static_lib("airun_kernels")), &kernel_objs, &nvcc);
+    archive(base(), &out_dir.join(static_lib("airun_fp4")), &fp4_objs, &nvcc);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=airun_kernels");
@@ -244,19 +259,84 @@ fn find_cuda() -> Option<PathBuf> {
     None
 }
 
-/// Runs nvcc, surfacing its diagnostics verbatim when it fails: they are the
-/// single most useful thing when a kernel breaks, more than "build failed".
-fn run_nvcc(mut cmd: Command, nvcc: &Path) {
-    let output = cmd.output().unwrap_or_else(|e| {
-        panic!("failed to run nvcc at {}: {e}", nvcc.display());
+/// Object file name for a source: `ops.cu` -> `ops.obj` / `ops.o`.
+fn object(src: &Path) -> String {
+    let stem = src.file_stem().unwrap().to_string_lossy();
+    if cfg!(windows) { format!("{stem}.obj") } else { format!("{stem}.o") }
+}
+
+/// How many nvcc processes to run at once. Cargo's `NUM_JOBS` honours `-j`;
+/// the cap keeps peak RAM sane, since each cicc of the big units takes ~1-2 GB.
+fn parallel_jobs() -> usize {
+    let n = env::var("NUM_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1);
+    n.clamp(1, 8)
+}
+
+/// Compiles every job, a few at a time, largest sources first so the longest
+/// unit starts immediately. All failures are reported, not just the first.
+fn compile_parallel(mut jobs: Vec<(PathBuf, PathBuf, Command)>, nvcc: &Path) {
+    jobs.sort_by_key(|(src, _, _)| std::cmp::Reverse(std::fs::metadata(src).map(|m| m.len()).unwrap_or(0)));
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let failed = std::sync::Mutex::new(Vec::<String>::new());
+    let workers = parallel_jobs();
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let Some((src, _obj, cmd)) = queue.lock().unwrap().next() else { break };
+                let name = src.file_name().unwrap().to_string_lossy().into_owned();
+                let start = std::time::Instant::now();
+                match run_nvcc(cmd, nvcc) {
+                    Ok(()) => println!("nvcc {name}: {:.1}s", start.elapsed().as_secs_f32()),
+                    Err(log) => {
+                        for line in log.lines() {
+                            println!("cargo:warning=nvcc {name}: {line}");
+                        }
+                        failed.lock().unwrap().push(name);
+                    }
+                }
+            });
+        }
     });
-    if !output.status.success() {
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            println!("cargo:warning=nvcc: {line}");
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            println!("cargo:warning=nvcc: {line}");
-        }
-        panic!("nvcc failed with status {}", output.status);
+    let failed = failed.into_inner().unwrap();
+    if !failed.is_empty() {
+        panic!(
+            "nvcc failed on {}. The compiler messages are in the warnings above; \
+             fix the kernel and build again",
+            failed.join(", ")
+        );
     }
+}
+
+/// Packs compiled objects into a static library (nvcc drives lib.exe / ar).
+fn archive(mut cmd: Command, lib: &Path, objects: &[PathBuf], nvcc: &Path) {
+    cmd.arg("-lib").arg("-o").arg(lib).args(objects);
+    if let Err(log) = run_nvcc(cmd, nvcc) {
+        for line in log.lines() {
+            println!("cargo:warning=nvcc -lib: {line}");
+        }
+        panic!("nvcc could not create {}; see the warnings above", lib.display());
+    }
+}
+
+/// Runs nvcc, returning its diagnostics verbatim when it fails: they are the
+/// single most useful thing when a kernel breaks, more than "build failed".
+fn run_nvcc(mut cmd: Command, nvcc: &Path) -> Result<(), String> {
+    let output = cmd.output().unwrap_or_else(|e| {
+        panic!(
+            "failed to run nvcc at {}: {e}. Check that the CUDA Toolkit is installed \
+             and CUDA_PATH points at it",
+            nvcc.display()
+        );
+    });
+    if output.status.success() {
+        return Ok(());
+    }
+    let mut log = String::from_utf8_lossy(&output.stderr).into_owned();
+    log.push_str(&String::from_utf8_lossy(&output.stdout));
+    log.push_str(&format!("(exit status {})", output.status));
+    Err(log)
 }
