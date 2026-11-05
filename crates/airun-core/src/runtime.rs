@@ -1237,7 +1237,7 @@ impl Runtime {
                 // SAFETY of the capture: everything queue_shard touches lives
                 // in `self` or in `dg`, both of which outlive the graph.
                 airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
-                let queued = self.queue_shard(si, dg.token.as_slice(), dg.position.as_slice(), true, true);
+                let queued = self.queue_shard(si, dg.token.as_slice(), dg.position.as_slice(), true, true, false);
                 let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
                 match queued.and_then(|_| Ok(ended?)) {
                     Ok(g) => dg.graphs[si] = Some(g),
@@ -1278,7 +1278,7 @@ impl Runtime {
             if si > 0 {
                 self.handoff(si, token_ids.len())?;
             }
-            self.queue_shard(si, token_ids, positions, upload, true)?;
+            self.queue_shard(si, token_ids, positions, upload, true, true)?;
         }
         Ok(())
     }
@@ -1313,7 +1313,7 @@ impl Runtime {
     /// the first, the layers, the final norm and logits on the last. With
     /// `fill_ple` the PLE rows are hashed and gathered here; a graph replay
     /// does that beforehand (see forward_decode_graphed).
-    fn queue_shard(&mut self, si: usize, token_ids: &[i32], positions: &[i32], upload: bool, fill_ple: bool)
+    fn queue_shard(&mut self, si: usize, token_ids: &[i32], positions: &[i32], upload: bool, fill_ple: bool, record_ple_event: bool)
         -> Result<()> {
         let cfg = self.model.config.clone();
         let n = token_ids.len();
@@ -1352,7 +1352,7 @@ impl Runtime {
             if fill_ple {
                 self.ple_fill(token_ids)?;
             }
-            self.ple_upload(si, n)?;
+            self.ple_upload(si, n, record_ple_event)?;
         }
 
         for local in 0..self.states[si].layers.len() {
@@ -1750,13 +1750,22 @@ impl Runtime {
     }
 
     /// Queues the upload of `n` staged PLE rows on shard `si`.
-    fn ple_upload(&self, si: usize, n: usize) -> Result<()> {
+    fn ple_upload(&self, si: usize, n: usize, record_event: bool) -> Result<()> {
         let (Some(pc), st) = (&self.model.config.ple, &self.states[si]) else { return Ok(()) };
         let ps = st.hc.as_ref().and_then(|h| h.ple.as_ref())
             .ok_or_else(|| CoreError::Other("the PLE layer's GPU has no PLE scratch".into()))?;
         let host = ps.emb_host.borrow();
         ps.emb.copy_from_host_at(0, &host.as_slice()[..n * pc.n_heads() * pc.head_dim], &st.stream)?;
-        ps.uploaded.record(&st.stream)?;
+        // The staging guard is a CUDA event the batch path host-synchronizes
+        // on before refilling the pinned rows. Recording it inside the decode
+        // graph capture leaves the event graph-owned, and the next batch
+        // prefill's cudaEventSynchronize on it faults the whole context (a
+        // sticky cudaErrorInvalidValue that kills every later request). The
+        // graph path guards the pinned buffer with a full stream sync instead,
+        // so it skips the record.
+        if record_event {
+            ps.uploaded.record(&st.stream)?;
+        }
         Ok(())
     }
 
