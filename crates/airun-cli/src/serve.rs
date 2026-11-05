@@ -164,6 +164,18 @@ pub struct ServeArgs {
     #[arg(long, default_value = "")]
     pub reasoning_budget_message: String,
 
+    /// Thinking on, off, or as the template decides (auto), as
+    /// llama-server's --reasoning. A request's `enable_thinking` wins.
+    #[arg(long, value_name = "on|off|auto", default_value = "auto", value_parser = crate::reasoning::parse_switch_arg)]
+    pub reasoning: String,
+
+    /// Default reasoning level: none, low (1024 thinking tokens), medium
+    /// (4096), high (16384) or max (unlimited). A request's
+    /// `reasoning_effort` (or Responses' `reasoning.effort`) wins; an
+    /// explicit budget wins over both.
+    #[arg(long, value_name = "LEVEL", value_parser = crate::reasoning::parse_arg)]
+    pub reasoning_effort: Option<String>,
+
     /// Directory where `POST /slots/0?action=save|restore` keeps the cache
     /// of a conversation. Unset: slot actions answer 501, as in llama-server.
     #[arg(long)]
@@ -221,6 +233,11 @@ struct AppState {
     slot: std::sync::Mutex<SlotInfo>,
     reasoning_budget: Option<usize>,
     reasoning_budget_message: String,
+    /// --reasoning and --reasoning-effort.
+    reasoning_default: Option<bool>,
+    reasoning_effort: Option<String>,
+    /// The template reads `reasoning_effort` itself.
+    template_effort: bool,
     slot_save_path: Option<PathBuf>,
     embeddings: bool,
     pooling: Pooling,
@@ -264,16 +281,16 @@ fn breaker_mask(pieces: &[Vec<u8>], breakers: &[String]) -> Vec<bool> {
 /// Reasoning support read from the chat template, used when the prompt is
 /// built without it.
 #[derive(Clone, Copy, Default)]
-struct Thinking {
+pub(crate) struct Thinking {
     /// The template knows `<think>` blocks, so `enable_thinking` means something.
-    supported: bool,
+    pub(crate) supported: bool,
     /// The generation prompt already opens the block (Qwen3.5 and later), so the
     /// model never emits `<think>` itself.
     prompt_opens_block: bool,
 }
 
 impl Thinking {
-    fn from_template(template: &str) -> Self {
+    pub(crate) fn from_template(template: &str) -> Self {
         Self {
             supported: template.contains("<think>"),
             prompt_opens_block: template.contains("'<think>\\n'"),
@@ -281,7 +298,7 @@ impl Thinking {
     }
 
     /// Text appended after `<|im_start|>assistant\n`.
-    fn generation_prefix(self, enabled: bool) -> &'static str {
+    pub(crate) fn generation_prefix(self, enabled: bool) -> &'static str {
         match (self.supported, enabled) {
             (false, _) => "",
             (true, false) => "<think>\n\n</think>\n\n",
@@ -448,13 +465,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
     if let Some(mm) = &args.mmproj {
         load_opts.reserve_bytes += crate::media::vision_reserve(mm, args.image_max_tokens)?;
     }
-    let (runtime, report) = loader::load(&args.model, &load_opts, |stage, d, t| {
-        if t > 0 && d % 64 == 0 {
-            eprint!("\r{stage}: {d}/{t}   ");
-        }
-    })
-    .with_context(|| format!("failed to load {}", args.model.display()))?;
-    eprintln!("\r{}", report.config.summary());
+    let mut bar = crate::progress::LoadBar::new(&args.model);
+    let (runtime, report) = loader::load(&args.model, &load_opts, |stage, d, t| bar.update(stage, d, t))
+        .with_context(|| format!("failed to load {}", args.model.display()))?;
+    bar.finish();
+    eprintln!("{}", report.config.summary());
     eprint!("{}", report.placement.report());
     let vision = match &args.mmproj {
         Some(mm) => {
@@ -649,6 +664,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
         fim,
         reasoning_budget: (args.reasoning_budget >= 0).then_some(args.reasoning_budget as usize),
         reasoning_budget_message: args.reasoning_budget_message.clone(),
+        reasoning_default: crate::reasoning::parse_switch(&args.reasoning).unwrap_or(None),
+        reasoning_effort: args.reasoning_effort.clone(),
+        template_effort: template_src.contains("reasoning_effort"),
         slot_save_path: args.slot_save_path.clone(),
         embeddings: args.embeddings,
         pooling,
@@ -1965,6 +1983,11 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 fn chat_prompt(state: &AppState, req: &Value) -> Result<(String, bool), Response> {
+    chat_prompt_ex(state, req).map(|(p, o, _)| (p, o))
+}
+
+/// [`chat_prompt`], and whether the template took the reasoning level itself.
+fn chat_prompt_ex(state: &AppState, req: &Value) -> Result<(String, bool, bool), Response> {
     let Some(messages) = req.get("messages").filter(|m| m.as_array().is_some_and(|a| !a.is_empty())) else {
         return Err(api_error(StatusCode::BAD_REQUEST, "'messages' is required", "invalid_request_error"));
     };
@@ -1990,13 +2013,42 @@ fn chat_prompt(state: &AppState, req: &Value) -> Result<(String, bool), Response
             kwargs.entry(k).or_insert_with(|| v.clone());
         }
     }
+    // Levels: "none" turns thinking off; the others go to a template that
+    // reads reasoning_effort (Qwen3.8's knows low, medium and xhigh), and
+    // become a thinking budget (in chat_job) where it does not, or where it
+    // rejects the name.
+    let effort = request_effort(state, req);
+    kwargs.remove("reasoning_effort");
+    if effort == Some(crate::reasoning::Level::Off) {
+        kwargs.entry("enable_thinking").or_insert(json!(false));
+    }
+    if let Some(on) = state.reasoning_default {
+        kwargs.entry("enable_thinking").or_insert(json!(on));
+    }
+    let named = req.get("reasoning_effort").and_then(Value::as_str).map(str::to_string)
+        .or_else(|| state.reasoning_effort.clone())
+        .filter(|_| state.template_effort && effort != Some(crate::reasoning::Level::Off));
+    let mut native = false;
     let prompt = match &state.template {
-        Some(t) => t.render(&messages, req.get("tools"), true, &kwargs)
-            .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string(), "invalid_request_error"))?,
+        Some(t) => {
+            let with_effort = named.as_ref().and_then(|e| {
+                let mut k = kwargs.clone();
+                k.insert("reasoning_effort".into(), json!(e));
+                t.render(&messages, req.get("tools"), true, &k).ok()
+            });
+            match with_effort {
+                Some(p) => {
+                    native = true;
+                    p
+                }
+                None => t.render(&messages, req.get("tools"), true, &kwargs)
+                    .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string(), "invalid_request_error"))?,
+            }
+        }
         None => fallback_chatml(state, &messages, kwargs.get("enable_thinking").and_then(Value::as_bool)),
     };
     let opened = prompt.trim_end_matches(['\n', ' ']).ends_with("<think>");
-    Ok((prompt, opened))
+    Ok((prompt, opened, native))
 }
 
 /// ChatML by hand, for a GGUF without a usable template.
@@ -2052,7 +2104,7 @@ impl ChatJob {
 /// `req`, in chat-completions form, ready to run. `n_probs`: report this many
 /// alternatives per token.
 async fn chat_job(state: &AppState, req: &Value, n_probs: Option<usize>) -> Result<ChatJob, Response> {
-    let (prompt, opened) = chat_prompt(state, req)?;
+    let (prompt, opened, native_effort) = chat_prompt_ex(state, req)?;
     let tokens = {
         let rt = state.runtime.lock().await;
         crate::media::tokenize(&rt, &prompt, &request_images(req), true)
@@ -2072,8 +2124,17 @@ async fn chat_job(state: &AppState, req: &Value, n_probs: Option<usize>) -> Resu
     // way to end it from outside.
     let reasoning_control = req.get("reasoning_control").and_then(Value::as_bool).unwrap_or(false);
     let stop = Arc::new(AtomicBool::new(false));
-    let budget = req.get("reasoning_budget_tokens").or_else(|| req.get("thinking_budget_tokens"))
-        .and_then(Value::as_i64).map_or(state.reasoning_budget, |b| (b >= 0).then_some(b as usize));
+    // An explicit budget, else the level's (when the template does not read
+    // levels itself), else --reasoning-budget.
+    let level_budget = match request_effort(state, req) {
+        Some(crate::reasoning::Level::Budget(b)) if !native_effort => Some(b),
+        _ => None,
+    };
+    let budget = match req.get("reasoning_budget_tokens").or_else(|| req.get("thinking_budget_tokens"))
+        .and_then(Value::as_i64) {
+        Some(b) => (b >= 0).then_some(b as usize),
+        None => level_budget.unwrap_or(state.reasoning_budget),
+    };
     if let Some((start, end)) = &state.think_tags {
         if budget.is_some() || reasoning_control {
             let message = req.get("reasoning_budget_message").and_then(Value::as_str)
@@ -2087,6 +2148,14 @@ async fn chat_job(state: &AppState, req: &Value, n_probs: Option<usize>) -> Resu
         }
     }
     Ok(ChatJob { spec, opened, extract, tools, control: (reasoning_control, stop) })
+}
+
+/// The reasoning level a request asks for (its `reasoning_effort`, else
+/// --reasoning-effort); an unknown name counts as none given.
+fn request_effort(state: &AppState, req: &Value) -> Option<crate::reasoning::Level> {
+    req.get("reasoning_effort").and_then(Value::as_str).map(str::to_string)
+        .or_else(|| state.reasoning_effort.clone())
+        .and_then(|e| crate::reasoning::parse(&e))
 }
 
 /// Keeps a completion addressable by `/control` while it runs.
@@ -2640,6 +2709,12 @@ fn anthropic_to_chat(req: &Value) -> Result<Value, Response> {
         let kwargs = chat.entry("chat_template_kwargs").or_insert_with(|| json!({}));
         if let Some(k) = kwargs.as_object_mut() {
             k.insert("enable_thinking".into(), json!(t != "disabled"));
+        }
+        // Anthropic's thinking budget is llama-server's thinking_budget_tokens.
+        if t == "enabled" {
+            if let Some(b) = req.pointer("/thinking/budget_tokens").and_then(Value::as_i64) {
+                chat.insert("thinking_budget_tokens".into(), json!(b));
+            }
         }
     }
     Ok(Value::Object(chat))

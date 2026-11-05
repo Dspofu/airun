@@ -7,6 +7,8 @@ mod gpu;
 mod inspect;
 mod perplexity;
 mod media;
+mod progress;
+mod reasoning;
 mod quantize;
 mod replay;
 mod run;

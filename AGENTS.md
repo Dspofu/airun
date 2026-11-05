@@ -847,3 +847,17 @@ seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
   2 blocos e 4 buffers (cópias de 8 bytes): -26%.
 - O GPU 0 também desenha a tela: outro programa usando a GPU derrubou o
   prefill de 2018 para ~1650 numa rodada. Compare sempre no mesmo momento.
+
+## Barra de carregamento e níveis de raciocínio (2026-11-05)
+
+- `crates/airun-cli/src/progress.rs`: a carga do modelo mostra etapa,
+  porcentagem, camadas, GiB e tempo restante (numa linha que se redesenha num
+  terminal; a cada 25% num log). `run`, `serve`, `bench` e `perplexity`.
+- `crates/airun-cli/src/reasoning.rs`: níveis none/low/medium/high/max. O
+  `serve` tenta o nível no template (Qwen3.8 aceita low, medium, xhigh) e, se
+  o template não o lê ou recusa o nome, usa o orçamento de pensamento.
+- **`run` não pensava** com Qwen3.5/3.8: o prompt ChatML puro não abria o
+  `<think>` como o template abre. Agora segue a regra do template
+  (`Thinking::from_template`), como o `serve`.
+- FP4 gate/up/SwiGLU num launch (`matmul_nvfp4_kernel<true>`): +2% de prefill.
+

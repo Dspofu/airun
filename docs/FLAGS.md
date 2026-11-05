@@ -130,6 +130,18 @@ temperatura antes mudaria o que o top-p seleciona, e rodar top-p antes do top-k
 tornaria o top-k inócuo. Todo filtro preserva **pelo menos um** candidato — um
 filtro que esvazia o conjunto vira uma troca silenciosa de amostrador.
 
+### Raciocínio
+
+| Flag | Padrão | Descrição |
+|---|---|---|
+| `--reasoning <on\|off\|auto>` | `auto` | Liga ou desliga o pensamento (`<think>`), ou deixa o padrão do template do modelo. Como o `--reasoning` do llama-server. Vale também no `serve`. |
+| `--reasoning-effort <nível>` | — | Quanto o modelo pode pensar: `none`, `low` (1024 tokens), `medium` (4096), `high` (16384) ou `max` (sem limite). Se o template do modelo entende `reasoning_effort` (o do Qwen3.8 tem `low`, `medium` e `xhigh`), o nível vai para ele; senão vira um orçamento de tokens, e esgotado o orçamento o `</think>` é forçado e o modelo responde. Vale também no `serve`, como padrão dos pedidos. |
+| `--reasoning-budget <N>` | — | Tokens de pensamento permitidos, por cima do nível; `-1` sem limite. |
+
+Na API: `reasoning_effort` (Chat), `reasoning.effort` (Responses), `thinking.budget_tokens`
+(Anthropic), `reasoning_budget_tokens` / `thinking_budget_tokens` (llama-server). O web UI
+tem o nível ao lado do botão Thinking.
+
 ### Imagens
 
 | Flag | Padrão | Descrição |
@@ -480,6 +492,7 @@ e duas sessões separadas variam ~15%.
 | Variável | Efeito |
 |---|---|
 | `AIRUN_NO_MMQ_STREAMK=1` | O MMQ assíncrono volta à grade de tiles inteiros (com split-K onde ela ocupa mal a GPU). Com stream-K as últimas tiles são divididas em fatias de K iguais entre todos os SMs: prefill de 128 tokens no Qwen3-4B de 2767 para 3269 t/s. |
+| `AIRUN_NO_FP4_GLU=1` | Num FFN NVFP4 nas RTX 50, gate e up voltam a ser dois matmuls FP4, com o SwiGLU na quantização do down. Por padrão os três são um launch só (SwiGLU no epílogo): +2% de prefill no 27B. |
 | `AIRUN_NO_DELTA_CHUNK=1` | O prefill das camadas delta-net volta à recorrência token a token. Por padrão, lotes de 64+ tokens usam a forma em blocos nos tensor cores (bf16, acumulação fp32): +8,5% de prefill no 27B, +7% no 35B, perplexidade igual. |
 | `AIRUN_NO_MMQ_SPLIT=1` | Sem split-K no MMQ (onde o stream-K não roda: kernel síncrono, Q6_K). |
 | `AIRUN_MMQ_TC=64` ou `=128` | Força a largura da tile de tokens do MMQ. Padrão: 128 a partir de 128 tokens. |

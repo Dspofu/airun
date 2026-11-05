@@ -98,6 +98,21 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1024)]
     pub image_max_tokens: usize,
 
+    /// Thinking (Qwen3.5/3.8 and other models with a <think> block): on, off,
+    /// or the model's default (auto).
+    #[arg(long, value_name = "on|off|auto", default_value = "auto", value_parser = crate::reasoning::parse_switch_arg)]
+    pub reasoning: String,
+
+    /// How long the model may think: none, low (1024 tokens), medium (4096),
+    /// high (16384) or max (unlimited). Past it `</think>` is forced and the
+    /// model answers.
+    #[arg(long, value_name = "LEVEL", value_parser = crate::reasoning::parse_arg)]
+    pub reasoning_effort: Option<String>,
+
+    /// Thinking tokens allowed, overriding --reasoning-effort; -1 unlimited.
+    #[arg(long, allow_negative_numbers = true)]
+    pub reasoning_budget: Option<i64>,
+
     /// CUDA ordinals to use, comma separated. Defaults to every supported GPU.
     #[arg(long, value_delimiter = ',')]
     pub gpus: Vec<i32>,
@@ -194,6 +209,9 @@ impl RunArgs {
             mmproj: None,
             image: Vec::new(),
             image_max_tokens: 1024,
+            reasoning: "auto".into(),
+            reasoning_effort: None,
+            reasoning_budget: None,
             gpus: Vec::new(),
             tensor_split: Vec::new(),
             single_gpu: None,
@@ -286,29 +304,22 @@ pub fn run(args: RunArgs) -> Result<()> {
     }
 
     let quiet = args.quiet;
-    let mut last_stage = String::new();
     let mut opts = args.load_options();
     if let Some(mm) = &args.mmproj {
         opts.reserve_bytes += crate::media::vision_reserve(mm, args.image_max_tokens)?;
     }
     let images: Vec<airun_core::vision::Rgb> =
         args.image.iter().map(|p| crate::media::read_image(p)).collect::<Result<_>>()?;
+    let mut bar = crate::progress::LoadBar::new(&args.model);
     let (mut runtime, report) = loader::load(&args.model, &opts, |stage, done, total| {
-        if quiet {
-            return;
-        }
-        if stage != last_stage {
-            last_stage = stage.to_string();
-        }
-        if total > 0 && (done % 32 == 0 || done == total) {
-            eprint!("\r{stage}: {done}/{total}   ");
-            let _ = std::io::stderr().flush();
+        if !quiet {
+            bar.update(stage, done, total);
         }
     })
     .with_context(|| format!("failed to load {}", args.model.display()))?;
 
     if !quiet {
-        eprint!("\r");
+        bar.finish();
         eprintln!("{}", report.config.summary());
         eprintln!(
             "loaded {} of weights in {:.1}s",
@@ -342,10 +353,28 @@ pub fn run(args: RunArgs) -> Result<()> {
     if marked == 0 && !image_ids.is_empty() {
         prompt_text = format!("{}{prompt_text}", format!("{}\n", crate::media::MARKER).repeat(image_ids.len()));
     }
+    // Thinking off, by switch or level: an empty block the model continues
+    // after, as the Qwen templates write it with enable_thinking false.
+    let level = args.reasoning_effort.as_deref().and_then(crate::reasoning::parse);
+    let think_off = crate::reasoning::parse_switch(&args.reasoning) == Ok(Some(false)) || level == Some(crate::reasoning::Level::Off);
+    // The block opened or closed as the model's own template does it: Qwen3.5
+    // and later open `<think>` in the generation prompt when thinking is on
+    // (their default), so the plain ChatML prompt alone left them not
+    // thinking at all.
+    let template = airun_gguf::GgufFile::open(&args.model).ok()
+        .and_then(|g| g.get("tokenizer.chat_template").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    let prefix = crate::serve::Thinking::from_template(&template).generation_prefix(!think_off);
+    let opened = prefix.ends_with("<think>\n");
     let full_prompt = if args.raw {
         prompt_text
     } else {
-        apply_chat_template(args.system.as_deref(), &prompt_text, None)
+        apply_chat_template(args.system.as_deref(), &prompt_text, Some(prefix))
+    };
+    let budget = match (args.reasoning_budget, level) {
+        (Some(b), _) => (b >= 0).then_some(b as usize),
+        (None, Some(crate::reasoning::Level::Budget(b))) => b,
+        _ => None,
     };
 
     let tokens = crate::media::tokenize(&runtime, &full_prompt, &image_ids, true)?;
@@ -354,6 +383,17 @@ pub fn run(args: RunArgs) -> Result<()> {
     }
 
     let mut sampler = Sampler::new(args.sampling());
+    if let Some(b) = budget.filter(|_| !think_off) {
+        let (start, end) = (runtime.tokenizer.encode("<think>", false), runtime.tokenizer.encode("</think>", false));
+        if start.is_empty() || end.is_empty() {
+            eprintln!("note: --reasoning-effort/--reasoning-budget ignored: the vocabulary has no <think> tokens");
+        } else {
+            sampler = sampler.with_reasoning_budget(airun_core::ReasoningBudget {
+                start, forced: end.clone(), end, budget: Some(b),
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), opened,
+            });
+        }
+    }
     let mut stdout = std::io::stdout();
 
     let stats = runtime.generate(&tokens, args.predict, &mut sampler, |_, text| {

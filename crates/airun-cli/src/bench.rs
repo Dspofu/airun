@@ -132,8 +132,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
     run_args.tensor_split = args.tensor_split.clone();
     run_args.alloc = args.alloc.clone();
 
-    let (mut runtime, report) = loader::load(&args.model, &run_args.load_options(), |_, _, _| {})
+    let mut bar = crate::progress::LoadBar::new(&args.model);
+    let (mut runtime, report) = loader::load(&args.model, &run_args.load_options(), |s, d, t| bar.update(s, d, t))
         .with_context(|| format!("failed to load {}", args.model.display()))?;
+    bar.finish();
     // The planner may have lowered the prompt batch to keep the model on one
     // GPU; chunking by the one asked for would then overrun the runtime.
     let batch = runtime.max_batch().min(args.batch_size);

@@ -113,8 +113,10 @@ pub fn run(args: PerplexityArgs) -> Result<()> {
     run_args.single_gpu = args.single_gpu;
     run_args.alloc = args.alloc.clone();
 
-    let (mut runtime, report) = loader::load(&args.model, &run_args.load_options(), |_, _, _| {})
+    let mut bar = crate::progress::LoadBar::new(&args.model);
+    let (mut runtime, report) = loader::load(&args.model, &run_args.load_options(), |s, d, t| bar.update(s, d, t))
         .with_context(|| format!("failed to load {}", args.model.display()))?;
+    bar.finish();
 
     println!("{}", report.config.summary());
 

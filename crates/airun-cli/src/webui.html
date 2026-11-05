@@ -92,6 +92,9 @@
   button.danger { border-color: var(--err); color: var(--err); background: transparent; }
   button:disabled { opacity: .45; cursor: not-allowed; }
   button.small { padding: 5px 10px; font-size: 12px; font-weight: 600; }
+  select.small { font: inherit; font-size: 12px; font-weight: 600; padding: 4px 8px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--text); cursor: pointer; }
+  select.small:disabled { opacity: .45; cursor: not-allowed; }
 
   /* --- the log: the scroll container ------------------------------------- */
   #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 24px 18px 8px; }
@@ -291,6 +294,12 @@
     <label class="pill" id="thinkPill" hidden title="Let the model reason before answering">
       <input type="checkbox" id="think" checked><span class="ico">✦</span> Thinking
     </label>
+    <select id="effort" class="small" hidden title="How long the model may think: low 1k, medium 4k, high 16k tokens, max unlimited">
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+      <option value="max" selected>max</option>
+    </select>
     <button class="small" id="settingsBtn">Settings</button>
     <button class="small" id="newChat">New chat</button>
   </header>
@@ -404,7 +413,7 @@ let controller = null;   // AbortController for the in-flight request
 let props = {};
 
 // --- settings ---------------------------------------------------------------
-const CONTROLS = ["think", "thinkBudget", "temp", "top_p", "top_k", "min_p", "rep",
+const CONTROLS = ["think", "effort", "thinkBudget", "temp", "top_p", "top_k", "min_p", "rep",
                   "maxTok", "seed", "sys", "apiKey"];
 
 function loadSettings() {
@@ -429,6 +438,7 @@ function syncLabels() {
   $("repV").textContent   = (+$("rep").value).toFixed(2);
   $("thinkBudgetV").textContent = (+$("thinkBudget").value > 0 ? $("thinkBudget").value : "∞");
   $("thinkPill").classList.toggle("on", $("think").checked);
+  $("effort").disabled = !$("think").checked;
 }
 for (const id of CONTROLS) {
   $(id).addEventListener("input", () => { syncLabels(); saveSettings(); });
@@ -773,8 +783,10 @@ async function generate() {
     enable_thinking: thinking,
     chat_template_kwargs: { enable_thinking: thinking },
   };
+  // An explicit budget wins over the level; "max" sends nothing.
   const budget = +$("thinkBudget").value;
   if (thinking && budget > 0) body.reasoning_budget_tokens = budget;
+  else if (thinking && $("effort").value !== "max") body.reasoning_effort = $("effort").value;
   const seed = $("seed").value.trim();
   if (seed !== "" && !Number.isNaN(+seed)) body.seed = +seed;
 
@@ -1042,6 +1054,7 @@ async function connect() {
     $("modelName").textContent = props.model || "";
     $("maxTok").max = props.ctx || 32768;
     $("thinkPill").hidden = !props.thinking;
+    $("effort").hidden = !props.thinking;
 
     const rows = [
       ["arch", props.arch],
