@@ -9,6 +9,7 @@ mod perplexity;
 mod media;
 mod progress;
 mod reasoning;
+mod sched;
 mod quantize;
 mod replay;
 mod run;

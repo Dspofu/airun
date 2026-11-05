@@ -960,6 +960,7 @@ mod tests {
             attn_output_gate: false,
             ffn_norm_name: "ffn_norm",
             kv_type: Default::default(),
+            slots: 1,
             hc: None,
             ple: None,
             ssm_gate_sigmoid: false,

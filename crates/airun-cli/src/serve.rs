@@ -110,6 +110,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "FILE")]
     pub mmproj: Option<PathBuf>,
 
+    /// Requests served at once (llama-server's --parallel): each gets a slot
+    /// with its own KV cache and state at the full context, and the running
+    /// ones advance together, one forward pass per token for all of them.
+    /// VRAM for the caches grows with N. Turns MTP off.
+    #[arg(long, visible_alias = "np", default_value_t = 1)]
+    pub parallel: usize,
+
     /// Most tokens one image may take (a 32 x 32 pixel area each).
     #[arg(long, default_value_t = 1024)]
     pub image_max_tokens: usize,
@@ -206,7 +213,9 @@ struct SlotInfo {
 }
 
 struct AppState {
-    runtime: Mutex<Runtime>,
+    runtime: Arc<Mutex<Runtime>>,
+    /// With --parallel above 1: the scheduler that runs generations.
+    sched: Option<std::sync::Mutex<std::sync::mpsc::Sender<crate::sched::Job>>>,
     /// The vision encoder, with --mmproj.
     vision: Option<std::sync::Mutex<airun_core::vision::VisionModel>>,
     /// Images already encoded, by a hash of their file bytes: a chat sends
@@ -462,6 +471,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     eprintln!("loading {}", args.model.display());
     let mut load_opts = run_args.load_options();
+    load_opts.slots = args.parallel.max(1);
     if let Some(mm) = &args.mmproj {
         load_opts.reserve_bytes += crate::media::vision_reserve(mm, args.image_max_tokens)?;
     }
@@ -640,10 +650,13 @@ pub fn run(args: ServeArgs) -> Result<()> {
         }],
     });
 
+    let shared_rt = Arc::new(Mutex::new(runtime));
+    let sched = (args.parallel > 1).then(|| std::sync::Mutex::new(crate::sched::spawn(Arc::clone(&shared_rt))));
     let state = Arc::new(AppState {
+        sched,
         vision,
         image_memo: std::sync::Mutex::new(Vec::new()),
-        runtime: Mutex::new(runtime),
+        runtime: shared_rt,
         model_name: model_name.clone(),
         api_key: args.api_key.clone(),
         default_max_tokens: args.default_max_tokens,
@@ -1458,8 +1471,91 @@ fn stop_sequences(v: Option<&Value>) -> Vec<String> {
 /// hold, token, probs)` sees the text so far after each token, with how many
 /// trailing bytes may still turn into a stop sequence and the probabilities
 /// recorded since the last call (when asked for); returning false stops early.
+/// [`run_generation`] through the --parallel scheduler: the job goes to its
+/// thread and the tokens come back here, where stop sequences and the
+/// callback run as before.
+fn run_generation_scheduled(state: &AppState, spec: &GenSpec,
+    mut on_text: impl FnMut(&str, usize, u32, &[TokenProbs]) -> bool) -> Result<(GenEnd, String)> {
+    let sink: ProbsSink = Default::default();
+    let mut sampler = Sampler::new(spec.params.clone());
+    if let Some((_, g)) = &spec.grammar {
+        sampler = sampler.with_grammar(g.clone());
+    }
+    if let Some(n) = spec.n_probs {
+        sampler = sampler.with_probs(n, Arc::clone(&sink));
+    }
+    if let Some(r) = &spec.reasoning {
+        sampler = sampler.with_reasoning_budget(r.clone());
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (etx, erx) = std::sync::mpsc::channel();
+    let job = crate::sched::Job {
+        tokens: spec.tokens.clone(),
+        max_tokens: spec.max_tokens.unwrap_or(state.ctx),
+        sampler,
+        events: etx,
+        cancel: Arc::clone(&cancel),
+    };
+    state.sched.as_ref().expect("checked by the caller").lock().unwrap_or_else(|e| e.into_inner()).send(job)
+        .map_err(|_| anyhow::anyhow!("the scheduler has stopped; restart the server"))?;
+    state.processing.store(true, Ordering::Relaxed);
+    let mut text = String::new();
+    let mut word: Option<String> = None;
+    let mut seen = 0usize;
+    let result = loop {
+        match erx.recv() {
+            Ok(crate::sched::Event::Token(tok, piece)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let fresh: Vec<TokenProbs> = {
+                    let s = sink.lock().unwrap();
+                    let v = s[seen.min(s.len())..].to_vec();
+                    seen = s.len();
+                    v
+                };
+                text.push_str(&piece);
+                let keep = if let Some((cut, w)) = stop_at(&text, &spec.stops) {
+                    text.truncate(cut);
+                    word = Some(w.to_string());
+                    on_text(&text, 0, tok, &fresh);
+                    false
+                } else {
+                    on_text(&text, ambiguous_tail(&text, &spec.stops), tok, &fresh)
+                };
+                if !keep {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Ok(crate::sched::Event::Done(r)) => break r,
+            Err(_) => break Err("the scheduler dropped the request".to_string()),
+        }
+    };
+    state.processing.store(false, Ordering::Relaxed);
+    let mut stats = result.map_err(|e| anyhow::anyhow!("{e}"))?;
+    if word.is_some() {
+        stats.stop = airun_core::runtime::StopReason::Cancelled;
+    }
+    log_request(&stats);
+    let id_task = state.tasks.fetch_add(1, Ordering::Relaxed);
+    *state.slot.lock().unwrap() = SlotInfo {
+        id_task,
+        n_prompt_tokens: stats.prompt_tokens,
+        n_prompt_tokens_processed: stats.processed_tokens(),
+        n_prompt_tokens_cache: stats.cached_tokens,
+        n_decoded: stats.generated_tokens,
+        params: generation_settings(spec),
+    };
+    let st = stop_type(stats.stop, word.is_some());
+    let probs = std::mem::take(&mut *sink.lock().unwrap());
+    Ok((GenEnd { stats, stop_type: st, stopping_word: word.unwrap_or_default(), probs }, text))
+}
+
 fn run_generation(state: &AppState, spec: &GenSpec,
     mut on_text: impl FnMut(&str, usize, u32, &[TokenProbs]) -> bool) -> Result<(GenEnd, String)> {
+    if state.sched.is_some() {
+        return run_generation_scheduled(state, spec, on_text);
+    }
     let mut rt = state.runtime.blocking_lock();
     state.processing.store(true, Ordering::Relaxed);
     let sink: ProbsSink = Default::default();

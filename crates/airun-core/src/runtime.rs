@@ -37,6 +37,18 @@ enum LayerState {
     },
 }
 
+/// A conversation held apart from the active one (see [`Runtime::set_slots`]):
+/// its layer states, one set per shard, and where its sequence stands. The
+/// active slot's states live in the shards themselves; its entry is empty.
+#[derive(Default)]
+struct SlotStore {
+    states: Vec<Vec<LayerState>>,
+    n_past: usize,
+    history: Vec<u32>,
+    rope_shift: i32,
+    image_spans: Vec<(usize, usize, i32)>,
+}
+
 /// The first bytes of a [`Runtime::save_state`] file, with its format version.
 const STATE_MAGIC: &[u8] = b"AIRUNST1";
 
@@ -338,6 +350,12 @@ pub struct Runtime {
     rope_shift: i32,
     /// (first slot, slots, shift before it) of every cached image, to rewind.
     image_spans: Vec<(usize, usize, i32)>,
+    /// Conversations kept side by side (`set_slots`), the active one's state
+    /// in the shards and the others' here.
+    slots: Vec<SlotStore>,
+    active_slot: usize,
+    /// During a multi-slot decode step: the slot of each row.
+    mixed: Option<Vec<usize>>,
     /// Drafts per speculative step (see `set_draft`); 0 decodes plainly.
     draft: usize,
     /// Forward passes since the mapped experts were last rebalanced.
@@ -679,6 +697,9 @@ impl Runtime {
             embeds_ready: false,
             rope_shift: 0,
             image_spans: Vec::new(),
+            slots: vec![SlotStore::default()],
+            active_slot: 0,
+            mixed: None,
             draft: 0,
             since_rebalance: 0,
             rebalances: 0,
@@ -1644,6 +1665,231 @@ impl Runtime {
         self.set_rope_shift(before + n as i32 - img.nx.max(img.ny) as i32)
     }
 
+    // --- slots: several conversations, each with its own caches ---------------
+
+    /// Keeps `n` conversations' caches side by side (llama-server's
+    /// --parallel). Each slot gets its own KV cache and recurrent state at the
+    /// full context; the planner must have counted them (Config::slots).
+    /// [`Self::decode_rows`] then advances several slots in one forward pass.
+    /// Speculative decoding is turned off: its head keeps one sequence.
+    pub fn set_slots(&mut self, n: usize) -> Result<()> {
+        let n = n.max(1);
+        let cfg = &self.model.config;
+        if n > 1 && (cfg.indexer.is_some() || cfg.hc.is_some() || cfg.ple.is_some()) {
+            return Err(CoreError::Other(format!(
+                "{} keeps state (sparse-attention index, hyper-connections or n-gram tables) that airun does not \
+                 hold per conversation yet; run it with --parallel 1", cfg.arch_name)));
+        }
+        if n > self.max_batch {
+            return Err(CoreError::Other(format!(
+                "--parallel {n} exceeds the prompt batch of {}; raise --batch-size", self.max_batch)));
+        }
+        while self.slots.len() < n {
+            let mut sets = Vec::with_capacity(self.states.len());
+            for si in 0..self.states.len() {
+                sets.push(self.fresh_states(si)?);
+            }
+            self.slots.push(SlotStore { states: sets, ..Default::default() });
+        }
+        self.slots.truncate(n);
+        if n > 1 {
+            self.draft = 0;
+        }
+        Ok(())
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn active_slot(&self) -> usize {
+        self.active_slot
+    }
+
+    /// The tokens slot `s` holds.
+    pub fn slot_history(&self, s: usize) -> &[u32] {
+        if s == self.active_slot { &self.history } else { &self.slots[s].history }
+    }
+
+    /// How much of `tokens` slot `s` already holds (see [`Self::reusable_prefix`]).
+    pub fn slot_prefix(&self, s: usize, tokens: &[u32]) -> usize {
+        let hist = self.slot_history(s);
+        let limit = tokens.len().saturating_sub(1);
+        let common = hist.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(limit);
+        if self.model.config.is_hybrid() && common < hist.len() { 0 } else { common }
+    }
+
+    /// Zeroed layer states for shard `si`, as the runtime allocates them.
+    fn fresh_states(&self, si: usize) -> Result<Vec<LayerState>> {
+        let cfg = &self.model.config;
+        let st = &self.states[si];
+        device::set_device(st.device)?;
+        let mut out = Vec::with_capacity(st.layers.len());
+        for &l in &st.layers {
+            out.push(match cfg.layer_kind(l) {
+                LayerKind::Attention => {
+                    let bytes = cfg.n_head_kv * self.ctx * cfg.kv_type.row_bytes(cfg.head_dim);
+                    LayerState::Kv {
+                        k: DeviceBuffer::zeroed(st.device, bytes, &st.stream)?,
+                        v: DeviceBuffer::zeroed(st.device, bytes, &st.stream)?,
+                        qsa: None,
+                    }
+                }
+                LayerKind::LinearAttention => {
+                    let ssm = cfg.ssm.as_ref().ok_or_else(|| CoreError::Other("linear layer without an ssm config".into()))?;
+                    LayerState::Delta {
+                        state: DeviceBuffer::zeroed(st.device, ssm.state_elements(), &st.stream)?,
+                        conv: DeviceBuffer::zeroed(st.device, ssm.conv_state_elements(), &st.stream)?,
+                    }
+                }
+            });
+        }
+        st.stream.synchronize()?;
+        Ok(out)
+    }
+
+    /// The layer state of slot `slot` for shard `si`'s `local`-th layer.
+    fn slot_state(&self, slot: usize, si: usize, local: usize) -> &LayerState {
+        if slot == self.active_slot { &self.states[si].states[local] } else { &self.slots[slot].states[si][local] }
+    }
+
+    /// Makes slot `s` the one single-sequence calls run on. Its states swap
+    /// into the shards; captured decode graphs held the old ones' addresses.
+    pub fn switch_slot(&mut self, s: usize) -> Result<()> {
+        if s == self.active_slot {
+            return Ok(());
+        }
+        if s >= self.slots.len() {
+            return Err(CoreError::Other(format!("slot {s} does not exist ({} slots)", self.slots.len())));
+        }
+        let a = self.active_slot;
+        for si in 0..self.states.len() {
+            let cur = std::mem::take(&mut self.states[si].states);
+            self.slots[a].states.resize_with(self.states.len(), Vec::new);
+            self.slots[a].states[si] = cur;
+            self.states[si].states = std::mem::take(&mut self.slots[s].states[si]);
+        }
+        self.slots[a].n_past = self.n_past;
+        self.slots[a].history = std::mem::take(&mut self.history);
+        self.slots[a].rope_shift = self.rope_shift;
+        self.slots[a].image_spans = std::mem::take(&mut self.image_spans);
+        self.n_past = self.slots[s].n_past;
+        self.history = std::mem::take(&mut self.slots[s].history);
+        self.image_spans = std::mem::take(&mut self.slots[s].image_spans);
+        let shift = self.slots[s].rope_shift;
+        self.active_slot = s;
+        self.decode_graph = None;
+        self.chain = None;
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+        self.set_rope_shift(shift)
+    }
+
+    /// Prefills slot `s` with `prompt`, reusing what it already holds, and
+    /// returns the last token's logits and how many tokens came from cache.
+    pub fn slot_begin(&mut self, s: usize, prompt: &[u32]) -> Result<(Vec<f32>, usize)> {
+        if prompt.is_empty() {
+            return Err(CoreError::Other("an empty prompt has nothing to continue".into()));
+        }
+        self.switch_slot(s)?;
+        let cached = Self::image_safe_prefix(prompt, self.reusable_prefix(prompt));
+        self.rewind_to(cached);
+        let cached = self.n_past.min(cached);
+        let mut done = self.prefill_images(prompt, cached)?;
+        let mut logits = Vec::new();
+        while done < prompt.len() {
+            let take = (prompt.len() - done).min(self.max_batch);
+            let chunk = &prompt[done..done + take];
+            done += take;
+            if done < prompt.len() {
+                self.step(chunk)?;
+            } else {
+                logits = self.forward_pinned(chunk)?.to_vec();
+            }
+        }
+        Ok((logits, cached))
+    }
+
+    /// One decode step for several conversations at once: row b feeds token
+    /// `rows[b].1` to slot `rows[b].0` (distinct slots) and gets that slot's
+    /// next-token logits, `vocab_size` floats a row. The matmuls read each
+    /// weight once for all the rows -- what makes serving several requests
+    /// faster than taking them in turn.
+    pub fn decode_rows(&mut self, rows: &[(usize, u32)]) -> Result<Vec<f32>> {
+        if rows.len() == 1 {
+            self.switch_slot(rows[0].0)?;
+            return Ok(self.forward_pinned(&[rows[0].1])?.to_vec());
+        }
+        let n = rows.len();
+        if n > self.max_batch {
+            return Err(CoreError::Other(format!("{n} rows exceed the batch of {}", self.max_batch)));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut positions = Vec::with_capacity(n);
+        let mut rope = vec![0i32; 3 * n];
+        for (b, &(slot, _)) in rows.iter().enumerate() {
+            if slot >= self.slots.len() || !seen.insert(slot) {
+                return Err(CoreError::Other(format!("decode_rows needs distinct, existing slots (row {b})")));
+            }
+            let (past, shift) = if slot == self.active_slot { (self.n_past, self.rope_shift) }
+                else { (self.slots[slot].n_past, self.slots[slot].rope_shift) };
+            if past + 1 > self.ctx {
+                return Err(CoreError::Other(format!(
+                    "slot {slot} is at its {} context; raise --ctx-size or start a new conversation", self.ctx)));
+            }
+            positions.push(past as i32);
+            for a in 0..3 {
+                rope[a * n + b] = past as i32 - shift;
+            }
+        }
+        for st in &self.states {
+            device::set_device(st.device)?;
+            st.mpos.copy_from_host_at(0, &rope, &st.stream)?;
+        }
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+        let ids: Vec<i32> = rows.iter().map(|&(_, t)| t as i32).collect();
+        self.mixed = Some(rows.iter().map(|&(s, _)| s).collect());
+        self.image_rows = Some(n);
+        self.skip_logits = true;
+        let queued = self.queue_forward(&ids, &positions);
+        self.mixed = None;
+        self.image_rows = None;
+        self.skip_logits = false;
+        queued?;
+        for &(slot, tok) in rows {
+            if slot == self.active_slot {
+                self.n_past += 1;
+                self.history.push(tok);
+            } else {
+                self.slots[slot].n_past += 1;
+                self.slots[slot].history.push(tok);
+            }
+        }
+        self.rebalance_experts()?;
+
+        let cfg = &self.model.config;
+        let st = self.states.last().expect("a runtime has at least one device");
+        device::set_device(st.device)?;
+        let out_w = self.model.output_tensor();
+        let mut host = vec![0f32; n * cfg.vocab_size];
+        const ROWS: usize = 8;
+        let buf = DeviceBuffer::<f32>::new(st.device, ROWS.min(n) * cfg.vocab_size)?;
+        for r0 in (0..n).step_by(ROWS) {
+            let m = ROWS.min(n - r0);
+            ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr(r0 * cfg.n_embd), buf.as_mut_ptr(),
+                cfg.n_embd, cfg.vocab_size, m, out_w.row_bytes, &st.stream)?;
+            if out_w.global_scale != 1.0 {
+                ops::scale(buf.as_mut_ptr(), out_w.global_scale, m * cfg.vocab_size, &st.stream)?;
+            }
+            buf.copy_to_host(&mut host[r0 * cfg.vocab_size..(r0 + m) * cfg.vocab_size], &st.stream)?;
+        }
+        st.stream.synchronize()?;
+        Ok(host)
+    }
+
     pub fn reusable_prefix(&self, tokens: &[u32]) -> usize {
         let limit = tokens.len().saturating_sub(1);
         let common = self
@@ -1752,7 +1998,7 @@ impl Runtime {
             st.xb2.fill_zero(stream)?;
         } else {
             match &w.block {
-                Block::Attention(a) => self.run_attention(si, state, a, n, cfg)?,
+                Block::Attention(a) => self.run_attention(si, state, layer, a, n, cfg)?,
                 Block::Linear(l) => self.run_linear_attention(si, state, stash, layer, l, n, cfg)?,
             }
         }
@@ -1887,7 +2133,7 @@ impl Runtime {
 
         self.hc_mix(si, mix_attn, n, cfg)?;
         match &w.block {
-            Block::Attention(a) => self.run_attention(si, state, a, n, cfg)?,
+            Block::Attention(a) => self.run_attention(si, state, layer, a, n, cfg)?,
             Block::Linear(l) => self.run_linear_attention(si, state, stash, layer, l, n, cfg)?,
         }
         trace_block(st, layer, "mixer", n, cfg)?;
@@ -2058,6 +2304,7 @@ impl Runtime {
         &self,
         si: usize,
         kv_state: &LayerState,
+        layer: usize,
         a: &crate::model::AttentionWeights,
         n: usize,
         cfg: &Config,
@@ -2142,116 +2389,148 @@ impl Runtime {
             ));
         };
 
-        if !fused_prologue_disabled() {
-            // q/k norms, RoPE and the cache write in one launch (see
-            // qk_norm_rope_store_kernel); the same arithmetic as the steps below.
+        if let Some(rows) = self.mixed.as_deref() {
+            // One token per conversation: each row's cache write and attention
+            // against its own slot's cache, the projections around them batched.
+            let local = self.states[si].layers.iter().position(|&l| l == layer)
+                .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
             let null = std::ptr::null::<std::ffi::c_void>();
-            ops::qk_norm_rope_store(
-                st.q.as_mut_ptr(), st.k.as_ptr(), st.v.as_ptr(),
-                a.q_norm.as_ref().map_or(null, |w| w.as_ptr()),
-                a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
-                kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.as_ptr(),
-                n, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
-                (!rope_off).then_some((rope_dim, self.rope_for(si, cfg), rope_interleaved)),
-                cfg.kv_type, stream,
-            )?;
+            let (qw, kw) = (cfg.n_head * cfg.head_dim, cfg.n_head_kv * cfg.head_dim);
+            let window = std::env::var("AIRUN_ATTN_WINDOW").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
+            for (b, &slot) in rows.iter().enumerate() {
+                let LayerState::Kv { k: kc, v: vc, .. } = self.slot_state(slot, si, local) else {
+                    return Err(CoreError::Other("an attention layer was given a recurrent state".into()));
+                };
+                // The rotation position comes from this row of mpos (all three
+                // axes equal: text), so each slot keeps its own image shift.
+                let rope = cfg.rope.positioned(0, Some((st.mpos.as_ptr() as u64 + 4 * b as u64, rows.len())));
+                ops::qk_norm_rope_store(
+                    st.q.offset_ptr(b * qw), st.k.offset_ptr(b * kw), st.v.offset_ptr(b * kw),
+                    a.q_norm.as_ref().map_or(null, |w| w.as_ptr()),
+                    a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
+                    kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.offset_ptr(b),
+                    1, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
+                    (!rope_off).then_some((rope_dim, rope, rope_interleaved)),
+                    cfg.kv_type, stream,
+                )?;
+                ops::attention_split_sel(st.attn.offset_ptr(b * qw), &st.attn_partial,
+                    st.q.offset_ptr(b * qw), kc.as_ptr(), vc.as_ptr(), st.positions.offset_ptr(b),
+                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
+                    window, ops::attention_splits(self.ctx), cfg.kv_type, std::ptr::null(), stream)?;
+            }
         } else {
-            // Per-head RMSNorm before RoPE. Rows are contiguous head_dim slices, so
-            // this is one call over n * heads rows.
-            if let Some(qn) = &a.q_norm {
-                ops::rmsnorm(
-                    st.q.as_mut_ptr(),
-                    st.q.as_ptr(),
-                    qn.as_ptr(),
-                    cfg.head_dim,
-                    n * cfg.n_head,
-                    cfg.rms_eps,
-                    stream,
+            if !fused_prologue_disabled() {
+                // q/k norms, RoPE and the cache write in one launch (see
+                // qk_norm_rope_store_kernel); the same arithmetic as the steps below.
+                let null = std::ptr::null::<std::ffi::c_void>();
+                ops::qk_norm_rope_store(
+                    st.q.as_mut_ptr(), st.k.as_ptr(), st.v.as_ptr(),
+                    a.q_norm.as_ref().map_or(null, |w| w.as_ptr()),
+                    a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
+                    kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.as_ptr(),
+                    n, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
+                    (!rope_off).then_some((rope_dim, self.rope_for(si, cfg), rope_interleaved)),
+                    cfg.kv_type, stream,
                 )?;
-            }
-            if let Some(kn) = &a.k_norm {
-                ops::rmsnorm(
-                    st.k.as_mut_ptr(),
-                    st.k.as_ptr(),
-                    kn.as_ptr(),
-                    cfg.head_dim,
-                    n * cfg.n_head_kv,
-                    cfg.rms_eps,
-                    stream,
-                )?;
-            }
+            } else {
+                // Per-head RMSNorm before RoPE. Rows are contiguous head_dim slices, so
+                // this is one call over n * heads rows.
+                if let Some(qn) = &a.q_norm {
+                    ops::rmsnorm(
+                        st.q.as_mut_ptr(),
+                        st.q.as_ptr(),
+                        qn.as_ptr(),
+                        cfg.head_dim,
+                        n * cfg.n_head,
+                        cfg.rms_eps,
+                        stream,
+                    )?;
+                }
+                if let Some(kn) = &a.k_norm {
+                    ops::rmsnorm(
+                        st.k.as_mut_ptr(),
+                        st.k.as_ptr(),
+                        kn.as_ptr(),
+                        cfg.head_dim,
+                        n * cfg.n_head_kv,
+                        cfg.rms_eps,
+                        stream,
+                    )?;
+                }
 
-            if !rope_off {
-                ops::rope(
-                    st.q.as_mut_ptr(),
-                    st.positions.as_ptr(),
-                    n,
-                    cfg.n_head,
-                    cfg.head_dim,
-                    rope_dim,
-                    self.rope_for(si, cfg),
-                    rope_interleaved,
-                    stream,
-                )?;
-                ops::rope(
-                    st.k.as_mut_ptr(),
+                if !rope_off {
+                    ops::rope(
+                        st.q.as_mut_ptr(),
+                        st.positions.as_ptr(),
+                        n,
+                        cfg.n_head,
+                        cfg.head_dim,
+                        rope_dim,
+                        self.rope_for(si, cfg),
+                        rope_interleaved,
+                        stream,
+                    )?;
+                    ops::rope(
+                        st.k.as_mut_ptr(),
+                        st.positions.as_ptr(),
+                        n,
+                        cfg.n_head_kv,
+                        cfg.head_dim,
+                        rope_dim,
+                        self.rope_for(si, cfg),
+                        rope_interleaved,
+                        stream,
+                    )?;
+                }
+
+                ops::kv_store(
+                    kc.as_mut_ptr(),
+                    vc.as_mut_ptr(),
+                    st.k.as_ptr(),
+                    st.v.as_ptr(),
                     st.positions.as_ptr(),
                     n,
                     cfg.n_head_kv,
                     cfg.head_dim,
-                    rope_dim,
-                    self.rope_for(si, cfg),
-                    rope_interleaved,
+                    self.ctx,
+                    cfg.kv_type,
                     stream,
                 )?;
             }
 
-            ops::kv_store(
-                kc.as_mut_ptr(),
-                vc.as_mut_ptr(),
-                st.k.as_ptr(),
-                st.v.as_ptr(),
-                st.positions.as_ptr(),
-                n,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                self.ctx,
-                cfg.kv_type,
-                stream,
-            )?;
-        }
-
-        // QSA: the cells each query attends to, as a list for decode and a
-        // mask for batches; None attends densely.
-        let sparse = match (qsa_cache, &a.indexer, &st.qsa, &cfg.indexer) {
-            (Some(qc), Some(iw), Some(qs), Some(ix)) => {
-                self.qsa_select(st, qc, iw, qs, ix, n, cfg.rope_dim, cfg)?;
-                Some(qs)
-            }
-            _ => None,
-        };
-
-        let window = std::env::var("AIRUN_ATTN_WINDOW").ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
-        if n == 1 && std::env::var("AIRUN_NO_SPLIT_ATTN").is_err() {
-            ops::attention_split_sel(st.attn.as_mut_ptr(), &st.attn_partial,
-                st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(), st.positions.as_ptr(),
-                cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
-                window, ops::attention_splits(self.ctx), cfg.kv_type,
-                sparse.map_or(std::ptr::null(), |qs| qs.list.as_ptr()), stream)?;
-        } else {
-            // A single query without the split kernel reads the mask too.
-            if n == 1 {
-                if let (Some(qs), Some(qc)) = (sparse, qsa_cache) {
-                    qsa::select(qs.scores.as_ptr(), qs.max_blocks, st.positions.as_ptr(), 0, 1, qc.ratio,
-                        cfg.indexer.as_ref().map_or(0, |ix| ix.width(qc.ratio)), std::ptr::null_mut(),
-                        qs.mask.as_mut_ptr(), qs.words, stream)?;
+            // QSA: the cells each query attends to, as a list for decode and a
+            // mask for batches; None attends densely.
+            let sparse = match (qsa_cache, &a.indexer, &st.qsa, &cfg.indexer) {
+                (Some(qc), Some(iw), Some(qs), Some(ix)) => {
+                    self.qsa_select(st, qc, iw, qs, ix, n, cfg.rope_dim, cfg)?;
+                    Some(qs)
                 }
+                _ => None,
+            };
+
+            let window = std::env::var("AIRUN_ATTN_WINDOW").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
+            if n == 1 && std::env::var("AIRUN_NO_SPLIT_ATTN").is_err() {
+                ops::attention_split_sel(st.attn.as_mut_ptr(), &st.attn_partial,
+                    st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(), st.positions.as_ptr(),
+                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
+                    window, ops::attention_splits(self.ctx), cfg.kv_type,
+                    sparse.map_or(std::ptr::null(), |qs| qs.list.as_ptr()), stream)?;
+            } else {
+                // A single query without the split kernel reads the mask too.
+                if n == 1 {
+                    if let (Some(qs), Some(qc)) = (sparse, qsa_cache) {
+                        qsa::select(qs.scores.as_ptr(), qs.max_blocks, st.positions.as_ptr(), 0, 1, qc.ratio,
+                            cfg.indexer.as_ref().map_or(0, |ix| ix.width(qc.ratio)), std::ptr::null_mut(),
+                            qs.mask.as_mut_ptr(), qs.words, stream)?;
+                    }
+                }
+                ops::attention_masked(st.attn.as_mut_ptr(), st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
+                    st.positions.as_ptr(), n, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
+                    self.ctx, cfg.attn_scale(), window, cfg.kv_type,
+                    sparse.map(|qs| (qs.mask.as_ptr(), qs.words)), self.n_past + n, stream)?;
             }
-            ops::attention_masked(st.attn.as_mut_ptr(), st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
-                st.positions.as_ptr(), n, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
-                self.ctx, cfg.attn_scale(), window, cfg.kv_type,
-                sparse.map(|qs| (qs.mask.as_ptr(), qs.words)), self.n_past + n, stream)?;
         }
         // AIRUN_ATTN_NO_GATE=1 drops the gate entirely, which says whether the
         // gate is the thing going wrong or merely riding along.
@@ -2337,7 +2616,20 @@ impl Runtime {
         // conv_out; one token stays in place.
         let silu = std::env::var("AIRUN_SSM_NO_CONV_SILU").is_err();
         let reverse = std::env::var("AIRUN_SSM_CONV_REVERSE").is_ok();
-        let conv_rows = if n > 1 {
+        let conv_rows = if let Some(rows) = self.mixed.as_deref() {
+            // One token per conversation: each row convolves in place against
+            // its own slot's history.
+            let local = self.states[si].layers.iter().position(|&x| x == layer)
+                .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
+            for (b, &slot) in rows.iter().enumerate() {
+                let LayerState::Delta { conv: c, .. } = self.slot_state(slot, si, local) else {
+                    return Err(CoreError::Other("a linear layer was given a KV cache".into()));
+                };
+                hybrid::causal_conv1d_ex(h.qkv.offset_ptr(b * ssm.qkv_dim()), l.conv1d.as_ptr(), c.as_mut_ptr(), 1,
+                    ssm.qkv_dim(), ssm.conv_kernel, silu, reverse, true, stream)?;
+            }
+            &h.qkv
+        } else if n > 1 {
             hybrid::causal_conv1d_oop(h.qkv.as_ptr(), h.conv_out.as_mut_ptr(), l.conv1d.as_ptr(),
                 conv.as_mut_ptr(), n, ssm.qkv_dim(), ssm.conv_kernel, silu, reverse, stash.is_none(), stream)?;
             &h.conv_out
@@ -2422,6 +2714,19 @@ impl Runtime {
         }
 
         // The recurrence writes over the value slice, which is no longer needed.
+        if let Some(rows) = self.mixed.as_deref() {
+            let local = self.states[si].layers.iter().position(|&x| x == layer)
+                .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
+            for (b, &slot) in rows.iter().enumerate() {
+                let LayerState::Delta { state: sl, .. } = self.slot_state(slot, si, local) else {
+                    return Err(CoreError::Other("a linear layer was given a KV cache".into()));
+                };
+                hybrid::delta_rule_ex(sl.as_mut_ptr(), st.q.offset_ptr(b * k_dim), st.k.offset_ptr(b * k_dim),
+                    h.core.offset_ptr(b * ssm.v_dim()), h.decay.offset_ptr(b * ssm.n_v_heads),
+                    h.beta.offset_ptr(b * ssm.n_v_heads), st.attn.offset_ptr(b * ssm.v_dim()), 1,
+                    ssm.n_k_heads, ssm.n_v_heads, ssm.head_k_dim(), ssm.head_v_dim(), true, stream)?;
+            }
+        } else {
         hybrid::delta_rule_ex(
             state.as_mut_ptr(),
             st.q.as_ptr(),
@@ -2438,6 +2743,7 @@ impl Runtime {
             stash.is_none(),
             stream,
         )?;
+        }
 
         // Normalize, scale by the learned weight, then gate -- the order of
         // Qwen3-Next's RMSNormGated and of llama.cpp's build_norm_gated.
@@ -2720,16 +3026,16 @@ impl Runtime {
         sampler: &mut Sampler,
         mut on_token: impl FnMut(u32, &str) -> bool,
     ) -> Result<GenerationStats> {
-        if self.speculates() && !(sampler.is_pure_greedy() && !gpu_argmax_disabled()) {
-            eprintln!(
-                "note: speculative decoding (--draft) is off for this generation: it \
-                 needs pure greedy sampling (temperature 0 and no repeat/presence/\
-                 frequency penalties; --repeat-penalty 1.0)."
-            );
-        }
+        // Speculation keeps any sampler's distribution (Sampler::sample_draft)
+        // but mirostat's, whose running state would follow rejected drafts.
         let has_images = prompt.iter().any(|&t| is_image_token(t));
-        if sampler.is_pure_greedy() && !gpu_argmax_disabled() && self.speculates() && !has_images {
-            return self.generate_spec(prompt, max_tokens, &mut on_token);
+        let can_spec = !gpu_argmax_disabled() && (sampler.is_pure_greedy() || sampler.drafts_ok());
+        if self.speculates() && !can_spec {
+            eprintln!("note: speculative decoding (--draft) is off for this generation: mirostat sampling \
+                       does not run with drafts");
+        }
+        if can_spec && self.speculates() && !has_images {
+            return self.generate_spec(prompt, max_tokens, sampler, &mut on_token);
         }
         let start = std::time::Instant::now();
 

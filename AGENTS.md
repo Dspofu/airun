@@ -861,3 +861,28 @@ seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
   (`Thinking::from_template`), como o `serve`.
 - FP4 gate/up/SwiGLU num launch (`matmul_nvfp4_kernel<true>`): +2% de prefill.
 
+## Várias requisições ao mesmo tempo e MTP com temperatura (2026-11-05)
+
+- **Slots** (`Runtime::set_slots`, `serve --parallel N`): cada slot tem o seu
+  conjunto de `LayerState` (KV e delta-net) por shard; o ativo fica nos
+  shards e os outros em `Runtime::slots`. `switch_slot` troca os conjuntos e
+  descarta os grafos de decode (eles guardavam os endereços). O planner conta
+  N vezes o cache (`Config::slots`).
+- **`decode_rows`**: um token de cada slot num passe só. Os matmuls e o que é
+  por token rodam em lote; nos 4 pontos com estado (escrita do KV e atenção,
+  convolução e recorrência da delta-net) o runtime chama o kernel de sempre
+  uma vez por linha com o estado do slot dela (`self.mixed`). A posição da
+  RoPE vem do `mpos` (os três eixos iguais), então cada slot mantém o seu
+  deslocamento de imagem. Sem grafo CUDA nesse caminho.
+- **Agendador** (`crates/airun-cli/src/sched.rs`): uma thread admite um
+  pedido por passo (prefill no slot livre de maior prefixo em comum) e avança
+  os ativos juntos. `run_generation` manda o pedido e recebe os tokens por
+  canal; stop sequences e stream continuam na thread do pedido. Com
+  `--parallel 1` nada disso roda.
+- Modelos com QSA, hyper-connections ou PLE recusam `--parallel` > 1.
+- **MTP com temperatura** (`Sampler::sample_draft`): o rascunho (argmax da
+  cabeça) é aceito com a probabilidade que a cadeia de amostragem lhe dá e,
+  recusado, o token sai da distribuição sem ele; teste
+  `sampling_against_a_draft_keeps_the_distribution` (200 mil sorteios).
+  27B: 25,7 -> 47,2 tok/s a temp 0,7. Mirostat continua sem MTP.
+

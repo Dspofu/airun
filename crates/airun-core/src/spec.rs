@@ -484,8 +484,16 @@ impl Runtime {
         &mut self,
         prompt: &[u32],
         max_tokens: usize,
+        sampler: &mut crate::sample::Sampler,
         on_token: &mut dyn FnMut(u32, &str) -> bool,
     ) -> Result<GenerationStats> {
+        // Pure greedy compares the drafts with the GPU's argmaxes; anything
+        // else reads the verified rows' logits and samples against the drafts
+        // (Sampler::sample_draft), which keeps the sampler's distribution.
+        let sampling = !sampler.is_pure_greedy();
+        let vocab = self.model.config.vocab_size;
+        let mut row_logits: Vec<f32> = Vec::new();
+        let mut hist: Vec<u32> = prompt.iter().copied().filter(|&t| !crate::runtime::is_image_token(t)).collect();
         let start = std::time::Instant::now();
         self.spec_init()?;
         let k = self.draft;
@@ -519,10 +527,17 @@ impl Runtime {
                 device::set_device(st.device)?;
                 let logits = st.logits.as_ref().ok_or_else(|| CoreError::Other(
                     "output shard has no logits buffer".into()))?;
-                let sp = self.sp();
-                ops::argmax(logits.as_ptr(), logits.len(), sp.picks.as_mut_ptr(), sp.scratch.as_mut_ptr(),
-                    std::ptr::null_mut(), &st.stream)?;
-                t = self.read_picks(1)?[0];
+                if sampling {
+                    row_logits.resize(vocab, 0.0);
+                    logits.copy_to_host(&mut row_logits[..vocab], &st.stream)?;
+                    st.stream.synchronize()?;
+                    t = sampler.sample(&mut row_logits[..vocab], &hist);
+                } else {
+                    let sp = self.sp();
+                    ops::argmax(logits.as_ptr(), logits.len(), sp.picks.as_mut_ptr(), sp.scratch.as_mut_ptr(),
+                        std::ptr::null_mut(), &st.stream)?;
+                    t = self.read_picks(1)?[0];
+                }
             }
             self.stage_h(true, take - 1)?;
             self.save_pending(take - 1)?;
@@ -564,6 +579,7 @@ impl Runtime {
         };
 
         // t is the newest token: handed out, not yet in the caches.
+        hist.push(t);
         if let Some(s) = emit(self, t, &mut generated, &mut decoder) {
             stop = s;
         } else {
@@ -587,8 +603,36 @@ impl Runtime {
                 let picks = self.verify(&input)?;
                 timing[0] += t0.elapsed().as_secs_f64();
                 let mut a = 0;
-                while a < drafts.len() && drafts[a] == picks[a] {
-                    a += 1;
+                let mut sampled = None;
+                if sampling {
+                    // The verify left every row's logits on the output device.
+                    let n = input.len();
+                    row_logits.resize(n * vocab, 0.0);
+                    {
+                        let st = self.states.last().expect("a runtime has at least one device");
+                        device::set_device(st.device)?;
+                        self.sp().logits.copy_to_host(&mut row_logits[..n * vocab], &st.stream)?;
+                        st.stream.synchronize()?;
+                    }
+                    let mut h = hist.clone();
+                    while a < drafts.len() {
+                        let row = &mut row_logits[a * vocab..(a + 1) * vocab];
+                        let (tok, took) = sampler.sample_draft(row, &h, drafts[a]);
+                        if !took {
+                            sampled = Some(tok);
+                            break;
+                        }
+                        h.push(tok);
+                        a += 1;
+                    }
+                    if sampled.is_none() {
+                        let row = &mut row_logits[a * vocab..(a + 1) * vocab];
+                        sampled = Some(sampler.sample(row, &h));
+                    }
+                } else {
+                    while a < drafts.len() && drafts[a] == picks[a] {
+                        a += 1;
+                    }
                 }
                 drafted += drafts.len();
                 accepted += a;
@@ -603,13 +647,18 @@ impl Runtime {
                         break;
                     }
                     last_token = tok;
+                    hist.push(tok);
                     committed += 1;
                 }
-                let next = picks[committed - 1];
+                let next = match sampled {
+                    Some(s) if committed - 1 == a => s,
+                    _ => picks[committed - 1],
+                };
                 if ended.is_none() {
                     ended = emit(self, next, &mut generated, &mut decoder);
                     if ended.is_none() {
                         last_token = next;
+                        hist.push(next);
                     }
                 }
 

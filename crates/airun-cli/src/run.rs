@@ -265,6 +265,7 @@ impl RunArgs {
             allow_fallback: !self.no_fallback,
             draft: self.draft,
             mtp_file: self.mtp.clone(),
+            slots: 1,
             alloc: self.alloc.alloc,
             main_gpu: self.alloc.main_gpu,
         }

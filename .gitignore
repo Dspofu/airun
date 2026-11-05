@@ -9,3 +9,5 @@
 *.swp
 Thumbs.db
 desktop.ini
+# A second, CUDA-free build directory used for quick type checks.
+/target-check

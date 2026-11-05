@@ -251,6 +251,9 @@ pub struct Config {
     /// Storage format of the KV cache. A runtime choice, not a file property:
     /// from_gguf leaves it at f16 and the loader applies the user's option.
     pub kv_type: airun_cuda::ops::KvType,
+    /// Conversations whose caches are kept at once (see Runtime::set_slots):
+    /// the KV cache and recurrent state are counted this many times.
+    pub slots: usize,
 
     /// Hyper-connection residual streams, on qwen4exp.
     pub hc: Option<HcConfig>,
@@ -501,6 +504,7 @@ impl Config {
             attn_output_gate,
             ffn_norm_name,
             kv_type: Default::default(),
+            slots: 1,
             ssm_gate_sigmoid,
             hc,
             ple,
@@ -721,7 +725,8 @@ impl Config {
             let r = ix.ratios.iter().copied().filter(|&r| r > 0).min()?;
             (ctx > ix.width(r)).then(|| (ctx / r * ix.dim * 4 + 4096 * ix.dim * 2) as u64)
         });
-        2 * (self.n_head_kv * ctx) as u64 * self.kv_type.row_bytes(self.head_dim) as u64 + qsa.unwrap_or(0)
+        (2 * (self.n_head_kv * ctx) as u64 * self.kv_type.row_bytes(self.head_dim) as u64 + qsa.unwrap_or(0))
+            * self.slots.max(1) as u64
     }
 
     /// KV cache across the whole model.
@@ -736,7 +741,7 @@ impl Config {
     /// Recurrent and convolution state bytes for one linear-attention layer.
     pub fn ssm_bytes_per_layer(&self) -> u64 {
         match &self.ssm {
-            Some(s) => ((s.state_elements() + s.conv_state_elements()) * 4) as u64,
+            Some(s) => ((s.state_elements() + s.conv_state_elements()) * 4 * self.slots.max(1)) as u64,
             None => 0,
         }
     }
@@ -846,6 +851,7 @@ mod tests {
             attn_output_gate: false,
             ffn_norm_name: "ffn_norm",
             kv_type: Default::default(),
+            slots: 1,
             hc: None,
             ple: None,
             ssm_gate_sigmoid: false,
@@ -868,6 +874,7 @@ mod tests {
             attn_output_gate: true,
             ffn_norm_name: "post_attention_norm",
             kv_type: Default::default(),
+            slots: 1,
             ssm: Some(SsmConfig {
                 conv_kernel: 4,
                 inner_size: 4096,

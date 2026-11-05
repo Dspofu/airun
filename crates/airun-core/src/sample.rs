@@ -222,6 +222,10 @@ pub struct Sampler {
     counts: Vec<u32>,
     /// Mirostat's running target surprise.
     mu: f32,
+    /// While [`Self::sample_draft`] runs: the drafted token, and whether it
+    /// was accepted.
+    draft: Option<u32>,
+    draft_accepted: bool,
 }
 
 impl Sampler {
@@ -246,6 +250,8 @@ impl Sampler {
             candidates: Vec::new(),
             counts: Vec::new(),
             mu: 2.0 * 5.0,
+            draft: None,
+            draft_accepted: false,
         }
         .with_mu()
     }
@@ -289,6 +295,29 @@ impl Sampler {
             || p.frequency_penalty != 0.0) && p.repeat_last_n > 0;
         p.temperature <= 0.0 && p.logit_bias.is_empty() && !penalizing && p.dry_multiplier <= 0.0
             && self.grammar.is_none() && self.probs.is_none() && self.budget.is_none()
+    }
+
+    /// Whether speculative decoding can sample for this sampler through
+    /// [`Self::sample_draft`]: everything but mirostat, whose running state
+    /// would follow drafts it then throws away.
+    pub fn drafts_ok(&self) -> bool {
+        self.params.mirostat == 0
+    }
+
+    /// Speculative sampling against a deterministic draft (the MTP head's
+    /// argmax): [`Self::sample`], except that `draft` is taken with exactly
+    /// the probability this sampler's distribution gives it, and otherwise
+    /// the token is drawn from that distribution without it. Over the coin,
+    /// the token is distributed as [`Self::sample`]'s would be -- the drafts
+    /// change the speed, not the text's statistics. Returns the token and
+    /// whether it is the draft. At temperature 0 this is "accept if it is the
+    /// argmax".
+    pub fn sample_draft(&mut self, logits: &mut [f32], history: &[u32], draft: u32) -> (u32, bool) {
+        self.draft = Some(draft);
+        self.draft_accepted = false;
+        let tok = self.sample(logits, history);
+        self.draft = None;
+        (tok, self.draft_accepted && tok == draft)
     }
 
     /// Picks the next token. `logits` is modified in place.
@@ -347,7 +376,9 @@ impl Sampler {
         }
 
         if self.params.temperature <= 0.0 {
-            return argmax(logits);
+            let best = argmax(logits);
+            self.draft_accepted = self.draft == Some(best);
+            return best;
         }
 
         if self.params.mirostat != 0 {
@@ -419,11 +450,29 @@ impl Sampler {
             }
         }
 
-        let total: f32 = self.candidates.iter().map(|c| c.1).sum();
+        let mut total: f32 = self.candidates.iter().map(|c| c.1).sum();
         if total <= 0.0 {
             // Every survivor rounded to zero probability, which a very cold
             // temperature on a flat distribution can do.
+            self.draft_accepted = self.draft == Some(self.candidates[0].0);
             return self.candidates[0].0;
+        }
+        // A draft is taken with its probability here, else drawn around.
+        if let Some(d) = self.draft {
+            let p = self.candidates.iter().find(|c| c.0 == d).map_or(0.0, |c| c.1) / total;
+            if self.rng.next_f32() < p {
+                self.draft_accepted = true;
+                return d;
+            }
+            if let Some(i) = self.candidates.iter().position(|c| c.0 == d) {
+                if self.candidates.len() > 1 {
+                    self.candidates.remove(i);
+                    total = self.candidates.iter().map(|c| c.1).sum();
+                    if total <= 0.0 {
+                        return self.candidates[0].0;
+                    }
+                }
+            }
         }
 
         let mut target = self.rng.next_f32() * total;
@@ -750,6 +799,42 @@ impl Rng {
 
 #[cfg(test)]
 mod tests {
+
+    /// Speculative sampling must not change what is sampled: tokens drawn
+    /// through sample_draft, whatever the draft, follow sample's own
+    /// distribution.
+    #[test]
+    fn sampling_against_a_draft_keeps_the_distribution() {
+        let base = vec![2.0f32, 1.0, 0.5, 0.0, -1.0, 1.5];
+        let params = SamplingParams { temperature: 0.8, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 7,
+            ..SamplingParams::default() };
+        let n = 200_000;
+        let freq = |draft: Option<u32>| {
+            let mut s = Sampler::new(params.clone());
+            let mut c = vec![0usize; base.len()];
+            for _ in 0..n {
+                let mut l = base.clone();
+                let t = match draft {
+                    Some(d) => s.sample_draft(&mut l, &[], d).0,
+                    None => s.sample(&mut l, &[]),
+                };
+                c[t as usize] += 1;
+            }
+            c.iter().map(|&x| x as f64 / n as f64).collect::<Vec<_>>()
+        };
+        let plain = freq(None);
+        for d in [0u32, 2, 4] {
+            let with = freq(Some(d));
+            for (a, b) in plain.iter().zip(&with) {
+                assert!((a - b).abs() < 0.006, "draft {d}: {plain:?} vs {with:?}");
+            }
+        }
+        // At temperature 0 the draft is taken exactly when it is the argmax.
+        let mut g = Sampler::new(SamplingParams { temperature: 0.0, ..params.clone() });
+        assert_eq!(g.sample_draft(&mut base.clone(), &[], 0), (0, true));
+        assert_eq!(g.sample_draft(&mut base.clone(), &[], 3), (0, false));
+    }
+
     use super::*;
 
     fn penalties(logits: &mut [f32], history: &[u32], last_n: usize, r: f32, p: f32, f: f32) {

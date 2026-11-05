@@ -45,6 +45,9 @@ pub struct LoadOptions {
     /// `mtp-<name>.gguf` next to a model converted with `--no-mtp`). None
     /// looks for one next to the model when the model has no head.
     pub mtp_file: Option<std::path::PathBuf>,
+    /// Conversations kept side by side (serve --parallel); their caches are
+    /// planned for and allocated at load. Turns MTP off when above 1.
+    pub slots: usize,
     /// Where weights may live: only VRAM, VRAM then RAM, or airun's choice.
     pub alloc: AllocMode,
     /// The GPU filled first; None picks the fastest.
@@ -66,6 +69,7 @@ impl Default for LoadOptions {
             allow_fallback: true,
             draft: Some(0),
             mtp_file: None,
+            slots: 1,
             alloc: AllocMode::Auto,
             main_gpu: None,
         }
@@ -97,6 +101,7 @@ pub fn load(
     let gguf = std::sync::Arc::new(GgufFile::open(path)?);
     let mut config = Config::from_gguf(&gguf)?;
     config.kv_type = opts.kv_type;
+    config.slots = opts.slots.max(1);
 
     if let Architecture::Unsupported(reason) = config.architecture {
         return Err(CoreError::UnsupportedArchitecture {
@@ -118,7 +123,9 @@ pub fn load(
     // tokens wakes far more experts than decoding 1 (Qwen3.8-35B-A3B on an
     // RTX 5060 Ti, 64% of drafts accepted: 115 -> 91 tok/s), so it is off
     // there unless asked for.
-    let draft_wanted = opts.draft != Some(0);
+    // One MTP head keeps one sequence: several conversations decode plainly.
+    let draft_wanted = opts.draft != Some(0) && opts.slots <= 1;
+    let config_slots = opts.slots.max(1);
     let mtp_src = if draft_wanted { mtp_source(path, &gguf, &config, opts.mtp_file.as_deref())? } else { None };
     let draft = match opts.draft {
         Some(d) => d,
@@ -316,6 +323,7 @@ pub fn load(
         let placement_out = model.placement.clone();
         let mut runtime = Runtime::new(model, tokenizer, streams, batch)?;
         runtime.set_draft(draft);
+        runtime.set_slots(config_slots)?;
 
         return Ok((
             runtime,
