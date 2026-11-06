@@ -113,7 +113,8 @@ pub struct ServeArgs {
     /// Requests served at once (llama-server's --parallel): each gets a slot
     /// with its own KV cache and state at the full context, and the running
     /// ones advance together, one forward pass per token for all of them.
-    /// VRAM for the caches grows with N. Turns MTP off.
+    /// VRAM for the caches grows with N. A request running alone decodes as
+    /// with --parallel 1 (MTP with --draft included); batched steps do not draft.
     #[arg(long, visible_alias = "np", default_value_t = 1)]
     pub parallel: usize,
 
@@ -214,6 +215,9 @@ struct SlotInfo {
 
 struct AppState {
     runtime: Arc<Mutex<Runtime>>,
+    /// The runtime's tokenizer, usable while a generation holds the runtime
+    /// (with --parallel, a request has to reach the scheduler to be batched).
+    tokenizer: Arc<airun_core::tokenizer::Tokenizer>,
     /// With --parallel above 1: the scheduler that runs generations.
     sched: Option<std::sync::Mutex<std::sync::mpsc::Sender<crate::sched::Job>>>,
     /// The vision encoder, with --mmproj.
@@ -705,6 +709,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         }],
     });
 
+    let tokenizer = Arc::clone(&runtime.tokenizer);
     let shared_rt = Arc::new(Mutex::new(runtime));
     let sched = (args.parallel > 1).then(|| std::sync::Mutex::new(crate::sched::spawn(Arc::clone(&shared_rt))));
     let state = Arc::new(AppState {
@@ -712,6 +717,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         vision,
         image_memo: std::sync::Mutex::new(Vec::new()),
         runtime: shared_rt,
+        tokenizer,
         model_name: model_name.clone(),
         api_key: args.api_key.clone(),
         default_max_tokens: args.default_max_tokens,
@@ -1333,11 +1339,11 @@ async fn tokenize(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
     let content = req.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
     let add_special = req.get("add_special").and_then(Value::as_bool).unwrap_or(false);
     let with_pieces = req.get("with_pieces").and_then(Value::as_bool).unwrap_or(false);
-    let rt = state.runtime.lock().await;
-    let ids = rt.tokenizer.encode(&content, add_special);
+    let tk = &*state.tokenizer;
+    let ids = tk.encode(&content, add_special);
     let tokens: Vec<Value> = if with_pieces {
         ids.iter().map(|&id| {
-            let bytes = rt.tokenizer.decode_bytes(&[id]);
+            let bytes = tk.decode_bytes(&[id]);
             let piece = match String::from_utf8(bytes.clone()) {
                 Ok(s) => Value::String(s),
                 // A piece that is part of a multi-byte character, as bytes.
@@ -1358,8 +1364,7 @@ async fn detokenize(State(state): State<Arc<AppState>>, headers: HeaderMap, body
     let req = match parse_body(&body) { Ok(v) => v, Err(e) => return e };
     let ids: Vec<u32> = req.get("tokens").and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|t| t.as_u64().map(|x| x as u32)).collect()).unwrap_or_default();
-    let rt = state.runtime.lock().await;
-    let content = rt.tokenizer.decode(&ids, false);
+    let content = state.tokenizer.decode(&ids, false);
     Json(json!({ "content": content })).into_response()
 }
 
@@ -1717,23 +1722,23 @@ async fn native_completion(State(state): State<Arc<AppState>>, headers: HeaderMa
     let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
     let images = request_images(&req);
     let (prompt_text, tokens) = {
-        let rt = state.runtime.lock().await;
+        let rt = &*state.tokenizer;
         match req.get("prompt") {
-            Some(Value::String(s)) if !images.is_empty() => match crate::media::tokenize(&rt, s, &images, true) {
+            Some(Value::String(s)) if !images.is_empty() => match crate::media::tokenize(rt, s, &images, true) {
                 Ok(t) => (s.clone(), t),
                 Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("{e:#}"), "invalid_request_error"),
             },
-            Some(Value::String(s)) => (s.clone(), rt.tokenizer.encode(s, true)),
+            Some(Value::String(s)) => (s.clone(), rt.encode(s, true)),
             // Token ids, or a mix of ids and strings, as llama-server takes.
             Some(Value::Array(a)) if a.iter().all(|x| x.is_u64() || x.is_string()) && !a.is_empty() => {
                 let mut ids = Vec::new();
                 for x in a {
                     match x {
-                        Value::String(s) => ids.extend(rt.tokenizer.encode(s, ids.is_empty())),
+                        Value::String(s) => ids.extend(rt.encode(s, ids.is_empty())),
                         v => ids.push(v.as_u64().unwrap_or(0) as u32),
                     }
                 }
-                (rt.tokenizer.decode(&ids, false), ids)
+                (rt.decode(&ids, false), ids)
             }
             _ => return api_error(StatusCode::BAD_REQUEST, "\"prompt\" must be a string, a list of tokens, \
                 or a list of mixed strings and tokens", "invalid_request_error"),
@@ -1759,9 +1764,9 @@ async fn infill(State(state): State<Arc<AppState>>, headers: HeaderMap, body: ax
     };
     let field = |k: &str| req.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     let (prompt_text, tokens) = {
-        let rt = state.runtime.lock().await;
-        let enc = |s: &str| rt.tokenizer.encode(s, false);
-        let mut t = rt.tokenizer.encode("", true);
+        let tk = &*state.tokenizer;
+        let enc = |s: &str| tk.encode(s, false);
+        let mut t = tk.encode("", true);
         if let Some(repo) = fim.repo {
             t.push(repo);
             t.extend(enc("myproject\n"));
@@ -1783,7 +1788,7 @@ async fn infill(State(state): State<Arc<AppState>>, headers: HeaderMap, body: ax
         t.extend(enc(&field("input_suffix")));
         t.push(fim.middle);
         t.extend(enc(&field("prompt")));
-        (rt.tokenizer.decode(&t, false), t)
+        (tk.decode(&t, false), t)
     };
     native_generate(state, req, prompt_text, tokens).await
 }
@@ -1912,7 +1917,7 @@ async fn oai_completions(State(state): State<Arc<AppState>>, headers: HeaderMap,
     if prompt.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "\"prompt\" must be provided", "invalid_request_error");
     }
-    let tokens = state.runtime.lock().await.tokenizer.encode(&prompt, true);
+    let tokens = state.tokenizer.encode(&prompt, true);
     let max = req.get("max_tokens").or_else(|| req.get("n_predict")).and_then(Value::as_u64)
         .map_or(state.default_max_tokens, |m| m as usize);
     // `logprobs` is the number of alternatives here (chat's is a flag).
@@ -2276,8 +2281,7 @@ impl ChatJob {
 async fn chat_job(state: &AppState, req: &Value, n_probs: Option<usize>) -> Result<ChatJob, Response> {
     let (prompt, opened, native_effort) = chat_prompt_ex(state, req)?;
     let tokens = {
-        let rt = state.runtime.lock().await;
-        crate::media::tokenize(&rt, &prompt, &request_images(req), true)
+        crate::media::tokenize(&state.tokenizer, &prompt, &request_images(req), true)
             .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("{e:#}"), "invalid_request_error"))?
     };
     let max = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).or_else(|| req.get("n_predict"))
@@ -2309,8 +2313,7 @@ async fn chat_job(state: &AppState, req: &Value, n_probs: Option<usize>) -> Resu
         if budget.is_some() || reasoning_control {
             let message = req.get("reasoning_budget_message").and_then(Value::as_str)
                 .unwrap_or(&state.reasoning_budget_message);
-            let rt = state.runtime.lock().await;
-            let mut forced = if message.is_empty() { Vec::new() } else { rt.tokenizer.encode(message, false) };
+            let mut forced = if message.is_empty() { Vec::new() } else { state.tokenizer.encode(message, false) };
             forced.extend_from_slice(end);
             spec.reasoning = Some(airun_core::ReasoningBudget {
                 start: start.clone(), end: end.clone(), forced, budget, stop: Arc::clone(&stop), opened,
@@ -2374,7 +2377,7 @@ fn stream_chat(state: &AppState, job: &ChatJob, mut emit: impl FnMut(Delta, Vec<
 /// The tokens of a chat prompt, for the `input_tokens` endpoints.
 async fn count_chat_tokens(state: &AppState, req: &Value) -> Result<usize, Response> {
     let (prompt, _) = chat_prompt(state, req)?;
-    Ok(state.runtime.lock().await.tokenizer.encode(&prompt, true).len())
+    Ok(state.tokenizer.encode(&prompt, true).len())
 }
 
 fn generation_failed(e: impl std::fmt::Display) -> Response {
@@ -3085,11 +3088,11 @@ mod tests {
 
     #[test]
     fn holding_back_never_splits_a_character() {
-        let stops = vec!["…done".to_string()];
-        let text = "wait …do";
+        let stops = vec!["â€¦done".to_string()];
+        let text = "wait â€¦do";
         let hold = ambiguous_tail(text, &stops);
         assert!(text.is_char_boundary(text.len() - hold));
-        assert_eq!(&text[text.len() - hold..], "…do");
+        assert_eq!(&text[text.len() - hold..], "â€¦do");
     }
 
     #[test]

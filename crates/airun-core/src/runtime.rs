@@ -47,6 +47,8 @@ struct SlotStore {
     history: Vec<u32>,
     rope_shift: i32,
     image_spans: Vec<(usize, usize, i32)>,
+    /// Its own turn snapshot, so a request on another slot does not take it.
+    turn_snap: Option<TurnSnapshot>,
 }
 
 /// A hybrid's recurrent state (delta-net matrices and convolutions, QSA keys,
@@ -304,6 +306,13 @@ struct DeviceState {
     v: DeviceBuffer<f32>,
     attn: DeviceBuffer<f32>,
     attn_partial: DeviceBuffer<f32>,
+    /// With --parallel: per local layer, 2 x slots device pointers -- a
+    /// decode_rows step's K (or delta-net state) caches for rows 0..n, then
+    /// its V (or convolution) ones -- rewritten before each step, so the
+    /// batched kernels can reach every row's own state in one launch.
+    rows_tab: Option<DeviceBuffer<u64>>,
+    /// attn_partial for every slot at once, for the batched attention.
+    rows_partial: Option<DeviceBuffer<f32>>,
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
     positions: DeviceBuffer<i32>,
@@ -343,6 +352,33 @@ struct DecodeGraph {
     position: airun_cuda::PinnedBuffer<i32>,
 }
 
+/// Captured [`Runtime::decode_rows`] passes, one per list of slots (in row
+/// order), each a graph per shard as [`DecodeGraph`]. Every per-row state
+/// buffer belongs to its slot for good (switch_slot moves the handles, not
+/// the memory) and positions come from device buffers, so a graph stays good
+/// for as long as the same slots decode together. Without them a batched
+/// step issued ~2 launches per row and stateful layer one by one.
+struct MixedGraphs {
+    entries: Vec<(Vec<usize>, Vec<Option<airun_cuda::Graph>>)>,
+    tokens: airun_cuda::PinnedBuffer<i32>,
+    positions: airun_cuda::PinnedBuffer<i32>,
+}
+
+/// Slot lists kept captured at once; the oldest goes first.
+const MIXED_GRAPHS: usize = 8;
+
+/// AIRUN_NO_ROWS_BATCH=1 runs decode_rows' stateful kernels once per row.
+fn rows_batched_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("AIRUN_NO_ROWS_BATCH").is_ok_and(|v| v.trim() != "0"))
+}
+
+/// AIRUN_NO_ROWS_GRAPH=1 runs decode_rows without graphs.
+fn mixed_graphs_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("AIRUN_NO_ROWS_GRAPH").is_ok_and(|v| v.trim() != "0"))
+}
+
 /// Whether AIRUN_NO_GRAPH=1 turned off decode graph capture.
 fn graphs_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -365,7 +401,8 @@ pub type PrefillHook = Box<dyn FnMut(PrefillProgress) + Send>;
 
 pub struct Runtime {
     pub model: Model,
-    pub tokenizer: Tokenizer,
+    /// Shared, so a server can tokenize while a generation holds the runtime.
+    pub tokenizer: std::sync::Arc<Tokenizer>,
     states: Vec<DeviceState>,
     ctx: usize,
     max_batch: usize,
@@ -376,6 +413,9 @@ pub struct Runtime {
     history: Vec<u32>,
     /// Captured decode step; built on the first single-token forward.
     decode_graph: Option<DecodeGraph>,
+    mixed_graphs: Option<MixedGraphs>,
+    /// A batched step failed to capture once; they run uncaptured since.
+    mixed_graph_off: bool,
     /// Hybrids only: the recurrent state at the last turn boundary prefilled.
     turn_snap: Option<TurnSnapshot>,
     /// Greedy decoding's pick on the device, its pinned landing slot and the
@@ -385,6 +425,9 @@ pub struct Runtime {
     chain: Option<ChainGraph>,
     /// Pinned landing buffer for the logits a sampler reads, reused per token.
     logits_host: Option<airun_cuda::PinnedBuffer<f32>>,
+    /// decode_rows' logits, on the output device and pinned on the host,
+    /// kept: allocating them each step synchronized the device (cudaFree).
+    rows_logits: Option<(DeviceBuffer<f32>, airun_cuda::PinnedBuffer<f32>)>,
     /// Set during a speculative verify: delta-net layers stash their inputs
     /// instead of advancing their state.
     defer: bool,
@@ -697,6 +740,8 @@ impl Runtime {
                 v: DeviceBuffer::new(dev, b * v_width)?,
                 attn: DeviceBuffer::new(dev, b * attn_width)?,
                 attn_partial: DeviceBuffer::new(dev, cfg.n_head * ops::attention_splits(ctx) * (cfg.head_dim + 2))?,
+                rows_tab: None,
+                rows_partial: None,
                 gate: DeviceBuffer::new(dev, b * ffn_width.max(1))?,
                 up: DeviceBuffer::new(dev, b * ffn_width.max(1))?,
                 positions: DeviceBuffer::new(dev, b)?,
@@ -737,13 +782,16 @@ impl Runtime {
 
         Ok(Self {
             model,
-            tokenizer,
+            tokenizer: std::sync::Arc::new(tokenizer),
             states,
             ctx,
             max_batch,
             n_past: 0,
             history: Vec::new(),
             decode_graph: None,
+            mixed_graphs: None,
+            rows_logits: None,
+            mixed_graph_off: false,
             turn_snap: None,
             pick: None,
             chain: None,
@@ -1757,7 +1805,8 @@ impl Runtime {
     /// --parallel). Each slot gets its own KV cache and recurrent state at the
     /// full context; the planner must have counted them (Config::slots).
     /// [`Self::decode_rows`] then advances several slots in one forward pass.
-    /// Speculative decoding is turned off: its head keeps one sequence.
+    /// The MTP head keeps one sequence: it drafts only in a plain
+    /// [`Self::generate`] on one slot, and goes stale on every slot switch.
     pub fn set_slots(&mut self, n: usize) -> Result<()> {
         let n = n.max(1);
         let cfg = &self.model.config;
@@ -1778,8 +1827,19 @@ impl Runtime {
             self.slots.push(SlotStore { states: sets, ..Default::default() });
         }
         self.slots.truncate(n);
-        if n > 1 {
-            self.draft = 0;
+        // Their graphs held the dropped or new slots' buffers.
+        self.mixed_graphs = None;
+        for st in &mut self.states {
+            if n > 1 {
+                device::set_device(st.device)?;
+                let cfg = &self.model.config;
+                st.rows_tab = Some(DeviceBuffer::zeroed(st.device, st.layers.len().max(1) * 2 * n, &st.stream)?);
+                st.rows_partial = Some(DeviceBuffer::new(st.device,
+                    n * cfg.n_head * ops::attention_splits(self.ctx) * (cfg.head_dim + 2))?);
+            } else {
+                st.rows_tab = None;
+                st.rows_partial = None;
+            }
         }
         Ok(())
     }
@@ -1799,10 +1859,11 @@ impl Runtime {
 
     /// How much of `tokens` slot `s` already holds (see [`Self::reusable_prefix`]).
     pub fn slot_prefix(&self, s: usize, tokens: &[u32]) -> usize {
-        let hist = self.slot_history(s);
-        let limit = tokens.len().saturating_sub(1);
-        let common = hist.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(limit);
-        if self.model.config.is_hybrid() && common < hist.len() { 0 } else { common }
+        if s == self.active_slot {
+            self.reusable_prefix(tokens)
+        } else {
+            self.prefix_of(&self.slots[s].history, self.slots[s].turn_snap.as_ref(), tokens)
+        }
     }
 
     /// Zeroed layer states for shard `si`, as the runtime allocates them.
@@ -1859,9 +1920,15 @@ impl Runtime {
         self.slots[a].history = std::mem::take(&mut self.history);
         self.slots[a].rope_shift = self.rope_shift;
         self.slots[a].image_spans = std::mem::take(&mut self.image_spans);
+        self.slots[a].turn_snap = self.turn_snap.take();
         self.n_past = self.slots[s].n_past;
         self.history = std::mem::take(&mut self.slots[s].history);
         self.image_spans = std::mem::take(&mut self.slots[s].image_spans);
+        self.turn_snap = self.slots[s].turn_snap.take();
+        if let Some(snap) = self.turn_snap.as_mut() {
+            // The MTP head's cache is one for every slot; others wrote it since.
+            snap.pending = false;
+        }
         let shift = self.slots[s].rope_shift;
         self.active_slot = s;
         self.decode_graph = None;
@@ -1889,13 +1956,21 @@ impl Runtime {
         let start = std::time::Instant::now();
         let mut done = self.prefill_images(prompt, cached)?;
         let mut logits = Vec::new();
+        // As generate: the state before the last header, for the next turn.
+        let snap_at = self.snapshot_point(prompt, done);
         self.prefill_report(done, prompt.len(), cached, start);
         while done < prompt.len() {
-            let take = (prompt.len() - done).min(self.max_batch);
+            let mut take = (prompt.len() - done).min(self.max_batch);
+            if let Some(p) = snap_at.filter(|&p| p > done) {
+                take = take.min(p - done);
+            }
             let chunk = &prompt[done..done + take];
             done += take;
             if done < prompt.len() {
                 self.step(chunk)?;
+                if snap_at == Some(done) {
+                    self.take_snapshot(false)?;
+                }
             } else {
                 logits = self.forward_pinned(chunk)?.to_vec();
             }
@@ -1909,10 +1984,10 @@ impl Runtime {
     /// next-token logits, `vocab_size` floats a row. The matmuls read each
     /// weight once for all the rows -- what makes serving several requests
     /// faster than taking them in turn.
-    pub fn decode_rows(&mut self, rows: &[(usize, u32)]) -> Result<Vec<f32>> {
+    pub fn decode_rows(&mut self, rows: &[(usize, u32)]) -> Result<&mut [f32]> {
         if rows.len() == 1 {
             self.switch_slot(rows[0].0)?;
-            return Ok(self.forward_pinned(&[rows[0].1])?.to_vec());
+            return self.forward_pinned(&[rows[0].1]);
         }
         let n = rows.len();
         if n > self.max_batch {
@@ -1944,10 +2019,26 @@ impl Runtime {
             sp.synced = false;
         }
         let ids: Vec<i32> = rows.iter().map(|&(_, t)| t as i32).collect();
+        self.fill_rows_tab(rows)?;
         self.mixed = Some(rows.iter().map(|&(s, _)| s).collect());
         self.image_rows = Some(n);
         self.skip_logits = true;
-        let queued = self.queue_forward(&ids, &positions);
+        let graphed = !graphs_disabled() && !mixed_graphs_disabled() && !self.mixed_graph_off
+            && !self.states.iter().any(|s| s.moe.as_ref().is_some_and(|m| m.upload.is_some()));
+        let queued = if graphed {
+            let mut launched = false;
+            match self.queue_rows_graphed(&ids, &positions, &mut launched) {
+                // Nothing ran: the first shard did not capture.
+                Err(e) if !launched => {
+                    eprintln!("note: batched decode runs without CUDA graphs: {e}");
+                    self.mixed_graph_off = true;
+                    self.queue_forward(&ids, &positions)
+                }
+                r => r,
+            }
+        } else {
+            self.queue_forward(&ids, &positions)
+        };
         self.mixed = None;
         self.image_rows = None;
         self.skip_logits = false;
@@ -1964,40 +2055,150 @@ impl Runtime {
         self.rebalance_experts()?;
 
         let cfg = &self.model.config;
+        let vocab = cfg.vocab_size;
+        let n_embd = cfg.n_embd;
         let st = self.states.last().expect("a runtime has at least one device");
         device::set_device(st.device)?;
         let out_w = self.model.output_tensor();
-        let mut host = vec![0f32; n * cfg.vocab_size];
+        let need = n * vocab;
+        if self.rows_logits.as_ref().is_none_or(|(_, h)| h.len() < need) {
+            self.rows_logits = None;
+            self.rows_logits = Some((DeviceBuffer::<f32>::new(st.device, need)?, airun_cuda::PinnedBuffer::new(need)?));
+        }
+        let (dev, host) = self.rows_logits.as_mut().expect("allocated above");
+        // The matvec takes up to 8 rows at once (each weight read once for them).
         const ROWS: usize = 8;
-        let buf = DeviceBuffer::<f32>::new(st.device, ROWS.min(n) * cfg.vocab_size)?;
         for r0 in (0..n).step_by(ROWS) {
             let m = ROWS.min(n - r0);
-            ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr(r0 * cfg.n_embd), buf.as_mut_ptr(),
-                cfg.n_embd, cfg.vocab_size, m, out_w.row_bytes, &st.stream)?;
+            let out = dev.offset_ptr(r0 * vocab);
+            ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr(r0 * n_embd), out,
+                n_embd, vocab, m, out_w.row_bytes, &st.stream)?;
             if out_w.global_scale != 1.0 {
-                ops::scale(buf.as_mut_ptr(), out_w.global_scale, m * cfg.vocab_size, &st.stream)?;
+                ops::scale(out, out_w.global_scale, m * vocab, &st.stream)?;
             }
-            buf.copy_to_host(&mut host[r0 * cfg.vocab_size..(r0 + m) * cfg.vocab_size], &st.stream)?;
         }
+        dev.copy_to_host(&mut host.as_mut_slice()[..need], &st.stream)?;
         st.stream.synchronize()?;
-        Ok(host)
+        Ok(&mut host.as_mut_slice()[..need])
+    }
+
+    /// Writes each shard's `rows_tab` for these rows (see the field). Queued on
+    /// the shard's stream ahead of the step, which the previous step's
+    /// logits read has already waited out.
+    fn fill_rows_tab(&self, rows: &[(usize, u32)]) -> Result<()> {
+        let n = rows.len();
+        let stride = 2 * self.slots.len();
+        for si in 0..self.states.len() {
+            let st = &self.states[si];
+            let Some(tab) = st.rows_tab.as_ref() else { continue };
+            let mut host = vec![0u64; st.layers.len().max(1) * stride];
+            for local in 0..st.layers.len() {
+                for (b, &(slot, _)) in rows.iter().enumerate() {
+                    let (a, c) = match self.slot_state(slot, si, local) {
+                        LayerState::Kv { k, v, .. } => (k.as_ptr() as u64, v.as_ptr() as u64),
+                        LayerState::Delta { state, conv } => (state.as_ptr() as u64, conv.as_ptr() as u64),
+                    };
+                    host[local * stride + b] = a;
+                    host[local * stride + n + b] = c;
+                }
+            }
+            device::set_device(st.device)?;
+            tab.copy_from_host_at(0, &host, &st.stream)?;
+        }
+        Ok(())
+    }
+
+    /// Row `b`'s table entries for shard `si`'s `local`-th layer: the K /
+    /// delta-state pointers of the n rows, then the V / conv ones.
+    fn rows_tab_at(&self, si: usize, local: usize) -> Option<(*const std::ffi::c_void, *const std::ffi::c_void)> {
+        if rows_batched_disabled() {
+            return None;
+        }
+        let n = self.mixed.as_ref()?.len();
+        let tab = self.states[si].rows_tab.as_ref()?;
+        let base = local * 2 * self.slots.len();
+        Some((tab.offset_ptr(base) as *const _, tab.offset_ptr(base + n) as *const _))
+    }
+
+    /// [`Self::queue_forward`] for decode_rows (`self.mixed` set) through a
+    /// graph per shard captured for these slots. `launched` tells whether
+    /// any work was queued (when not, an error can be retried uncaptured).
+    fn queue_rows_graphed(&mut self, ids: &[i32], positions: &[i32], launched: &mut bool) -> Result<()> {
+        let key = self.mixed.clone().expect("decode_rows sets the rows");
+        let n = ids.len();
+        let mut mg = match self.mixed_graphs.take() {
+            Some(mg) => mg,
+            None => MixedGraphs {
+                entries: Vec::new(),
+                tokens: airun_cuda::PinnedBuffer::new(self.max_batch)?,
+                positions: airun_cuda::PinnedBuffer::new(self.max_batch)?,
+            },
+        };
+        // decode_rows waited for the previous replay (its logits), so the
+        // staging it copied from is free.
+        mg.tokens.as_mut_slice()[..n].copy_from_slice(ids);
+        mg.positions.as_mut_slice()[..n].copy_from_slice(positions);
+        let at = match mg.entries.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                if mg.entries.len() >= MIXED_GRAPHS {
+                    mg.entries.remove(0);
+                }
+                mg.entries.push((key, (0..self.states.len()).map(|_| None).collect()));
+                mg.entries.len() - 1
+            }
+        };
+        let mut result = Ok(());
+        for si in 0..self.states.len() {
+            if si > 0 {
+                result = self.handoff(si, n);
+                if result.is_err() { break; }
+            }
+            device::set_device(self.states[si].device)?;
+            if mg.entries[at].1[si].is_none() {
+                // Everything queue_shard touches lives in `self` or `mg`.
+                airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
+                let queued = self.queue_shard(si, &mg.tokens.as_slice()[..n], &mg.positions.as_slice()[..n],
+                    true, true, false);
+                let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
+                match queued.and_then(|_| Ok(ended?)) {
+                    Ok(g) => mg.entries[at].1[si] = Some(g),
+                    Err(e) => {
+                        mg.entries.remove(at);
+                        self.mixed_graph_off = true;
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            *launched = true;
+            result = mg.entries[at].1[si].as_ref().expect("graph was just built")
+                .launch(&self.states[si].stream).map_err(Into::into);
+            if result.is_err() { break; }
+        }
+        self.mixed_graphs = Some(mg);
+        result
     }
 
     pub fn reusable_prefix(&self, tokens: &[u32]) -> usize {
+        self.prefix_of(&self.history, self.turn_snap.as_ref(), tokens)
+    }
+
+    /// How much of `tokens` a sequence holding `history` (and `snap`) reuses.
+    fn prefix_of(&self, history: &[u32], snap: Option<&TurnSnapshot>, tokens: &[u32]) -> usize {
         let limit = tokens.len().saturating_sub(1);
-        let common = self
-            .history
+        let common = history
             .iter()
             .zip(tokens)
             .take_while(|(a, b)| a == b)
             .count()
             .min(limit);
 
-        if self.model.config.is_hybrid() && common < self.history.len() {
+        if self.model.config.is_hybrid() && common < history.len() {
             // The recurrent state is the whole history's; it can only go back
             // to the turn snapshot, when the prompt still agrees up to it.
-            return self.turn_snap.as_ref()
-                .filter(|s| s.tokens.len() <= common && self.history[..s.tokens.len()] == s.tokens[..])
+            return snap
+                .filter(|s| s.tokens.len() <= common && history[..s.tokens.len()] == s.tokens[..])
                 .map_or(0, |s| s.tokens.len());
         }
         common
@@ -2578,6 +2779,10 @@ impl Runtime {
             let (qw, kw) = (cfg.n_head * cfg.head_dim, cfg.n_head_kv * cfg.head_dim);
             let window = std::env::var("AIRUN_ATTN_WINDOW").ok()
                 .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
+            // Every row's attention in one launch when the kernel takes the shape.
+            let batched = self.rows_tab_at(si, local)
+                .filter(|_| ops::attention_split_rows_ok(cfg.n_head, cfg.n_head_kv, cfg.head_dim))
+                .zip(st.rows_partial.as_ref());
             for (b, &slot) in rows.iter().enumerate() {
                 let LayerState::Kv { k: kc, v: vc, .. } = self.slot_state(slot, si, local) else {
                     return Err(CoreError::Other("an attention layer was given a recurrent state".into()));
@@ -2594,10 +2799,17 @@ impl Runtime {
                     (!rope_off).then_some((rope_dim, rope, rope_interleaved)),
                     cfg.kv_type, stream,
                 )?;
-                ops::attention_split_sel(st.attn.offset_ptr(b * qw), &st.attn_partial,
-                    st.q.offset_ptr(b * qw), kc.as_ptr(), vc.as_ptr(), st.positions.offset_ptr(b),
-                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
-                    window, ops::attention_splits(self.ctx), cfg.kv_type, std::ptr::null(), stream)?;
+                if batched.is_none() {
+                    ops::attention_split_sel(st.attn.offset_ptr(b * qw), &st.attn_partial,
+                        st.q.offset_ptr(b * qw), kc.as_ptr(), vc.as_ptr(), st.positions.offset_ptr(b),
+                        cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
+                        window, ops::attention_splits(self.ctx), cfg.kv_type, std::ptr::null(), stream)?;
+                }
+            }
+            if let Some(((kv, _), partial)) = batched {
+                ops::attention_split_rows(st.attn.as_mut_ptr(), partial, st.q.as_ptr(), kv, st.positions.as_ptr(),
+                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(), window,
+                    ops::attention_splits(self.ctx), cfg.kv_type, rows.len(), stream)?;
             }
         } else {
             if !fused_prologue_disabled() {
@@ -2801,12 +3013,17 @@ impl Runtime {
             // its own slot's history.
             let local = self.states[si].layers.iter().position(|&x| x == layer)
                 .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
-            for (b, &slot) in rows.iter().enumerate() {
-                let LayerState::Delta { conv: c, .. } = self.slot_state(slot, si, local) else {
-                    return Err(CoreError::Other("a linear layer was given a KV cache".into()));
-                };
-                hybrid::causal_conv1d_ex(h.qkv.offset_ptr(b * ssm.qkv_dim()), l.conv1d.as_ptr(), c.as_mut_ptr(), 1,
-                    ssm.qkv_dim(), ssm.conv_kernel, silu, reverse, true, stream)?;
+            if let Some((_, convs)) = self.rows_tab_at(si, local) {
+                hybrid::causal_conv1d_rows(h.qkv.as_mut_ptr(), l.conv1d.as_ptr(), convs, rows.len(),
+                    ssm.qkv_dim(), ssm.conv_kernel, silu, reverse, stream)?;
+            } else {
+                for (b, &slot) in rows.iter().enumerate() {
+                    let LayerState::Delta { conv: c, .. } = self.slot_state(slot, si, local) else {
+                        return Err(CoreError::Other("a linear layer was given a KV cache".into()));
+                    };
+                    hybrid::causal_conv1d_ex(h.qkv.offset_ptr(b * ssm.qkv_dim()), l.conv1d.as_ptr(), c.as_mut_ptr(), 1,
+                        ssm.qkv_dim(), ssm.conv_kernel, silu, reverse, true, stream)?;
+                }
             }
             &h.qkv
         } else if n > 1 {
@@ -2897,7 +3114,17 @@ impl Runtime {
         if let Some(rows) = self.mixed.as_deref() {
             let local = self.states[si].layers.iter().position(|&x| x == layer)
                 .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
+            let batched = self.rows_tab_at(si, local).filter(|_|
+                hybrid::delta_rule_rows_ok(ssm.n_k_heads, ssm.n_v_heads, ssm.head_k_dim(), ssm.head_v_dim()));
+            if let Some((states, _)) = batched {
+                hybrid::delta_rule_rows(states, st.q.as_ptr(), st.k.as_ptr(), h.core.as_ptr(), h.decay.as_ptr(),
+                    h.beta.as_ptr(), st.attn.as_mut_ptr(), rows.len(), ssm.n_k_heads, ssm.n_v_heads,
+                    ssm.head_k_dim(), ssm.head_v_dim(), stream)?;
+            }
             for (b, &slot) in rows.iter().enumerate() {
+                if batched.is_some() {
+                    break;
+                }
                 let LayerState::Delta { state: sl, .. } = self.slot_state(slot, si, local) else {
                     return Err(CoreError::Other("a linear layer was given a KV cache".into()));
                 };
@@ -3206,6 +3433,24 @@ impl Runtime {
         sampler: &mut Sampler,
         mut on_token: impl FnMut(u32, &str) -> bool,
     ) -> Result<GenerationStats> {
+        let mut decoder = self.tokenizer.stream_decoder();
+        self.generate_with(prompt, max_tokens, sampler, &mut decoder, true, &mut on_token)
+    }
+
+    /// [`Self::generate`] with the caller's text decoder, for a generation
+    /// that may go on elsewhere (the --parallel scheduler pauses one when
+    /// another request arrives). With `flush` false the bytes of a character
+    /// cut at the end stay in `decoder`. The token `on_token` refuses is handed
+    /// out but not in the caches: what continues the generation feeds it.
+    pub fn generate_with(
+        &mut self,
+        prompt: &[u32],
+        max_tokens: usize,
+        sampler: &mut Sampler,
+        decoder: &mut crate::tokenizer::StreamDecoder,
+        flush: bool,
+        on_token: &mut dyn FnMut(u32, &str) -> bool,
+    ) -> Result<GenerationStats> {
         // Speculation keeps any sampler's distribution (Sampler::sample_draft)
         // but mirostat's, whose running state would follow rejected drafts.
         let has_images = prompt.iter().any(|&t| is_image_token(t));
@@ -3215,7 +3460,7 @@ impl Runtime {
                        does not run with drafts");
         }
         if can_spec && self.speculates() && !has_images {
-            return self.generate_spec(prompt, max_tokens, sampler, &mut on_token);
+            return self.generate_spec(prompt, max_tokens, sampler, decoder, flush, on_token);
         }
         let start = std::time::Instant::now();
 
@@ -3263,7 +3508,6 @@ impl Runtime {
         let mut history: Vec<u32> = prompt.iter().copied().filter(|&t| !is_image_token(t)).collect();
         // Streaming has to decode across tokens, not per token: a character can
         // straddle two of them, and decoding each alone would destroy it.
-        let mut decoder = self.tokenizer.stream_decoder();
         let mut last_token = 0u32;
 
         // Chained greedy steps queued and not yet read, oldest first: the slot
@@ -3333,9 +3577,11 @@ impl Runtime {
 
         // A generation that stops mid-character leaves bytes behind; emit them
         // rather than dropping text on the floor.
-        let tail = decoder.flush();
-        if !tail.is_empty() {
-            on_token(last_token, &tail);
+        if flush {
+            let tail = decoder.flush();
+            if !tail.is_empty() {
+                on_token(last_token, &tail);
+            }
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;

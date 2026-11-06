@@ -47,7 +47,7 @@ O airun é feito para a **família Qwen**. Arquiteturas (`general.architecture`)
 | Amostragem e geração restrita (GBNF, JSON schema) | testadas |
 | MTP (especulativo), também com temperatura | 27B: 26 → 68 tok/s guloso, 25,7 → 47,2 a temp 0,7 |
 | Visão (`mmproj` qwen3vl_merger) | lê texto em imagem como o llama.cpp |
-| `serve --parallel` | 4 pedidos: 2,2x o throughput, respostas iguais às de um por vez |
+| `serve --parallel` | 4 pedidos no 27B: ~85 tok/s somados (um sozinho com MTP: 38); um pedido sozinho igual a sem a flag (MTP incluso) |
 | Stream replay, níveis de raciocínio, barra de carga | testados |
 
 **Ainda não:** `qwen3moe`, áudio, LoRA, rerank, vídeo, Qwen3-VL com deepstack.
@@ -927,6 +927,122 @@ seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
   recusado, o token sai da distribuição sem ele; teste
   `sampling_against_a_draft_keeps_the_distribution` (200 mil sorteios).
   27B: 25,7 -> 47,2 tok/s a temp 0,7. Mirostat continua sem MTP.
+
+## `--parallel` sem perda para um pedido sozinho (2026-11-06, 5070 Ti + 5060)
+
+Medido com `serve`, pedidos de 200–300 tokens, base (`--parallel 1`) e
+`--parallel 4` alternados na mesma sessão (o PC estava em uso; rodadas com
+queda geral de ~35% foram descartadas).
+
+- **O que se perdia:** com `--parallel` > 1 o loader não carregava a cabeça
+  MTP e todo pedido passava pelo `decode_rows` (logits inteiros para o host,
+  sem argmax na GPU, sem a cadeia de grafos). 27B NVFP4 `--draft 4`, pedido
+  sozinho: guloso 38,6 -> 27,4 tok/s (-29%), temp 0,7 33,6 -> 27,4 (-18%).
+  Qwen3-4B Q8_0: guloso 134,5 -> 126,8 (-6%). Além disso o `slot_prefix`
+  ignorava o snapshot de turno: o mesmo prompt de novo ia para um slot vazio
+  (0 de 23 tokens do cache, prefill 340 contra 75 ms).
+- **Modo solo** (`sched.rs`, `solo`): sem ninguém ativo nem na fila, o pedido
+  roda por `Runtime::generate_with` no slot dele — o mesmo caminho do
+  `--parallel 1`. O callback olha o canal a cada token; chegou outro pedido,
+  devolve false, e o token recusado (entregue, fora dos caches) vira o `next`
+  do passo em lote, como já era. `generate_with` recebe o `StreamDecoder` de
+  fora e não esvazia a cauda, para um caractere cortado na pausa continuar.
+  Quando os outros terminam, o que sobrou volta ao solo com o prompt =
+  histórico do slot + `next` (prefill de 1 token). MTP nessa volta só se a
+  cabeça cobre o cache (`spec_keeps_prefix`) ou se refazer custa até 256
+  tokens (`REDO_FOR_DRAFTS`): a cabeça é uma só e fica velha a cada troca de
+  slot ou passo em lote. `AIRUN_NO_PARALLEL_SOLO=1` desliga.
+- **Tokenizar sem o lock do runtime:** `Runtime::tokenizer` é `Arc` e o
+  `AppState` guarda uma cópia. Sem isso o solo, que segura o runtime durante a
+  geração, impedia o pedido novo de chegar à fila (os 4 simultâneos caíram a
+  42,6 tok/s, um atrás do outro).
+- **Snapshot por slot:** `SlotStore::turn_snap`, trocado no `switch_slot`
+  (que zera o `pending` dele: a cabeça foi escrita por outros). `slot_begin`
+  também tira o snapshot, e `slot_prefix` usa a mesma regra do
+  `reusable_prefix` (`prefix_of`). 27B, `--parallel 2`, duas conversas com
+  system prompt de 1.237 tokens, inclusive ao mesmo tempo: turno 2 com 1.243
+  do cache em cada uma.
+- **Grafo no passo em lote** (`queue_rows_graphed`, `MixedGraphs`): tudo que
+  depende da posição no caminho `mixed` vem de buffers na GPU (`positions`,
+  `mpos`) e os buffers de estado de cada slot nunca mudam de endereço (o
+  `switch_slot` move os handles), então um grafo por shard, por lista de slots
+  em ordem, vale enquanto os mesmos slots andam juntos (até 8 listas). Se a
+  captura falhar no primeiro shard, volta ao caminho antigo com uma `note:`.
+  `AIRUN_NO_ROWS_GRAPH=1` desliga. 4 pedidos (3 rodadas alternadas):
+
+  | Modelo | sem grafo | com grafo |
+  |---|---|---|
+  | 27B, temp 0,7 | 57,7–58,6 | **67,3–67,8** |
+  | 27B, guloso | 59,2–60,9 | **71,1–72,8** (texto idêntico ao sem grafo) |
+  | 4B, guloso | 146–217 | 161–246 (+10–13%, ruidoso) |
+
+- **Resultado, pedido sozinho:** 27B `--draft 4` guloso 38,2–38,7 contra
+  36,0–38,3 da base; temp 0,7 32,3–33,8 contra 32,8–33,6; 4B guloso
+  126,6/127,2 contra 123,9/127,6. Texto guloso idêntico ao da base.
+- **Ainda custa:** a VRAM do cache (N vezes, o contexto automático cai) e a
+  cabeça MTP, que agora carrega também com `--parallel` quando há `--draft`.
+  Atualizado na seção seguinte (passo em lote).
+- **Texto guloso com vários pedidos ao mesmo tempo difere do de um por vez**
+  (já era assim antes desta mudança, conferido com `AIRUN_NO_PARALLEL_SOLO=1`):
+  o lote soma em outra ordem e um quase-empate vira; depende também de quando
+  cada pedido entra. A frase "respostas iguais às de um por vez" da tabela do
+  §2 só vale para pedidos que não se sobrepõem.
+
+## Passo em lote do `--parallel`: onde ia o tempo (2026-11-06, 5070 Ti + 5060)
+
+Perfilado com nsys (`--cuda-graph-trace=node`) e `AIRUN_SCHED_TIMING=1`.
+27B NVFP4 `--tensor-split 5,2` (a cabeça BF16 fica na 5060), 4 pedidos. Os
+kernels com estado somavam só ~5% da GPU; o que pesava:
+
+- **Logits do lote: 13 ms por passo.** A saída BF16 (248k x 5120, 2,5 GB) com
+  4 linhas ia para o kernel em blocos de 16 tokens (`matvec_tiled`), e o
+  `decode_rows` alocava (`cudaMalloc`/`cudaFree`, que sincroniza) e copiava
+  para memória paginável a cada passo. Agora: `matvec_half_kernel` (BF16/F16,
+  1..8 tokens, 16 bytes por lane, cada peso lido uma vez para todos os
+  tokens; `AIRUN_NO_HALF_MATVEC=1` volta ao antigo) e buffers fixos
+  (`rows_logits`, GPU + host fixado), devolvidos como fatia. Com 1 token na
+  5070 Ti: 3,30 -> 3,02 ms (o antigo já dava 770 GB/s; ganho pequeno). Na 5060
+  os dois ficam em ~6 ms, que é a banda dela. **Cuidado:** o nsys deste PC
+  rotula as GPUs trocadas; confira pela banda.
+- **Matvec F32 estreito com várias linhas:** os portões da delta-net (48
+  saídas) com 4 tokens iam para o kernel em blocos com 3 blocos de grade:
+  55 us contra 5 com 1 token, ~2,8 ms por passo. `matvec_tallk_kernel` agora
+  pega até 16 tokens (`blockIdx.y`; `AIRUN_NO_TALLK_TOKENS=1` desliga). Isso
+  vale também para o **verify do MTP** (5 linhas), que caía no mesmo kernel de
+  3 blocos: 27B `--draft 4`, um pedido, 3 rodadas alternadas, guloso
+  41,2–41,9 -> **43,9–44,7** tok/s, temp 0,7 35,5–35,6 -> **37,3–38,3**; 4
+  pedidos 80–81 -> 84–86. O prefill de poucos tokens (o resto de um prompt
+  em cache) também passa por ele, então o texto guloso de um turno pode virar
+  num quase-empate em relação a antes (visto no 27B, no caractere 305).
+- **Atenção, delta-net e conv uma vez por linha:** `attention_split_rows`,
+  `delta_rule_rows`, `causal_conv1d_rows`, com a linha em `blockIdx.z`/`y` e
+  uma tabela de ponteiros por shard (`rows_tab`, K/estado das n linhas e
+  depois V/conv), reescrita antes de cada passo; os grafos guardam só o
+  endereço da tabela. A atenção de um token com contexto curto leva ~70 us
+  quase sem usar a GPU (4 blocos de um warp), então juntar as 4 linhas tira
+  ~3 ms por passo. Mesma aritmética: bit a bit igual (caso no selftest).
+  `AIRUN_NO_ROWS_BATCH=1` volta ao laço.
+- **Amostragem:** cada linha numa thread (`sample_rows`); custava pouco
+  (~1 ms para as 4), mas era serial.
+
+Resultado, sem log por passo, rodadas alternadas (t/s somados, guloso / temp
+0,7); texto guloso idêntico entre as variantes em todas as rodadas:
+
+| | tudo | sem lote (`NO_ROWS_BATCH`) | sem `matvec_half` |
+|---|---|---|---|
+| 27B, 4 pedidos (3 rodadas) | **81–86 / 89–92** | 75–80 / 84–88 | 79–82 / 85–90 |
+| 4B, 4 pedidos (2 rodadas) | **362–377 / 361–380** | 294–306 / 317–326 | 351 / 375–383 |
+
+Antes desta rodada o 4B com 4 pedidos dava 233–246, e o 27B 67–73
+(`-c 16384`, que deixa a atenção um pouco mais cara).
+
+- **Medir sem log por passo.** Com `AIRUN_SCHED_TIMING=1` (uma linha de
+  stderr por passo), o intervalo entre passos crescia de 45 para 50–62 ms
+  (p90 de +26 ms) e o t/s caía para 51–60. Use o log para ver a divisão do
+  passo, não para medir velocidade.
+- **Falta:** a admissão faz um prefill por vez (4 prompts curtos: ~1,5 s antes
+  do primeiro passo em lote), e o resto do passo é matvec dos pesos, que já
+  lê cada peso uma vez para todas as linhas.
 
 ## Medições de decode com MTP: reserve, draft, cabeça (2026-11-05, 2× 5060 Ti)
 

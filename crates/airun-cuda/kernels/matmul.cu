@@ -254,6 +254,10 @@ __global__ __launch_bounds__(128) void matvec_tallk_kernel(
 
     const int row = blockIdx.x;
     if (row >= n_rows) return;
+    // A few tokens (a --parallel step, an MTP verify): one per blockIdx.y. The
+    // row is small enough to come from L2 after the first.
+    x += (size_t)blockIdx.y * K;
+    y += (size_t)blockIdx.y * n_rows;
 
     const int groups = K / 32;
     const uint8_t* wr = w + (size_t)row * row_bytes;
@@ -281,6 +285,8 @@ __global__ __launch_bounds__(128) void matvec_tallk_kernel(
 }
 
 #define PREFILL_ROWS 4
+// Tokens up to which a narrow matrix stays on matvec_tallk_kernel.
+#define TALLK_TOKENS 16
 
 // Integer-path prefill tile, separate from the f32 one because the register
 // pressure differs: the dp4a kernel holds no decoded-float arrays, only the
@@ -919,6 +925,101 @@ __global__ void dequantize_kernel(
     X(AIRUN_TYPE_MXFP4)         \
     X(AIRUN_TYPE_NVFP4)
 
+// BF16 / F16 weights against 1..8 tokens: each lane loads 16 bytes (8 weights)
+// of a row per step, so a warp reads 512 contiguous bytes, and every weight
+// serves all M tokens. The group-at-a-time decode kernel had each lane fetch a
+// 64-byte group -- strided across the warp -- and re-read W once per token in
+// the tiled path: the 248k x 5120 BF16 output head of a Qwen3.8-27B took 6 ms
+// for one token (420 GB/s on an RTX 5070 Ti) and 13 ms for four.
+#define HALF_MV_R 4
+template <int TYPE, int M>
+__global__ __launch_bounds__(128) void matvec_half_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const size_t row_bytes) {
+
+    constexpr int R = HALF_MV_R;
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * R;
+    if (row0 >= n_rows) return;
+    const int n_row = min(R, n_rows - row0);
+
+    float acc[R][M];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
+
+    for (int k0 = threadIdx.x * 8; k0 < K; k0 += 256) {
+        // Every row's bytes requested before any arithmetic (see matvec_rows).
+        uint4 q[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            q[r] = *(const uint4*)(w + (size_t)(row0 + min(r, n_row - 1)) * row_bytes + (size_t)k0 * 2);
+        }
+        float xv[M][8];
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const float4* xp = (const float4*)(x + (size_t)m * K + k0);
+            const float4 a = xp[0], b = xp[1];
+            xv[m][0] = a.x; xv[m][1] = a.y; xv[m][2] = a.z; xv[m][3] = a.w;
+            xv[m][4] = b.x; xv[m][5] = b.y; xv[m][6] = b.z; xv[m][7] = b.w;
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint32_t u[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
+            float wv[8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if constexpr (TYPE == AIRUN_TYPE_BF16) {
+                    wv[2 * j + 0] = bf16_to_f32((uint16_t)(u[j] & 0xFFFF));
+                    wv[2 * j + 1] = bf16_to_f32((uint16_t)(u[j] >> 16));
+                } else {
+                    wv[2 * j + 0] = __half2float(__ushort_as_half((unsigned short)(u[j] & 0xFFFF)));
+                    wv[2 * j + 1] = __half2float(__ushort_as_half((unsigned short)(u[j] >> 16)));
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < M; ++m)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[r][m] = fmaf(wv[i], xv[m][i], acc[r][m]);
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (r >= n_row) break;
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const float s = warp_reduce_sum(acc[r][m]);
+            if (threadIdx.x == 0) y[(size_t)m * n_rows + row0 + r] = s;
+        }
+    }
+}
+
+// AIRUN_NO_TALLK_TOKENS=1 sends narrow matrices with 2+ tokens back to the
+// tiled kernel.
+static bool tallk_tokens_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_TALLK_TOKENS");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// AIRUN_NO_HALF_MATVEC=1 keeps BF16/F16 decode on the group kernels.
+static bool half_matvec_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_HALF_MATVEC");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 // AIRUN_NO_WMMA=1 keeps large batches on the register-tiled kernels, so the
 // tensor-core path can be measured against them without a rebuild.
 static bool airun_force_no_wmma() {
@@ -1305,9 +1406,11 @@ airun_status airun_matvec(
     const dim3 block(32, ROWS_PER_BLOCK);
     const int grid_rows = (n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
 
-    if (n_tokens == 1 && n_rows < 512) {
-        // Narrow decode matrices: one block per row (see matvec_tallk_kernel).
-        const dim3 tgrid(n_rows);
+    if ((n_tokens == 1 || (n_tokens <= TALLK_TOKENS && !tallk_tokens_disabled())) && n_rows < 512) {
+        // Narrow decode matrices: one block per row (see matvec_tallk_kernel),
+        // and per token. With 4 tokens the tiled kernel below ran 3 blocks:
+        // 55us for a 48-row delta-net gate, against 5us for one token.
+        const dim3 tgrid(n_rows, n_tokens);
         const dim3 tblock(128);
 
 #define LAUNCH(TYPE)                                                           matvec_tallk_kernel<TYPE><<<tgrid, tblock, 0, stream>>>(                       (const uint8_t*)w, (const float*)x, (float*)y,                             k, n_rows, (size_t)row_bytes);
@@ -1317,6 +1420,20 @@ airun_status airun_matvec(
             default: return AIRUN_ERR_BAD_TYPE;
         }
 #undef LAUNCH
+    } else if ((type_id == AIRUN_TYPE_BF16 || type_id == AIRUN_TYPE_F16) && n_tokens <= 8
+               && k % 256 == 0 && !half_matvec_disabled()) {
+        const dim3 hblock(32, 4);
+        const dim3 hgrid((n_rows + 4 * HALF_MV_R - 1) / (4 * HALF_MV_R));
+#define HALF_LAUNCH(TYPE, M) matvec_half_kernel<TYPE, M><<<hgrid, hblock, 0, stream>>>( \
+            (const uint8_t*)w, (const float*)x, (float*)y, k, n_rows, (size_t)row_bytes)
+#define HALF_CASES(TYPE) switch (n_tokens) { \
+            case 1: HALF_LAUNCH(TYPE, 1); break; case 2: HALF_LAUNCH(TYPE, 2); break; \
+            case 3: HALF_LAUNCH(TYPE, 3); break; case 4: HALF_LAUNCH(TYPE, 4); break; \
+            case 5: HALF_LAUNCH(TYPE, 5); break; case 6: HALF_LAUNCH(TYPE, 6); break; \
+            case 7: HALF_LAUNCH(TYPE, 7); break; default: HALF_LAUNCH(TYPE, 8); break; }
+        if (type_id == AIRUN_TYPE_BF16) { HALF_CASES(AIRUN_TYPE_BF16) } else { HALF_CASES(AIRUN_TYPE_F16) }
+#undef HALF_CASES
+#undef HALF_LAUNCH
     } else if (n_tokens == 1) {
         // Each warp covers ROWS_PER_WARP rows in this path.
         const int warps = (n_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;

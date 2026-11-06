@@ -68,7 +68,8 @@ modelo principal confere todos de uma vez. Os que ele aprova saem de graça.
   sem a cabeça (`--no-mtp`) e a cabeça num `mtp-<nome>.gguf` ao lado. O airun
   acha esse arquivo sozinho na pasta do modelo (confere se é do mesmo modelo),
   ou use `--mtp <arquivo>`.
-- **Sem MTP** quando há imagem no prompt ou com `serve --parallel` acima de 1.
+- **Sem MTP** quando há imagem no prompt. Com `serve --parallel` acima de 1, o
+  MTP só roda enquanto um pedido gera sozinho (veja abaixo).
 - Quando o MTP não pode rodar numa geração, o airun imprime uma `note:` dizendo
   por quê.
 
@@ -245,7 +246,18 @@ llama-server:
   sozinho 22,7 tok/s; 4 juntos somam 50,3 tok/s (cada um a ~13).
 - Um pedido novo vai para o slot que já tem o começo da conversa em cache, então
   o próximo turno de um chat não reprocessa o histórico.
-- Com N maior que 1 o MTP fica desligado, e modelos `qwen4exp` não aceitam.
+- **Um pedido sozinho roda como sem a flag:** sem ninguém gerando nem na fila,
+  ele passa pelo mesmo caminho do `--parallel 1` (MTP com `--draft`, escolha
+  gulosa na GPU, grafos de decode, snapshot de turno). Quando chega outro, ele
+  pausa no token que está entregando e os dois seguem juntos. No 27B NVFP4 com
+  `--draft 4` (5070 Ti + 5060): sozinho 38,3 tok/s com ou sem `--parallel 4`
+  (antes da mudança, 27,4 com a flag). `AIRUN_NO_PARALLEL_SOLO=1` desliga.
+- Os passos em lote não usam o MTP (a cabeça guarda uma sequência só). Um
+  pedido que voltou a ficar sozinho depois de um lote segue sem rascunho, a não
+  ser que refazer o que a cabeça perdeu custe até 256 tokens.
+- Cada slot guarda o próprio snapshot de turno (híbridos), então duas conversas
+  alternadas reaproveitam cada uma o seu histórico.
+- Modelos `qwen4exp` não aceitam N maior que 1.
 
 ### Cache de prompt
 
@@ -540,5 +552,11 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_NO_FUSED_PROLOGUE=1` | q/k norm, RoPE e escrita no cache em lançamentos separados. |
 | `AIRUN_NO_FUSED_NORMS=1` | Soma residual e RMSNorm seguinte em dois lançamentos. |
 | `AIRUN_NO_GRAPH=1` | O decode lança os kernels um a um em vez de repetir um CUDA graph capturado. |
+| `AIRUN_NO_ROWS_GRAPH=1` | O passo em lote do `serve --parallel` (`decode_rows`) lança os kernels um a um. Por padrão é um grafo por lista de slots: 4 pedidos no 27B de 59 para 70 tok/s somados. |
+| `AIRUN_NO_ROWS_BATCH=1` | No passo em lote, atenção, delta-net e convolução rodam um kernel por linha em vez de um para todas (mesmo resultado; 4 pedidos no 4B: 300 contra 370 tok/s). |
+| `AIRUN_NO_TALLK_TOKENS=1` | Matrizes estreitas (menos de 512 linhas, como os portões da delta-net) com 2 a 16 tokens voltam ao kernel em blocos. Por padrão ficam no de um bloco por linha e token: verify do MTP no 27B +7%. |
+| `AIRUN_NO_HALF_MATVEC=1` | Matrizes BF16/F16 com 1 a 8 tokens (a cabeça de saída de vários GGUF) voltam aos kernels por grupo. |
+| `AIRUN_SCHED_TIMING=1` | Uma linha por passo em lote do `serve --parallel`: forward, amostragem, entrega. Atrapalha a medição de velocidade. |
+| `AIRUN_NO_PARALLEL_SOLO=1` | Com `serve --parallel`, um pedido sozinho também passa pelo passo em lote (sem MTP, logits copiados para o host). |
 | `AIRUN_NO_GPU_ARGMAX=1` | Decodificação gulosa copia os logits para o host e escolhe lá. |
 | `AIRUN_NO_DECODE_PIPELINE=1` | Decodificação gulosa espera cada token antes de enfileirar o passo seguinte. Com o pipeline o passo i+1 lê o token do passo i direto da GPU; o texto gerado é idêntico. Não roda em híbridos (o estado recorrente absorveria o passo especulativo). |

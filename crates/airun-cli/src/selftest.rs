@@ -135,6 +135,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_matmul_fp4(args.device, &stream, &mut report)?;
     test_matmul_fp4_glu(args.device, &stream, &mut report)?;
     test_matvec_batch(args.device, &stream, &mut report)?;
+    test_matvec_few_tokens(args.device, &stream, &mut report)?;
 
     println!("\n== elementwise and norms ==");
     test_rmsnorm(args.device, &stream, &mut report)?;
@@ -158,6 +159,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_delta_defer(args.device, &stream, &mut report)?;
     test_conv_oop(args.device, &stream, &mut report)?;
     test_delta_head_broadcast(args.device, &stream, &mut report)?;
+    test_rows_batched(args.device, &stream, &mut report)?;
     test_rmsnorm_gated(args.device, &stream, &mut report)?;
     test_split_head_gate(args.device, &stream, &mut report)?;
 
@@ -1365,6 +1367,149 @@ fn test_delta_defer(device: i32, stream: &Stream, report: &mut Report) -> Result
     report.case("delta rule + conv: verify leaves state, commit replays it",
         format!("state untouched {untouched}, history untouched {hist_untouched}, outputs equal {same_out},                  committed state equal {same_state}"),
         untouched && hist_untouched && same_out && same_state);
+    Ok(())
+}
+
+/// matvec with 1..8 tokens, as a --parallel step or an MTP verify feeds it:
+/// BF16/F16 matrices of 512+ rows go to matvec_half_kernel, narrow ones to
+/// matvec_tallk_kernel (one block per row and token). Against the f64 CPU
+/// product, held to f32 accumulation error.
+fn test_matvec_few_tokens(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const K: usize = 512;
+    for (ty, n_rows) in [(GgmlType::BF16, 600usize), (GgmlType::F16, 600), (GgmlType::F32, 48), (GgmlType::Q8_0, 48)] {
+        let layout = ty.layout().unwrap();
+        let blocks_per_row = K / layout.elements as usize;
+        let row_bytes = blocks_per_row * layout.bytes as usize;
+        let mut rng = Rng::new(0xFE_7000 + ty.id() as u64);
+        let mut packed = Vec::with_capacity(n_rows * row_bytes);
+        for _ in 0..n_rows {
+            packed.extend_from_slice(&random_blocks(&mut rng, ty, blocks_per_row));
+        }
+        let mut rows = vec![0f32; n_rows * K];
+        for r in 0..n_rows {
+            dequant::dequantize(ty, &packed[r * row_bytes..(r + 1) * row_bytes], K, &mut rows[r * K..(r + 1) * K])?;
+        }
+        let d_w = DeviceBuffer::<u8>::from_slice(device, &packed, stream)?;
+        let mut worst = 0f64;
+        for n_tok in [1usize, 2, 3, 4, 5, 8] {
+            let x = rng.floats(n_tok * K);
+            let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+            let d_y = DeviceBuffer::<f32>::new(device, n_tok * n_rows)?;
+            ops::matvec(ops::KernelType(ty.id() as i32), d_w.as_ptr(), d_x.as_ptr(), d_y.as_mut_ptr(),
+                K, n_rows, n_tok, row_bytes, stream)?;
+            let gpu = d_y.to_vec(stream)?;
+            for t in 0..n_tok {
+                for r in 0..n_rows {
+                    let (mut acc, mut mag) = (0f64, 0f64);
+                    for i in 0..K {
+                        let term = f64::from(rows[r * K + i]) * f64::from(x[t * K + i]);
+                        acc += term;
+                        mag += term.abs();
+                    }
+                    // f32 accumulation over K terms.
+                    let allowed = mag * K as f64 * f64::from(f32::EPSILON) + 1e-30;
+                    worst = worst.max((f64::from(gpu[t * n_rows + r]) - acc).abs() / allowed);
+                }
+            }
+        }
+        report.case(&format!("matvec 1..8 tokens {ty} ({n_rows} rows)"),
+            format!("error/bound {worst:.3}x"), worst <= 1.0);
+    }
+    Ok(())
+}
+
+/// decode_rows' batched stateful kernels -- delta rule, convolution and
+/// split attention for one token of each of several conversations, each row
+/// with its own state through a pointer table -- against the one-row kernels
+/// run row by row. Same arithmetic, so bit-identical.
+fn test_rows_batched(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const ROWS: usize = 4;
+    let mut rng = Rng::new(0x80_75_0001);
+    let up = |x: &[f32]| DeviceBuffer::<f32>::from_slice(device, x, stream);
+    let table = |p: &[u64]| DeviceBuffer::<u64>::from_slice(device, p, stream);
+
+    // Delta rule: 2 key heads, 4 value heads, 128 x 128 (the Qwen3.5 shape).
+    let (nk, nv, dk, dv) = (2usize, 4usize, 128usize, 128usize);
+    let q = up(&rng.floats(ROWS * nk * dk))?;
+    let k = up(&rng.floats(ROWS * nk * dk))?;
+    let v = up(&rng.floats(ROWS * nv * dv))?;
+    let decay = up(&(0..ROWS * nv).map(|_| 0.5 + rng.unit().abs() * 0.49).collect::<Vec<_>>())?;
+    let beta = up(&(0..ROWS * nv).map(|_| rng.unit().abs().max(0.01)).collect::<Vec<_>>())?;
+    let init: Vec<Vec<f32>> = (0..ROWS).map(|_| rng.floats(nv * dk * dv).iter().map(|x| x * 0.1).collect()).collect();
+    let (mut s_one, mut s_all) = (Vec::new(), Vec::new());
+    for st in &init {
+        s_one.push(up(st)?);
+        s_all.push(up(st)?);
+    }
+    let (o_one, o_all) = (DeviceBuffer::<f32>::new(device, ROWS * nv * dv)?, DeviceBuffer::<f32>::new(device, ROWS * nv * dv)?);
+    for (b, st) in s_one.iter().enumerate() {
+        airun_cuda::hybrid::delta_rule_ex(st.as_mut_ptr(), q.offset_ptr(b * nk * dk), k.offset_ptr(b * nk * dk),
+            v.offset_ptr(b * nv * dv), decay.offset_ptr(b * nv), beta.offset_ptr(b * nv),
+            o_one.offset_ptr(b * nv * dv), 1, nk, nv, dk, dv, true, stream)?;
+    }
+    let tab = table(&s_all.iter().map(|b| b.as_ptr() as u64).collect::<Vec<_>>())?;
+    airun_cuda::hybrid::delta_rule_rows(tab.as_ptr(), q.as_ptr(), k.as_ptr(), v.as_ptr(), decay.as_ptr(), beta.as_ptr(),
+        o_all.as_mut_ptr(), ROWS, nk, nv, dk, dv, stream)?;
+    let mut delta_same = o_one.to_vec(stream)? == o_all.to_vec(stream)?;
+    for (a, b) in s_one.iter().zip(&s_all) {
+        delta_same &= a.to_vec(stream)? == b.to_vec(stream)?;
+    }
+
+    // Convolution: 96 channels, width 4.
+    let (ch, ker) = (96usize, 4usize);
+    let raw = rng.floats(ROWS * ch);
+    let w = up(&rng.floats(ch * ker))?;
+    let hists: Vec<Vec<f32>> = (0..ROWS).map(|_| rng.floats(ch * (ker - 1))).collect();
+    let (x_one, x_all) = (up(&raw)?, up(&raw)?);
+    let (mut h_one, mut h_all) = (Vec::new(), Vec::new());
+    for h in &hists {
+        h_one.push(up(h)?);
+        h_all.push(up(h)?);
+    }
+    for (b, h) in h_one.iter().enumerate() {
+        airun_cuda::hybrid::causal_conv1d_ex(x_one.offset_ptr(b * ch), w.as_ptr(), h.as_mut_ptr(), 1, ch, ker,
+            true, false, true, stream)?;
+    }
+    let tab = table(&h_all.iter().map(|b| b.as_ptr() as u64).collect::<Vec<_>>())?;
+    airun_cuda::hybrid::causal_conv1d_rows(x_all.as_mut_ptr(), w.as_ptr(), tab.as_ptr(), ROWS, ch, ker, true, false, stream)?;
+    let mut conv_same = x_one.to_vec(stream)? == x_all.to_vec(stream)?;
+    for (a, b) in h_one.iter().zip(&h_all) {
+        conv_same &= a.to_vec(stream)? == b.to_vec(stream)?;
+    }
+
+    // Split attention: 8 query heads on 2 KV heads, head_dim 128, f16 caches
+    // of 300 cells, each row at its own position (one past a split boundary,
+    // one at the end).
+    let (heads, kvh, dim, ctx) = (8usize, 2usize, 128usize, 300usize);
+    let splits = ops::attention_splits(ctx);
+    let pos = [0i32, 63, 150, 299];
+    let qa = up(&rng.floats(ROWS * heads * dim))?;
+    let mut caches = Vec::new();
+    for _ in 0..ROWS {
+        let kc: Vec<half::f16> = rng.floats(kvh * ctx * dim).iter().map(|&x| half::f16::from_f32(x)).collect();
+        let vc: Vec<half::f16> = rng.floats(kvh * ctx * dim).iter().map(|&x| half::f16::from_f32(x)).collect();
+        caches.push((DeviceBuffer::from_slice(device, &kc, stream)?, DeviceBuffer::from_slice(device, &vc, stream)?));
+    }
+    let d_pos = DeviceBuffer::from_slice(device, &pos, stream)?;
+    let one_partial = DeviceBuffer::<f32>::new(device, heads * splits * (dim + 2))?;
+    let all_partial = DeviceBuffer::<f32>::new(device, ROWS * heads * splits * (dim + 2))?;
+    let (a_one, a_all) = (DeviceBuffer::<f32>::new(device, ROWS * heads * dim)?, DeviceBuffer::<f32>::new(device, ROWS * heads * dim)?);
+    let scale = 1.0 / (dim as f32).sqrt();
+    for (b, (kc, vc)) in caches.iter().enumerate() {
+        ops::attention_split(a_one.offset_ptr(b * heads * dim), &one_partial, qa.offset_ptr(b * heads * dim),
+            kc.as_ptr(), vc.as_ptr(), d_pos.offset_ptr(b), heads, kvh, dim, ctx, scale, 0, splits,
+            ops::KvType::F16, stream)?;
+    }
+    let mut ptrs: Vec<u64> = caches.iter().map(|(kc, _)| kc.as_ptr() as u64).collect();
+    ptrs.extend(caches.iter().map(|(_, vc)| vc.as_ptr() as u64));
+    let tab = table(&ptrs)?;
+    ops::attention_split_rows(a_all.as_mut_ptr(), &all_partial, qa.as_ptr(), tab.as_ptr(), d_pos.as_ptr(),
+        heads, kvh, dim, ctx, scale, 0, splits, ops::KvType::F16, ROWS, stream)?;
+    let attn_same = a_one.to_vec(stream)? == a_all.to_vec(stream)?;
+
+    report.case("decode_rows batched kernels match one row at a time",
+        format!("delta rule {delta_same}, convolution {conv_same}, split attention {attn_same}"),
+        delta_same && conv_same && attn_same);
     Ok(())
 }
 

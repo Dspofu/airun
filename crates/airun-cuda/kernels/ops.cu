@@ -639,6 +639,12 @@ __global__ void attention_merge_kernel(float* out, const float* partial,
     __shared__ float s_w[MERGE_MAX_SPLITS];
     __shared__ float s_total;
     const int head = blockIdx.x;
+    // Several rows (a --parallel step): row blockIdx.y, its own partials,
+    // output and position.
+    const size_t row = blockIdx.y;
+    partial += row * gridDim.x * splits * (head_dim + 2);
+    out += row * gridDim.x * head_dim;
+    positions += row;
     const float* base = partial + (size_t)head * splits * (head_dim + 2);
     const int active = min(MERGE_MAX_SPLITS,
                            attention_active_splits(positions, window, splits, keys_per_split, wave));
@@ -759,8 +765,19 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
     const float scale,
     const int sliding_window,
     const int32_t* __restrict__ idx,      // QSA: key j is cache row idx[j]; null = row j
-    const int wave) {                     // see attention_active_splits
+    const int wave,                       // see attention_active_splits
+    const uint8_t* const* __restrict__ kv_rows = nullptr) {  // rows mode: K then V cache per row
 
+    if (kv_rows) {
+        // Row blockIdx.z of a --parallel step: its query, position, partials
+        // and its own conversation's cache.
+        const size_t r = blockIdx.z;
+        q += r * n_heads * D;
+        positions += r;
+        partial += r * n_heads * gridDim.y * (D + 2);
+        k_cache = kv_rows[r];
+        v_cache = kv_rows[gridDim.z + r];
+    }
     using S = GqaShape<D>;
     constexpr int LD = S::LD;
     constexpr int DP = D / 64;             // half2 pairs per lane across a row
@@ -928,8 +945,9 @@ template <int D>
 static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q, const uint8_t* k,
                                      const uint8_t* v, const int32_t* pos, int heads, int kv_heads,
                                      int max_seq, float scale, int window, int splits,
-                                     const int32_t* idx, int* wave_out, cudaStream_t stream) {
-    const dim3 grid(kv_heads, splits);
+                                     const int32_t* idx, int* wave_out, cudaStream_t stream,
+                                     int rows = 1, const uint8_t* const* kv_rows = nullptr) {
+    const dim3 grid(kv_heads, splits, rows);
     const int G = heads / kv_heads;
     const size_t smem = (size_t)G * D * 4 + GqaShape<D>::T_BYTES + (size_t)G * GQA_TILE * 4;
 #define GQA_LAUNCH(KVT)                                                                     \
@@ -944,7 +962,7 @@ static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q
         const int wave = split_waves_disabled() ? 0 : max(1, per_sm * sms / kv_heads);    \
         *wave_out = wave;                                                                  \
         attention_decode_gqa_kernel<D, KVT><<<grid, 32, smem, stream>>>(                    \
-            partial, q, k, v, pos, heads, kv_heads, max_seq, scale, window, idx, wave);    \
+            partial, q, k, v, pos, heads, kv_heads, max_seq, scale, window, idx, wave, kv_rows); \
     } while (0)
     switch (kv_type) {
         case KV_Q8_0: GQA_LAUNCH(KV_Q8_0); break;
@@ -1724,6 +1742,37 @@ airun_status airun_attention_split(
     AIRUN_TRY(cudaGetLastError());
     attention_merge_kernel<<<heads, dim, 0, stream>>>((float*)out, (const float*)partial, dim, splits,
         (const int32_t*)positions, window, gqa ? GQA_KEYS_PER_SPLIT : 0, wave);
+    AIRUN_CHECK_LAUNCH();
+}
+
+// Decode attention for one token of each of `rows` conversations, row r
+// against its own cache (kv_rows: device array, `rows` K pointers then `rows`
+// V pointers), at positions[r]; `partial` holds rows x the one-row scratch.
+// The GQA kernel's shapes only; anything else is refused and the caller loops.
+airun_status airun_attention_split_rows(
+    void* out, void* partial, const void* q, const void* const* kv_rows,
+    const void* positions, int32_t heads, int32_t kv_heads, int32_t dim,
+    int32_t max_seq, float scale, int32_t window, int32_t splits, int32_t kv_type,
+    int32_t rows, cudaStream_t stream) {
+    if (rows <= 0) return AIRUN_OK;
+    if (dim <= 0 || dim % 32 || dim > 256 || kv_heads <= 0 || heads % kv_heads || splits <= 0)
+        return AIRUN_ERR_BAD_ARG;
+    if (kv_type < KV_F16 || kv_type > KV_Q4_0) return AIRUN_ERR_BAD_ARG;
+    const bool gqa = heads / kv_heads <= GQA_MAX && !gqa_decode_disabled() &&
+        (dim == 64 || dim == 128 || dim == 256);
+    if (!gqa) return AIRUN_ERR_BAD_ARG;
+    const float* qq = (const float*)q;
+    const int32_t* pp = (const int32_t*)positions;
+    const uint8_t* const* kv = (const uint8_t* const*)kv_rows;
+    float* part = (float*)partial;
+    int wave = 0;
+    cudaError_t e;
+    if (dim == 64)       e = launch_gqa_decode<64>(kv_type, part, qq, nullptr, nullptr, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, rows, kv);
+    else if (dim == 128) e = launch_gqa_decode<128>(kv_type, part, qq, nullptr, nullptr, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, rows, kv);
+    else                 e = launch_gqa_decode<256>(kv_type, part, qq, nullptr, nullptr, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, rows, kv);
+    AIRUN_TRY(e);
+    attention_merge_kernel<<<dim3(heads, rows), dim, 0, stream>>>((float*)out, (const float*)partial, dim, splits,
+        pp, window, GQA_KEYS_PER_SPLIT, wave);
     AIRUN_CHECK_LAUNCH();
 }
 

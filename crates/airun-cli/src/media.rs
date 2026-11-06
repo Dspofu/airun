@@ -81,12 +81,11 @@ pub fn encode_image(vision: &VisionModel, runtime: &mut Runtime, img: &Rgb) -> R
 }
 
 /// The prompt's tokens with each [`MARKER`] replaced by the next image.
-pub fn tokenize(runtime: &Runtime, text: &str, images: &[Vec<u32>], add_special: bool) -> Result<Vec<u32>> {
+pub fn tokenize(tk: &airun_core::tokenizer::Tokenizer, text: &str, images: &[Vec<u32>], add_special: bool) -> Result<Vec<u32>> {
     let parts: Vec<&str> = text.split(MARKER).collect();
     if parts.len() - 1 != images.len() {
         bail!("the prompt has {} image markers ({MARKER}) and {} images were given", parts.len() - 1, images.len());
     }
-    let tk = &runtime.tokenizer;
     let id = |s: &str| tk.id_of(s).with_context(|| format!("the model's vocabulary has no {s} token"));
     let (start, end) = if images.is_empty() { (0, 0) } else { (id("<|vision_start|>")?, id("<|vision_end|>")?) };
     let mut out = Vec::new();

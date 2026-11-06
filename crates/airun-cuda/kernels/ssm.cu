@@ -35,10 +35,15 @@ __global__ void causal_conv1d_kernel(
     const int kernel,
     const int apply_silu,
     const int reverse,
-    const int keep_state) {
+    const int keep_state,
+    float* const* __restrict__ states = nullptr) {  // rows mode: row blockIdx.y, one token each
 
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
+    if (states) {
+        state = states[blockIdx.y];
+        x += (size_t)blockIdx.y * channels;
+    }
 
     const int hist = kernel - 1;
     const float* w = weight + (size_t)c * kernel;
@@ -328,8 +333,19 @@ __global__ __launch_bounds__(256) void delta_rule_reg_kernel(
     const int n_v_heads,
     const int head_k_dim,
     const int head_v_dim,
-    const int keep_state) {
+    const int keep_state,
+    float* const* __restrict__ states = nullptr) {  // rows mode: row blockIdx.z, one token each
 
+    if (states) {
+        const size_t r = blockIdx.z;
+        state = states[r];
+        q += r * n_k_heads * head_k_dim;
+        k += r * n_k_heads * head_k_dim;
+        v += r * n_v_heads * head_v_dim;
+        out += r * n_v_heads * head_v_dim;
+        decay += r * n_v_heads;
+        beta += r * n_v_heads;
+    }
     // Value columns of the state never interact (each has its own memory
     // read, correction and output), so a head's columns split across
     // blockIdx.y: one block per head left 22 of a 70-SM card idle.
@@ -758,6 +774,47 @@ airun_status airun_delta_rule(
             (const float*)decay, (const float*)beta, (float*)out,
             n_tokens, n_k_heads, n_v_heads, head_k_dim, head_v_dim);
     }
+    AIRUN_CHECK_LAUNCH();
+}
+
+// One token for each of `rows` conversations, each with its own state
+// (states: device array of `rows` pointers): a --parallel decode step in one
+// launch instead of one per row. Only the register kernel's shapes (Qwen3.5 /
+// 3.8: 128 x 128); anything else is refused and the caller loops.
+airun_status airun_delta_rule_rows(
+    void* const* states, const void* q, const void* k, const void* v,
+    const void* decay, const void* beta, void* out,
+    int32_t rows, int32_t n_k_heads, int32_t n_v_heads,
+    int32_t head_k_dim, int32_t head_v_dim, cudaStream_t stream) {
+
+    if (rows <= 0) return AIRUN_OK;
+    if (n_k_heads <= 0 || n_v_heads <= 0 || n_v_heads % n_k_heads != 0) return AIRUN_ERR_BAD_ARG;
+    if (!(head_k_dim == 16 * DELTA_DK_PAR && head_v_dim % DELTA_COLS == 0)) return AIRUN_ERR_BAD_ARG;
+    const dim3 threads(DELTA_COLS, DELTA_DK_PAR);
+    const dim3 grid(n_v_heads, head_v_dim / DELTA_COLS, rows);
+    const size_t shared =
+        (2 * (size_t)head_k_dim + (size_t)(DELTA_DK_PAR + 1) * DELTA_COLS) * sizeof(float);
+    delta_rule_reg_kernel<16><<<grid, threads, shared, stream>>>(
+        nullptr, (const float*)q, (const float*)k, (const float*)v,
+        (const float*)decay, (const float*)beta, (float*)out,
+        1, n_k_heads, n_v_heads, head_k_dim, head_v_dim, 1, (float* const*)states);
+    AIRUN_CHECK_LAUNCH();
+}
+
+// causal_conv1d for one token of each of `rows` conversations, in place, row
+// r's history at states[r].
+airun_status airun_causal_conv1d_rows(
+    void* x, const void* weight, void* const* states,
+    int32_t rows, int32_t channels, int32_t kernel, int32_t apply_silu,
+    int32_t reverse, cudaStream_t stream) {
+
+    if (rows <= 0 || channels <= 0) return AIRUN_OK;
+    if (kernel < 1 || kernel > 8) return AIRUN_ERR_BAD_ARG;
+    const int threads = 256;
+    const dim3 grid((channels + threads - 1) / threads, rows);
+    causal_conv1d_kernel<<<grid, threads, 0, stream>>>(
+        (float*)x, (const float*)weight, nullptr,
+        1, channels, kernel, apply_silu, reverse, 1, (float* const*)states);
     AIRUN_CHECK_LAUNCH();
 }
 

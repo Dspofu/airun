@@ -28,6 +28,13 @@ unsafe extern "C" {
 
     fn airun_l2norm(x: *mut c_void, rows: i32, head_dim: i32, eps: f32, stream: ffi::Stream) -> Status;
 
+    fn airun_causal_conv1d_rows(x: *mut c_void, weight: *const c_void, states: *const *mut c_void,
+        rows: i32, channels: i32, kernel: i32, apply_silu: i32, reverse: i32, stream: ffi::Stream) -> Status;
+
+    fn airun_delta_rule_rows(states: *const *mut c_void, q: *const c_void, k: *const c_void,
+        v: *const c_void, decay: *const c_void, beta: *const c_void, out: *mut c_void, rows: i32,
+        n_k_heads: i32, n_v_heads: i32, head_k_dim: i32, head_v_dim: i32, stream: ffi::Stream) -> Status;
+
     fn airun_causal_conv1d_oop(x: *const c_void, out: *mut c_void, weight: *const c_void,
         state: *mut c_void, n_tokens: i32, channels: i32, kernel: i32, apply_silu: i32,
         reverse: i32, keep_state: i32, stream: ffi::Stream) -> Status;
@@ -404,6 +411,51 @@ pub fn delta_rule_ex(
     }
     #[cfg(not(airun_cuda))]
     needs_cuda!(state, q, k, v, decay, beta, out, n_tokens, keep_state, stream)
+}
+
+/// Whether [`delta_rule_rows`] takes these head shapes.
+pub fn delta_rule_rows_ok(n_k_heads: usize, n_v_heads: usize, head_k_dim: usize, head_v_dim: usize) -> bool {
+    n_k_heads > 0 && n_v_heads % n_k_heads == 0 && head_k_dim == 128 && head_v_dim % 32 == 0
+}
+
+/// [`delta_rule_ex`] for one token of each of `rows` conversations: row r's
+/// q/k/v/decay/beta/out are row r of the batch and its state is `states[r]`
+/// (a device array of `rows` pointers). One launch for a --parallel step.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_rule_rows(states: *const c_void, q: *const c_void, k: *const c_void, v: *const c_void,
+    decay: *const c_void, beta: *const c_void, out: *mut c_void, rows: usize, n_k_heads: usize,
+    n_v_heads: usize, head_k_dim: usize, head_v_dim: usize, stream: &Stream) -> Result<()> {
+    if !delta_rule_rows_ok(n_k_heads, n_v_heads, head_k_dim, head_v_dim) {
+        return Err(bad_arg(format!("batched delta rule needs 128-wide keys, got k={head_k_dim} v={head_v_dim}")));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: `states` holds `rows` device pointers to states of n_v_heads *
+    // head_k_dim * head_v_dim floats; the other buffers hold `rows` tokens.
+    unsafe {
+        ffi::check(airun_delta_rule_rows(states as *const *mut c_void, q, k, v, decay, beta, out, rows as i32,
+            n_k_heads as i32, n_v_heads as i32, head_k_dim as i32, head_v_dim as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(states, q, k, v, decay, beta, out, rows, stream)
+}
+
+/// [`causal_conv1d_ex`] in place for one token of each of `rows`
+/// conversations, row r's history at `states[r]` (device array of pointers).
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_rows(x: *mut c_void, weight: *const c_void, states: *const c_void, rows: usize,
+    channels: usize, kernel: usize, apply_silu: bool, reverse: bool, stream: &Stream) -> Result<()> {
+    if !(1..=8).contains(&kernel) {
+        return Err(bad_arg(format!("convolution kernel width {kernel} is outside the supported 1..=8")));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: `x` holds rows * channels floats, `states` rows pointers to
+    // channels * (kernel - 1) floats each.
+    unsafe {
+        ffi::check(airun_causal_conv1d_rows(x, weight, states as *const *mut c_void, rows as i32, channels as i32,
+            kernel as i32, apply_silu as i32, reverse as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(x, weight, states, rows, channels, apply_silu, reverse, stream)
 }
 
 /// RMSNorm over the last axis, fused with a SiLU gate.

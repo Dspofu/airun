@@ -36,6 +36,9 @@ unsafe extern "C" {
         positions: *const c_void, n_tokens: i32, n_heads: i32, n_kv_heads: i32, head_dim: i32,
         max_seq: i32, eps: f32, rope_dim: i32, rope: RopeParams,
         interleaved: i32, rope_on: i32, kv_type: i32, stream: ffi::Stream) -> Status;
+    fn airun_attention_split_rows(out: *mut c_void, partial: *mut c_void, q: *const c_void,
+        kv_rows: *const *const c_void, positions: *const c_void, heads: i32, kv_heads: i32, dim: i32,
+        max_seq: i32, scale: f32, window: i32, splits: i32, kv_type: i32, rows: i32, stream: ffi::Stream) -> Status;
     fn airun_attention_split(out: *mut c_void, partial: *mut c_void,
         q: *const c_void, k: *const c_void, v: *const c_void, positions: *const c_void,
         heads: i32, kv_heads: i32, dim: i32, max_seq: i32, scale: f32,
@@ -1081,6 +1084,34 @@ pub fn attention_split(out: *mut c_void, partial: &crate::DeviceBuffer<f32>,
     window: usize, splits: usize, kv_type: KvType, stream: &Stream) -> Result<()> {
     attention_split_sel(out, partial, q, k, v, positions, heads, kv_heads, dim, ctx, scale, window, splits,
         kv_type, std::ptr::null(), stream)
+}
+
+/// Whether [`attention_split_rows`] takes these shapes (the GQA decode kernel's).
+pub fn attention_split_rows_ok(heads: usize, kv_heads: usize, dim: usize) -> bool {
+    kv_heads > 0 && heads % kv_heads == 0 && heads / kv_heads <= 8 && matches!(dim, 64 | 128 | 256)
+        && std::env::var("AIRUN_NO_GQA_DECODE").is_err()
+}
+
+/// [`attention_split`] for one token of each of `rows` conversations: row r's
+/// query, output and position are row r, its cache `kv_rows[r]` (K) and
+/// `kv_rows[rows + r]` (V), a device array of pointers. `partial` must hold
+/// `rows` times the one-row scratch. One launch pair for a --parallel step.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_split_rows(out: *mut c_void, partial: &crate::DeviceBuffer<f32>, q: *const c_void,
+    kv_rows: *const c_void, positions: *const c_void, heads: usize, kv_heads: usize, dim: usize, ctx: usize,
+    scale: f32, window: usize, splits: usize, kv_type: KvType, rows: usize, stream: &Stream) -> Result<()> {
+    if !attention_split_rows_ok(heads, kv_heads, dim) || splits == 0 || splits > 256
+        || partial.len() < rows * heads * splits * (dim + 2) {
+        return Err(bad_arg("invalid batched split attention dimensions or scratch"));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: shapes and scratch checked above; the pointer table and the
+    // caches it names outlive the stream's work, as for attention_split.
+    unsafe { ffi::check(airun_attention_split_rows(out, partial.as_mut_ptr(), q, kv_rows as *const *const c_void,
+        positions, heads as i32, kv_heads as i32, dim as i32, ctx as i32, scale, window as i32, splits as i32,
+        kv_type.id(), rows as i32, stream.raw())) }
+    #[cfg(not(airun_cuda))]
+    { let _ = (out, q, kv_rows, positions, ctx, scale, window, kv_type, rows, stream); Err(CudaError::NotBuiltWithCuda) }
 }
 
 /// [`attention_split`] over the cells a QSA selection names: `sel` is

@@ -127,8 +127,9 @@ pub fn load(
     if let Some(t) = config.ple.as_ref().and_then(|_| gguf.tensor("per_layer_token_embd.weight")) {
         sizes.other = sizes.other.saturating_sub(t.nbytes);
     }
-    // One MTP head keeps one sequence: several conversations decode plainly.
-    let draft_wanted = opts.draft != Some(0) && opts.slots <= 1;
+    // One MTP head keeps one sequence: with several slots it drafts for a
+    // request running alone (see sched.rs), and the batched steps decode plainly.
+    let draft_wanted = opts.draft != Some(0);
     let config_slots = opts.slots.max(1);
     let mut mtp_src = if draft_wanted { mtp_source(path, &gguf, &config, opts.mtp_file.as_deref())? } else { None };
     let moe_default = opts.draft.is_none() && config.moe.is_some();

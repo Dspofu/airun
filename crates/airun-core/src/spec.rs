@@ -109,6 +109,27 @@ impl Runtime {
         self.draft > 0 && self.model.mtp.is_some()
     }
 
+    pub fn draft(&self) -> usize {
+        self.draft
+    }
+
+    /// Whether a speculative [`Runtime::generate`] of `prompt` keeps the
+    /// prefix the caches already hold. It does only when the head's cache
+    /// covers that prefix too; otherwise it prefills the whole prompt again
+    /// (after another --parallel slot ran, say), and a long conversation is
+    /// better continued without drafts.
+    pub fn spec_keeps_prefix(&self, prompt: &[u32]) -> bool {
+        let cached = self.reusable_prefix(prompt);
+        if cached == 0 {
+            return true;
+        }
+        if cached < self.history.len() {
+            self.snapshot_has_head()
+        } else {
+            self.spec.as_ref().is_some_and(|s| s.synced)
+        }
+    }
+
     fn spec_init(&mut self) -> Result<()> {
         let k = self.draft;
         if self.spec.as_ref().is_some_and(|s| s.k == k) {
@@ -598,6 +619,8 @@ impl Runtime {
         prompt: &[u32],
         max_tokens: usize,
         sampler: &mut crate::sample::Sampler,
+        decoder: &mut crate::tokenizer::StreamDecoder,
+        flush: bool,
         on_token: &mut dyn FnMut(u32, &str) -> bool,
     ) -> Result<GenerationStats> {
         // Pure greedy compares the drafts with the GPU's argmaxes; anything
@@ -679,7 +702,6 @@ impl Runtime {
         let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let decode_start = std::time::Instant::now();
-        let mut decoder = self.tokenizer.stream_decoder();
         let mut generated = 0usize;
         let mut last_token = t;
         let (mut drafted, mut accepted) = (0usize, 0usize);
@@ -706,7 +728,7 @@ impl Runtime {
 
         // t is the newest token: handed out, not yet in the caches.
         hist.push(t);
-        if let Some(s) = emit(self, t, &mut generated, &mut decoder) {
+        if let Some(s) = emit(self, t, &mut generated, decoder) {
             stop = s;
         } else {
             // The head's row at n_past pairs the last prompt hidden with t.
@@ -768,7 +790,7 @@ impl Runtime {
                 let mut committed = 1; // t
                 let mut ended = None;
                 for &tok in &drafts[..a] {
-                    if let Some(s) = emit(self, tok, &mut generated, &mut decoder) {
+                    if let Some(s) = emit(self, tok, &mut generated, decoder) {
                         ended = Some(s);
                         break;
                     }
@@ -781,7 +803,7 @@ impl Runtime {
                     _ => picks[committed - 1],
                 };
                 if ended.is_none() {
-                    ended = emit(self, next, &mut generated, &mut decoder);
+                    ended = emit(self, next, &mut generated, decoder);
                     if ended.is_none() {
                         last_token = next;
                         hist.push(next);
@@ -838,9 +860,11 @@ impl Runtime {
             eprintln!("spec step: verify {:.2} ms, commit+absorb {:.2} ms, chain {:.2} ms ({steps} steps)",
                 ms(timing[0]), ms(timing[1]), ms(timing[2]));
         }
-        let tail = decoder.flush();
-        if !tail.is_empty() {
-            on_token(last_token, &tail);
+        if flush {
+            let tail = decoder.flush();
+            if !tail.is_empty() {
+                on_token(last_token, &tail);
+            }
         }
         Ok(GenerationStats {
             prompt_tokens: prompt.len(),

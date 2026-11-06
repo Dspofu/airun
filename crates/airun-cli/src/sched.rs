@@ -9,6 +9,14 @@
 //! (stop sequences, streaming, the response) as it did with one request at a
 //! time. The runtime lock is taken per step, so tokenize and the other small
 //! endpoints keep working between steps.
+//!
+//! A request with nobody else running or waiting runs alone through
+//! Runtime::generate on its slot, as without --parallel: the MTP head drafts,
+//! greedy picks stay on the GPU, the decode graphs and the turn snapshot work.
+//! The batched path reads every logit back and samples on the host, and the
+//! head keeps one sequence, so a lone request there lost up to 29% (27B with
+//! --draft 4: 38.6 -> 27.4 tok/s). When another request arrives the lone one
+//! pauses after the token it is handing out, and both go on in batched steps.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -48,6 +56,8 @@ struct Running {
     cached: usize,
     prefill_ms: f64,
     decode_start: Instant,
+    drafted: usize,
+    accepted: usize,
 }
 
 /// Starts the scheduler thread; the returned sender takes jobs.
@@ -66,6 +76,8 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
     let mut waiting: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     // When each slot last took a request (0: never), for admit's tie-break.
     let mut used = vec![0u64; slots];
+    let mut last_step = Instant::now();
+    let started = Instant::now();
     loop {
         // Take what has arrived; with nothing running, wait for a job.
         loop {
@@ -85,6 +97,27 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
                 Ok(j) => waiting.push_back(j),
                 Err(_) => return,
             }
+        }
+
+        // Alone: run it as without --parallel until someone else arrives.
+        if active.len() + waiting.len() == 1 && !solo_disabled() {
+            let r = match waiting.pop_front() {
+                Some(job) if job.cancel.load(Ordering::Relaxed) => {
+                    let _ = job.events.send(Event::Done(Err("cancelled".into())));
+                    continue;
+                }
+                Some(job) => {
+                    let rt = runtime.blocking_lock();
+                    let slot = pick_slot(&rt, &job.tokens, &active, &mut used);
+                    fresh(&rt, slot, job, 0, 0.0)
+                }
+                None => active.pop().expect("one is running"),
+            };
+            let mut rt = runtime.blocking_lock();
+            if let Some(r) = solo(&mut rt, r, &rx, &mut waiting) {
+                active.push(r);
+            }
+            continue;
         }
 
         // Admit one waiting job per step, so a long prompt delays the others'
@@ -113,8 +146,14 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
         // One token for every running request.
         let rows: Vec<(usize, u32)> = active.iter().map(|r| (r.slot, r.next)).collect();
         let mut rt = runtime.blocking_lock();
-        let logits = match rt.decode_rows(&rows) {
-            Ok(l) => l,
+        let t0 = Instant::now();
+        let vocab = rt.model.config.vocab_size;
+        let ctx = rt.ctx();
+        let (toks, forward_ms) = match rt.decode_rows(&rows) {
+            Ok(logits) => {
+                let f = t0.elapsed().as_secs_f64() * 1e3;
+                (sample_rows(&mut active, logits, vocab), f)
+            }
             Err(e) => {
                 for r in active.drain(..) {
                     let _ = r.job.events.send(Event::Done(Err(e.to_string())));
@@ -122,33 +161,169 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
                 continue;
             }
         };
-        let vocab = rt.model.config.vocab_size;
-        let ctx = rt.ctx();
+        let t2 = Instant::now();
         let mut still = Vec::with_capacity(active.len());
-        for (b, mut r) in active.drain(..).enumerate() {
-            let row = &mut logits[b * vocab..(b + 1) * vocab].to_vec();
-            let tok = r.job.sampler.sample(row, &r.history);
+        for (mut r, tok) in active.drain(..).zip(toks) {
             let full = rt.slot_history(r.slot).len() >= ctx;
             match emit(&rt, &mut r, tok, full) {
                 Some(stop) => finish(&rt, r, stop),
                 None => still.push(r),
             }
         }
+        if step_timing() {
+            eprintln!("sched step: {} rows, forward {:.2} ms, sample {:.2} ms, emit {:.2} ms, between steps {:.2} ms, at {:.3} s",
+                rows.len(), forward_ms, (t2 - t0).as_secs_f64() * 1e3 - forward_ms, t2.elapsed().as_secs_f64() * 1e3,
+                (t0 - last_step).as_secs_f64() * 1e3, t0.duration_since(started).as_secs_f64());
+        }
+        last_step = Instant::now();
         active = still;
     }
+}
+
+/// AIRUN_SCHED_TIMING=1 prints where each batched step's time went.
+fn step_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AIRUN_SCHED_TIMING").is_ok_and(|v| v.trim() != "0"))
+}
+
+/// Each row's next token from its logits (`vocab` floats a row), the rows on
+/// threads of their own: sampling a 248k vocabulary takes milliseconds, and
+/// one after another the GPU waited for all of them every step.
+fn sample_rows(active: &mut [Running], logits: &mut [f32], vocab: usize) -> Vec<u32> {
+    if active.len() == 1 {
+        let r = &mut active[0];
+        return vec![r.job.sampler.sample(&mut logits[..vocab], &r.history)];
+    }
+    let work = active.iter_mut().zip(logits.chunks_mut(vocab))
+        .map(|(r, row)| (&mut r.job.sampler, &r.history, row));
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = work.map(|(s, h, row)| sc.spawn(move || s.sample(row, h))).collect();
+        handles.into_iter().map(|h| h.join().expect("a sampler thread does not panic")).collect()
+    })
+}
+
+/// Cached tokens a lone request may prefill again to get the MTP head back
+/// (its cache missed them): a few hundred cost less than drafting gains over
+/// a reply.
+const REDO_FOR_DRAFTS: usize = 256;
+
+/// AIRUN_NO_PARALLEL_SOLO=1 sends a lone request through the batched path too.
+fn solo_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("AIRUN_NO_PARALLEL_SOLO").is_ok_and(|v| v.trim() != "0"))
+}
+
+/// The free slot a job goes to: the most reusable prefix first; on a tie
+/// (often none at all) the least recently used, so an unrelated request does
+/// not evict the conversation that will come back next while an idle slot
+/// sits there.
+fn pick_slot(rt: &Runtime, tokens: &[u32], active: &[Running], used: &mut [u64]) -> usize {
+    let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
+    let free = (0..used.len()).filter(|s| !busy.contains(s));
+    let slot = free.max_by_key(|&s| (rt.slot_prefix(s, tokens), std::cmp::Reverse(used[s]),
+        usize::MAX - s)).expect("a slot is free");
+    used[slot] = used.iter().max().copied().unwrap_or(0) + 1;
+    slot
+}
+
+/// A job's state before its first token.
+fn fresh(rt: &Runtime, slot: usize, job: Job, cached: usize, prefill_ms: f64) -> Running {
+    let history: Vec<u32> = job.tokens.iter().copied().filter(|&t| !airun_core::runtime::is_image_token(t)).collect();
+    Running {
+        slot, history, decoder: rt.tokenizer.stream_decoder(), next: 0, last: 0, generated: 0, cached,
+        prefill_ms, decode_start: Instant::now(), drafted: 0, accepted: 0, job,
+    }
+}
+
+/// Runs `r` alone through Runtime::generate on its slot: from its prompt if
+/// it has no token yet, else from the slot's history and the token it handed
+/// out last. Returns it, paused, when another job arrives (now in `waiting`);
+/// None once it has finished.
+fn solo(rt: &mut Runtime, mut r: Running, rx: &Receiver<Job>,
+        waiting: &mut std::collections::VecDeque<Job>) -> Option<Running> {
+    let begun = r.generated == 0;
+    if let Err(e) = rt.switch_slot(r.slot) {
+        let _ = r.job.events.send(Event::Done(Err(e.to_string())));
+        return None;
+    }
+    let prompt = if begun {
+        r.job.tokens.clone()
+    } else {
+        let mut p = rt.slot_history(r.slot).to_vec();
+        p.push(r.next);
+        p
+    };
+    if begun {
+        rt.set_prefill_hook(r.job.progress.take());
+    }
+    // A head that missed part of what the slot holds (another slot ran, or
+    // this one decoded in batched steps) would make generate prefill the whole
+    // prompt again: go on without drafts rather than redo a conversation,
+    // unless what it would redo is short.
+    let draft = rt.draft();
+    if draft > 0 && !rt.spec_keeps_prefix(&prompt) && rt.reusable_prefix(&prompt) > REDO_FOR_DRAFTS {
+        rt.set_draft(0);
+    }
+    let left = r.job.max_tokens.saturating_sub(r.generated);
+    let (mut paused, mut gone) = (false, false);
+    let result = {
+        let Running { job, history, generated, last, next, decoder, .. } = &mut r;
+        let Job { sampler, events, cancel, max_tokens, .. } = job;
+        let max_tokens = *max_tokens;
+        let mut on_token = |tok: u32, text: &str| -> bool {
+            *generated += 1;
+            history.push(tok);
+            *last = tok;
+            *next = tok;
+            if events.send(Event::Token(tok, text.to_string())).is_err() || cancel.load(Ordering::Relaxed) {
+                gone = true;
+                return false;
+            }
+            if *generated < max_tokens {
+                while let Ok(j) = rx.try_recv() {
+                    waiting.push_back(j);
+                    paused = true;
+                }
+            }
+            !paused
+        };
+        rt.generate_with(&prompt, left, sampler, decoder, false, &mut on_token)
+    };
+    rt.set_draft(draft);
+    rt.set_prefill_hook(None);
+    let stats = match result {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = r.job.events.send(Event::Done(Err(e.to_string())));
+            return None;
+        }
+    };
+    if begun {
+        r.cached = stats.cached_tokens;
+        r.prefill_ms = stats.prefill_ms;
+        r.decode_start = Instant::now() - std::time::Duration::from_secs_f64(stats.decode_ms / 1000.0);
+    }
+    r.drafted += stats.drafted;
+    r.accepted += stats.accepted;
+    if gone {
+        finish(rt, r, StopReason::Cancelled);
+        return None;
+    }
+    if paused && stats.stop == StopReason::Cancelled {
+        if rt.slot_history(r.slot).len() >= rt.ctx() {
+            finish(rt, r, StopReason::ContextFull);
+            return None;
+        }
+        return Some(r);
+    }
+    finish(rt, r, stats.stop);
+    None
 }
 
 /// Prefills a job into the best free slot and emits its first token.
 fn admit(rt: &mut Runtime, job: Job, active: &[Running], used: &mut [u64])
     -> Result<Option<Running>, (Job, String)> {
-    let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
-    let free = (0..used.len()).filter(|s| !busy.contains(s));
-    // Most reusable prefix first; on a tie (often none at all) the least
-    // recently used slot, so an unrelated request does not evict the
-    // conversation that will come back next while an idle slot sits there.
-    let slot = free.max_by_key(|&s| (rt.slot_prefix(s, &job.tokens), std::cmp::Reverse(used[s]),
-        usize::MAX - s)).expect("a slot is free");
-    used[slot] = used.iter().max().copied().unwrap_or(0) + 1;
+    let slot = pick_slot(rt, &job.tokens, active, used);
     let start = Instant::now();
     let mut job = job;
     rt.set_prefill_hook(job.progress.take());
@@ -159,11 +334,7 @@ fn admit(rt: &mut Runtime, job: Job, active: &[Running], used: &mut [u64])
         Err(e) => return Err((job, e.to_string())),
     };
     let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let history: Vec<u32> = job.tokens.iter().copied().filter(|&t| !airun_core::runtime::is_image_token(t)).collect();
-    let mut r = Running {
-        slot, history, decoder: rt.tokenizer.stream_decoder(), next: 0, last: 0, generated: 0, cached,
-        prefill_ms, decode_start: Instant::now(), job,
-    };
+    let mut r = fresh(rt, slot, job, cached, prefill_ms);
     let tok = r.job.sampler.sample(&mut logits, &r.history);
     let full = rt.slot_history(slot).len() >= rt.ctx();
     Ok(match emit(rt, &mut r, tok, full) {
@@ -218,8 +389,8 @@ fn finish(_rt: &Runtime, mut r: Running, stop: StopReason) {
         prefill_ms: r.prefill_ms,
         decode_ms: r.decode_start.elapsed().as_secs_f64() * 1000.0,
         stop,
-        drafted: 0,
-        accepted: 0,
+        drafted: r.drafted,
+        accepted: r.accepted,
     };
     let _ = r.job.events.send(Event::Done(Ok(stats)));
 }

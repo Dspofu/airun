@@ -379,7 +379,7 @@ pub fn run(args: RunArgs) -> Result<()> {
         _ => None,
     };
 
-    let tokens = crate::media::tokenize(&runtime, &full_prompt, &image_ids, true)?;
+    let tokens = crate::media::tokenize(&runtime.tokenizer, &full_prompt, &image_ids, true)?;
     if !quiet {
         eprintln!("prompt: {} tokens\n", tokens.len());
     }
