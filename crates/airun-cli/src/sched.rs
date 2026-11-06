@@ -64,6 +64,8 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
     let slots = runtime.blocking_lock().n_slots();
     let mut active: Vec<Running> = Vec::new();
     let mut waiting: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+    // When each slot last took a request (0: never), for admit's tie-break.
+    let mut used = vec![0u64; slots];
     loop {
         // Take what has arrived; with nothing running, wait for a job.
         loop {
@@ -93,7 +95,7 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
                     let _ = job.events.send(Event::Done(Err("cancelled".into())));
                 } else {
                     let mut rt = runtime.blocking_lock();
-                    match admit(&mut rt, job, &active, slots) {
+                    match admit(&mut rt, job, &active, &mut used) {
                         Ok(Some(r)) => active.push(r),
                         Ok(None) => {}
                         Err((job, e)) => {
@@ -137,11 +139,16 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
 }
 
 /// Prefills a job into the best free slot and emits its first token.
-fn admit(rt: &mut Runtime, job: Job, active: &[Running], slots: usize)
+fn admit(rt: &mut Runtime, job: Job, active: &[Running], used: &mut [u64])
     -> Result<Option<Running>, (Job, String)> {
     let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
-    let free = (0..slots).filter(|s| !busy.contains(s));
-    let slot = free.max_by_key(|&s| (rt.slot_prefix(s, &job.tokens), usize::MAX - s)).expect("a slot is free");
+    let free = (0..used.len()).filter(|s| !busy.contains(s));
+    // Most reusable prefix first; on a tie (often none at all) the least
+    // recently used slot, so an unrelated request does not evict the
+    // conversation that will come back next while an idle slot sits there.
+    let slot = free.max_by_key(|&s| (rt.slot_prefix(s, &job.tokens), std::cmp::Reverse(used[s]),
+        usize::MAX - s)).expect("a slot is free");
+    used[slot] = used.iter().max().copied().unwrap_or(0) + 1;
     let start = Instant::now();
     let mut job = job;
     rt.set_prefill_hook(job.progress.take());
