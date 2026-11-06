@@ -29,6 +29,33 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
 
+# --- acha o Rust ------------------------------------------------------------
+# Com o Rust instalado fora do lugar padrao (ex.: E:\rust\cargo), um terminal
+# novo nao tem o cargo no PATH. O cargo.exe dessa pasta e o proxy do rustup, que
+# tambem precisa do RUSTUP_HOME para achar o toolchain.
+$savedPath = $env:PATH
+$savedCargoHome = $env:CARGO_HOME
+$savedRustupHome = $env:RUSTUP_HOME
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $homes = @()
+    if ($env:CARGO_HOME) { $homes += $env:CARGO_HOME }
+    $homes += Join-Path $env:USERPROFILE ".cargo"
+    foreach ($drive in (Get-PSDrive -PSProvider FileSystem).Root) {
+        $homes += Join-Path $drive "rust\cargo"
+    }
+    $cargoHome = $homes | Where-Object { Test-Path (Join-Path $_ "bin\cargo.exe") } | Select-Object -First 1
+    if (-not $cargoHome) {
+        Write-Error ("cargo nao encontrado no PATH nem em: " + ($homes -join ", ") +
+            ". Instale o Rust (https://rustup.rs) ou defina CARGO_HOME (e RUSTUP_HOME) para a pasta onde ele esta.")
+        exit 1
+    }
+    $env:CARGO_HOME = $cargoHome
+    $env:PATH = (Join-Path $cargoHome "bin") + ";" + $env:PATH
+    $rustupHome = Join-Path (Split-Path -Parent $cargoHome) "rustup"
+    if (-not $env:RUSTUP_HOME -and (Test-Path $rustupHome)) { $env:RUSTUP_HOME = $rustupHome }
+    Write-Host "Rust: $cargoHome (fora do PATH; defina CARGO_HOME, RUSTUP_HOME e o PATH no Windows para nao depender disto)"
+}
+
 function ConvertTo-AirunArch([string]$cc) {
     # "8.6" -> "86"; "12.0" -> "120"
     return ($cc -replace '\.', '')
@@ -122,4 +149,7 @@ try {
 } finally {
     $env:AIRUN_CUDA_ARCHS = $savedArchs
     $env:AIRUN_SKIP_CUDA = $savedSkip
+    $env:PATH = $savedPath
+    $env:CARGO_HOME = $savedCargoHome
+    $env:RUSTUP_HOME = $savedRustupHome
 }

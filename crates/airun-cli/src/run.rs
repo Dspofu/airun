@@ -67,8 +67,9 @@ pub struct RunArgs {
     pub batch_size: usize,
 
     /// Speculative decoding with the model's own MTP head: tokens drafted per
-    /// step (0 turns it off; default 4 on dense models, off on MoE models,
-    /// where it measured slower). Engages only when the sampler is pure
+    /// step (0 turns it off; default 4 on dense models, 2 on MoE models that
+    /// fit the GPUs whole, off on MoE models with experts in RAM, where it
+    /// measured slower). Engages only when the sampler is pure
     /// greedy: --temp 0 AND no penalties (this command defaults to
     /// --repeat-penalty 1.1, which disables it; pass --repeat-penalty 1.0).
     /// The drafts are verified by the model itself, so the text is the

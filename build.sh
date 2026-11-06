@@ -20,6 +20,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Um shell que não carregou o ~/.cargo/env (ex.: não interativo) não tem o
+# cargo no PATH, mesmo com o rustup instalado.
+if ! command -v cargo >/dev/null 2>&1; then
+    for d in "${CARGO_HOME:-}" "$HOME/.cargo"; do
+        if [ -n "$d" ] && [ -x "$d/bin/cargo" ]; then
+            export PATH="$d/bin:$PATH"
+            echo "Rust: $d (fora do PATH)"
+            break
+        fi
+    done
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "cargo não encontrado no PATH, em \$CARGO_HOME nem em ~/.cargo. Instale o Rust" \
+             "(https://rustup.rs) ou defina CARGO_HOME para a pasta onde ele está." >&2
+        exit 1
+    fi
+fi
+
 arch="" mode="auto" check=1 debug=0
 while [ $# -gt 0 ]; do
     case "$1" in

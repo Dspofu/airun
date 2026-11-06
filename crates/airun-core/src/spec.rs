@@ -43,15 +43,46 @@ pub(super) struct Spec {
     /// positions. Anything that advances the caches without the head clears it.
     pub(super) synced: bool,
     /// The verify of k + 1 tokens as a CUDA graph (one device only).
-    vgraph: Option<VerifyGraph>,
+    pub(super) vgraph: Option<VerifyGraph>,
+    /// The same split across GPUs: one graph per shard.
+    pub(super) vsgraph: Option<ShardedVerifyGraph>,
     /// The one-row head step as a CUDA graph.
     mgraph: Option<VerifyGraph>,
     /// [`Runtime::advance_graphed`]'s graphs, by accepted count - 1.
-    agraphs: Vec<Option<AdvanceGraph>>,
+    pub(super) agraphs: Vec<Option<AdvanceGraph>>,
+}
+
+/// A verify split across GPUs, captured as one graph per shard and replayed on
+/// each device's stream; the residual rows cross between GPUs outside the
+/// graphs (handoff), as in [`DecodeGraph`]. Issued launch by launch, a split
+/// verify of the 27B took 50.7 ms against 40.5 ms graphed on one GPU.
+pub(super) struct ShardedVerifyGraph {
+    graphs: Vec<Option<airun_cuda::Graph>>,
+    tokens: airun_cuda::PinnedBuffer<i32>,
+    positions: airun_cuda::PinnedBuffer<i32>,
+}
+
+/// How many tokens the draft head chooses among: the first rows of the output
+/// head, which in a byte-level BPE are the earliest merges and so roughly the
+/// most frequent tokens (FR-Spec, arXiv 2502.14856, ranks by corpus counts).
+/// Every draft is still checked by the full-vocabulary verify, so this trades
+/// acceptance for a cheaper head step, never the output. AIRUN_DRAFT_VOCAB
+/// sets it; 0 or anything at least the vocabulary means all of it.
+fn draft_vocab(vocab: usize) -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let k = *K.get_or_init(|| std::env::var("AIRUN_DRAFT_VOCAB").ok()
+        .and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if k == 0 { vocab } else { k.min(vocab) }
+}
+
+/// AIRUN_NO_VERIFY_SHARD_GRAPHS=1 issues a split verify launch by launch.
+fn shard_graphs_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("AIRUN_NO_VERIFY_SHARD_GRAPHS").is_ok_and(|v| v.trim() != "0"))
 }
 
 /// A captured advance (commit, head rows, k drafts) and its pinned inputs.
-struct AdvanceGraph {
+pub(super) struct AdvanceGraph {
     graph: Option<airun_cuda::Graph>,
     tokens: airun_cuda::PinnedBuffer<i32>,
     positions: airun_cuda::PinnedBuffer<i32>,
@@ -60,7 +91,7 @@ struct AdvanceGraph {
 /// A captured verify pass and the pinned staging its replays read, as
 /// [`DecodeGraph`] for decode: a verify is ~2000 launches, which issued one by
 /// one left the GPU idle for a quarter of the pass.
-struct VerifyGraph {
+pub(super) struct VerifyGraph {
     graph: Option<airun_cuda::Graph>,
     tokens: airun_cuda::PinnedBuffer<i32>,
     positions: airun_cuda::PinnedBuffer<i32>,
@@ -132,6 +163,7 @@ impl Runtime {
             scratch: DeviceBuffer::new(dev, ops::ARGMAX_SCRATCH)?,
             synced: false,
             vgraph: None,
+            vsgraph: None,
             mgraph: None,
             agraphs: Vec::new(),
         });
@@ -261,10 +293,13 @@ impl Runtime {
         self.run_block(si, &mtp.layer, &sp.kv, None, cfg.n_run_layers(), n, cfg, true, None)?;
         ops::rmsnorm(st.xb.as_mut_ptr(), st.x.as_ptr(), mtp.head_norm.as_ptr(), d, n, cfg.rms_eps, stream)?;
 
+        // The draft picks among the first rows of the output head only (see
+        // draft_vocab); the verify still scores the whole vocabulary.
         let out_w = self.model.output_tensor();
+        let vocab = draft_vocab(cfg.vocab_size);
         ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr((n - 1) * d),
-            sp.logits.as_mut_ptr(), d, cfg.vocab_size, 1, out_w.row_bytes, stream)?;
-        ops::argmax(sp.logits.as_ptr(), cfg.vocab_size, sp.picks.offset_ptr(slot), sp.scratch.as_mut_ptr(),
+            sp.logits.as_mut_ptr(), d, vocab, 1, out_w.row_bytes, stream)?;
+        ops::argmax(sp.logits.as_ptr(), vocab, sp.picks.offset_ptr(slot), sp.scratch.as_mut_ptr(),
             std::ptr::null_mut(), stream)?;
         Ok(())
     }
@@ -425,7 +460,11 @@ impl Runtime {
     /// output device until the next pass.
     fn verify(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
         let n = tokens.len();
-        let graphed = n == self.draft + 1 && self.states.len() == 1 && !graphs_disabled();
+        let full = n == self.draft + 1 && !graphs_disabled();
+        if full && self.states.len() > 1 && !shard_graphs_disabled() {
+            return self.verify_sharded(tokens);
+        }
+        let graphed = full && self.states.len() == 1;
         if !graphed {
             let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             let positions: Vec<i32> = (0..n).map(|i| (self.n_past + i) as i32).collect();
@@ -467,6 +506,64 @@ impl Runtime {
         st.stream.synchronize()?;
         let sp = self.sp();
         Ok(sp.picks_host.as_slice()[..n].iter().map(|&t| t as u32).collect())
+    }
+
+    /// [`Self::verify`] on a model split across GPUs: each shard's part of the
+    /// pass (and the picks, on the last) replays as its own graph, with the
+    /// residual handed between them as in decode.
+    fn verify_sharded(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
+        let n = tokens.len();
+        let shards = self.states.len();
+        let mut vg = match self.spec.as_mut().expect("set up by spec_init").vsgraph.take() {
+            Some(vg) => vg,
+            None => ShardedVerifyGraph {
+                graphs: (0..shards).map(|_| None).collect(),
+                tokens: airun_cuda::PinnedBuffer::new(n)?,
+                positions: airun_cuda::PinnedBuffer::new(n)?,
+            },
+        };
+        // The previous replays copied these slots when they ran; the last
+        // shard's was waited on below, and every earlier shard finished
+        // before it could. A commit queued since does not read them.
+        for (i, &t) in tokens.iter().enumerate() {
+            vg.tokens.as_mut_slice()[i] = t as i32;
+            vg.positions.as_mut_slice()[i] = (self.n_past + i) as i32;
+        }
+        let mut result = Ok(());
+        for si in 0..shards {
+            if si > 0 {
+                result = self.handoff(si, n);
+                if result.is_err() { break; }
+            }
+            device::set_device(self.states[si].device)?;
+            if vg.graphs[si].is_none() {
+                // SAFETY of the capture: everything queued lives in `self` or
+                // `vg`, and `vg` goes back into `self.spec` below.
+                self.defer = true;
+                self.skip_logits = true;
+                airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
+                let mut queued = self.queue_shard(si, vg.tokens.as_slice(), vg.positions.as_slice(), true, true, false);
+                if si + 1 == shards {
+                    queued = queued.and_then(|_| self.queue_picks(n));
+                }
+                let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
+                self.defer = false;
+                self.skip_logits = false;
+                match queued.and_then(|_| Ok(ended?)) {
+                    Ok(g) => vg.graphs[si] = Some(g),
+                    Err(e) => { result = Err(e); break; }
+                }
+            }
+            result = vg.graphs[si].as_ref().expect("graph was just built")
+                .launch(&self.states[si].stream).map_err(Into::into);
+            if result.is_err() { break; }
+        }
+        self.spec.as_mut().expect("set up by spec_init").vsgraph = Some(vg);
+        result?;
+        let st = self.states.last().expect("a runtime has at least one device");
+        device::set_device(st.device)?;
+        st.stream.synchronize()?;
+        Ok(self.sp().picks_host.as_slice()[..n].iter().map(|&t| t as u32).collect())
     }
 
     /// The verify's forward pass, with delta-net layers deferring.

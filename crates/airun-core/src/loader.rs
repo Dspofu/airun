@@ -82,6 +82,12 @@ impl Default for LoadOptions {
 /// on prose and 47.6 -> 48.2 on code, one GPU 54.1 -> 55.0; 5 lost on prose.
 pub const DEFAULT_DRAFT: usize = 4;
 
+/// The same on MoE models, when every expert fits in VRAM. Fewer than on
+/// dense models: each verified row wakes its own experts. Qwen3.8-35B-A3B
+/// Q5_K_M on 2x RTX 5060 Ti (2026-11-06): no MTP 109.6, draft 2 137.6, draft 3
+/// 128.2 tok/s on prose; 108.8 / 132.1 / 127.4 on code.
+pub const MOE_DEFAULT_DRAFT: usize = 2;
+
 /// What the loader did, for reporting.
 pub struct LoadReport {
     pub config: Config,
@@ -121,26 +127,39 @@ pub fn load(
     if let Some(t) = config.ple.as_ref().and_then(|_| gguf.tensor("per_layer_token_embd.weight")) {
         sizes.other = sizes.other.saturating_sub(t.nbytes);
     }
-    // MTP on a MoE model measured slower than plain decoding: verifying 4
-    // tokens wakes far more experts than decoding 1 (Qwen3.8-35B-A3B on an
-    // RTX 5060 Ti, 64% of drafts accepted: 115 -> 91 tok/s), so it is off
-    // there unless asked for.
     // One MTP head keeps one sequence: several conversations decode plainly.
     let draft_wanted = opts.draft != Some(0) && opts.slots <= 1;
     let config_slots = opts.slots.max(1);
-    let mtp_src = if draft_wanted { mtp_source(path, &gguf, &config, opts.mtp_file.as_deref())? } else { None };
-    let draft = match opts.draft {
+    let mut mtp_src = if draft_wanted { mtp_source(path, &gguf, &config, opts.mtp_file.as_deref())? } else { None };
+    let moe_default = opts.draft.is_none() && config.moe.is_some();
+    let mut draft = match opts.draft {
         Some(d) => d,
-        None if config.moe.is_some() => {
-            if mtp_src.is_some() {
-                eprintln!("note: the MTP head is off by default on MoE models (it decodes slower there); \
-                           --draft 3 turns it on");
-            }
-            0
-        }
+        None if config.moe.is_some() => MOE_DEFAULT_DRAFT,
         None => DEFAULT_DRAFT,
     };
-    let mtp_src = mtp_src.filter(|_| draft > 0);
+    // On a MoE the head pays only with every expert in VRAM: the verify's
+    // rows route to many more experts than one token does, and the ones in
+    // RAM cross PCIe (35B-A3B on one RTX 5060 Ti, experts partly in RAM:
+    // 44.7 -> 34.5 tok/s with draft 2). Same test plan_experts makes below,
+    // counting the head and its cache.
+    if moe_default && opts.alloc != AllocMode::Gpu && opts.expert_cache.is_none() {
+        if let Some(src) = &mtp_src {
+            let mut with_head = sizes.clone();
+            with_head.output += crate::model::mtp_head_bytes(src, &config) + config.kv_bytes_per_layer(opts.ctx);
+            if plan_experts(&gguf, &config, &with_head, &devices, opts).is_some() {
+                eprintln!("note: the MTP head is off: this MoE model does not fit the GPUs whole, and \
+                           drafting slows decoding when experts sit in RAM; --draft {MOE_DEFAULT_DRAFT} \
+                           turns it on anyway");
+                draft = 0;
+            }
+        }
+    }
+    // --expert-cache streams the misses from the file, which the head's wider
+    // verify only multiplies.
+    if moe_default && opts.expert_cache.is_some() {
+        draft = 0;
+    }
+    mtp_src = mtp_src.filter(|_| draft > 0);
     let load_mtp = mtp_src.is_some();
     if draft > 0 && !load_mtp && opts.draft.is_some() {
         let reason = if config.nextn_predict_layers == 0 {

@@ -745,6 +745,9 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
    lenta: 35B-A3B numa 5060 Ti 115 → 91 tok/s com 64% aceitos, porque o
    verify de 4 tokens acorda muito mais experts. Por isso `--draft` sem valor
    (`LoadOptions.draft = None`) é `DEFAULT_DRAFT` em denso e 0 em MoE.
+   **Mudou em 2026-11-06:** com o verify em grafo por GPU, um MoE inteiro na
+   VRAM ganha com MTP, e o padrão passou a `MOE_DEFAULT_DRAFT` (2) nesse caso;
+   com experts na RAM continua 0 (veja "Medições de decode com MTP" adiante).
    A cabeça é o bloco `n_run_layers()` (o `block_count` a conta); o bug antigo
    procurava `blk.{n_layers}` e nunca a achava. 27B numa 5060 Ti: 26,4 → 68,4.
    Falta: amostragem não gulosa.
@@ -954,6 +957,46 @@ Dividido, o planner põe 32/32 camadas e cada GPU fica em ~9 GiB.
   10,2 / 13,0 / 15,7 ms. O 4 ganhou do 3 em toda configuração (e na varredura
   do PC antigo, 61,4 contra 52,3), então `DEFAULT_DRAFT` passou a 4. O 5 só
   ganha em texto muito previsível.
+- **Verify dividido com um grafo por GPU (2026-11-06):** `verify_sharded`
+  em `spec.rs` captura a parte de cada shard (e os picks no último) como um
+  grafo CUDA por GPU, com o resíduo passando entre elas fora dos grafos
+  (`handoff`), como o decode. Antes, dividido, o verify era lançado kernel a
+  kernel (só uma GPU tinha grafo). `AIRUN_NO_VERIFY_SHARD_GRAPHS=1` volta ao
+  antigo. O `switch_slot` agora também descarta os grafos do MTP.
+  - 27B, 128k q4_0, draft 4, 4 rodadas alternadas: 44,4 → **51,8 t/s**,
+    verify 57,1 → 46,9 ms, texto idêntico ao caminho antigo.
+  - 35B-A3B Q5_K_M, `-c 32768`, 2 rodadas alternadas (antes do grafo,
+    draft 4 dava 96):
+
+    | 35B-A3B | sem MTP | draft 2 | draft 3 |
+    |---|---|---|---|
+    | 2 GPUs, tudo na VRAM, prosa | 109,6 | **137,6** (76%) | 128,2 (62%) |
+    | 2 GPUs, tudo na VRAM, código | 108,8 | **132,1** (71%) | 127,4 (62%) |
+    | 1 GPU, experts na RAM | **44,7** | 34,5 | 32,0 |
+
+    Por isso `MOE_DEFAULT_DRAFT = 2` (`loader.rs`) vale só quando o
+    `plan_experts`, contando a cabeça e o cache dela, diz que o modelo cabe
+    inteiro; senão o MTP fica desligado, com uma `note:`. `--alloc gpu` liga
+    (nada vai para a RAM); `--expert-cache` desliga.
+  - O Qwen4 Flash-Next não tem cabeça MTP; não passa por aqui.
+  - Esta máquina: GPU 0 (bus 03, a do monitor) está num PCIe 3.0 x4; a GPU 1
+    em 4.0 x8. Decode simples dividido 25,1 contra 26,4 t/s numa GPU só.
+- **Rascunho com vocabulário cortado (FR-Spec, arXiv 2502.14856):**
+  `AIRUN_DRAFT_VOCAB=K` faz a cabeça escolher só entre as K primeiras linhas
+  da `output.weight` (no BPE, ids baixos ≈ fusões mais frequentes); o verify
+  segue com o vocabulário inteiro, então a saída não muda. **Desligado por
+  padrão**, porque depende do idioma (27B dividido, draft 4, t/s e aceitação):
+
+  | Prompt | inteiro | K=151643 | K=65536 |
+  |---|---|---|---|
+  | código (EN) | 55,3 (58%) | 58,6 (58%) | **59,5** (55%) |
+  | conto em inglês | 44,2 (41%) | 46,9 | **49,1** (40%) |
+  | prosa em português | **51,8** (53%) | 49,7 (45%) | 52,2 (45%) |
+
+  O advance cai de 13,2 para 6,9 ms com K=65536. Português usa os tokens da
+  extensão do vocabulário (ids > 151k), que o prefixo corta. O caminho para
+  ligar por padrão: prefixo + os tokens já vistos na conversa (linhas copiadas
+  para um buffer próprio, com um mapa índice → id depois do argmax).
 - **Cópia Q8_0 da cabeça para o MTP: não vale.** A `output.weight` deste
   arquivo é Q5_K (874 MB), não BF16 — o comentário antigo em `plan.rs`
   estava errado. Uma Q8_0 (1,35 GB) leria mais bytes, não menos.

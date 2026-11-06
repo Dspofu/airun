@@ -34,24 +34,26 @@ fn main() {
         return;
     }
 
-    let cuda = match find_cuda() {
-        Some(p) => p,
-        None => {
-            println!("cargo:rustc-cfg=airun_no_cuda");
-            println!(
-                "cargo:warning=No CUDA toolkit found (set CUDA_PATH). Building a CPU-only \
-                 airun; GPU commands will report that the build lacks kernels."
-            );
-            return;
-        }
-    };
+    let archs: Vec<String> = env::var("AIRUN_CUDA_ARCHS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.split(&[',', ' '][..])
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| DEFAULT_ARCHS.iter().map(|s| s.to_string()).collect());
 
-    let nvcc = cuda.join("bin").join(exe("nvcc"));
-    if !nvcc.exists() {
+    let Some(cuda) = find_cuda(&archs) else {
         println!("cargo:rustc-cfg=airun_no_cuda");
-        println!("cargo:warning=CUDA_PATH={} has no nvcc", cuda.display());
+        println!(
+            "cargo:warning=No CUDA toolkit found (set CUDA_PATH). Building a CPU-only \
+             airun; GPU commands will report that the build lacks kernels."
+        );
         return;
-    }
+    };
+    let nvcc = cuda.join("bin").join(exe("nvcc"));
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let kernels_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("kernels");
@@ -64,17 +66,6 @@ fn main() {
         .collect();
     sources.sort();
     assert!(!sources.is_empty(), "no .cu files in {}", kernels_dir.display());
-
-    let archs: Vec<String> = env::var("AIRUN_CUDA_ARCHS")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            s.split(&[',', ' '][..])
-                .filter(|s| !s.is_empty())
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_else(|| DEFAULT_ARCHS.iter().map(|s| s.to_string()).collect());
 
     // Flags, include path, host compiler and its environment, shared by both
     // libraries below.
@@ -213,13 +204,68 @@ fn host_compiler_dir() -> Option<PathBuf> {
     tool.path().parent().map(Path::to_path_buf)
 }
 
-fn find_cuda() -> Option<PathBuf> {
+/// The toolkit to build with: the first candidate (CUDA_PATH and friends, then
+/// nvcc on PATH, then the default install folders, newest first) whose nvcc
+/// knows every requested architecture.
+///
+/// Installing CUDA sets CUDA_PATH to the version just installed, so a PC that
+/// got an older toolkit after a newer one (12.0 after 13.4) pointed the build
+/// at an nvcc without sm_120 and every kernel failed with "Unsupported gpu
+/// architecture 'compute_120'", with the right toolkit sitting next to it.
+fn find_cuda(archs: &[String]) -> Option<PathBuf> {
+    let candidates = cuda_candidates();
+    let first = candidates.first()?.clone();
+    for root in &candidates {
+        let missing = missing_archs(&root.join("bin").join(exe("nvcc")), archs);
+        if missing.is_empty() {
+            if *root != first {
+                println!(
+                    "cargo:warning=CUDA at {} cannot build sm_{}; using {} instead. Point CUDA_PATH \
+                     at it to silence this",
+                    first.display(),
+                    missing_archs(&first.join("bin").join(exe("nvcc")), archs).join(", sm_"),
+                    root.display()
+                );
+            }
+            return Some(root.clone());
+        }
+    }
+    let missing = missing_archs(&first.join("bin").join(exe("nvcc")), archs);
+    panic!(
+        "no installed CUDA toolkit can build sm_{} (tried {}). Install CUDA 12.8 or newer for RTX 50 \
+         (sm_120), or set AIRUN_CUDA_ARCHS to the architectures of your GPUs (e.g. \"86\")",
+        missing.join(", sm_"),
+        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    );
+}
+
+/// Architectures in `archs` that this nvcc cannot emit. An nvcc too old for
+/// `--list-gpu-arch` (before CUDA 11) is taken at its word: the build fails
+/// with nvcc's own message if it lacks one.
+fn missing_archs(nvcc: &Path, archs: &[String]) -> Vec<String> {
+    let Ok(out) = Command::new(nvcc).arg("--list-gpu-arch").output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let known = String::from_utf8_lossy(&out.stdout).into_owned();
+    let known: Vec<&str> = known.split_whitespace().filter_map(|s| s.strip_prefix("compute_")).collect();
+    archs.iter().filter(|a| !known.contains(&a.as_str())).cloned().collect()
+}
+
+/// Every CUDA toolkit root with an nvcc, in order of preference, without repeats.
+fn cuda_candidates() -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.join("bin").join(exe("nvcc")).exists() && !found.iter().any(|f| same_dir(f, &p)) {
+            found.push(p);
+        }
+    };
+
     for var in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
         if let Ok(p) = env::var(var) {
-            let p = PathBuf::from(p);
-            if p.join("bin").join(exe("nvcc")).exists() {
-                return Some(p);
-            }
+            push(PathBuf::from(p));
         }
     }
 
@@ -228,7 +274,7 @@ fn find_cuda() -> Option<PathBuf> {
         for dir in env::split_paths(&path) {
             if dir.join(exe("nvcc")).exists() {
                 if let Some(root) = dir.parent() {
-                    return Some(root.to_path_buf());
+                    push(root.to_path_buf());
                 }
             }
         }
@@ -240,23 +286,48 @@ fn find_cuda() -> Option<PathBuf> {
         PathBuf::from("/usr/local/cuda"),
     ];
     for root in roots {
-        if root.join("bin").join(exe("nvcc")).exists() {
-            return Some(root);
-        }
+        push(root.clone());
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
+        let mut versions: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        // By number: a string sort puts v12.10 before v12.9.
+        versions.sort_by_key(|p| std::cmp::Reverse(version_of(p)));
+        for v in versions {
+            push(v);
+        }
+    }
+    // Linux installs side by side as /usr/local/cuda-12.8, /usr/local/cuda-13.0...
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
         let mut versions: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.join("bin").join(exe("nvcc")).exists())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("cuda-")))
             .collect();
-        versions.sort();
-        if let Some(newest) = versions.pop() {
-            return Some(newest);
+        versions.sort_by_key(|p| std::cmp::Reverse(version_of(p)));
+        for v in versions {
+            push(v);
         }
     }
-    None
+    found
+}
+
+/// "v13.4" -> [13, 4]; folders without a version sort last.
+fn version_of(p: &Path) -> Vec<u32> {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    name.trim_start_matches(|c: char| !c.is_ascii_digit())
+        .split('.')
+        .map_while(|s| s.parse().ok())
+        .collect()
+}
+
+/// Paths from env vars and from the folder listing differ in case and
+/// trailing separators on Windows.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Object file name for a source: `ops.cu` -> `ops.obj` / `ops.o`.

@@ -1818,6 +1818,10 @@ impl Runtime {
         self.chain = None;
         if let Some(sp) = self.spec.as_mut() {
             sp.synced = false;
+            // These captured the old slot's delta-net and KV addresses too.
+            sp.vgraph = None;
+            sp.vsgraph = None;
+            sp.agraphs.clear();
         }
         self.set_rope_shift(shift)
     }
