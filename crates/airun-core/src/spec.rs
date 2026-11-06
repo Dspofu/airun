@@ -33,7 +33,7 @@ pub(super) struct Spec {
     cat: DeviceBuffer<f32>,
     /// The main model's hidden at the last position in the caches: the h of
     /// the first row the next prefill gives the head.
-    pending: DeviceBuffer<f32>,
+    pub(super) pending: DeviceBuffer<f32>,
     /// k + 1 rows of logits from a verify.
     logits: DeviceBuffer<f32>,
     picks: DeviceBuffer<i32>,
@@ -614,10 +614,14 @@ impl Runtime {
         // The head's cache must cover every cached position; one a plain
         // generation left behind is rebuilt along with the rest.
         let mut cached = self.reusable_prefix(prompt);
-        if cached > 0 && !self.sp().synced {
+        // Back to the turn snapshot: the head's cache is good only if the
+        // prefill that took it ran the head too.
+        let to_snapshot = cached > 0 && cached < self.history.len();
+        if if to_snapshot { !self.snapshot_has_head() } else { cached > 0 && !self.sp().synced } {
             cached = 0;
         }
         self.rewind_to(cached);
+        let cached = self.n_past.min(cached);
         if cached == 0 {
             let st = self.states.last().expect("a runtime has at least one device");
             device::set_device(st.device)?;
@@ -629,9 +633,13 @@ impl Runtime {
         // the head, pairing each token with the hidden before it.
         let mut prompt_done = cached;
         let mut t = 0u32;
+        let snap_at = self.snapshot_point(prompt, cached);
         self.prefill_report(prompt_done, prompt.len(), cached, start);
         while prompt_done < prompt.len() {
-            let take = (prompt.len() - prompt_done).min(self.max_batch);
+            let mut take = (prompt.len() - prompt_done).min(self.max_batch);
+            if let Some(p) = snap_at.filter(|&p| p > prompt_done) {
+                take = take.min(p - prompt_done);
+            }
             let chunk = prompt[prompt_done..prompt_done + take].to_vec();
             let pos0 = self.n_past;
             self.step(&chunk)?;
@@ -663,6 +671,9 @@ impl Runtime {
             let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
             let pos: Vec<i32> = (0..chunk.len()).map(|i| (pos0 + i) as i32).collect();
             self.mtp_queue(&ids, &pos)?;
+            if snap_at == Some(prompt_done) {
+                self.take_snapshot(true)?;
+            }
         }
         self.spec.as_mut().expect("set up above").synced = true;
         let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;

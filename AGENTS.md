@@ -997,6 +997,37 @@ Dividido, o planner põe 32/32 camadas e cada GPU fica em ~9 GiB.
   extensão do vocabulário (ids > 151k), que o prefixo corta. O caminho para
   ligar por padrão: prefixo + os tokens já vistos na conversa (linhas copiadas
   para um buffer próprio, com um mapa índice → id depois do argmax).
+- **Cache entre turnos nos híbridos (2026-11-06):** `TurnSnapshot` em
+  `runtime.rs`. As linhas do KV valem até qualquer posição, mas o estado
+  recorrente (delta-net, conv, anel QSA e `pooled`, histórico PLE) só anda
+  para a frente; como o template reescreve o `<think>` da resposta anterior,
+  o pedido seguinte divergia logo depois do cabeçalho do assistente e um
+  híbrido reprocessava a conversa inteira a cada turno. Agora o prefill para
+  exatamente antes do último `<|im_start|>` do prompt (`snapshot_point`),
+  copia esse estado para um buffer fixado reaproveitado (`take_snapshot`,
+  cópias assíncronas no stream de cada GPU, sem esperar) e segue; no turno
+  seguinte `reusable_prefix` aceita esse ponto e `rewind_to` restaura o
+  estado (`restore_snapshot`), mais a linha `pending` da cabeça MTP quando o
+  prefill que tirou o snapshot rodou a cabeça. `walk_state(false, ..)` é o
+  `save_state` sem as linhas de KV. `AIRUN_NO_STATE_SNAPSHOT=1` desliga.
+  - 27B dividido, `serve`, system prompt de ~2.760 tokens, 3 turnos: turno 2
+    reaproveitou 2.760 (prefill 443 ms, a maior parte montando o grafo de
+    decode pela primeira vez) contra 878 ms sem o snapshot; turno 3
+    reaproveitou 2.788, prefill **160 ms** contra 895.
+  - Correção: o mesmo pedido duas vezes (o segundo restaura e reprocessa da
+    mesma fronteira) sai **idêntico** no 27B (MTP ligado e desligado) e no
+    35B-A3B inteiro na VRAM.
+  - Partir o prefill nesse ponto muda as fronteiras de lote do primeiro
+    turno, então o texto guloso dele pode virar num quase-empate (como o MTP).
+- **Bug à parte, achado no teste acima (não corrigido):** MoE com experts na
+  RAM e lotes de 2–15 tokens não é determinístico. 35B-A3B numa GPU,
+  `AIRUN_NO_STATE_SNAPSHOT=1 -b 4`: três pedidos iguais, três textos
+  diferentes (com lotes grandes o mesmo teste sai idêntico). Suspeitos: a
+  residência dos experts muda entre execuções (`rebalance_experts`) e esse
+  caminho (`moe_stage_*`, `Staged.only` no stream lateral) dá resultados
+  diferentes conforme ela, ou há uma corrida entre o stream lateral e o
+  cálculo. Por isso o Qwen4 (experts na RAM) não serve para validar o
+  snapshot.
 - **Cópia Q8_0 da cabeça para o MTP: não vale.** A `output.weight` deste
   arquivo é Q5_K (874 MB), não BF16 — o comentário antigo em `plan.rs`
   estava errado. Uma Q8_0 (1,35 GB) leria mais bytes, não menos.

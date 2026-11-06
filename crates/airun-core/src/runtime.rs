@@ -49,6 +49,34 @@ struct SlotStore {
     image_spans: Vec<(usize, usize, i32)>,
 }
 
+/// A hybrid's recurrent state (delta-net matrices and convolutions, QSA keys,
+/// PLE history) as it stood just before the prompt's last `<|im_start|>`.
+///
+/// The KV rows are kept by position, so cutting the cache back is free, but a
+/// recurrent state only moves forward. A chat's next request repeats the
+/// transcript up to the assistant turn just generated and then differs (the
+/// template drops or rewrites the previous `<think>`), so without this a
+/// hybrid reprocessed the whole conversation every turn. Restoring the state
+/// at that header reuses everything before it.
+struct TurnSnapshot {
+    /// Tokens before the header; the state is what they leave.
+    tokens: Vec<u32>,
+    /// [`Runtime::walk_state`] without the KV rows, in pinned memory: the
+    /// copies are queued on each shard's stream, in order with the prefill,
+    /// and nothing waits for them. Kept across turns, as its size is fixed.
+    bytes: airun_cuda::PinnedBuffer<u8>,
+    /// Whether `bytes` ends with the MTP head's `pending` row at the same
+    /// point (hidden of the last token): the prefill that took it ran the
+    /// head too, so the head's cache rows before it are good.
+    pending: bool,
+}
+
+/// AIRUN_NO_STATE_SNAPSHOT=1 turns the turn snapshot off.
+fn snapshot_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("AIRUN_NO_STATE_SNAPSHOT").is_ok_and(|v| v.trim() != "0"))
+}
+
 /// The first bytes of a [`Runtime::save_state`] file, with its format version.
 const STATE_MAGIC: &[u8] = b"AIRUNST1";
 
@@ -60,6 +88,19 @@ enum StateBuf<'a> {
 }
 
 impl StateBuf<'_> {
+    /// Device address and byte count of `len` elements from `offset`.
+    fn raw(&self, offset: usize, len: usize) -> (*mut std::ffi::c_void, usize) {
+        fn go<T: Copy + Default>(b: &DeviceBuffer<T>, offset: usize, len: usize) -> (*mut std::ffi::c_void, usize) {
+            let size = std::mem::size_of::<T>();
+            (b.as_mut_ptr().wrapping_byte_add(offset * size), len * size)
+        }
+        match self {
+            Self::U8(b) => go(b, offset, len),
+            Self::U16(b) => go(b, offset, len),
+            Self::F32(b) => go(b, offset, len),
+        }
+    }
+
     /// Appends `len` elements from `offset` to `out`, as little-endian bytes.
     fn save(&self, offset: usize, len: usize, stream: &Stream, out: &mut Vec<u8>) -> Result<()> {
         fn go<T: Copy + Default>(b: &DeviceBuffer<T>, offset: usize, len: usize, stream: &Stream,
@@ -335,6 +376,8 @@ pub struct Runtime {
     history: Vec<u32>,
     /// Captured decode step; built on the first single-token forward.
     decode_graph: Option<DecodeGraph>,
+    /// Hybrids only: the recurrent state at the last turn boundary prefilled.
+    turn_snap: Option<TurnSnapshot>,
     /// Greedy decoding's pick on the device, its pinned landing slot and the
     /// argmax scratch.
     pick: Option<(DeviceBuffer<i32>, airun_cuda::PinnedBuffer<i32>, DeviceBuffer<i32>)>,
@@ -701,6 +744,7 @@ impl Runtime {
             n_past: 0,
             history: Vec::new(),
             decode_graph: None,
+            turn_snap: None,
             pick: None,
             chain: None,
             logits_host: None,
@@ -784,6 +828,8 @@ impl Runtime {
     pub fn reset(&mut self) {
         self.n_past = 0;
         self.history.clear();
+        // Its KV rows are about to be overwritten.
+        self.turn_snap = None;
         self.image_spans.clear();
         let _ = self.set_rope_shift(0);
         for st in &self.states {
@@ -823,7 +869,7 @@ impl Runtime {
         for t in &self.history {
             out.extend_from_slice(&t.to_le_bytes());
         }
-        self.walk_state(|buf, offset, len, stream| buf.save(offset, len, stream, &mut out))?;
+        self.walk_state(true, |buf, offset, len, stream| buf.save(offset, len, stream, &mut out))?;
         Ok(out)
     }
 
@@ -853,7 +899,8 @@ impl Runtime {
         input = rest;
         // The rows written depend on the position, so it must be set first.
         self.n_past = n_past;
-        let loaded = self.walk_state(|buf, offset, len, stream| buf.load(offset, len, stream, &mut input));
+        self.turn_snap = None;
+        let loaded = self.walk_state(true, |buf, offset, len, stream| buf.load(offset, len, stream, &mut input));
         if let Err(e) = loaded {
             // Half-written caches are garbage: start over rather than resume them.
             self.reset();
@@ -911,8 +958,11 @@ impl Runtime {
     }
 
     /// Calls `f(buffer, offset, len, stream)` on every stretch of cache that
-    /// holds the current sequence, in a fixed order.
-    fn walk_state(&self, mut f: impl FnMut(StateBuf<'_>, usize, usize, &Stream) -> Result<()>) -> Result<()> {
+    /// holds the current sequence, in a fixed order. Without `kv`, only the
+    /// state that does not stay valid when the sequence is cut back (see
+    /// [`TurnSnapshot`]).
+    fn walk_state(&self, kv: bool, mut f: impl FnMut(StateBuf<'_>, usize, usize, &Stream) -> Result<()>)
+        -> Result<()> {
         let cfg = &self.model.config;
         let row = cfg.kv_type.row_bytes(cfg.head_dim);
         for st in &self.states {
@@ -921,7 +971,7 @@ impl Runtime {
                 match state {
                     LayerState::Kv { k, v, qsa } => {
                         // [head][ctx][row]: the first n_past rows of each head.
-                        for h in 0..cfg.n_head_kv {
+                        for h in (0..cfg.n_head_kv).filter(|_| kv) {
                             f(StateBuf::U8(k), h * self.ctx * row, self.n_past * row, &st.stream)?;
                             f(StateBuf::U8(v), h * self.ctx * row, self.n_past * row, &st.stream)?;
                         }
@@ -1944,7 +1994,11 @@ impl Runtime {
             .min(limit);
 
         if self.model.config.is_hybrid() && common < self.history.len() {
-            return 0;
+            // The recurrent state is the whole history's; it can only go back
+            // to the turn snapshot, when the prompt still agrees up to it.
+            return self.turn_snap.as_ref()
+                .filter(|s| s.tokens.len() <= common && self.history[..s.tokens.len()] == s.tokens[..])
+                .map_or(0, |s| s.tokens.len());
         }
         common
     }
@@ -1952,16 +2006,20 @@ impl Runtime {
     /// Drops the cache cursor back to `n`, discarding what came after.
     ///
     /// Only ever called with a value [`reusable_prefix`] returned, which is what
-    /// makes it safe on hybrids: there it is either the full history or zero.
+    /// makes it safe on hybrids: there it is the full history, the turn
+    /// snapshot's point (whose recurrent state is put back here) or zero.
     fn rewind_to(&mut self, n: usize) {
         if n == 0 {
             self.reset();
             return;
         }
-        debug_assert!(
-            !self.model.config.is_hybrid() || n == self.history.len(),
-            "a hybrid's recurrent state cannot be rewound to an arbitrary point"
-        );
+        if self.model.config.is_hybrid() && n < self.history.len() {
+            if let Err(e) = self.restore_snapshot(n) {
+                eprintln!("warning: could not restore the turn snapshot ({e}); reprocessing the prompt");
+                self.reset();
+                return;
+            }
+        }
         // An image is all or nothing: a cut inside one drops it whole.
         let mut n = n;
         while let Some(&(start, len, before)) = self.image_spans.last() {
@@ -1978,6 +2036,85 @@ impl Runtime {
         }
         self.n_past = n;
         self.history.truncate(n);
+    }
+
+    /// Where a prefill of `prompt` from `from` stops to take the turn
+    /// snapshot: just before the last `<|im_start|>`, if it lies ahead.
+    pub(crate) fn snapshot_point(&self, prompt: &[u32], from: usize) -> Option<usize> {
+        if !self.model.config.is_hybrid() || snapshot_disabled() || !self.image_spans.is_empty()
+            || prompt.iter().any(|&t| is_image_token(t)) {
+            return None;
+        }
+        let start = self.tokenizer.id_of("<|im_start|>")?;
+        let p = prompt.iter().rposition(|&t| t == start)?;
+        (p > from).then_some(p)
+    }
+
+    /// Saves the recurrent state the caches hold now (n_past tokens), and the
+    /// MTP head's `pending` row when `with_head`.
+    pub(crate) fn take_snapshot(&mut self, with_head: bool) -> Result<()> {
+        let mut total = 0usize;
+        self.walk_state(false, |buf, offset, len, _| { total += buf.raw(offset, len).1; Ok(()) })?;
+        let pending_bytes = self.model.config.n_embd * std::mem::size_of::<f32>();
+        let with_head = with_head && self.spec.is_some();
+        let need = total + if with_head { pending_bytes } else { 0 };
+        // The previous snapshot's buffer, if it is big enough. Its last
+        // restore was queued on the streams that queue the copies below.
+        let mut bytes = match self.turn_snap.take() {
+            Some(s) if s.bytes.len() >= need => s.bytes,
+            _ => airun_cuda::PinnedBuffer::new(total + pending_bytes)?,
+        };
+        let base = bytes.as_raw();
+        let mut at = 0usize;
+        self.walk_state(false, |buf, offset, len, stream| {
+            let (src, n) = buf.raw(offset, len);
+            airun_cuda::copy_d2h(base.wrapping_byte_add(at), src, n, stream)?;
+            at += n;
+            Ok(())
+        })?;
+        if with_head {
+            let st = self.states.last().expect("a runtime has at least one device");
+            device::set_device(st.device)?;
+            let sp = self.spec.as_ref().expect("checked above");
+            airun_cuda::copy_d2h(base.wrapping_byte_add(at), sp.pending.as_ptr(), pending_bytes, &st.stream)?;
+        }
+        self.turn_snap = Some(TurnSnapshot { tokens: self.history[..self.n_past].to_vec(), bytes, pending: with_head });
+        Ok(())
+    }
+
+    /// Puts back the snapshot's recurrent state, `n` being its length. The
+    /// copies are queued on each shard's stream, ahead of the prefill that
+    /// follows.
+    fn restore_snapshot(&mut self, n: usize) -> Result<()> {
+        let snap = self.turn_snap.take().filter(|s| s.tokens.len() == n).ok_or_else(|| CoreError::Other(
+            "no turn snapshot at that point; this is a bug".into()))?;
+        let base = snap.bytes.as_raw();
+        let mut at = 0usize;
+        let loaded = self.walk_state(false, |buf, offset, len, stream| {
+            let (dst, bytes) = buf.raw(offset, len);
+            airun_cuda::copy_h2d(dst, base.wrapping_byte_add(at), bytes, stream)?;
+            at += bytes;
+            Ok(())
+        });
+        let head = snap.pending && self.spec.is_some();
+        if head {
+            let st = self.states.last().expect("a runtime has at least one device");
+            device::set_device(st.device)?;
+            let sp = self.spec.as_ref().expect("checked above");
+            airun_cuda::copy_h2d(sp.pending.as_mut_ptr(), base.wrapping_byte_add(at),
+                self.model.config.n_embd * std::mem::size_of::<f32>(), &st.stream)?;
+        }
+        if let Some(sp) = self.spec.as_mut() {
+            // The head's cache rows before n were written with these tokens.
+            sp.synced = head;
+        }
+        self.turn_snap = Some(snap);
+        loaded
+    }
+
+    /// Whether the turn snapshot carries the MTP head's state.
+    pub(crate) fn snapshot_has_head(&self) -> bool {
+        self.turn_snap.as_ref().is_some_and(|s| s.pending)
     }
 
     fn run_layer(
@@ -3097,13 +3234,20 @@ impl Runtime {
         let mut next: Option<u32> = None;
         let mut prompt_done = cached;
         let prompt_cached = cached;
+        let snap_at = self.snapshot_point(prompt, cached);
         self.prefill_report(prompt_done, prompt.len(), prompt_cached, start);
         while prompt_done < prompt.len() {
-            let take = (prompt.len() - prompt_done).min(self.max_batch);
+            let mut take = (prompt.len() - prompt_done).min(self.max_batch);
+            if let Some(p) = snap_at.filter(|&p| p > prompt_done) {
+                take = take.min(p - prompt_done);
+            }
             let chunk = &prompt[prompt_done..prompt_done + take];
             prompt_done += take;
             if prompt_done < prompt.len() {
                 self.step(chunk)?;
+                if snap_at == Some(prompt_done) {
+                    self.take_snapshot(false)?;
+                }
             } else if greedy {
                 next = Some(self.forward_argmax(chunk)?);
             } else {
