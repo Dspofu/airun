@@ -309,6 +309,19 @@ fn graphs_disabled() -> bool {
 }
 
 /// A loaded model ready to generate.
+/// How far a prompt's prefill has got: `processed` of `total` tokens, the
+/// first `cached` of them reused from the cache, `elapsed_ms` since it began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillProgress {
+    pub total: usize,
+    pub cached: usize,
+    pub processed: usize,
+    pub elapsed_ms: u64,
+}
+
+/// See [`Runtime::set_prefill_hook`].
+pub type PrefillHook = Box<dyn FnMut(PrefillProgress) + Send>;
+
 pub struct Runtime {
     pub model: Model,
     pub tokenizer: Tokenizer,
@@ -358,6 +371,8 @@ pub struct Runtime {
     mixed: Option<Vec<usize>>,
     /// Drafts per speculative step (see `set_draft`); 0 decodes plainly.
     draft: usize,
+    /// Called after each prefill batch (see `set_prefill_hook`).
+    prefill_hook: Option<PrefillHook>,
     /// Forward passes since the mapped experts were last rebalanced.
     since_rebalance: usize,
     /// Rebalances so far; every PROFILE_SAVE_EVERY of them saves the profile.
@@ -701,9 +716,27 @@ impl Runtime {
             active_slot: 0,
             mixed: None,
             draft: 0,
+            prefill_hook: None,
             since_rebalance: 0,
             rebalances: 0,
         })
+    }
+
+    /// Installs (or with None removes) a callback told after each prefill
+    /// batch how far the prompt has got -- what llama-server's
+    /// `return_progress` streams as `prompt_progress`. The batch is queued,
+    /// not waited on, when the call comes; the launch queue keeps the host at
+    /// most about a batch ahead of the GPU.
+    pub fn set_prefill_hook(&mut self, hook: Option<PrefillHook>) {
+        self.prefill_hook = hook;
+    }
+
+    /// Reports `processed` of `total` prompt tokens (`cached` of them from
+    /// the cache) to the prefill hook, if any.
+    pub(crate) fn prefill_report(&mut self, processed: usize, total: usize, cached: usize, start: std::time::Instant) {
+        if let Some(h) = self.prefill_hook.as_mut() {
+            h(PrefillProgress { total, cached, processed, elapsed_ms: start.elapsed().as_millis() as u64 });
+        }
     }
 
     pub fn ctx(&self) -> usize {
@@ -1580,6 +1613,7 @@ impl Runtime {
         let Some(last) = prompt.iter().rposition(|&t| is_image_token(t)) else { return Ok(from) };
         let end = last + 1;
         let mut done = from;
+        let start = std::time::Instant::now();
         while done < end {
             if is_image_token(prompt[done]) {
                 let run = prompt[done..].iter().take_while(|&&t| is_image_token(t)).count();
@@ -1588,6 +1622,7 @@ impl Runtime {
                     CoreError::Other("the prompt names an image that is not registered (register_image)".into()))?;
                 self.prefill_image(&img)?;
                 done += run;
+                self.prefill_report(done, prompt.len(), from, start);
             } else {
                 let text = prompt[done..end].iter().take_while(|&&t| !is_image_token(t)).count();
                 let mut i = 0;
@@ -1595,6 +1630,7 @@ impl Runtime {
                     let take = (text - i).min(self.max_batch);
                     self.step(&prompt[done + i..done + i + take])?;
                     i += take;
+                    self.prefill_report(done + i, prompt.len(), from, start);
                 }
                 done += text;
             }
@@ -1796,8 +1832,10 @@ impl Runtime {
         let cached = Self::image_safe_prefix(prompt, self.reusable_prefix(prompt));
         self.rewind_to(cached);
         let cached = self.n_past.min(cached);
+        let start = std::time::Instant::now();
         let mut done = self.prefill_images(prompt, cached)?;
         let mut logits = Vec::new();
+        self.prefill_report(done, prompt.len(), cached, start);
         while done < prompt.len() {
             let take = (prompt.len() - done).min(self.max_batch);
             let chunk = &prompt[done..done + take];
@@ -1807,6 +1845,7 @@ impl Runtime {
             } else {
                 logits = self.forward_pinned(chunk)?.to_vec();
             }
+            self.prefill_report(done, prompt.len(), cached, start);
         }
         Ok((logits, cached))
     }
@@ -3053,6 +3092,8 @@ impl Runtime {
         let greedy = sampler.is_pure_greedy() && !gpu_argmax_disabled();
         let mut next: Option<u32> = None;
         let mut prompt_done = cached;
+        let prompt_cached = cached;
+        self.prefill_report(prompt_done, prompt.len(), prompt_cached, start);
         while prompt_done < prompt.len() {
             let take = (prompt.len() - prompt_done).min(self.max_batch);
             let chunk = &prompt[prompt_done..prompt_done + take];
@@ -3064,6 +3105,7 @@ impl Runtime {
             } else {
                 self.forward_pinned(chunk)?;
             }
+            self.prefill_report(prompt_done, prompt.len(), prompt_cached, start);
         }
         let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
 

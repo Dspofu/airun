@@ -532,12 +532,14 @@ impl Runtime {
         // the head, pairing each token with the hidden before it.
         let mut prompt_done = cached;
         let mut t = 0u32;
+        self.prefill_report(prompt_done, prompt.len(), cached, start);
         while prompt_done < prompt.len() {
             let take = (prompt.len() - prompt_done).min(self.max_batch);
             let chunk = prompt[prompt_done..prompt_done + take].to_vec();
             let pos0 = self.n_past;
             self.step(&chunk)?;
             prompt_done += take;
+            self.prefill_report(prompt_done, prompt.len(), cached, start);
             if prompt_done == prompt.len() {
                 let st = self.states.last().expect("a runtime has at least one device");
                 device::set_device(st.device)?;

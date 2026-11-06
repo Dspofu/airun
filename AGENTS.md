@@ -874,6 +874,18 @@ seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
   `loader::upload_labels`. Os GiB da barra são o tamanho do arquivo vezes a
   fração de passos (não os bytes reais de cada GPU); o plano impresso depois
   tem os valores certos.
+- `return_progress` (llama-server): com stream, o chat manda um chunk com
+  `prompt_progress` {total, cache, processed, time_ms} e `choices: []` a cada
+  lote do prefill (`Runtime::set_prefill_hook`, também no MTP e no
+  `--parallel`). Sem esperar a GPU: a fila de lançamentos já segura o host
+  no máximo um lote à frente. Clientes que acham que falam com llama.cpp (o
+  `/props` tem `default_generation_settings`) esperam isso.
+- **Cache em híbridos com pensamento: falta.** O template do Qwen tira o
+  `<think>` das respostas antigas, então o próximo prompt não começa com o
+  histórico inteiro e `reusable_prefix` dá 0 (o estado delta-net não volta
+  atrás). Num agente com pensamento, todo turno reprocessa o contexto
+  (medido: 7,5k tokens, turno 2 com 0 do cache; sem pensar, 7.537 do cache).
+  Caminho: guardar o estado delta-net no fim do prompt e restaurá-lo.
 - `/props` traz `details` (contexto de treino e iniciado, KV, camadas por
   GPU/RAM, MoE com especialistas ativos/total, RoPE, MTP, notas do planner),
   e o painel de configurações da web UI mostra tudo isso.

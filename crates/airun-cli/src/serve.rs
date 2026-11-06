@@ -627,6 +627,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         n_probs: None,
         dry_breakers: DRY_BREAKERS.map(str::to_string).to_vec(),
         reasoning: None,
+        progress: None,
     };
     let props = json!({
         // llama-server's
@@ -1392,6 +1393,15 @@ struct GenSpec {
     dry_breakers: Vec<String>,
     /// A limit on the reply's reasoning, or a way to end it from `/control`.
     reasoning: Option<airun_core::ReasoningBudget>,
+    /// Told after each prefill batch (llama-server's `return_progress`).
+    progress: Option<ProgressFn>,
+}
+
+type ProgressFn = Arc<dyn Fn(airun_core::runtime::PrefillProgress) + Send + Sync>;
+
+/// llama-server's `prompt_progress` object.
+fn prompt_progress_json(p: airun_core::runtime::PrefillProgress) -> Value {
+    json!({ "total": p.total, "cache": p.cached, "processed": p.processed, "time_ms": p.elapsed_ms })
 }
 
 /// How a finished generation went.
@@ -1437,6 +1447,7 @@ impl AppState {
             n_probs,
             dry_breakers,
             reasoning: None,
+            progress: None,
         })
     }
 
@@ -1549,6 +1560,10 @@ fn run_generation_scheduled(state: &AppState, spec: &GenSpec,
         sampler,
         events: etx,
         cancel: Arc::clone(&cancel),
+        progress: spec.progress.as_ref().map(|p| {
+            let p = Arc::clone(p);
+            Box::new(move |x| p(x)) as airun_core::runtime::PrefillHook
+        }),
     };
     state.sched.as_ref().expect("checked by the caller").lock().unwrap_or_else(|e| e.into_inner()).send(job)
         .map_err(|_| anyhow::anyhow!("the scheduler has stopped; restart the server"))?;
@@ -1627,6 +1642,10 @@ fn run_generation(state: &AppState, spec: &GenSpec,
     let mut word: Option<String> = None;
     let mut seen = 0usize;
     let max = spec.max_tokens.unwrap_or(state.ctx);
+    if let Some(p) = &spec.progress {
+        let p = Arc::clone(p);
+        rt.set_prefill_hook(Some(Box::new(move |x| p(x))));
+    }
     // No reset: `generate` reuses whatever prefix of this prompt the caches hold.
     let result = rt.generate(&spec.tokens, max, &mut sampler, |tok, piece| {
         let fresh: Vec<TokenProbs> = {
@@ -1644,6 +1663,7 @@ fn run_generation(state: &AppState, spec: &GenSpec,
         }
         on_text(&text, ambiguous_tail(&text, &spec.stops), tok, &fresh)
     });
+    rt.set_prefill_hook(None);
     state.processing.store(false, Ordering::Relaxed);
     let stats = result?;
     log_request(&stats);
@@ -2371,8 +2391,9 @@ async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap
     let req = match attach_images(&state, req).await { Ok(v) => v, Err(e) => return e };
     let n_probs = req.get("logprobs").and_then(Value::as_bool).unwrap_or(false)
         .then(|| req.get("top_logprobs").and_then(Value::as_u64).unwrap_or(0) as usize);
-    let job = match chat_job(&state, &req, n_probs).await { Ok(j) => j, Err(e) => return e };
+    let mut job = match chat_job(&state, &req, n_probs).await { Ok(j) => j, Err(e) => return e };
     let include_usage = req.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false);
+    let return_progress = req.get("return_progress").and_then(Value::as_bool).unwrap_or(false);
     let model = req.get("model").and_then(Value::as_str).map_or_else(|| state.model_name.clone(), str::to_owned);
     let id = completion_id("chatcmpl-");
     let active = Active::register(&state, &id, &job);
@@ -2421,6 +2442,19 @@ async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap
     }
 
     let (tx, rx) = mpsc::unbounded_channel();
+    // llama-server's return_progress: a chunk with `prompt_progress` (and no
+    // choices) after each prefill batch. Besides showing progress, it keeps a
+    // proxy or tunnel from closing a connection that would otherwise stay
+    // silent through a long prefill.
+    if return_progress {
+        let ptx = tx.clone();
+        let envelope = envelope.clone();
+        job.spec.progress = Some(Arc::new(move |p| {
+            let mut chunk = envelope(json!([]));
+            chunk["prompt_progress"] = prompt_progress_json(p);
+            sse(&ptx, &chunk);
+        }));
+    }
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let _active = active;

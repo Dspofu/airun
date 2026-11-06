@@ -32,6 +32,8 @@ pub struct Job {
     pub events: Sender<Event>,
     /// Raised by the requester to end the generation (stop sequence, client gone).
     pub cancel: Arc<AtomicBool>,
+    /// Told after each batch of this job's prefill (`return_progress`).
+    pub progress: Option<airun_core::runtime::PrefillHook>,
 }
 
 struct Running {
@@ -141,7 +143,11 @@ fn admit(rt: &mut Runtime, job: Job, active: &[Running], slots: usize)
     let free = (0..slots).filter(|s| !busy.contains(s));
     let slot = free.max_by_key(|&s| (rt.slot_prefix(s, &job.tokens), usize::MAX - s)).expect("a slot is free");
     let start = Instant::now();
-    let (mut logits, cached) = match rt.slot_begin(slot, &job.tokens) {
+    let mut job = job;
+    rt.set_prefill_hook(job.progress.take());
+    let begun = rt.slot_begin(slot, &job.tokens);
+    rt.set_prefill_hook(None);
+    let (mut logits, cached) = match begun {
         Ok(v) => v,
         Err(e) => return Err((job, e.to_string())),
     };
