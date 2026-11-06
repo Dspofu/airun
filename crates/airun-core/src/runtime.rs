@@ -281,6 +281,13 @@ struct DeltaStash {
 struct QAct {
     buf: DeviceBuffer<u8>,
     valid: std::cell::Cell<bool>,
+    /// For matmuls on the CPU (layers in RAM, see cpu.rs): the input and
+    /// output in pinned memory, and whether `host_x` holds the current input.
+    host_x: std::cell::RefCell<Option<airun_cuda::PinnedBuffer<f32>>>,
+    host_y: std::cell::RefCell<Option<airun_cuda::PinnedBuffer<f32>>>,
+    host_valid: std::cell::Cell<bool>,
+    /// A feed-forward's gate and up products on the CPU (cpu_ffn).
+    host_mid: std::cell::RefCell<(Vec<f32>, Vec<f32>)>,
     /// The same input as NVFP4 blocks for the FP4 tensor cores, where the
     /// device and the model have them; same freshness protocol.
     fp4: Option<DeviceBuffer<u8>>,
@@ -385,10 +392,97 @@ fn mixed_graphs_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("AIRUN_NO_ROWS_GRAPH").is_ok_and(|v| v.trim() != "0"))
 }
 
-/// Whether AIRUN_NO_GRAPH=1 turned off decode graph capture.
+/// Whether AIRUN_NO_GRAPH=1 turned off decode graph capture, or some
+/// layer's matmuls run on the CPU, which a graph cannot hold.
 fn graphs_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("AIRUN_NO_GRAPH").is_ok_and(|v| v.trim() != "0"))
+    *OFF.get_or_init(|| std::env::var("AIRUN_NO_GRAPH").is_ok_and(|v| v.trim() != "0")) || crate::cpu::in_use()
+}
+
+/// Whether `w`'s matmuls run on the CPU: its weights stay in RAM and
+/// AIRUN_RAM_ON_GPU=1 did not ask for the old copy into VRAM (see cpu.rs).
+fn on_cpu(w: &GpuTensor) -> bool {
+    w.ram.is_some() && crate::cpu::pass_on_cpu()
+}
+
+/// A dense feed-forward whose three matrices are on the CPU, there in one
+/// go: `out = W_down (silu(W_gate x) * W_up x)`. One trip of the input down
+/// and the product up, where three matvecs moved the 17408-wide gate and up
+/// across PCIe too.
+fn cpu_ffn(gate: &GpuTensor, up: &GpuTensor, down: &GpuTensor, x: &DeviceBuffer<f32>, out: &DeviceBuffer<f32>,
+           n: usize, q8: &QAct, stream: &Stream) -> Result<()> {
+    let (nx, nf, ny) = (n * gate.k, n * gate.rows, n * down.rows);
+    let grow = |slot: &std::cell::RefCell<Option<airun_cuda::PinnedBuffer<f32>>>, len: usize| -> Result<()> {
+        if slot.borrow().as_ref().is_none_or(|b| b.len() < len) {
+            *slot.borrow_mut() = Some(airun_cuda::PinnedBuffer::new(len)?);
+        }
+        Ok(())
+    };
+    grow(&q8.host_x, nx)?;
+    grow(&q8.host_y, ny)?;
+    let mut hx = q8.host_x.borrow_mut();
+    let hx = hx.as_mut().expect("grown above");
+    x.copy_to_host_at(0, &mut hx.as_mut_slice()[..nx], stream)?;
+    stream.synchronize()?;
+    // host_x now holds the FFN input, not what an earlier matvec cached.
+    q8.host_valid.set(false);
+    fn host(w: &GpuTensor) -> &[u8] {
+        w.ram.as_ref().map(|r| r.host.as_slice()).expect("on_cpu checked it")
+    }
+    let mut mid = q8.host_mid.borrow_mut();
+    let (g, u) = &mut *mid;
+    g.resize(nf, 0.0);
+    u.resize(nf, 0.0);
+    let xs = &hx.as_slice()[..nx];
+    crate::cpu::matvec(gate.ty, host(gate), gate.row_bytes, gate.k, gate.rows, xs, n, g)?;
+    crate::cpu::matvec(up.ty, host(up), up.row_bytes, up.k, up.rows, xs, n, u)?;
+    let (sg, su) = (gate.global_scale, up.global_scale);
+    for (a, b) in g.iter_mut().zip(u.iter()) {
+        let gv = *a * sg;
+        *a = gv / (1.0 + (-gv).exp()) * (*b * su);
+    }
+    let mut hy = q8.host_y.borrow_mut();
+    let hy = hy.as_mut().expect("grown above");
+    crate::cpu::matvec(down.ty, host(down), down.row_bytes, down.k, down.rows, g, n, &mut hy.as_mut_slice()[..ny])?;
+    if down.global_scale != 1.0 {
+        hy.as_mut_slice()[..ny].iter_mut().for_each(|v| *v *= down.global_scale);
+    }
+    out.copy_from_host_at(0, &hy.as_slice()[..ny], stream)?;
+    Ok(())
+}
+
+/// [`matvec_reuse`] on the CPU threads: the input comes to pinned memory
+/// (once for several matrices of the same input), the product goes back.
+fn cpu_matvec(w: &GpuTensor, x: &DeviceBuffer<f32>, out: &DeviceBuffer<f32>, n: usize, q8: &QAct,
+              stream: &Stream) -> Result<()> {
+    let ram = w.ram.as_ref().expect("on_cpu checked it");
+    let (nx, ny) = (n * w.k, n * w.rows);
+    let grow = |slot: &std::cell::RefCell<Option<airun_cuda::PinnedBuffer<f32>>>, len: usize| -> Result<()> {
+        if slot.borrow().as_ref().is_none_or(|b| b.len() < len) {
+            *slot.borrow_mut() = Some(airun_cuda::PinnedBuffer::new(len)?);
+        }
+        Ok(())
+    };
+    grow(&q8.host_x, nx)?;
+    grow(&q8.host_y, ny)?;
+    let mut hx = q8.host_x.borrow_mut();
+    let hx = hx.as_mut().expect("grown above");
+    if !q8.host_valid.get() {
+        x.copy_to_host_at(0, &mut hx.as_mut_slice()[..nx], stream)?;
+    }
+    // Also orders the previous product's upload out of host_y before it is
+    // overwritten.
+    stream.synchronize()?;
+    q8.host_valid.set(true);
+    let mut hy = q8.host_y.borrow_mut();
+    let hy = hy.as_mut().expect("grown above");
+    crate::cpu::matvec(w.ty, ram.host.as_slice(), w.row_bytes, w.k, w.rows, &hx.as_slice()[..nx], n,
+        &mut hy.as_mut_slice()[..ny])?;
+    if w.global_scale != 1.0 {
+        hy.as_mut_slice()[..ny].iter_mut().for_each(|v| *v *= w.global_scale);
+    }
+    out.copy_from_host_at(0, &hy.as_slice()[..ny], stream)?;
+    Ok(())
 }
 
 /// A loaded model ready to generate.
@@ -787,6 +881,10 @@ impl Runtime {
                         b * cfg.n_embd.max(ffn_width).max(attn_width).max(hc_width) / 32 * 36,
                     )?,
                     valid: std::cell::Cell::new(false),
+                    host_x: std::cell::RefCell::new(None),
+                    host_y: std::cell::RefCell::new(None),
+                    host_valid: std::cell::Cell::new(false),
+                    host_mid: std::cell::RefCell::new((Vec::new(), Vec::new())),
                     fp4: if model_has_nvfp4 && ops::fp4_supported() {
                         Some(DeviceBuffer::new(dev, ops::nvfp4_act_bytes(b,
                             cfg.n_embd.max(ffn_width).max(attn_width).next_multiple_of(64)))?)
@@ -1539,6 +1637,7 @@ impl Runtime {
         let cfg = self.model.config.clone();
         let n = token_ids.len();
         device::set_device(self.states[si].device)?;
+        crate::cpu::set_pass(n);
 
         // --- embedding, on the shard that holds the table ---
         if si == 0 {
@@ -1587,7 +1686,7 @@ impl Runtime {
             // VRAM, in stream order, so they land after the previous such
             // layer is done with it. In a captured decode graph these are copy
             // nodes from the same pinned addresses.
-            for &(host, dev, bytes) in &self.model.layers[layer].ram_copies {
+            for &(host, dev, bytes) in self.model.layers[layer].ram_copies.iter().filter(|_| !crate::cpu::pass_on_cpu()) {
                 airun_cuda::copy_h2d(dev as *mut std::ffi::c_void, host as *const std::ffi::c_void, bytes,
                     &self.states[si].stream)?;
             }
@@ -2462,6 +2561,10 @@ impl Runtime {
             st.xb2.fill_zero(stream)?;
         } else {
             match &w.ffn {
+                FfnWeights::Dense { gate, up, down } if on_cpu(gate) && on_cpu(up) && on_cpu(down)
+                    && gate.k == up.k && gate.rows == up.rows && down.k == gate.rows => {
+                    cpu_ffn(gate, up, down, &st.xb, &st.xb2, n, &st.q8act, stream)?;
+                }
                 FfnWeights::Dense { gate, up, down } => {
                     let mut down_done = false;
                     // Prefill takes gate, up and SwiGLU as one integer tensor-core
@@ -2471,7 +2574,8 @@ impl Runtime {
                     // scale-linear). Only fuse when neither projection carries a
                     // global scale; otherwise the separate path scales gate and
                     // up before the SwiGLU.
-                    let no_scale = gate.global_scale == 1.0 && up.global_scale == 1.0;
+                    // Matrices on the CPU take the plain path (each through matvec).
+                    let no_scale = gate.global_scale == 1.0 && up.global_scale == 1.0 && !on_cpu(gate);
                     let glu = n > 1 && no_scale && !matvec_f32_forced() && same_shape(&[gate, up])
                         && !fp4_prefill(gate, n, &st.q8act)
                         && ops::matvec_supports_q8(gate.kernel_type())
@@ -2786,7 +2890,7 @@ impl Runtime {
         // Decode runs q, k and v as one launch (same f32 kernel, same result).
         // matvec3 writes q, k and v with no epilogue, so a global scale
         // (NVFP4 sidecar) sends them through matvec, which applies it.
-        let fused_qkv = n == 1 && !cfg.attn_output_gate && same_shape(&[&a.q, &a.k, &a.v])
+        let fused_qkv = n == 1 && !cfg.attn_output_gate && !on_cpu(&a.q) && same_shape(&[&a.q, &a.k, &a.v])
             && !q8_decode(&a.q) && [&a.q, &a.k, &a.v].iter().all(|t| t.global_scale == 1.0);
         if cfg.attn_output_gate {
             // The q projection packs a gate next to each head's queries; they
@@ -3972,7 +4076,7 @@ fn fp4_glu_disabled() -> bool {
 }
 
 fn fp4_prefill(w: &GpuTensor, n: usize, q8: &QAct) -> bool {
-    n >= 32 && q8.fp4.is_some() && w.kernel_type().0 == 40 && w.k % 256 == 0 && !matvec_f32_forced()
+    !on_cpu(w) && n >= 32 && q8.fp4.is_some() && w.kernel_type().0 == 40 && w.k % 256 == 0 && !matvec_f32_forced()
 }
 
 /// Decode on the integer kernel for this weight; see
@@ -4126,6 +4230,7 @@ fn matvec(
     // group whose weights are all float types never pays for quantization.
     q8.valid.set(false);
     q8.fp4_valid.set(false);
+    q8.host_valid.set(false);
     matvec_reuse(w, x, out, n, q8, stream)
 }
 
@@ -4151,6 +4256,9 @@ fn matvec_reuse(
     //   64+        int8 tensor cores (MMQ) on sm_80+ for the same types.
     //              Other types and older GPUs go to ops::matvec's fp16
     //              tensor-core kernel.
+    if on_cpu(w) {
+        return cpu_matvec(w, x, out, n, q8, stream);
+    }
     if fp4_prefill(w, n, q8) {
         let buf = q8.fp4.as_ref().expect("checked by fp4_prefill");
         if !q8.fp4_valid.get() {

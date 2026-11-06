@@ -1,6 +1,7 @@
 //! The airun runtime: model configuration, memory planning and execution.
 
 pub mod config;
+pub mod cpu;
 pub mod error;
 mod expert_cache;
 mod gather_pool;

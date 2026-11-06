@@ -473,8 +473,12 @@ pub fn plan(
                 return Ok(p);
             }
         }
-        // Then weights too, the whole cache already out.
-        try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes, &attention, true)
+        // Then weights too. The cache goes back to VRAM first: weights in
+        // RAM are read from DDR by the CPU (cpu.rs), a cache in RAM crosses
+        // PCIe every pass, growing with the conversation (27B on one RTX 5060
+        // behind PCIe 3.0 x1: 78 MB a token at 4096 cells, ~100 ms).
+        try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone(), &[], true)
+            .or_else(|_| try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes, &attention, true))
     };
 
     // Shrink the context until the plan fits, if permitted. Each attempt is a

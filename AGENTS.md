@@ -1061,6 +1061,38 @@ procura o maior contexto, até 1/4 menor, em que ela fica na mais rápida, e
 avisa com uma `note:`. Aqui: 126.976 em vez de 127.488, e sem a flag passou a
 63,8–63,9 / 47,3–47,6, igual ao `--parallel 4`. `-c` explícito não muda.
 
+## Camadas na RAM multiplicadas na CPU (2026-11-06, RTX 5060 8 GB sozinha)
+
+**O problema:** a máquina ficou só com a 5060, num link PCIe 3.0 x1 (~0,8 GB/s; `nvidia-smi -q`: Link Width Current 1x, Max 16x). O 27B NVFP4 deixava 47 camadas (9,4 GiB) na RAM, copiadas para a VRAM a cada passada: 11 s por token, 0,1 tok/s.
+
+**A solução (`cpu.rs`):**
+- **Kernel NVFP4 em AVX2:** `pshufb` com a LUT de e2m1, `sign`/`maddubs`/`madd`, escala UE4M3 × escala da ativação, int8 a cada 32 como o `quantize_act` da GPU. Pega 4 tokens por vez, decodificando o bloco uma vez só para os 4.
+- **Fallback:** `dequantize` mais produto f32, para F32 e os demais tipos.
+- **Pool de threads próprio:** pedaços de 32 linhas tomados dinamicamente (P-cores e E-cores rendem diferente) e espera ativa de 200 µs entre jobs, porque são ~300 matmuls por token.
+- **Medição isolada** (`tests/cpu_bench.rs`, matriz 17408×5120): 50–58 GB/s de 1 a 4 tokens; 26 GB/s com 8 tokens, já limitado por cálculo.
+
+**Integração no runtime:**
+- **Decisão por tensor:** `on_cpu(w)` vale para `w.ram` presente e `cpu::pass_on_cpu()`. O `queue_shard` chama `cpu::set_pass(n)`, que liga a CPU para passadas de até `AIRUN_CPU_MAX_TOKENS` (64) tokens.
+- **Prompt:** blocos maiores copiam as camadas como antes. No x1, um prompt de 2550 tokens fez 40 tok/s copiando e 10,6 na CPU; o empate fica em ~150 tokens por bloco.
+- **`cpu_matvec`:** ativação para memória pinned (uma vez para q/k/v: `host_valid`), sync, CPU, produto de volta.
+- **`cpu_ffn`:** gate, up, SwiGLU e down de uma vez.
+- **Caminhos fundidos desviados:** qkv fundido, GLU fundido e FP4 de prefill pulam esses tensores.
+- **Grafos CUDA:** desligados quando há camadas na CPU (`graphs_disabled() || cpu::in_use()`).
+
+**Planner:** quando os pesos vão para a RAM de qualquer jeito, o KV fica na VRAM antes. Num link lento, o KV na RAM custava ~100 ms por token com 4096 células.
+
+**Medido** (27B NVFP4, 5060 x1, i7-13700, DDR5-4800):
+
+| | antes | depois |
+|---|---|---|
+| geração sem rascunho | 0,1 tok/s | 3,2 |
+| geração com `--draft 2` | — | 5,3 (74% aceitos) |
+| prompt curto | 1,1 tok/s | 10,7 |
+
+- **Exatidão:** texto guloso idêntico ao de `AIRUN_RAM_ON_GPU=1`.
+- **Threads:** 8, 16 e 24 dão o mesmo resultado, porque a banda da RAM satura.
+- **Onde vai o tempo:** ~70% é cálculo na CPU, perto da banda; ~20% é esperar a GPU (17 camadas, cabeça BF16 e as idas e voltas pelo link x1).
+
 ## MTP nos passos em lote do `serve --parallel` (2026-11-06)
 
 **Cabeça por slot.**

@@ -539,6 +539,12 @@ impl Model {
         done += 1;
         progress(done, total_steps);
 
+        // Layers in RAM multiply on the CPU (cpu.rs) unless AIRUN_RAM_ON_GPU=1
+        // keeps copying them into VRAM before they run.
+        if placement.shards.iter().any(|s| !s.ram_layers.is_empty())
+            && !std::env::var("AIRUN_RAM_ON_GPU").is_ok_and(|v| v.trim() != "0") {
+            crate::cpu::set_in_use();
+        }
         let mut ram_staging: Vec<DeviceBuffer<u8>> = Vec::new();
         for dev in placement.devices() {
             let bytes = placement.staging_bytes(dev);

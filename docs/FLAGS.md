@@ -105,11 +105,30 @@ modelo principal confere todos de uma vez. Os que ele aprova saem de graça.
    cair para 131072. Numa conversa longa a cópia cresce: na posição 65536,
    18,9 tok/s, o mesmo de antes. `AIRUN_NO_KV_RAM=1` volta ao comportamento
    antigo.
-5. Se nem com todo o cache na RAM os pesos cabem, as camadas que sobram ficam
-   na RAM e são copiadas para a GPU antes de rodar. O resultado é idêntico,
-   mas fica lento: cada uma dessas camadas passa pela PCIe a cada token (27B
-   com 12 camadas na RAM: 45 → 9 tok/s). Com `--alloc gpu` nada disso
+5. Se nem com todo o cache na RAM os pesos cabem, o cache volta para a VRAM e
+   as camadas que sobram ficam na RAM. **Na geração** (passadas de até 64
+   tokens), os matmuls dessas camadas rodam **na CPU**, lendo direto da RAM. Só
+   as ativações, de poucos KB, cruzam a PCIe; atenção, delta-net e normas
+   continuam na GPU. **No prompt** (blocos maiores), elas são copiadas para a
+   GPU como antes, porque a CPU fica limitada por cálculo com muitos tokens. O
+   resultado é o mesmo que copiando, com texto guloso idêntico.
+
+   27B NVFP4 numa RTX 5060 8 GB sozinha, ligada em PCIe 3.0 x1, i7-13700 com
+   DDR5-4800:
+
+   | | antes (camadas copiadas pelo link) | agora |
+   |---|---|---|
+   | geração, sem rascunho | 0,1 tok/s | 3,2 |
+   | geração, `--draft 2` | — | 5,3 |
+   | prompt de 26 tokens | 1,1 tok/s | 10,7 |
+   | prompt de 2550 tokens | — | 40 (copiado, blocos de 512) |
+
+   `AIRUN_RAM_ON_GPU=1` volta a copiar sempre. Com `--alloc gpu` nada disso
    acontece (o contexto diminui). Modelos MoE seguem o plano de experts.
+
+   **Confira o slot da placa:** `nvidia-smi -q` mostra a largura do link em
+   "Link Width". Um slot x1 (ou riser) deixa a cópia de pesos 8–16× mais lenta
+   que um x8/x16, e é a cópia que pesa no prompt longo.
 
 Para tirar uma GPU do jogo de vez (por exemplo, a que fica para jogos ou para
 o monitor), use `--hide-gpu` ou `AIRUN_HIDE_GPUS`. O `--gpus` só escolhe onde o
@@ -588,6 +607,9 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_SCHED_TIMING=1` | Uma linha por passo em lote do `serve --parallel`: forward, amostragem, entrega. Atrapalha a medição de velocidade. |
 | `AIRUN_HIDE_GPUS=<lista>` | Como `--hide-gpu`, para todo comando: GPUs que o airun nunca toca. Não combina com `CUDA_VISIBLE_DEVICES`. |
 | `AIRUN_NO_KV_RAM=1` | Quando o contexto pedido não cabe, tira pesos da VRAM em vez do cache KV (o comportamento antigo). |
+| `AIRUN_RAM_ON_GPU=1` | Camadas que ficam na RAM são sempre copiadas para a VRAM antes de rodar, em vez de multiplicadas na CPU na geração. |
+| `AIRUN_CPU_THREADS=<n>` | Threads dos matmuls na CPU (padrão: uma por núcleo lógico). Na memória DDR5 do 13700, 8 já saturam a banda. |
+| `AIRUN_CPU_MAX_TOKENS=<n>` | Passadas de até n tokens multiplicam as camadas da RAM na CPU; maiores copiam para a GPU (padrão 64). |
 | `AIRUN_NO_ROWS_SPEC=1` | Com `serve --parallel`, os passos em lote seguem sem rascunhos do MTP (só o pedido sozinho rascunha). |
 | `AIRUN_ROWS_DRAFT=<k2,k3,...>` | Rascunhos por pedido num passo em lote de 2, 3... pedidos (padrão `2,1,1`; 0 = sem rascunho). |
 | `AIRUN_NO_SPLIT_FEW=1` | 2 a 16 tokens num tipo sem kernel de vários tokens (IQ4_XS, por exemplo) vão para o kernel em blocos em vez de uma chamada por token. |
