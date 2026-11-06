@@ -1389,6 +1389,17 @@ extern "C" {
 // cudaErrorInvalidValue, returned for a type this build has no kernel for;
 // defined above, where the gate/up entry point first needs it.
 
+// AIRUN_NO_SPLIT_FEW=1 keeps 2..16 tokens of a type without a multi-token
+// kernel on the tiled kernel (see airun_matvec).
+static bool split_few_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_SPLIT_FEW");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 airun_status airun_matvec(
     int32_t type_id,
     const void* w,
@@ -1503,6 +1514,18 @@ airun_status airun_matvec(
             }
 #undef LAUNCH
         }
+    } else if (n_tokens <= 16 && !split_few_disabled()) {
+        // A few tokens on a type with no multi-token kernel (IQ4_XS, as the
+        // Qwen3.8 MTP head is): the one-token kernel once per token reads the
+        // weights n times at full bandwidth, where the tiled kernel below is
+        // compute-bound -- 1.67 ms for 16 tokens of a 5120 x 17408 IQ4_XS
+        // matrix (5070 Ti), against ~30 us a token.
+        for (int t = 0; t < n_tokens; ++t) {
+            const airun_status s = airun_matvec(type_id, w, (const float*)x + (size_t)t * k,
+                                                (float*)y + (size_t)t * n_rows, k, n_rows, 1, row_bytes, stream);
+            if (s != AIRUN_OK) return s;
+        }
+        return AIRUN_OK;
     } else {
         // Each warp covers PREFILL_ROWS rows and TOKENS_PER_BLOCK tokens.
         const int warps = (n_rows + PREFILL_ROWS - 1) / PREFILL_ROWS;
@@ -1663,15 +1686,26 @@ airun_status airun_matvec_q8(
             default: return AIRUN_ERR_BAD_TYPE;
         }
 #undef LAUNCH
-    } else if (n_tokens <= 8 && type_id == AIRUN_TYPE_NVFP4 && !q8_wide_disabled()) {
+    } else if (n_tokens <= 16 && type_id == AIRUN_TYPE_NVFP4 && !q8_wide_disabled()) {
+        // 9..16 tokens (a batched verify of several conversations) as two
+        // passes of up to 8: on the 27B's 17408 x 5120 FFN (5070 Ti) 16
+        // tokens took ~175 us so, 204 in one 16-token pass (the activations
+        // every block re-reads outgrow the weights), 734 on the tiled kernel.
+        // MMQ (147) is not graph-safe: stream-K numbers its launches.
         constexpr int R = 2;
         const int blocks = (n_rows + R - 1) / R;
-        if (n_tokens <= 4) {
-            matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 4><<<blocks, WIDE_THREADS, 0, stream>>>(
-                (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);
-        } else {
-            matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 8><<<blocks, WIDE_THREADS, 0, stream>>>(
-                (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);
+        const int groups = k / 32;
+        for (int t0 = 0; t0 < n_tokens; t0 += 8) {
+            const int nt = min(8, n_tokens - t0);
+            const block_q8a* xt = (const block_q8a*)xq + (size_t)t0 * groups;
+            float* yt = (float*)y + (size_t)t0 * n_rows;
+            if (nt <= 4) {
+                matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 4><<<blocks, WIDE_THREADS, 0, stream>>>(
+                    (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes);
+            } else {
+                matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 8><<<blocks, WIDE_THREADS, 0, stream>>>(
+                    (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes);
+            }
         }
     } else if (n_tokens <= 8 && !q8_multi_disabled()) {
         const int warps = (n_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;

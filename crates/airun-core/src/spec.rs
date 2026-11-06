@@ -50,6 +50,59 @@ pub(super) struct Spec {
     mgraph: Option<VerifyGraph>,
     /// [`Runtime::advance_graphed`]'s graphs, by accepted count - 1.
     pub(super) agraphs: Vec<Option<AdvanceGraph>>,
+    /// Batched steps (verify_rows / accept_rows / draft_rows): each row's
+    /// head hidden for the next draft, the draft logits and the picks
+    /// ([step][row] for drafts, [row][token] for a verify).
+    rows_hsel: DeviceBuffer<f32>,
+    rows_logits: DeviceBuffer<f32>,
+    rows_picks: DeviceBuffer<i32>,
+    rows_picks_host: airun_cuda::PinnedBuffer<i32>,
+}
+
+/// The MTP head state of a slot that is not the active one (the active
+/// slot's lives in [`Spec`]): its cache, the hidden its next row pairs with,
+/// and whether both cover exactly what the slot holds.
+pub(super) struct SlotHead {
+    kv: LayerState,
+    pending: DeviceBuffer<f32>,
+    synced: bool,
+}
+
+/// What a batched verify ran, for [`Runtime::accept_rows`]: each row's slot
+/// and tokens (the newest, then its drafts), all of `t` tokens.
+pub(super) struct RowsSpec {
+    rows: Vec<(usize, Vec<u32>)>,
+    t: usize,
+}
+
+/// A batched verify's result: every row's greedy pick after each of its
+/// tokens (`t` per row), and the logits behind them when asked for.
+pub struct RowsVerify<'a> {
+    pub picks: Vec<u32>,
+    pub t: usize,
+    pub logits: Option<&'a mut [f32]>,
+}
+
+impl Spec {
+    /// Puts `incoming` (the newly active slot's head) in place and returns
+    /// the one it replaces. A slot without a head of its own gets this one,
+    /// out of sync.
+    pub(super) fn swap_head(&mut self, incoming: Option<SlotHead>) -> Option<SlotHead> {
+        let Some(h) = incoming else {
+            self.synced = false;
+            return None;
+        };
+        Some(SlotHead {
+            kv: std::mem::replace(&mut self.kv, h.kv),
+            pending: std::mem::replace(&mut self.pending, h.pending),
+            synced: std::mem::replace(&mut self.synced, h.synced),
+        })
+    }
+
+    /// Drops the graph that captured the head cache's address.
+    pub(super) fn forget_head_graph(&mut self) {
+        self.mgraph = None;
+    }
 }
 
 /// A verify split across GPUs, captured as one graph per shard and replayed on
@@ -74,6 +127,13 @@ fn draft_vocab(vocab: usize) -> usize {
         .and_then(|v| v.trim().parse().ok()).unwrap_or(0));
     if k == 0 { vocab } else { k.min(vocab) }
 }
+
+/// Drafts per conversation in a batched step of 2, 3, 4... (see
+/// Runtime::rows_draft); past the end, a plain batched step. Qwen3.8-27B
+/// NVFP4 on 5070 Ti + 5060, --draft 3, tok/s summed (plain batching in
+/// brackets): 2 rows 81.5 with 2 drafts, 78.5 with 3 [59]; 3 rows 98 with
+/// 1, 81 with 2 [82]; 4 rows 117 with 1, 98 with 2 [106].
+const ROWS_DRAFT: &[usize] = &[2, 1, 1];
 
 /// AIRUN_NO_VERIFY_SHARD_GRAPHS=1 issues a split verify launch by launch.
 fn shard_graphs_disabled() -> bool {
@@ -147,15 +207,17 @@ impl Runtime {
         for st in &mut self.states {
             device::set_device(st.device)?;
             let dev = st.device;
+            // Room for a batched verify of every slot (verify_rows).
+            let all = rows * self.slots.len().max(1);
             st.stash = st.layers.iter().map(|&l| -> Result<Option<DeltaStash>> {
                 Ok(match cfg.layer_kind(l) {
                     LayerKind::LinearAttention => Some(DeltaStash {
-                        raw: DeviceBuffer::new(dev, rows * ssm.qkv_dim())?,
-                        q: DeviceBuffer::new(dev, rows * ssm.k_dim())?,
-                        k: DeviceBuffer::new(dev, rows * ssm.k_dim())?,
-                        v: DeviceBuffer::new(dev, rows * ssm.v_dim())?,
-                        decay: DeviceBuffer::new(dev, rows * ssm.n_v_heads)?,
-                        beta: DeviceBuffer::new(dev, rows * ssm.n_v_heads)?,
+                        raw: DeviceBuffer::new(dev, all * ssm.qkv_dim())?,
+                        q: DeviceBuffer::new(dev, all * ssm.k_dim())?,
+                        k: DeviceBuffer::new(dev, all * ssm.k_dim())?,
+                        v: DeviceBuffer::new(dev, all * ssm.v_dim())?,
+                        decay: DeviceBuffer::new(dev, all * ssm.n_v_heads)?,
+                        beta: DeviceBuffer::new(dev, all * ssm.n_v_heads)?,
                     }),
                     LayerKind::Attention => None,
                 })
@@ -187,7 +249,447 @@ impl Runtime {
             vsgraph: None,
             mgraph: None,
             agraphs: Vec::new(),
+            rows_hsel: DeviceBuffer::new(dev, self.slots.len().max(1) * cfg.n_embd)?,
+            rows_logits: DeviceBuffer::new(dev, self.slots.len().max(1) * draft_vocab(cfg.vocab_size))?,
+            rows_picks: DeviceBuffer::new(dev, self.slots.len().max(1) * rows)?,
+            rows_picks_host: airun_cuda::PinnedBuffer::new(self.slots.len().max(1) * rows)?,
         });
+        for s in 0..self.slots.len() {
+            self.slots[s].head = None;
+        }
+        self.ensure_heads()?;
+        Ok(())
+    }
+
+    /// A head cache for every slot that has none (the planner counted one
+    /// per slot: Config::kv_bytes_per_layer).
+    fn ensure_heads(&mut self) -> Result<()> {
+        let cfg = &self.model.config;
+        let st = self.states.last().expect("a runtime has at least one device");
+        device::set_device(st.device)?;
+        let kv_bytes = cfg.n_head_kv * self.ctx * cfg.kv_type.row_bytes(cfg.head_dim);
+        for s in 0..self.slots.len() {
+            if s == self.active_slot || self.slots[s].head.is_some() {
+                continue;
+            }
+            self.slots[s].head = Some(SlotHead {
+                kv: LayerState::Kv {
+                    k: DeviceBuffer::zeroed(st.device, kv_bytes, &st.stream)?,
+                    v: DeviceBuffer::zeroed(st.device, kv_bytes, &st.stream)?,
+                    qsa: None,
+                },
+                pending: DeviceBuffer::zeroed(st.device, cfg.n_embd, &st.stream)?,
+                synced: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// Slot `slot`'s head cache.
+    pub(super) fn head_kv(&self, slot: usize) -> Result<&LayerState> {
+        if slot == self.active_slot {
+            return Ok(&self.sp().kv);
+        }
+        self.slots[slot].head.as_ref().map(|h| &h.kv).ok_or_else(|| CoreError::Other(
+            "a batched draft reached a slot without a head cache; this is a bug, run with --draft 0".into()))
+    }
+
+    fn head_pending(&self, slot: usize) -> Option<&DeviceBuffer<f32>> {
+        if slot == self.active_slot {
+            self.spec.as_ref().map(|sp| &sp.pending)
+        } else {
+            self.slots[slot].head.as_ref().map(|h| &h.pending)
+        }
+    }
+
+    /// Whether slot `slot`'s head covers exactly what the slot holds, so its
+    /// drafts are worth verifying.
+    pub fn head_synced(&self, slot: usize) -> bool {
+        let Some(sp) = self.spec.as_ref() else { return false };
+        if slot == self.active_slot { sp.synced } else { self.slots[slot].head.as_ref().is_some_and(|h| h.synced) }
+    }
+
+    pub(super) fn set_head_synced(&mut self, slot: usize, synced: bool) {
+        if slot == self.active_slot {
+            if let Some(sp) = self.spec.as_mut() {
+                sp.synced = synced;
+            }
+        } else if let Some(h) = self.slots.get_mut(slot).and_then(|s| s.head.as_mut()) {
+            h.synced = synced;
+        }
+    }
+
+    /// Drafts per conversation for a batched speculative step over `rows`
+    /// of them; 0 means a plain batched step. A verify of rows x (1 + k)
+    /// tokens costs more per token the more there are (an NVFP4 matmul of the
+    /// 27B: 50 us for 4 tokens, 86 for 8, ~175 for 16), so k shrinks as rows
+    /// grow. AIRUN_ROWS_DRAFT="k2,k3,k4,..." sets it for 2, 3, 4... rows.
+    pub fn rows_draft(&self, rows: usize) -> usize {
+        if !self.speculates() || rows < 2 || rows > self.slots.len() || std::env::var("AIRUN_NO_ROWS_SPEC").is_ok() {
+            return 0;
+        }
+        static TABLE: std::sync::OnceLock<Option<Vec<usize>>> = std::sync::OnceLock::new();
+        let table = TABLE.get_or_init(|| std::env::var("AIRUN_ROWS_DRAFT").ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()));
+        let k = match table {
+            Some(t) => t.get(rows - 2).or(t.last()).copied().unwrap_or(0),
+            None => ROWS_DRAFT.get(rows - 2).copied().unwrap_or(0),
+        };
+        let k = k.min(self.draft);
+        if rows * (k + 1) > self.max_batch { 0 } else { k }
+    }
+
+    /// The prefill's head step for the chunk just run through the main model
+    /// (`pos0` its first position): rows pairing each token with the hidden
+    /// before it, as generate_spec does. Queued, not waited on.
+    pub(super) fn head_prefill_chunk(&mut self, chunk: &[u32], pos0: usize) -> Result<()> {
+        self.spec_init()?;
+        self.stage_h(true, chunk.len() - 1)?;
+        self.save_pending(chunk.len() - 1)?;
+        let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+        let pos: Vec<i32> = (0..chunk.len()).map(|i| (pos0 + i) as i32).collect();
+        self.mtp_queue(&ids, &pos)
+    }
+
+    /// Zeroes the active slot's `pending` (a prefill from position 0).
+    pub(super) fn head_reset(&mut self) -> Result<()> {
+        self.spec_init()?;
+        let st = self.states.last().expect("a runtime has at least one device");
+        device::set_device(st.device)?;
+        self.sp().pending.fill_zero(&st.stream)?;
+        Ok(())
+    }
+
+    /// One batched speculative verify: row b runs `rows[b].1` (the slot's
+    /// newest token, then its drafts; every row the same length) through the
+    /// main model at the slot's next positions, advancing nothing. Returns
+    /// each token's greedy pick, plus the logits when `logits` (for sampled
+    /// rows). Complete it with [`Self::accept_rows`] before anything else
+    /// runs on these slots.
+    pub fn verify_rows(&mut self, rows: &[(usize, Vec<u32>)], logits: bool) -> Result<RowsVerify<'_>> {
+        self.spec_init()?;
+        self.ensure_heads()?;
+        let n_rows = rows.len();
+        let t = rows.first().map_or(0, |r| r.1.len());
+        if t == 0 || rows.iter().any(|r| r.1.len() != t) || n_rows * t > self.max_batch {
+            return Err(CoreError::Other("verify_rows needs rows of one length within the batch".into()));
+        }
+        let n = n_rows * t;
+        let mut seen = std::collections::HashSet::new();
+        let (mut ids, mut positions, mut rope, mut past) = (Vec::with_capacity(n), Vec::with_capacity(n),
+            vec![0i32; 3 * n], Vec::with_capacity(n_rows));
+        for (b, (slot, toks)) in rows.iter().enumerate() {
+            let slot = *slot;
+            if slot >= self.slots.len() || !seen.insert(slot) {
+                return Err(CoreError::Other(format!("verify_rows needs distinct, existing slots (row {b})")));
+            }
+            let (p, shift) = if slot == self.active_slot { (self.n_past, self.rope_shift) }
+                else { (self.slots[slot].n_past, self.slots[slot].rope_shift) };
+            if p + t > self.ctx {
+                return Err(CoreError::Other(format!(
+                    "slot {slot} has no room for {t} tokens in its {} context; this is a bug", self.ctx)));
+            }
+            past.push(p);
+            for (i, &tok) in toks.iter().enumerate() {
+                ids.push(tok as i32);
+                positions.push((p + i) as i32);
+                for a in 0..3 {
+                    rope[a * n + b * t + i] = (p + i) as i32 - shift;
+                }
+            }
+        }
+        for st in &self.states {
+            device::set_device(st.device)?;
+            st.mpos.copy_from_host_at(0, &rope, &st.stream)?;
+        }
+        let slot_rows: Vec<(usize, u32)> = rows.iter().map(|(s, v)| (*s, v[0])).collect();
+        self.fill_rows_tab(&slot_rows)?;
+        self.mixed = Some(rows.iter().map(|r| r.0).collect());
+        self.mixed_t = t;
+        self.mixed_past = past;
+        self.image_rows = Some(n);
+        self.defer = true;
+        self.skip_logits = true;
+        let graphed = !graphs_disabled() && !mixed_graphs_disabled() && !self.mixed_graph_off
+            && !self.states.iter().any(|s| s.moe.as_ref().is_some_and(|m| m.upload.is_some()));
+        let queued = if graphed {
+            let mut launched = false;
+            match self.queue_rows_graphed(&ids, &positions, &mut launched) {
+                Err(e) if !launched => {
+                    eprintln!("note: batched verify runs without CUDA graphs: {e}");
+                    self.mixed_graph_off = true;
+                    self.queue_forward(&ids, &positions)
+                }
+                r => r,
+            }
+        } else {
+            self.queue_forward(&ids, &positions)
+        };
+        self.mixed = None;
+        self.mixed_t = 1;
+        self.image_rows = None;
+        self.defer = false;
+        self.skip_logits = false;
+        queued?;
+
+        // Every token's logits and pick on the output device, and its hidden
+        // kept for the head.
+        let cfg = &self.model.config;
+        let (vocab, d) = (cfg.vocab_size, cfg.n_embd);
+        let st = self.states.last().expect("a runtime has at least one device");
+        device::set_device(st.device)?;
+        let row = d * std::mem::size_of::<f32>();
+        ops::copy_2d(self.sp().h.as_mut_ptr(), row, st.xb.as_ptr(), row, row, n, &st.stream)?;
+        let out_w = self.model.output_tensor();
+        let need = n * vocab;
+        if self.rows_logits.as_ref().is_none_or(|(_, h)| h.len() < need) {
+            self.rows_logits = None;
+            self.rows_logits = Some((DeviceBuffer::<f32>::new(st.device, need)?, airun_cuda::PinnedBuffer::new(need)?));
+        }
+        let sp = self.spec.as_mut().expect("set up by spec_init");
+        let (dev, host) = self.rows_logits.as_mut().expect("allocated above");
+        const AT_ONCE: usize = 8;
+        for r0 in (0..n).step_by(AT_ONCE) {
+            let m = AT_ONCE.min(n - r0);
+            let out = dev.offset_ptr(r0 * vocab);
+            ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr(r0 * d), out, d, vocab, m,
+                out_w.row_bytes, &st.stream)?;
+            if out_w.global_scale != 1.0 {
+                ops::scale(out, out_w.global_scale, m * vocab, &st.stream)?;
+            }
+        }
+        for i in 0..n {
+            ops::argmax(dev.offset_ptr(i * vocab), vocab, sp.rows_picks.offset_ptr(i), sp.scratch.as_mut_ptr(),
+                std::ptr::null_mut(), &st.stream)?;
+        }
+        sp.rows_picks.copy_to_host(&mut sp.rows_picks_host.as_mut_slice()[..n], &st.stream)?;
+        if logits {
+            dev.copy_to_host(&mut host.as_mut_slice()[..need], &st.stream)?;
+        }
+        st.stream.synchronize()?;
+        let picks = sp.rows_picks_host.as_slice()[..n].iter().map(|&p| p as u32).collect();
+        self.rows_spec = Some(RowsSpec { rows: rows.to_vec(), t });
+        let logits = if logits { Some(&mut host.as_mut_slice()[..need]) } else { None };
+        Ok(RowsVerify { picks, t, logits })
+    }
+
+    /// Completes the last [`Self::verify_rows`]: `accept[b] = (m, next)` --
+    /// row b's first m tokens go into its slot's caches (the newest and the
+    /// m - 1 drafts accepted), and `next`, the token after them, starts its
+    /// next step. Feeds every row's head and returns its next drafts.
+    pub fn accept_rows(&mut self, accept: &[(usize, u32)], k: usize) -> Result<Vec<Vec<u32>>> {
+        let RowsSpec { rows, t } = self.rows_spec.take().ok_or_else(|| CoreError::Other(
+            "accept_rows without a verify_rows before it; this is a bug".into()))?;
+        if accept.len() != rows.len() || accept.iter().any(|&(m, _)| m == 0 || m > t) {
+            return Err(CoreError::Other("accept_rows needs 1..=t tokens for every verified row".into()));
+        }
+        self.commit_rows(&rows, t, accept)?;
+        let mut bases = Vec::with_capacity(rows.len());
+        for ((slot, toks), &(m, _)) in rows.iter().zip(accept) {
+            let slot = *slot;
+            let p = if slot == self.active_slot {
+                let p = self.n_past;
+                self.n_past += m;
+                self.history.extend_from_slice(&toks[..m]);
+                p
+            } else {
+                let s = &mut self.slots[slot];
+                let p = s.n_past;
+                s.n_past += m;
+                s.history.extend_from_slice(&toks[..m]);
+                p
+            };
+            bases.push(p);
+        }
+        // The head's rows p+1 .. p+t pair the verify's hiddens (already in
+        // spec.h) with the tokens after them: the accepted drafts and next,
+        // then filler rows past the end, rewritten before anything attends to
+        // them. Its pick after row m - 1 is the first draft.
+        let d = self.model.config.n_embd;
+        let n = rows.len() * t;
+        let (mut ids, mut pos, mut sel) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::new());
+        for (b, ((_, toks), &(m, next))) in rows.iter().zip(accept).enumerate() {
+            for i in 0..t {
+                ids.push(if i + 1 < m { toks[i + 1] } else { next } as i32);
+                pos.push((bases[b] + 1 + i).min(self.ctx - 1) as i32);
+            }
+            sel.push(m - 1);
+        }
+        {
+            let st = self.states.last().expect("a runtime has at least one device");
+            device::set_device(st.device)?;
+            let row = d * std::mem::size_of::<f32>();
+            for (b, ((slot, _), &(m, _))) in rows.iter().zip(accept).enumerate() {
+                if let Some(pend) = self.head_pending(*slot) {
+                    ops::copy_2d(pend.as_mut_ptr(), row, self.sp().h.offset_ptr((b * t + m - 1) * d), row, row, 1,
+                        &st.stream)?;
+                }
+            }
+        }
+        let slots: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        let first: Vec<usize> = (0..rows.len()).map(|b| bases[b] + accept[b].0).collect();
+        self.head_rows(&slots, t, &ids, &pos, &sel, 0)?;
+        self.chain_rows(&slots, &first, k)
+    }
+
+    /// First drafts for slots that have none: row b's head row at the
+    /// slot's next position pairs its `pending` hidden with `rows[b].1`.
+    pub fn draft_rows(&mut self, rows: &[(usize, u32)], k: usize) -> Result<Vec<Vec<u32>>> {
+        self.spec_init()?;
+        self.ensure_heads()?;
+        let d = self.model.config.n_embd;
+        let mut pos = Vec::with_capacity(rows.len());
+        {
+            let st = self.states.last().expect("a runtime has at least one device");
+            device::set_device(st.device)?;
+            let row = d * std::mem::size_of::<f32>();
+            for (b, &(slot, _)) in rows.iter().enumerate() {
+                let pend = self.head_pending(slot).ok_or_else(|| CoreError::Other(
+                    "a batched draft reached a slot without a head cache; this is a bug".into()))?;
+                ops::copy_2d(self.sp().h.offset_ptr(b * d), row, pend.as_ptr(), row, row, 1, &st.stream)?;
+                pos.push(if slot == self.active_slot { self.n_past } else { self.slots[slot].n_past });
+            }
+        }
+        let slots: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        let ids: Vec<i32> = rows.iter().map(|r| r.1 as i32).collect();
+        let p32: Vec<i32> = pos.iter().map(|&p| p as i32).collect();
+        self.head_rows(&slots, 1, &ids, &p32, &vec![0; rows.len()], 0)?;
+        self.chain_rows(&slots, &pos, k)
+    }
+
+    /// The remaining k - 1 drafts after [`Self::head_rows`] left each row's
+    /// first in picks[0..rows] and its hidden in rows_hsel: one head row per
+    /// slot at a time, at `first[b] + i`. Returns every row's k drafts.
+    fn chain_rows(&mut self, slots: &[usize], first: &[usize], k: usize) -> Result<Vec<Vec<u32>>> {
+        let k = k.clamp(1, self.draft.max(1));
+        let r = slots.len();
+        let d = self.model.config.n_embd;
+        for i in 1..k {
+            {
+                let st = self.states.last().expect("a runtime has at least one device");
+                let sp = self.sp();
+                let row = d * std::mem::size_of::<f32>();
+                ops::copy_2d(sp.h.as_mut_ptr(), row, sp.rows_hsel.as_ptr(), row, row, r, &st.stream)?;
+                ops::copy_2d(st.tokens.as_mut_ptr(), 4, sp.rows_picks.offset_ptr((i - 1) * r), 4, 4, r, &st.stream)?;
+            }
+            let pos: Vec<i32> = first.iter().map(|&p| (p + i).min(self.ctx - 1) as i32).collect();
+            self.head_rows(slots, 1, &[], &pos, &vec![0; r], i)?;
+        }
+        let st = self.states.last().expect("a runtime has at least one device");
+        let sp = self.spec.as_mut().expect("set up by spec_init");
+        sp.rows_picks.copy_to_host(&mut sp.rows_picks_host.as_mut_slice()[..k * r], &st.stream)?;
+        st.stream.synchronize()?;
+        let h = sp.rows_picks_host.as_slice();
+        Ok((0..r).map(|b| (0..k).map(|i| h[i * r + b] as u32).collect()).collect())
+    }
+
+    /// The head over `t` tokens for each of `slots` (row b: tokens
+    /// `ids[b*t..]` at `pos[b*t..]`; empty `ids` keeps the tokens already on
+    /// the device), reading spec.h, against each slot's own head cache. Row
+    /// b's output at token `sel[b]` lands in rows_hsel[b] and its draft pick
+    /// in picks[step * rows + b].
+    fn head_rows(&mut self, slots: &[usize], t: usize, ids: &[i32], pos: &[i32], sel: &[usize], step: usize)
+        -> Result<()> {
+        let r = slots.len();
+        let n = r * t;
+        let mut rope = vec![0i32; 3 * n];
+        for (b, &slot) in slots.iter().enumerate() {
+            let shift = if slot == self.active_slot { self.rope_shift } else { self.slots[slot].rope_shift };
+            for i in 0..t {
+                for a in 0..3 {
+                    rope[a * n + b * t + i] = pos[b * t + i] - shift;
+                }
+            }
+        }
+        {
+            let st = self.states.last().expect("a runtime has at least one device");
+            device::set_device(st.device)?;
+            if !ids.is_empty() {
+                st.tokens.copy_from_host_at(0, ids, &st.stream)?;
+            }
+            st.positions.copy_from_host_at(0, pos, &st.stream)?;
+            st.mpos.copy_from_host_at(0, &rope, &st.stream)?;
+        }
+        self.mixed = Some(slots.to_vec());
+        self.mixed_t = t;
+        self.mixed_past = (0..r).map(|b| pos[b * t] as usize).collect();
+        self.mixed_head = true;
+        self.image_rows = Some(n);
+        let ran = self.head_rows_body(n, sel, t, step);
+        self.mixed = None;
+        self.mixed_t = 1;
+        self.mixed_head = false;
+        self.image_rows = None;
+        ran
+    }
+
+    fn head_rows_body(&self, n: usize, sel: &[usize], t: usize, step: usize) -> Result<()> {
+        let cfg = &self.model.config;
+        let mtp = self.model.mtp.as_ref().ok_or_else(|| CoreError::Other(
+            "speculative decoding without an MTP head; this is a bug".into()))?;
+        let sp = self.sp();
+        let si = self.states.len() - 1;
+        let st = &self.states[si];
+        let stream = &st.stream;
+        let d = cfg.n_embd;
+        let embd = &self.model.token_embd;
+        ops::embed(embd.kernel_type(), sp.e.as_mut_ptr(), self.model.embedding_ptr(st.device)?,
+            st.tokens.as_ptr(), n, d, embd.row_bytes, embd.rows, stream)?;
+        ops::rmsnorm(sp.e.as_mut_ptr(), sp.e.as_ptr(), mtp.enorm.as_ptr(), d, n, cfg.rms_eps, stream)?;
+        ops::rmsnorm(st.xb2.as_mut_ptr(), sp.h.as_ptr(), mtp.hnorm.as_ptr(), d, n, cfg.rms_eps, stream)?;
+        let row = d * std::mem::size_of::<f32>();
+        ops::copy_2d(sp.cat.as_mut_ptr(), 2 * row, sp.e.as_ptr(), row, row, n, stream)?;
+        ops::copy_2d(sp.cat.offset_ptr(d), 2 * row, st.xb2.as_ptr(), row, row, n, stream)?;
+        matvec(&mtp.eh_proj, &sp.cat, &st.x, n, &st.q8act, stream)?;
+        self.run_block(si, &mtp.layer, &sp.kv, None, cfg.n_run_layers(), n, cfg, true, None)?;
+        ops::rmsnorm(st.xb.as_mut_ptr(), st.x.as_ptr(), mtp.head_norm.as_ptr(), d, n, cfg.rms_eps, stream)?;
+        let r = sel.len();
+        for (b, &i) in sel.iter().enumerate() {
+            ops::copy_2d(sp.rows_hsel.offset_ptr(b * d), row, st.xb.offset_ptr((b * t + i) * d), row, row, 1, stream)?;
+        }
+        let out_w = self.model.output_tensor();
+        let vocab = draft_vocab(cfg.vocab_size);
+        const AT_ONCE: usize = 8;
+        for r0 in (0..r).step_by(AT_ONCE) {
+            let m = AT_ONCE.min(r - r0);
+            ops::matvec(out_w.kernel_type(), out_w.ptr(), sp.rows_hsel.offset_ptr(r0 * d),
+                sp.rows_logits.offset_ptr(r0 * vocab), d, vocab, m, out_w.row_bytes, stream)?;
+        }
+        for b in 0..r {
+            ops::argmax(sp.rows_logits.offset_ptr(b * vocab), vocab, sp.rows_picks.offset_ptr(step * r + b),
+                sp.scratch.as_mut_ptr(), std::ptr::null_mut(), stream)?;
+        }
+        Ok(())
+    }
+
+    /// Pushes row b's first `accept[b].0` verified tokens into its slot's
+    /// delta-net states (the batched [`Self::commit`]).
+    fn commit_rows(&self, rows: &[(usize, Vec<u32>)], t: usize, accept: &[(usize, u32)]) -> Result<()> {
+        let cfg = &self.model.config;
+        let ssm = cfg.ssm.as_ref().expect("speculation runs on hybrids");
+        let silu = std::env::var("AIRUN_SSM_NO_CONV_SILU").is_err();
+        let reverse = std::env::var("AIRUN_SSM_CONV_REVERSE").is_ok();
+        let (qd, kd, vd, nv) = (ssm.qkv_dim(), ssm.k_dim(), ssm.v_dim(), ssm.n_v_heads);
+        for (si, st) in self.states.iter().enumerate() {
+            device::set_device(st.device)?;
+            let h = st.hybrid.as_ref().expect("hybrid scratch on a hybrid model");
+            for (local, sh) in st.stash.iter().enumerate() {
+                let Some(sh) = sh else { continue };
+                let Block::Linear(l) = &self.model.layers[st.layers[local]].block else { continue };
+                for (b, ((slot, _), &(m, _))) in rows.iter().zip(accept).enumerate() {
+                    let LayerState::Delta { state, conv } = self.slot_state(*slot, si, local) else { continue };
+                    let r = b * t;
+                    let bytes = m * qd * std::mem::size_of::<f32>();
+                    ops::copy_2d(h.qkv.as_mut_ptr(), bytes, sh.raw.offset_ptr(r * qd), bytes, bytes, 1, &st.stream)?;
+                    hybrid::causal_conv1d_ex(h.qkv.as_mut_ptr(), l.conv1d.as_ptr(), conv.as_mut_ptr(), m, qd,
+                        ssm.conv_kernel, silu, reverse, true, &st.stream)?;
+                    hybrid::delta_rule_ex(state.as_mut_ptr(), sh.q.offset_ptr(r * kd), sh.k.offset_ptr(r * kd),
+                        sh.v.offset_ptr(r * vd), sh.decay.offset_ptr(r * nv), sh.beta.offset_ptr(r * nv),
+                        st.attn.as_mut_ptr(), m, ssm.n_k_heads, nv, ssm.head_k_dim(), ssm.head_v_dim(), true,
+                        &st.stream)?;
+                }
+            }
+        }
         Ok(())
     }
 

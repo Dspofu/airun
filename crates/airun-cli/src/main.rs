@@ -4,6 +4,7 @@
 mod bench;
 mod convert;
 mod gpu;
+mod hide;
 mod inspect;
 mod perplexity;
 mod media;
@@ -37,6 +38,9 @@ use clap::{Parser, Subcommand};
           --gpus <0,1>            CUDA ordinals to use
           --alloc <auto|gpu|memory>  where the weights live
           --main-gpu <N>          GPU filled first (and running the RAM layers)
+  any command
+          --hide-gpu <0|5060|GPU-uuid>  GPUs airun never touches (AIRUN_HIDE_GPUS
+                                  hides them for good); the rest are numbered from 0
   run, serve
           --draft <N>             MTP speculative decoding, drafts per step
                                   (run: 3 on dense models, off on MoE; serve: 0)
@@ -60,6 +64,12 @@ Examples:
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// GPUs airun never touches, comma separated: CUDA ordinals (as `airun gpu`
+    /// lists them with nothing hidden), UUIDs, or part of a name (`5060`). The
+    /// rest are numbered from 0. AIRUN_HIDE_GPUS does the same, for good.
+    #[arg(long = "hide-gpu", global = true, value_delimiter = ',', value_name = "GPUS")]
+    hide_gpu: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -97,6 +107,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    hide::apply(&cli.hide_gpu)?;
     match cli.command {
         Command::Run(args) => run::run(args),
         Command::Inspect(args) => inspect::run(args),

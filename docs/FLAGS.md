@@ -25,8 +25,9 @@ airun selftest    conferir os kernels da GPU contra a referência em Rust
 | `-b`, `--batch-size <N>` | `512` | Quantos tokens do prompt são processados por vez. Maior = prompt mais rápido e mais VRAM. Não muda a geração. |
 | `--kv-type <tipo>` | `f16` | Formato do cache: `f16`, `q8_0` ou `q4_0`. Os dois últimos cabem 2x e 3,6x mais contexto, com perda de qualidade muito pequena. |
 | `--gpus <lista>` | todas | Quais GPUs usar, ex.: `--gpus 0,1`. O número é o do CUDA, que pode não bater com o do `nvidia-smi`: confira com `airun gpu`. |
+| `--hide-gpu <lista>` | nenhuma | GPUs que o airun **nunca** toca, nem para abrir contexto: número do CUDA (como `airun gpu` mostra sem nada oculto), UUID ou parte do nome, ex.: `--hide-gpu 5060`. Vale para qualquer comando. As outras passam a ser numeradas a partir de 0, e `--gpus`/`--main-gpu`/`--tensor-split` usam a numeração nova. Para ocultar sempre, defina `AIRUN_HIDE_GPUS` no ambiente. |
 | `--main-gpu <N>` | a mais rápida | A GPU que é enchida primeiro. Escolha a que está no slot PCIe mais rápido. |
-| `--alloc <modo>` | `auto` | Onde os pesos podem ficar. `auto`: nas GPUs necessárias e, só se faltar, na RAM. `gpu`: só na VRAM (se não couber, reduz o contexto ou dá erro). `memory`: em todas as GPUs e depois na RAM. |
+| `--alloc <modo>` | `auto` | Onde os pesos e o cache podem ficar. `auto`: nas GPUs necessárias e, só se faltar, na RAM (primeiro o cache, depois os pesos). `gpu`: só na VRAM (se não couber, reduz o contexto ou dá erro). `memory`: em todas as GPUs e depois na RAM. |
 | `--tensor-split <frações>` | — | Divide as camadas à mão, ex.: `0.7,0.3`. Desliga a divisão automática. |
 | `--single-gpu <N>` | — | Põe o modelo inteiro numa GPU. |
 | `--vram-reserve <MiB>` | `384` | VRAM deixada livre em cada GPU (o Windows não entrega os últimos megabytes). |
@@ -96,10 +97,24 @@ modelo principal confere todos de uma vez. Os que ele aprova saem de graça.
      43,0 tok/s em comparação a dividir ao meio.)
    - **GPUs iguais** (até 10% de diferença): divide ao meio. A geração fica
      igual e o prompt quase dobra, porque as duas trabalham juntas.
-4. Se nem todas as GPUs juntas comportam o modelo, as camadas que sobram ficam
+4. Se o contexto pedido com `-c` não cabe, **o cache KV das últimas camadas de
+   atenção vai para a RAM** (só o necessário). A cada passada só as células já
+   preenchidas vêm para a VRAM, então numa conversa curta quase nada cruza a
+   PCIe. O resultado é idêntico. 27B NVFP4 na 5070 Ti + 5060, `-c 262144`:
+   15,7 → 63,0 tok/s; com `--parallel 4`, 6,1 → 60,9, e o contexto deixou de
+   cair para 131072. Numa conversa longa a cópia cresce: na posição 65536,
+   18,9 tok/s, o mesmo de antes. `AIRUN_NO_KV_RAM=1` volta ao comportamento
+   antigo.
+5. Se nem com todo o cache na RAM os pesos cabem, as camadas que sobram ficam
    na RAM e são copiadas para a GPU antes de rodar. O resultado é idêntico,
    mas fica lento: cada uma dessas camadas passa pela PCIe a cada token (27B
-   com 12 camadas na RAM: 45 → 9 tok/s). Com `--alloc gpu` isso não acontece.
+   com 12 camadas na RAM: 45 → 9 tok/s). Com `--alloc gpu` nada disso
+   acontece (o contexto diminui). Modelos MoE seguem o plano de experts.
+
+Para tirar uma GPU do jogo de vez (por exemplo, a que fica para jogos ou para
+o monitor), use `--hide-gpu` ou `AIRUN_HIDE_GPUS`. O `--gpus` só escolhe onde o
+modelo vai, e o CUDA ainda pode abrir contexto (algumas centenas de MiB) nas
+outras.
 
 `--stats` mostra o que foi decidido.
 
@@ -252,9 +267,23 @@ llama-server:
   pausa no token que está entregando e os dois seguem juntos. No 27B NVFP4 com
   `--draft 4` (5070 Ti + 5060): sozinho 38,3 tok/s com ou sem `--parallel 4`
   (antes da mudança, 27,4 com a flag). `AIRUN_NO_PARALLEL_SOLO=1` desliga.
-- Os passos em lote não usam o MTP (a cabeça guarda uma sequência só). Um
-  pedido que voltou a ficar sozinho depois de um lote segue sem rascunho, a não
-  ser que refazer o que a cabeça perdeu custe até 256 tokens.
+- **Os passos em lote também usam o MTP.** Cada slot tem o próprio cache da
+  cabeça, e uma passada confere os rascunhos de todos os pedidos juntos. O
+  texto é o mesmo que cada pedido geraria sozinho (temp 0). Quanto mais
+  pedidos, menos rascunhos por pedido: conferir muitos tokens de uma vez custa
+  mais por token. São 2 rascunhos com 2 pedidos e 1 com 3 ou 4; com mais de 4,
+  o lote segue sem rascunho. 27B NVFP4 (5070 Ti + 5060, `--draft 3`), tok/s
+  somados:
+
+  | pedidos | sem MTP no lote | com MTP no lote |
+  |---|---|---|
+  | 2 | 59 | 81,5 |
+  | 3 | 82 | 98 |
+  | 4 | 106 | 117 |
+  | 4, `-c 262144` (KV na RAM) | 88,5 | 107 |
+
+  `AIRUN_NO_ROWS_SPEC=1` desliga; `AIRUN_ROWS_DRAFT=2,1,1` escolhe os
+  rascunhos para 2, 3, 4... pedidos.
 - Cada slot guarda o próprio snapshot de turno (híbridos), então duas conversas
   alternadas reaproveitam cada uma o seu histórico.
 - Modelos `qwen4exp` não aceitam N maior que 1.
@@ -557,6 +586,11 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_NO_TALLK_TOKENS=1` | Matrizes estreitas (menos de 512 linhas, como os portões da delta-net) com 2 a 16 tokens voltam ao kernel em blocos. Por padrão ficam no de um bloco por linha e token: verify do MTP no 27B +7%. |
 | `AIRUN_NO_HALF_MATVEC=1` | Matrizes BF16/F16 com 1 a 8 tokens (a cabeça de saída de vários GGUF) voltam aos kernels por grupo. |
 | `AIRUN_SCHED_TIMING=1` | Uma linha por passo em lote do `serve --parallel`: forward, amostragem, entrega. Atrapalha a medição de velocidade. |
+| `AIRUN_HIDE_GPUS=<lista>` | Como `--hide-gpu`, para todo comando: GPUs que o airun nunca toca. Não combina com `CUDA_VISIBLE_DEVICES`. |
+| `AIRUN_NO_KV_RAM=1` | Quando o contexto pedido não cabe, tira pesos da VRAM em vez do cache KV (o comportamento antigo). |
+| `AIRUN_NO_ROWS_SPEC=1` | Com `serve --parallel`, os passos em lote seguem sem rascunhos do MTP (só o pedido sozinho rascunha). |
+| `AIRUN_ROWS_DRAFT=<k2,k3,...>` | Rascunhos por pedido num passo em lote de 2, 3... pedidos (padrão `2,1,1`; 0 = sem rascunho). |
+| `AIRUN_NO_SPLIT_FEW=1` | 2 a 16 tokens num tipo sem kernel de vários tokens (IQ4_XS, por exemplo) vão para o kernel em blocos em vez de uma chamada por token. |
 | `AIRUN_NO_PARALLEL_SOLO=1` | Com `serve --parallel`, um pedido sozinho também passa pelo passo em lote (sem MTP, logits copiados para o host). |
 | `AIRUN_NO_GPU_ARGMAX=1` | Decodificação gulosa copia os logits para o host e escolhe lá. |
 | `AIRUN_NO_DECODE_PIPELINE=1` | Decodificação gulosa espera cada token antes de enfileirar o passo seguinte. Com o pipeline o passo i+1 lê o token do passo i direto da GPU; o texto gerado é idêntico. Não roda em híbridos (o estado recorrente absorveria o passo especulativo). |

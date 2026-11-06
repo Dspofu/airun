@@ -46,6 +46,13 @@ pub fn run(args: GpuArgs) -> Result<()> {
         devices.len()
     );
 
+    for h in crate::hide::hidden() {
+        println!("hidden (--hide-gpu / AIRUN_HIDE_GPUS): {h}");
+    }
+    if !crate::hide::hidden().is_empty() {
+        println!();
+    }
+
     for d in &devices {
         let generation = d.generation();
         let status = if !generation.is_supported() {

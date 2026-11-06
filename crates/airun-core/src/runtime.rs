@@ -18,6 +18,7 @@ use airun_cuda::qsa;
 
 #[path = "spec.rs"]
 mod spec;
+pub use spec::RowsVerify;
 
 /// What a layer carries from one token to the next.
 enum LayerState {
@@ -49,6 +50,8 @@ struct SlotStore {
     image_spans: Vec<(usize, usize, i32)>,
     /// Its own turn snapshot, so a request on another slot does not take it.
     turn_snap: Option<TurnSnapshot>,
+    /// Its own MTP head cache (the active slot's is in `Runtime::spec`).
+    head: Option<spec::SlotHead>,
 }
 
 /// A hybrid's recurrent state (delta-net matrices and convolutions, QSA keys,
@@ -313,6 +316,9 @@ struct DeviceState {
     rows_tab: Option<DeviceBuffer<u64>>,
     /// attn_partial for every slot at once, for the batched attention.
     rows_partial: Option<DeviceBuffer<f32>>,
+    /// The VRAM copy (K, V) of one layer's cache that the attention layers
+    /// whose KV cache stays in RAM run on (see Shard::kv_ram_layers).
+    kv_stage: Option<(DeviceBuffer<u8>, DeviceBuffer<u8>)>,
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
     positions: DeviceBuffer<i32>,
@@ -455,6 +461,15 @@ pub struct Runtime {
     active_slot: usize,
     /// During a multi-slot decode step: the slot of each row.
     mixed: Option<Vec<usize>>,
+    /// Tokens per row of a mixed pass: 1 for decode_rows, 1 + drafts for a
+    /// batched verify (spec::verify_rows) or the head's rows.
+    mixed_t: usize,
+    /// Each row's first position in a mixed pass of several tokens a row.
+    mixed_past: Vec<usize>,
+    /// The mixed pass is the MTP head's: attention reads each row's head cache.
+    mixed_head: bool,
+    /// The last batched verify's rows, which spec::accept_rows completes.
+    rows_spec: Option<spec::RowsSpec>,
     /// Drafts per speculative step (see `set_draft`); 0 decodes plainly.
     draft: usize,
     /// Called after each prefill batch (see `set_prefill_hook`).
@@ -495,6 +510,11 @@ impl Drop for Runtime {
         // The counts since the last rebalance are lost; the rest is kept.
         self.save_expert_profile();
     }
+}
+
+/// A zeroed K or V cache of `bytes`, in VRAM or (`in_ram`) pinned RAM.
+fn kv_cache(dev: i32, bytes: usize, in_ram: bool, stream: &Stream) -> Result<DeviceBuffer<u8>> {
+    Ok(if in_ram { DeviceBuffer::in_ram(dev, bytes)? } else { DeviceBuffer::zeroed(dev, bytes, stream)? })
 }
 
 impl Runtime {
@@ -547,8 +567,10 @@ impl Runtime {
             for &l in &shard.layers {
                 layer_states.push(match cfg.layer_kind(l) {
                     LayerKind::Attention => LayerState::Kv {
-                        k: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim), &stream)?,
-                        v: DeviceBuffer::zeroed(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim), &stream)?,
+                        k: kv_cache(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim),
+                            placement.kv_in_ram(l), &stream)?,
+                        v: kv_cache(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim),
+                            placement.kv_in_ram(l), &stream)?,
                         qsa: match qsa_ratio(cfg, l, ctx) {
                             Some(ratio) => {
                                 let dim = cfg.indexer.as_ref().expect("qsa_ratio checked it").dim;
@@ -742,6 +764,10 @@ impl Runtime {
                 attn_partial: DeviceBuffer::new(dev, cfg.n_head * ops::attention_splits(ctx) * (cfg.head_dim + 2))?,
                 rows_tab: None,
                 rows_partial: None,
+                kv_stage: if shard.kv_ram_layers.is_empty() { None } else {
+                    let bytes = cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim);
+                    Some((DeviceBuffer::new(dev, bytes)?, DeviceBuffer::new(dev, bytes)?))
+                },
                 gate: DeviceBuffer::new(dev, b * ffn_width.max(1))?,
                 up: DeviceBuffer::new(dev, b * ffn_width.max(1))?,
                 positions: DeviceBuffer::new(dev, b)?,
@@ -807,6 +833,10 @@ impl Runtime {
             slots: vec![SlotStore::default()],
             active_slot: 0,
             mixed: None,
+            mixed_t: 1,
+            mixed_past: Vec::new(),
+            mixed_head: false,
+            rows_spec: None,
             draft: 0,
             prefill_hook: None,
             since_rebalance: 0,
@@ -1805,8 +1835,9 @@ impl Runtime {
     /// --parallel). Each slot gets its own KV cache and recurrent state at the
     /// full context; the planner must have counted them (Config::slots).
     /// [`Self::decode_rows`] then advances several slots in one forward pass.
-    /// The MTP head keeps one sequence: it drafts only in a plain
-    /// [`Self::generate`] on one slot, and goes stale on every slot switch.
+    /// Each slot keeps its own MTP head cache too (swapped in with its
+    /// states), so a slot's head stays good across switches and batched steps
+    /// draft as well (spec::verify_rows).
     pub fn set_slots(&mut self, n: usize) -> Result<()> {
         let n = n.max(1);
         let cfg = &self.model.config;
@@ -1876,9 +1907,10 @@ impl Runtime {
             out.push(match cfg.layer_kind(l) {
                 LayerKind::Attention => {
                     let bytes = cfg.n_head_kv * self.ctx * cfg.kv_type.row_bytes(cfg.head_dim);
+                    let in_ram = self.model.placement.kv_in_ram(l);
                     LayerState::Kv {
-                        k: DeviceBuffer::zeroed(st.device, bytes, &st.stream)?,
-                        v: DeviceBuffer::zeroed(st.device, bytes, &st.stream)?,
+                        k: kv_cache(st.device, bytes, in_ram, &st.stream)?,
+                        v: kv_cache(st.device, bytes, in_ram, &st.stream)?,
                         qsa: None,
                     }
                 }
@@ -1925,20 +1957,19 @@ impl Runtime {
         self.history = std::mem::take(&mut self.slots[s].history);
         self.image_spans = std::mem::take(&mut self.slots[s].image_spans);
         self.turn_snap = self.slots[s].turn_snap.take();
-        if let Some(snap) = self.turn_snap.as_mut() {
-            // The MTP head's cache is one for every slot; others wrote it since.
-            snap.pending = false;
-        }
         let shift = self.slots[s].rope_shift;
         self.active_slot = s;
         self.decode_graph = None;
         self.chain = None;
         if let Some(sp) = self.spec.as_mut() {
-            sp.synced = false;
-            // These captured the old slot's delta-net and KV addresses too.
+            // Each slot keeps its own head cache: swap it in with the states.
+            let incoming = self.slots[s].head.take();
+            self.slots[a].head = sp.swap_head(incoming);
+            // These captured the old slot's delta-net, KV and head addresses.
             sp.vgraph = None;
             sp.vsgraph = None;
             sp.agraphs.clear();
+            sp.forget_head_graph();
         }
         self.set_rope_shift(shift)
     }
@@ -1950,9 +1981,24 @@ impl Runtime {
             return Err(CoreError::Other("an empty prompt has nothing to continue".into()));
         }
         self.switch_slot(s)?;
-        let cached = Self::image_safe_prefix(prompt, self.reusable_prefix(prompt));
+        let mut cached = Self::image_safe_prefix(prompt, self.reusable_prefix(prompt));
+        // With drafting on, the MTP head is fed as in generate, so the slot
+        // drafts in batched steps (spec::verify_rows). A head that missed
+        // part of the cached prefix makes a short one worth prefilling again;
+        // a long one goes on without it. No head through images.
+        let mut head = self.speculates() && !prompt.iter().any(|&t| is_image_token(t));
+        if head && cached > 0 {
+            let valid = if cached < self.history.len() { self.snapshot_has_head() } else { self.head_synced(s) };
+            if !valid {
+                if cached <= 256 { cached = 0 } else { head = false }
+            }
+        }
         self.rewind_to(cached);
         let cached = self.n_past.min(cached);
+        self.set_head_synced(s, false);
+        if head && cached == 0 {
+            self.head_reset()?;
+        }
         let start = std::time::Instant::now();
         let mut done = self.prefill_images(prompt, cached)?;
         let mut logits = Vec::new();
@@ -1965,17 +2011,22 @@ impl Runtime {
                 take = take.min(p - done);
             }
             let chunk = &prompt[done..done + take];
+            let pos0 = self.n_past;
             done += take;
             if done < prompt.len() {
                 self.step(chunk)?;
-                if snap_at == Some(done) {
-                    self.take_snapshot(false)?;
-                }
             } else {
                 logits = self.forward_pinned(chunk)?.to_vec();
             }
+            if head {
+                self.head_prefill_chunk(chunk, pos0)?;
+            }
+            if snap_at == Some(done) {
+                self.take_snapshot(head)?;
+            }
             self.prefill_report(done, prompt.len(), cached, start);
         }
+        self.set_head_synced(s, head);
         Ok((logits, cached))
     }
 
@@ -2015,8 +2066,8 @@ impl Runtime {
             device::set_device(st.device)?;
             st.mpos.copy_from_host_at(0, &rope, &st.stream)?;
         }
-        if let Some(sp) = self.spec.as_mut() {
-            sp.synced = false;
+        for &(slot, _) in rows {
+            self.set_head_synced(slot, false);
         }
         let ids: Vec<i32> = rows.iter().map(|&(_, t)| t as i32).collect();
         self.fill_rows_tab(rows)?;
@@ -2124,7 +2175,11 @@ impl Runtime {
     /// graph per shard captured for these slots. `launched` tells whether
     /// any work was queued (when not, an error can be retried uncaptured).
     fn queue_rows_graphed(&mut self, ids: &[i32], positions: &[i32], launched: &mut bool) -> Result<()> {
-        let key = self.mixed.clone().expect("decode_rows sets the rows");
+        // A batched verify (several tokens a row) is a graph of its own.
+        let mut key = self.mixed.clone().expect("decode_rows sets the rows");
+        if self.mixed_t > 1 {
+            key.push(usize::MAX - self.mixed_t);
+        }
         let n = ids.len();
         let mut mg = match self.mixed_graphs.take() {
             Some(mg) => mg,
@@ -2681,6 +2736,41 @@ impl Runtime {
     }
 
     /// Softmax attention, optionally with a per-head sigmoid output gate.
+    /// For a layer whose KV cache stays in RAM: copies the cells this pass
+    /// reads into the shard's stage and returns the stage's (K, V), which the
+    /// cache write and the attention then use. A cache in VRAM is returned
+    /// as it is.
+    fn kv_stage_in(&self, st: &DeviceState, kc: &DeviceBuffer<u8>, vc: &DeviceBuffer<u8>,
+                   positions: *const std::ffi::c_void, n: usize)
+        -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
+        if !kc.is_in_ram() {
+            return Ok((kc.as_mut_ptr(), vc.as_mut_ptr()));
+        }
+        let cfg = &self.model.config;
+        let (sk, sv) = st.kv_stage.as_ref().ok_or_else(|| CoreError::Other(
+            "a KV cache in RAM on a GPU without a stage; restart with --alloc gpu and report this".into()))?;
+        let row = cfg.kv_type.row_bytes(cfg.head_dim);
+        for (stage, cache) in [(sk, kc), (sv, vc)] {
+            ops::kv_stage(stage.as_mut_ptr(), cache.as_ptr(), positions, n, cfg.n_head_kv, self.ctx, row,
+                true, &st.stream)?;
+        }
+        Ok((sk.as_mut_ptr(), sv.as_mut_ptr()))
+    }
+
+    /// Writes the cells this pass stored in the stage back to a KV cache in
+    /// RAM (see [`Self::kv_stage_in`]); nothing for one in VRAM.
+    fn kv_stage_out(&self, st: &DeviceState, kc: &DeviceBuffer<u8>, vc: &DeviceBuffer<u8>,
+                    positions: *const std::ffi::c_void, n: usize) -> Result<()> {
+        let Some((sk, sv)) = st.kv_stage.as_ref().filter(|_| kc.is_in_ram()) else { return Ok(()) };
+        let cfg = &self.model.config;
+        let row = cfg.kv_type.row_bytes(cfg.head_dim);
+        for (stage, cache) in [(sk, kc), (sv, vc)] {
+            ops::kv_stage(cache.as_mut_ptr(), stage.as_ptr(), positions, n, cfg.n_head_kv, self.ctx, row,
+                false, &st.stream)?;
+        }
+        Ok(())
+    }
+
     fn run_attention(
         &self,
         si: usize,
@@ -2771,37 +2861,58 @@ impl Runtime {
         };
 
         if let Some(rows) = self.mixed.as_deref() {
-            // One token per conversation: each row's cache write and attention
-            // against its own slot's cache, the projections around them batched.
-            let local = self.states[si].layers.iter().position(|&l| l == layer)
-                .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
+            // Rows of `t` tokens, one row per conversation: each row's cache
+            // write and attention against its own slot's cache (or, for the
+            // head's rows, its slot's head cache), the projections around them
+            // batched.
+            let t = self.mixed_t;
+            let local = if self.mixed_head { 0 } else {
+                self.states[si].layers.iter().position(|&l| l == layer)
+                    .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?
+            };
             let null = std::ptr::null::<std::ffi::c_void>();
             let (qw, kw) = (cfg.n_head * cfg.head_dim, cfg.n_head_kv * cfg.head_dim);
             let window = std::env::var("AIRUN_ATTN_WINDOW").ok()
                 .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
-            // Every row's attention in one launch when the kernel takes the shape.
+            // Every row's attention in one launch when the kernel takes the shape
+            // (and the caches are in VRAM: one in RAM goes through the stage).
             let batched = self.rows_tab_at(si, local)
+                .filter(|_| t == 1 && !self.mixed_head)
                 .filter(|_| ops::attention_split_rows_ok(cfg.n_head, cfg.n_head_kv, cfg.head_dim))
+                .filter(|_| !kc.is_in_ram())
                 .zip(st.rows_partial.as_ref());
             for (b, &slot) in rows.iter().enumerate() {
-                let LayerState::Kv { k: kc, v: vc, .. } = self.slot_state(slot, si, local) else {
+                let state = if self.mixed_head { self.head_kv(slot)? } else { self.slot_state(slot, si, local) };
+                let LayerState::Kv { k: kc, v: vc, .. } = state else {
                     return Err(CoreError::Other("an attention layer was given a recurrent state".into()));
                 };
+                let at = b * t;
+                let pos = st.positions.offset_ptr(at);
+                let (kp, vp) = self.kv_stage_in(st, kc, vc, pos, t)?;
                 // The rotation position comes from this row of mpos (all three
                 // axes equal: text), so each slot keeps its own image shift.
-                let rope = cfg.rope.positioned(0, Some((st.mpos.as_ptr() as u64 + 4 * b as u64, rows.len())));
+                let rope = cfg.rope.positioned(0, Some((st.mpos.as_ptr() as u64 + 4 * at as u64, rows.len() * t)));
                 ops::qk_norm_rope_store(
-                    st.q.offset_ptr(b * qw), st.k.offset_ptr(b * kw), st.v.offset_ptr(b * kw),
+                    st.q.offset_ptr(at * qw), st.k.offset_ptr(at * kw), st.v.offset_ptr(at * kw),
                     a.q_norm.as_ref().map_or(null, |w| w.as_ptr()),
                     a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
-                    kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.offset_ptr(b),
-                    1, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
+                    kp, vp, pos,
+                    t, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
                     (!rope_off).then_some((rope_dim, rope, rope_interleaved)),
                     cfg.kv_type, stream,
                 )?;
-                if batched.is_none() {
-                    ops::attention_split_sel(st.attn.offset_ptr(b * qw), &st.attn_partial,
-                        st.q.offset_ptr(b * qw), kc.as_ptr(), vc.as_ptr(), st.positions.offset_ptr(b),
+                self.kv_stage_out(st, kc, vc, pos, t)?;
+                if t > 1 {
+                    // The cells come from `positions` on the device; `keys` only
+                    // picks a long-context variant, and a constant keeps a
+                    // captured verify valid at every position.
+                    let keys = if self.mixed_head { self.mixed_past.get(b).copied().unwrap_or(0) + t } else { self.ctx };
+                    ops::attention_masked(st.attn.offset_ptr(at * qw), st.q.offset_ptr(at * qw), kp, vp, pos,
+                        t, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(), window,
+                        cfg.kv_type, None, keys, stream)?;
+                } else if batched.is_none() {
+                    ops::attention_split_sel(st.attn.offset_ptr(at * qw), &st.attn_partial,
+                        st.q.offset_ptr(at * qw), kp, vp, pos,
                         cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
                         window, ops::attention_splits(self.ctx), cfg.kv_type, std::ptr::null(), stream)?;
                 }
@@ -2812,6 +2923,7 @@ impl Runtime {
                     ops::attention_splits(self.ctx), cfg.kv_type, rows.len(), stream)?;
             }
         } else {
+            let (kp, vp) = self.kv_stage_in(st, kc, vc, st.positions.as_ptr(), n)?;
             if !fused_prologue_disabled() {
                 // q/k norms, RoPE and the cache write in one launch (see
                 // qk_norm_rope_store_kernel); the same arithmetic as the steps below.
@@ -2820,7 +2932,7 @@ impl Runtime {
                     st.q.as_mut_ptr(), st.k.as_ptr(), st.v.as_ptr(),
                     a.q_norm.as_ref().map_or(null, |w| w.as_ptr()),
                     a.k_norm.as_ref().map_or(null, |w| w.as_ptr()),
-                    kc.as_mut_ptr(), vc.as_mut_ptr(), st.positions.as_ptr(),
+                    kp, vp, st.positions.as_ptr(),
                     n, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.rms_eps,
                     (!rope_off).then_some((rope_dim, self.rope_for(si, cfg), rope_interleaved)),
                     cfg.kv_type, stream,
@@ -2877,8 +2989,8 @@ impl Runtime {
                 }
 
                 ops::kv_store(
-                    kc.as_mut_ptr(),
-                    vc.as_mut_ptr(),
+                    kp,
+                    vp,
                     st.k.as_ptr(),
                     st.v.as_ptr(),
                     st.positions.as_ptr(),
@@ -2890,6 +3002,8 @@ impl Runtime {
                     stream,
                 )?;
             }
+
+            self.kv_stage_out(st, kc, vc, st.positions.as_ptr(), n)?;
 
             // QSA: the cells each query attends to, as a list for decode and a
             // mask for batches; None attends densely.
@@ -2905,7 +3019,7 @@ impl Runtime {
                 .and_then(|v| v.parse().ok()).unwrap_or(cfg.sliding_window);
             if n == 1 && std::env::var("AIRUN_NO_SPLIT_ATTN").is_err() {
                 ops::attention_split_sel(st.attn.as_mut_ptr(), &st.attn_partial,
-                    st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(), st.positions.as_ptr(),
+                    st.q.as_ptr(), kp, vp, st.positions.as_ptr(),
                     cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
                     window, ops::attention_splits(self.ctx), cfg.kv_type,
                     sparse.map_or(std::ptr::null(), |qs| qs.list.as_ptr()), stream)?;
@@ -2918,7 +3032,7 @@ impl Runtime {
                             qs.mask.as_mut_ptr(), qs.words, stream)?;
                     }
                 }
-                ops::attention_masked(st.attn.as_mut_ptr(), st.q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
+                ops::attention_masked(st.attn.as_mut_ptr(), st.q.as_ptr(), kp, vp,
                     st.positions.as_ptr(), n, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
                     self.ctx, cfg.attn_scale(), window, cfg.kv_type,
                     sparse.map(|qs| (qs.mask.as_ptr(), qs.words)), self.n_past + n, stream)?;
@@ -3008,7 +3122,22 @@ impl Runtime {
         // conv_out; one token stays in place.
         let silu = std::env::var("AIRUN_SSM_NO_CONV_SILU").is_err();
         let reverse = std::env::var("AIRUN_SSM_CONV_REVERSE").is_ok();
-        let conv_rows = if let Some(rows) = self.mixed.as_deref() {
+        let conv_rows = if let Some(rows) = self.mixed.as_deref().filter(|_| self.mixed_t > 1) {
+            // Several tokens per conversation (a batched verify): each row
+            // convolves out of place against its own slot's history, which
+            // moves only when no stash defers it.
+            let (t, qd) = (self.mixed_t, ssm.qkv_dim());
+            let local = self.states[si].layers.iter().position(|&x| x == layer)
+                .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
+            for (b, &slot) in rows.iter().enumerate() {
+                let LayerState::Delta { conv: c, .. } = self.slot_state(slot, si, local) else {
+                    return Err(CoreError::Other("a linear layer was given a KV cache".into()));
+                };
+                hybrid::causal_conv1d_oop(h.qkv.offset_ptr(b * t * qd), h.conv_out.offset_ptr(b * t * qd),
+                    l.conv1d.as_ptr(), c.as_mut_ptr(), t, qd, ssm.conv_kernel, silu, reverse, stash.is_none(), stream)?;
+            }
+            &h.conv_out
+        } else if let Some(rows) = self.mixed.as_deref() {
             // One token per conversation: each row convolves in place against
             // its own slot's history.
             let local = self.states[si].layers.iter().position(|&x| x == layer)
@@ -3111,7 +3240,21 @@ impl Runtime {
         }
 
         // The recurrence writes over the value slice, which is no longer needed.
-        if let Some(rows) = self.mixed.as_deref() {
+        if let Some(rows) = self.mixed.as_deref().filter(|_| self.mixed_t > 1) {
+            let t = self.mixed_t;
+            let local = self.states[si].layers.iter().position(|&x| x == layer)
+                .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
+            for (b, &slot) in rows.iter().enumerate() {
+                let LayerState::Delta { state: sl, .. } = self.slot_state(slot, si, local) else {
+                    return Err(CoreError::Other("a linear layer was given a KV cache".into()));
+                };
+                let r = b * t;
+                hybrid::delta_rule_ex(sl.as_mut_ptr(), st.q.offset_ptr(r * k_dim), st.k.offset_ptr(r * k_dim),
+                    h.core.offset_ptr(r * ssm.v_dim()), h.decay.offset_ptr(r * ssm.n_v_heads),
+                    h.beta.offset_ptr(r * ssm.n_v_heads), st.attn.offset_ptr(r * ssm.v_dim()), t,
+                    ssm.n_k_heads, ssm.n_v_heads, ssm.head_k_dim(), ssm.head_v_dim(), stash.is_none(), stream)?;
+            }
+        } else if let Some(rows) = self.mixed.as_deref() {
             let local = self.states[si].layers.iter().position(|&x| x == layer)
                 .ok_or_else(|| CoreError::Other("a mixed decode reached a layer its shard does not hold".into()))?;
             let batched = self.rows_tab_at(si, local).filter(|_|

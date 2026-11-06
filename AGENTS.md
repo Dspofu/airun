@@ -1044,6 +1044,111 @@ Antes desta rodada o 4B com 4 pedidos dava 233–246, e o 27B 67–73
   do primeiro passo em lote), e o resto do passo é matvec dos pesos, que já
   lê cada peso uma vez para todas as linhas.
 
+## Contexto automático e a cabeça na GPU rápida (2026-11-06, 5070 Ti + 5060)
+
+O usuário viu `--parallel 4` mais rápido que sem a flag com um pedido só.
+Medido (27B NVFP4, `--mmproj`, `--kv-type q4_0 -b 256 --draft 3`, sem `-c`, 3
+rodadas alternadas): 63,8 contra 52,5 tok/s guloso, 47,6 contra 36,4 a temp
+0,7. Não era o `--parallel`: sem a flag o contexto automático subia a 127.488,
+onde o layout com a GPU rápida no fim (`fill_fastest_last`) já não cabia, e o
+planner caía no "filling GPU 0 first", que deixa a cabeça de saída (e o MTP,
+que a lê a cada rascunho) na 5060. Com `--parallel 4` o contexto era 25.856 e
+o layout bom cabia.
+
+`auto_ctx` (`loader.rs`) agora, entre GPUs desiguais (sem `--main-gpu` nem
+`--tensor-split`), se o maior contexto põe a cabeça fora da GPU mais rápida,
+procura o maior contexto, até 1/4 menor, em que ela fica na mais rápida, e
+avisa com uma `note:`. Aqui: 126.976 em vez de 127.488, e sem a flag passou a
+63,8–63,9 / 47,3–47,6, igual ao `--parallel 4`. `-c` explícito não muda.
+
+## MTP nos passos em lote do `serve --parallel` (2026-11-06)
+
+**Cabeça por slot.**
+- `spec::SlotHead` (KV, `pending`, `synced`) fica em `SlotStore::head`; a do slot ativo continua em `Spec`.
+- `switch_slot` troca as cabeças (`Spec::swap_head`) em vez de marcar a cabeça como fora de sincronia.
+- `decode_rows` só tira de sincronia as linhas que avançou.
+- `slot_begin` alimenta a cabeça no prefill (`head_prefill_chunk`) quando há rascunho, com as mesmas regras do `generate_spec`.
+- O planner já contava uma cabeça por slot (`kv_bytes_per_layer` × slots).
+
+**Passo especulativo em lote** (`sched::spec_step`):
+1. `draft_rows`: primeiros rascunhos de quem não tem, a partir do `pending` do slot.
+2. `verify_rows`: passada mista com `mixed_t = 1 + k` tokens por linha, `defer` ligado e stash do delta-net para todas as linhas. É capturada como grafo em `MixedGraphs`, com a chave incluindo `t`.
+3. O scheduler escolhe os aceitos (greedy pelos picks da GPU; amostrando, `sample_draft` em threads).
+4. `accept_rows` faz três coisas:
+   - `commit_rows` avança cada delta-net só com os m aceitos;
+   - a cabeça absorve as t linhas de cada slot (linhas extras são reescritas antes de alguém atender a elas);
+   - `chain_rows` gera os próximos rascunhos.
+
+Quem não tem cabeça sincronizada entra com rascunhos de enchimento, o que continua exato.
+
+**Mudanças no runtime em modo misto:**
+- **Atenção** (`run_attention`, `mixed_t > 1`): cada linha grava t células e usa `attention_masked`. O argumento `keys` é constante (`ctx`), para o grafo valer em qualquer posição.
+- **`mixed_head`:** troca o cache pela cabeça do slot.
+- **Delta-net:** conv `oop` e `delta_rule_ex` por linha, com t tokens.
+
+**Kernels:**
+- **NVFP4, 9 a 16 tokens:** duas passadas de até 8 no `matvec_q8_wide_multi_kernel` (~175 µs na FFN 17408×5120 com 16 tokens). O kernel em blocos levava 734 µs; uma passada de 16, 204 µs.
+- **MMQ:** faria 147 µs, mas o stream-K numera os lançamentos (época passada como argumento) e não serve em grafo.
+- **Tipos sem kernel de vários tokens** (IQ4_XS, que é a camada da cabeça MTP desse 27B): de 2 a 16 tokens, uma chamada por token. Antes, 1,67 ms para 16 tokens no kernel em blocos.
+- **Medição isolada:** `crates/airun-cuda/tests/matvec_bench.rs`.
+
+**Medições** (27B NVFP4, 5070 Ti + 5060, `--mmproj ... --kv-type q4_0 -b 256 --draft 3 --parallel 4`, 200 tokens, guloso, tok/s somados):
+- **Rascunhos por número de pedidos** (`ROWS_DRAFT = [2, 1, 1]`):
+  - 2 pedidos: 81,5 com 2 rascunhos, 78,5 com 3, contra 59 sem MTP;
+  - 3 pedidos: 98 com 1, 81 com 2, contra 82;
+  - 4 pedidos: 117 com 1, 98 com 2, contra 106;
+  - 4 pedidos, temp 0,7: 118 contra 106.
+- **`-c 262144` com KV na RAM:** 2 pedidos 78 contra 54; 4 pedidos 107 contra 88,5.
+- **Exatidão:** a temp 0, o texto de cada pedido no lote é idêntico ao dele sozinho (2 e 4 pedidos).
+
+**Armadilha de VRAM.**
+- **O que acontece:** o layout que põe a cabeça de saída na GPU rápida enche essa GPU até o orçamento. Buffers alocados depois do plano a empurraram ~125 MiB além dele: stash por slot, logits do lote, linhas da cabeça e grafos.
+- **Efeito:** o Windows começou a paginar a VRAM. Passos de 110 ms foram para 300–650 ms, de repente e no meio da geração, com uma GPU a 100% e a outra ociosa. Até o pedido sozinho caiu de 57–63 para 45–55 t/s.
+- **Correção:** `model::spec_scratch_bytes` entra no plano junto com a cabeça.
+- **Diagnóstico:** se reaparecer, teste `--vram-reserve 900`. Se resolver, é alocação fora do plano.
+
+## Cache KV na RAM antes dos pesos, e `--hide-gpu` (2026-11-06)
+
+**KV na RAM.** Com `-c` explícito que não cabe, o planner (`plan.rs`, `plan()` → `place`) tenta, nesta ordem:
+1. tudo na VRAM;
+2. o cache KV das últimas k camadas de atenção na RAM, com k crescendo;
+3. todo o KV na RAM mais os pesos que sobrarem (`spill_to_ram`).
+
+Como funciona:
+- **Por que o KV vai primeiro:** pesos são lidos inteiros a cada passada; do cache só as células preenchidas.
+- **Planner:** `try_place(.., kv_ram, spill)`.
+  - O stage (K+V de uma camada de **um** slot, `Config::kv_stage_bytes`) é cobrado da última camada movida durante a divisão e, no fim, de cada shard que tem alguma (`Shard::kv_stage_bytes`).
+  - Só para `alloc` que permite RAM, sem MoE, e com linhas de cache múltiplas de 4 bytes.
+- **Memória:** `DeviceBuffer::in_ram` (pinned mapeada; `is_in_ram`).
+- **Runtime:**
+  - `kv_stage_in` usa `ops::kv_stage(to_stage=true)` para copiar as células `[0, max pos+1)` de cada cabeça para `DeviceState::kv_stage`. A escrita no cache e a atenção usam o stage.
+  - `kv_stage_out` devolve só as células novas.
+  - O comprimento vem de `positions` na GPU, então os grafos de decode valem para qualquer posição.
+  - No passo em lote (`mixed`), camadas com KV na RAM vão linha a linha, sem o kernel batched.
+- **Cópias de memória:** passaram a usar `cudaMemcpyDefault` (`device.cu`), porque um buffer "de device" pode ser RAM mapeada.
+
+Medido no 27B NVFP4 (5070 Ti + 5060, `--kv-type q4_0 -b 256 --draft 3`):
+
+| Caso | Antes | Depois |
+|---|---|---|
+| `-c 262144`, serve | 15,7 tok/s (13 camadas de pesos na RAM) | 63,0 (KV de 10 das 16 camadas na RAM) |
+| `-c 262144`, temp 0,7 | 12,3 | 49,3 |
+| `-c 262144 --parallel 4` | 6,1 (contexto cortado para 131072, 43 camadas na RAM) | 60,9 (contexto mantido, 18 GiB de KV pinned) |
+| Decode na posição 65536 | 18,9 | 18,9 |
+
+- Com `run` greedy o texto sai idêntico ao de `AIRUN_NO_KV_RAM=1`.
+- O prefill do prompt de 921 tokens caiu de 1526 para 1249 tok/s, porque o layout mudou.
+- Selftest: `test_kv_in_ram`. Teste do planner: `the_kv_cache_goes_to_ram_before_weights`.
+
+**`--hide-gpu` / `AIRUN_HIDE_GPUS`** (`airun-cli/src/hide.rs`, chamado no início do `main`):
+- Um filho `airun gpu --json` lista as GPUs. Depois `CUDA_VISIBLE_DEVICES` recebe os UUIDs das que ficam, então o runtime nunca abre contexto nas ocultas (medido: 5060 com 0 MiB).
+- Cada item aceita:
+  - um número, que é ordinal se alguma GPU o tem, senão parte do nome (`5060`);
+  - um UUID;
+  - parte do nome.
+- As restantes são renumeradas a partir de 0. Uma `note:` diz a numeração nova, e `airun gpu` lista as ocultas.
+- Não combina com `CUDA_VISIBLE_DEVICES` já definido.
+
 ## Medições de decode com MTP: reserve, draft, cabeça (2026-11-05, 2× 5060 Ti)
 
 Máquina: 2× RTX 5060 Ti (gêmeas, sm_120; a de bus 03 desenha a tela).

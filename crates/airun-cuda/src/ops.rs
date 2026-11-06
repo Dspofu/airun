@@ -142,6 +142,18 @@ unsafe extern "C" {
         stream: ffi::Stream,
     ) -> Status;
 
+    fn airun_kv_stage(
+        dst: *mut c_void,
+        src: *const c_void,
+        positions: *const c_void,
+        n_tokens: i32,
+        n_kv_heads: i32,
+        max_seq: i32,
+        row_bytes: i32,
+        to_stage: i32,
+        stream: ffi::Stream,
+    ) -> Status;
+
     fn airun_kv_store(
         k_cache: *mut c_void,
         v_cache: *mut c_void,
@@ -1022,6 +1034,42 @@ pub fn qk_norm_rope_store(q: *mut c_void, k: *const c_void, v: *const c_void,
         Err(CudaError::NotBuiltWithCuda)
     }
 }
+/// For a KV cache kept in RAM: with `to_stage`, copies the cells of
+/// `[0, max position + 1)` of every head from `src` (the cache in RAM) into
+/// `dst` (its VRAM copy); otherwise the cells at `positions` from `src` (the
+/// VRAM copy) back to `dst`. Both are `[head][max_seq][row_bytes]`, the
+/// positions are read on the device, and `row_bytes` must be a multiple of 4.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_stage(
+    dst: *mut c_void,
+    src: *const c_void,
+    positions: *const c_void,
+    n_tokens: usize,
+    n_kv_heads: usize,
+    max_seq: usize,
+    row_bytes: usize,
+    to_stage: bool,
+    stream: &Stream,
+) -> Result<()> {
+    if row_bytes % 4 != 0 {
+        return Err(bad_arg(format!(
+            "a KV cache in RAM needs rows of a multiple of 4 bytes, got {row_bytes}; use --alloc gpu              (everything in VRAM) or another --kv-type"
+        )));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: both buffers hold n_kv_heads * max_seq rows of row_bytes; the
+    // kernel clamps every cell to [0, max_seq).
+    unsafe {
+        ffi::check(airun_kv_stage(dst, src, positions, n_tokens as i32, n_kv_heads as i32, max_seq as i32,
+            row_bytes as i32, to_stage as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (dst, src, positions, n_tokens, n_kv_heads, max_seq, row_bytes, to_stage, stream);
+        Err(CudaError::NotBuiltWithCuda)
+    }
+}
+
 /// Writes freshly computed K/V for each token into the cache at its position.
 #[allow(clippy::too_many_arguments)]
 pub fn kv_store(

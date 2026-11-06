@@ -1698,6 +1698,54 @@ static bool flash_disabled() {
 
 #define AIRUN_CASE(TYPE) case TYPE: LAUNCH(TYPE); break;
 
+// A KV cache kept in RAM ([head][max_seq][row_bytes], mapped pinned memory)
+// runs through a VRAM copy of one layer's cache: kv_stage brings in the cells
+// a pass reads, [0, max position + 1) of every head, and kv_unstage writes the
+// pass's new cells back. The length comes from `positions` on the device, so
+// one decode graph serves every position, and only the filled part of the
+// cache crosses PCIe.
+__device__ __forceinline__ int32_t kv_stage_cells(const int32_t* positions, int32_t n, int32_t max_seq) {
+    int32_t hi = -1;
+    for (int32_t i = 0; i < n; ++i) hi = max(hi, positions[i]);
+    return min(hi + 1, max_seq);
+}
+
+template <typename W>
+__global__ void kv_stage_kernel(W* __restrict__ dst, const W* __restrict__ src,
+                                const int32_t* __restrict__ positions, int32_t n,
+                                int32_t max_seq, int32_t row_words) {
+    const int32_t cells = kv_stage_cells(positions, n, max_seq);
+    const size_t head = (size_t)blockIdx.y * max_seq * row_words;
+    const size_t len = (size_t)cells * row_words;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < len; i += (size_t)gridDim.x * blockDim.x) {
+        dst[head + i] = src[head + i];
+    }
+}
+
+// One block per token and head: that cell's row, stage -> RAM.
+template <typename W>
+__global__ void kv_unstage_kernel(W* __restrict__ dst, const W* __restrict__ src,
+                                  const int32_t* __restrict__ positions, int32_t max_seq, int32_t row_words) {
+    const int32_t p = positions[blockIdx.x];
+    if (p < 0 || p >= max_seq) return;
+    const size_t at = ((size_t)blockIdx.y * max_seq + p) * row_words;
+    for (int32_t i = threadIdx.x; i < row_words; i += blockDim.x) dst[at + i] = src[at + i];
+}
+
+template <typename W>
+static void kv_stage_launch(void* dst, const void* src, const int32_t* positions, int32_t n_tokens,
+                            int32_t n_kv_heads, int32_t max_seq, int32_t row_words, bool to_stage,
+                            cudaStream_t stream) {
+    if (to_stage) {
+        // Enough loads in flight to keep PCIe busy: ~64k threads.
+        const dim3 grid((256 + n_kv_heads - 1) / n_kv_heads, n_kv_heads);
+        kv_stage_kernel<W><<<grid, 256, 0, stream>>>((W*)dst, (const W*)src, positions, n_tokens, max_seq, row_words);
+    } else {
+        const dim3 grid(n_tokens, n_kv_heads);
+        kv_unstage_kernel<W><<<grid, 64, 0, stream>>>((W*)dst, (const W*)src, positions, max_seq, row_words);
+    }
+}
+
 extern "C" {
 
 airun_status airun_attention_split(
@@ -1877,6 +1925,25 @@ airun_status airun_embed(
         default: return AIRUN_ERR_BAD_ARG;
     }
 #undef LAUNCH
+    AIRUN_CHECK_LAUNCH();
+}
+
+// `to_stage`: RAM -> VRAM (cells [0, max position + 1)); otherwise the
+// tokens' own cells VRAM -> RAM. K and V alike, so called once for each.
+// 16-byte words where the rows allow (f16, q4_0 at head_dim 256), 4 otherwise.
+airun_status airun_kv_stage(void* dst, const void* src, const void* positions, int32_t n_tokens,
+                            int32_t n_kv_heads, int32_t max_seq, int32_t row_bytes, int32_t to_stage,
+                            cudaStream_t stream) {
+    if (n_tokens <= 0) return AIRUN_OK;
+    const uintptr_t align = (uintptr_t)dst | (uintptr_t)src;
+    const int32_t* pos = (const int32_t*)positions;
+    if (row_bytes % 16 == 0 && align % 16 == 0) {
+        kv_stage_launch<uint4>(dst, src, pos, n_tokens, n_kv_heads, max_seq, row_bytes / 16, to_stage, stream);
+    } else if (row_bytes % 4 == 0 && align % 4 == 0) {
+        kv_stage_launch<uint32_t>(dst, src, pos, n_tokens, n_kv_heads, max_seq, row_bytes / 4, to_stage, stream);
+    } else {
+        return AIRUN_ERR_BAD_ARG;
+    }
     AIRUN_CHECK_LAUNCH();
 }
 

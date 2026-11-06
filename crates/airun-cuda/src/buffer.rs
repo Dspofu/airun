@@ -16,6 +16,9 @@ pub struct DeviceBuffer<T> {
     ptr: *mut c_void,
     len: usize,
     device: i32,
+    /// The pinned host allocation behind `ptr` when the buffer lives in RAM
+    /// (see [`DeviceBuffer::in_ram`]); null for VRAM.
+    host: *mut c_void,
     _marker: PhantomData<T>,
 }
 
@@ -58,8 +61,46 @@ impl<T: Copy> DeviceBuffer<T> {
             ptr,
             len,
             device,
+            host: std::ptr::null_mut(),
             _marker: PhantomData,
         })
+    }
+
+    /// `len` zeroed elements of pinned RAM that kernels on `device` read and
+    /// write through PCIe (mapped memory), used like any device buffer. For
+    /// data a pass touches only a part of, such as a KV cache whose filled
+    /// cells are copied into VRAM before they are read.
+    pub fn in_ram(device: i32, len: usize) -> Result<Self> {
+        let bytes = std::mem::size_of::<T>() * len;
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `host` is a valid out-parameter.
+        let status = unsafe { ffi::airun_host_alloc(bytes as u64, &mut host) };
+        if status != ffi::AIRUN_OK {
+            return Err(CudaError::Runtime {
+                code: status as i32,
+                name: "AIRUN_HOST_ALLOC".into(),
+                message: format!(
+                    "could not pin {} of RAM for a KV cache; close other programs, lower -c or                      --parallel, or use --alloc gpu",
+                    crate::human_bytes(bytes as u64)
+                ),
+            });
+        }
+        // SAFETY: a fresh allocation of exactly `bytes`, not yet seen by any stream.
+        unsafe { std::ptr::write_bytes(host as *mut u8, 0, bytes) };
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `host` is a live airun_host_alloc allocation; `ptr` a valid out-parameter.
+        let status = unsafe { ffi::airun_host_device_ptr(device, host, &mut ptr) };
+        if status != ffi::AIRUN_OK {
+            // SAFETY: allocated above, freed once.
+            unsafe { ffi::airun_host_free(host) };
+            return Err(CudaError::from_status(status));
+        }
+        Ok(Self { ptr, len, device, host, _marker: PhantomData })
+    }
+
+    /// Whether the buffer lives in RAM (see [`DeviceBuffer::in_ram`]).
+    pub fn is_in_ram(&self) -> bool {
+        !self.host.is_null()
     }
 
     /// Allocates and zeroes `len` elements.
@@ -209,7 +250,7 @@ impl<T: Copy> DeviceBuffer<T> {
         // SAFETY: byte count clamped to the smaller allocation. The peer variant
         // handles the no-P2P case internally by staging through host memory.
         ffi::check(unsafe {
-            if src.device == self.device {
+            if src.device == self.device || src.is_in_ram() || self.is_in_ram() {
                 ffi::airun_memcpy_d2d(self.ptr, src.ptr, bytes, stream.raw())
             } else {
                 ffi::airun_memcpy_peer(
@@ -238,11 +279,16 @@ impl<T> Drop for DeviceBuffer<T> {
         if self.ptr.is_null() {
             return;
         }
-        // SAFETY: the pointer came from airun_malloc on this device and is freed
-        // exactly once. A failure here is unrecoverable and not worth panicking
-        // in a destructor over -- process teardown reclaims it regardless.
+        // SAFETY: the pointer came from airun_malloc on this device (or the
+        // host allocation from airun_host_alloc) and is freed exactly once. A
+        // failure here is unrecoverable and not worth panicking in a
+        // destructor over -- process teardown reclaims it regardless.
         unsafe {
-            ffi::airun_free(self.device, self.ptr);
+            if self.host.is_null() {
+                ffi::airun_free(self.device, self.ptr);
+            } else {
+                ffi::airun_host_free(self.host);
+            }
         }
     }
 }

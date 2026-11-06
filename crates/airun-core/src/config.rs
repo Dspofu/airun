@@ -729,6 +729,18 @@ impl Config {
             * self.slots.max(1) as u64
     }
 
+    /// One attention layer's K and V cells for every slot, without the QSA
+    /// keys: what a KV cache kept in RAM takes out of VRAM.
+    pub fn kv_cells_bytes_per_layer(&self, ctx: usize) -> u64 {
+        self.kv_stage_bytes(ctx) * self.slots.max(1) as u64
+    }
+
+    /// One slot's K and V cells of one attention layer: the VRAM copy a KV
+    /// cache kept in RAM is read through.
+    pub fn kv_stage_bytes(&self, ctx: usize) -> u64 {
+        2 * (self.n_head_kv * ctx) as u64 * self.kv_type.row_bytes(self.head_dim) as u64
+    }
+
     /// KV cache across the whole model.
     ///
     /// On hybrids only the softmax-attention layers hold a KV cache; the linear

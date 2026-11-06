@@ -125,11 +125,18 @@ pub struct Shard {
     pub ram_layers: Vec<usize>,
     pub ram_bytes: u64,
     pub staging_bytes: u64,
+    /// Attention layers of this shard whose KV cells stay in pinned RAM. A
+    /// pass copies the filled ones into `kv_stage_bytes` of VRAM (one slot's
+    /// K and V of one layer) and writes its new cells back; `kv_bytes` holds
+    /// the rest of the shard's state.
+    pub kv_ram_layers: Vec<usize>,
+    pub kv_ram_bytes: u64,
+    pub kv_stage_bytes: u64,
 }
 
 impl Shard {
     pub fn total_bytes(&self) -> u64 {
-        self.weight_bytes + self.kv_bytes + self.scratch_bytes + self.staging_bytes
+        self.weight_bytes + self.kv_bytes + self.scratch_bytes + self.staging_bytes + self.kv_stage_bytes
     }
 
     pub fn headroom(&self) -> i64 {
@@ -179,6 +186,11 @@ impl Placement {
     /// Whether layer `l`'s weights stay in RAM.
     pub fn layer_in_ram(&self, l: usize) -> bool {
         self.shards.iter().any(|s| s.ram_layers.contains(&l))
+    }
+
+    /// Whether layer `l`'s KV cells stay in RAM.
+    pub fn kv_in_ram(&self, l: usize) -> bool {
+        self.shards.iter().any(|s| s.kv_ram_layers.contains(&l))
     }
 
     /// VRAM staging for the layers in RAM on `device`.
@@ -234,6 +246,17 @@ impl Placement {
                     s.ram_layers.len(),
                     airun_cuda::human_bytes(s.ram_bytes),
                     airun_cuda::human_bytes(s.staging_bytes),
+                );
+            }
+            if !s.kv_ram_layers.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "      KV cache of {} attention layers ({}..{}) in RAM: {} pinned, read through {} of VRAM",
+                    s.kv_ram_layers.len(),
+                    s.kv_ram_layers[0],
+                    s.kv_ram_layers[s.kv_ram_layers.len() - 1],
+                    airun_cuda::human_bytes(s.kv_ram_bytes),
+                    airun_cuda::human_bytes(s.kv_stage_bytes),
                 );
             }
         }
@@ -426,10 +449,38 @@ pub fn plan(
         });
     }
 
+    // What does not fit the GPUs goes to RAM (--alloc auto/memory), the KV
+    // cache before weights: a pass reads every byte of a layer's weights but
+    // only the filled cells of its cache, so a short conversation barely
+    // touches a cache in RAM. Qwen3.8-27B NVFP4 on 5070 Ti + 5060 at -c
+    // 262144: 13 layers' weights in RAM ran at 15.8 tok/s.
+    let attention: Vec<usize> = (0..n_layers)
+        .filter(|&l| cfg.layer_kind(l) == crate::config::LayerKind::Attention)
+        .collect();
+    let kv_to_ram = req.alloc.spills() && cfg.moe.is_none() && !attention.is_empty()
+        && cfg.kv_type.row_bytes(cfg.head_dim) % 4 == 0
+        && std::env::var("AIRUN_NO_KV_RAM").is_err();
+    let place = |ctx: usize, notes: Vec<String>| {
+        let first = try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone(), &[], !kv_to_ram);
+        if first.is_ok() || !kv_to_ram {
+            return first;
+        }
+        // The fewest layers whose cache, moved, lets the rest fit; the last
+        // ones, which sit with the output head on the fastest GPU.
+        for k in 1..=attention.len() {
+            let moved = &attention[attention.len() - k..];
+            if let Ok(p) = try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone(), moved, false) {
+                return Ok(p);
+            }
+        }
+        // Then weights too, the whole cache already out.
+        try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes, &attention, true)
+    };
+
     // Shrink the context until the plan fits, if permitted. Each attempt is a
     // full placement, so what succeeds is exactly what will be allocated.
     loop {
-        match try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone()) {
+        match place(ctx, notes.clone()) {
             Ok(p) => return Ok(p),
             Err(shortfall) => {
                 let min_ctx = 512;
@@ -469,23 +520,33 @@ fn try_place(
     req: &PlacementRequest,
     ctx: usize,
     mut notes: Vec<String>,
+    kv_ram: &[usize],
+    spill: bool,
 ) -> std::result::Result<Placement, Shortfall> {
     // Per-layer state depends on what the layer is: softmax-attention layers
     // carry a KV cache that scales with context, linear-attention layers a
-    // recurrent state that does not, and MTP layers are never run.
+    // recurrent state that does not, and MTP layers are never run. Layers in
+    // `kv_ram` keep their KV cells in RAM, the rest of their state in VRAM.
+    let moved = cfg.kv_cells_bytes_per_layer(ctx);
     let per_layer_state = |l: usize| -> u64 {
         if l >= cfg.n_run_layers() {
             return 0;
         }
         match cfg.layer_kind(l) {
+            crate::config::LayerKind::Attention if kv_ram.contains(&l) => cfg.kv_bytes_per_layer(ctx) - moved,
             crate::config::LayerKind::Attention => cfg.kv_bytes_per_layer(ctx),
             crate::config::LayerKind::LinearAttention => cfg.ssm_bytes_per_layer(),
         }
     };
+    // The VRAM copy those caches are read through, charged to the last of
+    // them while the layers are spread (and then to every GPU holding any).
+    let stage = if kv_ram.is_empty() { 0 } else { cfg.kv_stage_bytes(ctx) };
+    let stage_layer = kv_ram.iter().max().copied();
+    let state_cost = |l: usize| per_layer_state(l) + if Some(l) == stage_layer { stage } else { 0 };
 
     let n_layers = cfg.n_run_layers();
     let layer_cost: Vec<u64> = (0..n_layers)
-        .map(|l| sizes.per_layer.get(l).copied().unwrap_or(0) + per_layer_state(l))
+        .map(|l| sizes.per_layer.get(l).copied().unwrap_or(0) + state_cost(l))
         .collect();
     let fixed = sizes.embedding + sizes.output + sizes.other;
     let total_needed: u64 = layer_cost.iter().sum::<u64>() + fixed;
@@ -505,8 +566,8 @@ fn try_place(
                     detail: format!("GPU {target} was requested but is not available"),
                 })?;
             let budget = budgets.get(&dev.ordinal).copied().unwrap_or(0);
-            if req.alloc.spills() && cfg.moe.is_none() && total_needed + scratch_bytes(cfg, batch, true) > budget {
-                match spill_to_ram(&[dev], &budgets, &layer_cost, sizes, cfg, batch, &per_layer_state) {
+            if spill && req.alloc.spills() && cfg.moe.is_none() && total_needed + scratch_bytes(cfg, batch, true) > budget {
+                match spill_to_ram(&[dev], &budgets, &layer_cost, sizes, cfg, batch, &state_cost) {
                     Some((a, r)) => {
                         notes.push(format!(
                             "GPU {} holds {} of {n_layers} layers; the other {} stay in RAM (--alloc {})",
@@ -642,8 +703,8 @@ fn try_place(
                             if req.main_gpu.is_some() { "--main-gpu" } else { "the fastest" }));
                         a
                     }
-                    None if req.alloc.spills() && cfg.moe.is_none() => {
-                        match spill_to_ram(ordered, &budgets, &layer_cost, sizes, cfg, batch, &per_layer_state) {
+                    None if spill && req.alloc.spills() && cfg.moe.is_none() => {
+                        match spill_to_ram(ordered, &budgets, &layer_cost, sizes, cfg, batch, &state_cost) {
                             Some((a, r)) => {
                                 notes.push(format!(
                                     "the GPUs hold {} of {n_layers} layers; the other {} stay in RAM and run on \
@@ -708,6 +769,9 @@ fn try_place(
             staging_bytes: staging_for(&ram_layers, sizes),
             ram_layers,
             ram_bytes,
+            kv_stage_bytes: if layers.iter().any(|l| kv_ram.contains(l)) { stage } else { 0 },
+            kv_ram_bytes: layers.iter().filter(|l| kv_ram.contains(l)).count() as u64 * moved,
+            kv_ram_layers: layers.iter().copied().filter(|l| kv_ram.contains(l)).collect(),
         });
     }
 
@@ -743,6 +807,15 @@ fn try_place(
     // Drop GPUs a proportional split left with nothing to do.
     shards.retain(|s| !s.layers.is_empty() || s.hosts_embedding || s.hosts_output);
 
+    if !kv_ram.is_empty() {
+        notes.push(format!(
+            "the KV cache of {} of {} attention layers stays in RAM (--alloc {}): each pass copies the filled \
+             cells to VRAM, so decoding slows as the conversation grows; a smaller -c (or leaving -c out, \
+             which picks the largest that fits) keeps it all in VRAM",
+            kv_ram.len(),
+            (0..n_layers).filter(|&l| cfg.layer_kind(l) == crate::config::LayerKind::Attention).count(),
+            req.alloc.name()));
+    }
     if shards.len() > 1 {
         notes.push(format!(
             "{} activation handoff(s) per forward pass between GPUs",
@@ -1153,6 +1226,31 @@ mod tests {
         assert!(p.shards[0].layers.len() > p.shards[1].layers.len(), "{:?}", layers(&p));
         let bad = PlacementRequest { main_gpu: Some(7), ..Default::default() };
         assert!(plan(&cfg, &sz, &devs, &bad).is_err());
+    }
+
+    /// Weights that fit with a cache that does not: the cache of the last
+    /// layers goes to RAM, the weights stay; --alloc gpu shrinks the context.
+    #[test]
+    fn the_kv_cache_goes_to_ram_before_weights() {
+        let cfg = config(40);
+        let sz = sizes(40, 300); // ~11.7 GiB of weights, 6.25 GiB of cache at 40960
+        let devs = vec![device(0, 15, 70, 256)];
+        let req = PlacementRequest { ctx: 40960, ..Default::default() };
+        let p = plan(&cfg, &sz, &devs, &req).unwrap();
+        assert_eq!(p.ctx, 40960);
+        let s = &p.shards[0];
+        assert!(s.ram_layers.is_empty(), "no weight leaves VRAM while a cache can");
+        assert!(!s.kv_ram_layers.is_empty() && s.kv_ram_layers.len() < 40);
+        // The last layers, with one stage for all of them.
+        assert_eq!(*s.kv_ram_layers.last().unwrap(), 39);
+        assert_eq!(s.kv_stage_bytes, cfg.kv_stage_bytes(40960));
+        assert_eq!(s.kv_ram_bytes, s.kv_ram_layers.len() as u64 * cfg.kv_cells_bytes_per_layer(40960));
+        assert!(s.total_bytes() <= s.budget_bytes);
+        assert!(p.kv_in_ram(39) && !p.kv_in_ram(0));
+
+        let gpu_only = PlacementRequest { ctx: 40960, alloc: AllocMode::Gpu, ..Default::default() };
+        let p = plan(&cfg, &sz, &devs, &gpu_only).unwrap();
+        assert!(p.ctx < 40960 && p.shards[0].kv_ram_layers.is_empty(), "--alloc gpu shrinks the context instead");
     }
 
     /// A model bigger than the GPU keeps its context and puts the layers that

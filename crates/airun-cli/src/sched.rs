@@ -13,10 +13,16 @@
 //! A request with nobody else running or waiting runs alone through
 //! Runtime::generate on its slot, as without --parallel: the MTP head drafts,
 //! greedy picks stay on the GPU, the decode graphs and the turn snapshot work.
-//! The batched path reads every logit back and samples on the host, and the
-//! head keeps one sequence, so a lone request there lost up to 29% (27B with
-//! --draft 4: 38.6 -> 27.4 tok/s). When another request arrives the lone one
-//! pauses after the token it is handing out, and both go on in batched steps.
+//! The batched path reads every logit back and samples on the host, so a lone
+//! request there lost up to 29% (27B with --draft 4: 38.6 -> 27.4 tok/s).
+//! When another request arrives the lone one pauses after the token it is
+//! handing out, and both go on in batched steps.
+//!
+//! With drafting on, a batched step speculates too (spec_step): every
+//! request's drafts are verified in one pass and each takes 1 + accepted
+//! tokens, with fewer drafts the more requests there are (Runtime::rows_draft).
+//! 27B NVFP4, 5070 Ti + 5060, --draft 3: 2 requests 59 -> 81 tok/s summed,
+//! 4 requests 106 -> 117.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -58,6 +64,9 @@ struct Running {
     decode_start: Instant,
     drafted: usize,
     accepted: usize,
+    /// The MTP head's drafts for the token after `next`, for the next
+    /// batched speculative step (empty: none yet).
+    drafts: Vec<u32>,
 }
 
 /// Starts the scheduler thread; the returned sender takes jobs.
@@ -143,7 +152,30 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
         if active.is_empty() {
             continue;
         }
+        // With drafting on, every running request verifies its drafts in one
+        // pass: each gets 1 + accepted tokens a step instead of 1.
+        {
+            let mut rt = runtime.blocking_lock();
+            let k = rt.rows_draft(active.len());
+            let room = active.iter().all(|r| rt.slot_history(r.slot).len() + 2 * (rt.draft() + 1) <= rt.ctx());
+            if room && k > 0 {
+                let t0 = Instant::now();
+                if let Err(e) = spec_step(&mut rt, &mut active, k) {
+                    for r in active.drain(..) {
+                        let _ = r.job.events.send(Event::Done(Err(e.to_string())));
+                    }
+                }
+                if step_timing() {
+                    eprintln!("sched spec step: {} rows, {:.2} ms", active.len(), t0.elapsed().as_secs_f64() * 1e3);
+                }
+                last_step = Instant::now();
+                continue;
+            }
+        }
         // One token for every running request.
+        for r in active.iter_mut() {
+            r.drafts.clear();
+        }
         let rows: Vec<(usize, u32)> = active.iter().map(|r| (r.slot, r.next)).collect();
         let mut rt = runtime.blocking_lock();
         let t0 = Instant::now();
@@ -178,6 +210,135 @@ fn run(runtime: Arc<Mutex<Runtime>>, rx: Receiver<Job>) {
         last_step = Instant::now();
         active = still;
     }
+}
+
+/// One batched speculative step: every request's newest token and drafts
+/// through one verify, then each takes the drafts the main model agrees with
+/// (or, sampling, those sample_draft keeps) and the model's own next token,
+/// exactly as a lone generate does. A request whose head cannot draft
+/// (prefilled without it) rides along with filler drafts: still exact, it
+/// just takes one token.
+fn spec_step(rt: &mut Runtime, active: &mut Vec<Running>, k: usize) -> anyhow::Result<()> {
+    // Drafts from a step with fewer rows are longer: their first k still hold.
+    for r in active.iter_mut() {
+        r.drafts.truncate(k);
+    }
+    let need: Vec<(usize, u32)> = active.iter()
+        .filter(|r| r.drafts.len() != k && rt.head_synced(r.slot)).map(|r| (r.slot, r.next)).collect();
+    if !need.is_empty() {
+        let drafted = rt.draft_rows(&need, k)?;
+        for ((slot, _), d) in need.iter().zip(drafted) {
+            if let Some(r) = active.iter_mut().find(|r| r.slot == *slot) {
+                r.drafts = d;
+            }
+        }
+    }
+    for r in active.iter_mut() {
+        if r.drafts.len() != k {
+            r.drafts = vec![r.next; k];
+        }
+    }
+    let rows: Vec<(usize, Vec<u32>)> = active.iter().map(|r| {
+        let mut v = vec![r.next];
+        v.extend_from_slice(&r.drafts);
+        (r.slot, v)
+    }).collect();
+    let sampling = active.iter().any(|r| !r.job.sampler.is_pure_greedy());
+    let vocab = rt.model.config.vocab_size;
+    let tv = Instant::now();
+    let verified = rt.verify_rows(&rows, sampling)?;
+    let verify_ms = tv.elapsed().as_secs_f64() * 1e3;
+    let t = verified.t;
+    let picks = verified.picks;
+    // Per request: the tokens it takes, in order (accepted drafts, then the
+    // model's next). Sampled requests on threads of their own, as sample_rows.
+    let mut logits = verified.logits;
+    let chosen: Vec<(usize, u32)> = {
+        let rows_logits: Vec<Option<&mut [f32]>> = match logits.as_deref_mut() {
+            Some(l) => l.chunks_mut(t * vocab).map(Some).collect(),
+            None => (0..active.len()).map(|_| None).collect(),
+        };
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = active.iter_mut().zip(rows_logits).enumerate().map(|(b, (r, lg))| {
+                let picks = &picks[b * t..(b + 1) * t];
+                let drafts = &r.drafts;
+                let sampler = &mut r.job.sampler;
+                let hist = &r.history;
+                sc.spawn(move || -> (usize, u32) {
+                    match lg {
+                        Some(lg) if !sampler.is_pure_greedy() => {
+                            let mut h = hist.clone();
+                            let mut a = 0;
+                            while a < drafts.len() {
+                                let row = &mut lg[a * vocab..(a + 1) * vocab];
+                                let (tok, took) = sampler.sample_draft(row, &h, drafts[a]);
+                                if !took {
+                                    return (a, tok);
+                                }
+                                h.push(tok);
+                                a += 1;
+                            }
+                            let row = &mut lg[a * vocab..(a + 1) * vocab];
+                            (a, sampler.sample(row, &h))
+                        }
+                        _ => {
+                            let mut a = 0;
+                            while a < drafts.len() && drafts[a] == picks[a] {
+                                a += 1;
+                            }
+                            (a, picks[a])
+                        }
+                    }
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().expect("a sampler thread does not panic")).collect()
+        })
+    };
+    // Hand the tokens out; a request stops wherever a lone one would.
+    let ctx = rt.ctx();
+    let mut accept = Vec::with_capacity(active.len());
+    let mut ended = Vec::with_capacity(active.len());
+    for (r, &(a, next)) in active.iter_mut().zip(&chosen) {
+        let real = r.drafts != vec![r.next; k] || rt.head_synced(r.slot);
+        if real {
+            r.drafted += k;
+            r.accepted += a;
+        }
+        let base = rt.slot_history(r.slot).len();
+        let mut committed = 1;
+        let mut stop = None;
+        let toks: Vec<u32> = r.drafts[..a].to_vec();
+        for &tok in &toks {
+            if let Some(s) = emit(rt, r, tok, base + committed >= ctx) {
+                stop = Some(s);
+                break;
+            }
+            committed += 1;
+        }
+        if stop.is_none() {
+            stop = emit(rt, r, next, base + committed >= ctx);
+        }
+        accept.push((committed, next));
+        ended.push(stop);
+    }
+    let ta = Instant::now();
+    let drafts = rt.accept_rows(&accept, k)?;
+    if step_timing() {
+        eprintln!("  verify {verify_ms:.2} ms, accept {:.2} ms, accepted {:?}", ta.elapsed().as_secs_f64() * 1e3,
+            accept.iter().map(|a| a.0).collect::<Vec<_>>());
+    }
+    let mut still = Vec::with_capacity(active.len());
+    for ((mut r, stop), d) in active.drain(..).zip(ended).zip(drafts) {
+        match stop {
+            Some(stop) => finish(rt, r, stop),
+            None => {
+                r.drafts = if rt.head_synced(r.slot) { d } else { Vec::new() };
+                still.push(r);
+            }
+        }
+    }
+    *active = still;
+    Ok(())
 }
 
 /// AIRUN_SCHED_TIMING=1 prints where each batched step's time went.
@@ -231,7 +392,7 @@ fn fresh(rt: &Runtime, slot: usize, job: Job, cached: usize, prefill_ms: f64) ->
     let history: Vec<u32> = job.tokens.iter().copied().filter(|&t| !airun_core::runtime::is_image_token(t)).collect();
     Running {
         slot, history, decoder: rt.tokenizer.stream_decoder(), next: 0, last: 0, generated: 0, cached,
-        prefill_ms, decode_start: Instant::now(), drafted: 0, accepted: 0, job,
+        prefill_ms, decode_start: Instant::now(), drafted: 0, accepted: 0, drafts: Vec::new(), job,
     }
 }
 

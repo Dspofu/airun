@@ -180,23 +180,26 @@ airun_status airun_host_free(void* ptr) {
     return (airun_status)cudaFreeHost(ptr);
 }
 
+// cudaMemcpyDefault throughout: a KV cache kept in RAM (mapped pinned memory)
+// is handed around as a device buffer, so a "device" side may be host memory,
+// and the runtime works the direction out from the addresses.
 airun_status airun_memcpy_h2d(void* dst, const void* src, uint64_t bytes, cudaStream_t stream) {
-    return (airun_status)cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyHostToDevice, stream);
+    return (airun_status)cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyDefault, stream);
 }
 
 airun_status airun_memcpy_d2h(void* dst, const void* src, uint64_t bytes, cudaStream_t stream) {
-    return (airun_status)cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyDeviceToHost, stream);
+    return (airun_status)cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyDefault, stream);
 }
 
 airun_status airun_memcpy_d2d(void* dst, const void* src, uint64_t bytes, cudaStream_t stream) {
-    return (airun_status)cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyDeviceToDevice, stream);
+    return (airun_status)cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyDefault, stream);
 }
 
 // `rows` runs of `width` bytes, `spitch` apart in src and `dpitch` apart in dst.
 airun_status airun_memcpy2d_d2d(void* dst, uint64_t dpitch, const void* src, uint64_t spitch,
                                 uint64_t width, uint64_t rows, cudaStream_t stream) {
     return (airun_status)cudaMemcpy2DAsync(dst, (size_t)dpitch, src, (size_t)spitch, (size_t)width,
-                                           (size_t)rows, cudaMemcpyDeviceToDevice, stream);
+                                           (size_t)rows, cudaMemcpyDefault, stream);
 }
 
 // Cross-device copy. Falls back to a staged copy through host memory when the

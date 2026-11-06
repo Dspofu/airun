@@ -815,6 +815,30 @@ pub fn mtp_head_bytes(src: &GgufFile, config: &Config) -> u64 {
     src.tensors().iter().filter(|t| t.name.starts_with(&prefix)).map(|t| t.nbytes).sum()
 }
 
+/// VRAM speculative decoding allocates once it starts (runtime::spec), on
+/// top of the head and its cache: the head's input rows, the verify's
+/// logits, the delta-net stash for every slot's verified rows, the batched
+/// verify's logits, and room for the graphs. Left out of the plan, the fast
+/// GPU (filled to its budget when it holds the output head) ran ~125 MiB
+/// over on the 27B with --parallel 4, and Windows began paging VRAM: steps
+/// went from 110 to 400 ms.
+pub fn spec_scratch_bytes(config: &Config, batch: usize, draft: usize) -> u64 {
+    let slots = config.slots.max(1) as u64;
+    let rows = draft as u64 + 1;
+    let (d, vocab) = (config.n_embd as u64, config.vocab_size as u64);
+    let f = std::mem::size_of::<f32>() as u64;
+    let head_rows = 4 * batch as u64 * d * f;
+    let logits = rows * vocab * f + slots * (vocab + d) * f;
+    let batched = if slots > 1 { slots * rows * vocab * f } else { 0 };
+    let stash = config.ssm.as_ref().map_or(0, |ssm| {
+        let linear = (0..config.n_run_layers())
+            .filter(|&l| config.layer_kind(l) == crate::config::LayerKind::LinearAttention).count() as u64;
+        let per_row = (ssm.qkv_dim() + 2 * ssm.k_dim() + ssm.v_dim() + 2 * ssm.n_v_heads) as u64 * f;
+        linear * slots * rows * per_row
+    });
+    head_rows + logits + batched + stash + (32 << 20)
+}
+
 /// Whether the file carries the MTP head's weights (see [`mtp_supported`]).
 pub fn mtp_head_present(gguf: &GgufFile, config: &Config) -> bool {
     gguf.tensor(&format!("blk.{}.nextn.eh_proj.weight", config.n_run_layers())).is_some()

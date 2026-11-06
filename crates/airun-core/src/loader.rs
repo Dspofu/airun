@@ -127,8 +127,8 @@ pub fn load(
     if let Some(t) = config.ple.as_ref().and_then(|_| gguf.tensor("per_layer_token_embd.weight")) {
         sizes.other = sizes.other.saturating_sub(t.nbytes);
     }
-    // One MTP head keeps one sequence: with several slots it drafts for a
-    // request running alone (see sched.rs), and the batched steps decode plainly.
+    // With several slots each keeps its own head cache (Config::slots counts
+    // them in kv_bytes_per_layer), and batched steps draft too (spec::verify_rows).
     let draft_wanted = opts.draft != Some(0);
     let config_slots = opts.slots.max(1);
     let mut mtp_src = if draft_wanted { mtp_source(path, &gguf, &config, opts.mtp_file.as_deref())? } else { None };
@@ -174,7 +174,8 @@ pub fn load(
         };
         eprintln!("note: --draft {draft} is ignored: {reason}.");
     }
-    let head_bytes = mtp_src.as_ref().map_or(0, |src| crate::model::mtp_head_bytes(src, &config));
+    let head_bytes = mtp_src.as_ref().map_or(0, |src| crate::model::mtp_head_bytes(src, &config)
+        + crate::model::spec_scratch_bytes(&config, opts.batch, draft));
     let auto;
     let opts = if opts.ctx_auto {
         let ctx = auto_ctx(&config, &sizes, &devices, opts, load_mtp.then_some(head_bytes));
@@ -511,6 +512,34 @@ fn auto_ctx(config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &Loa
                 break;
             }
             if fits(mid) { lo = mid } else { hi = mid }
+        }
+    }
+    // Between unequal cards the plan wants the output head on the fastest one
+    // (fill_fastest_last): it is read whole every token and again per MTP
+    // draft. At the very largest context that layout can stop fitting -- the
+    // slow card then holds the embedding *and* layers -- and the planner falls
+    // back to filling the fast card first, which leaves the head on the slow
+    // one. Qwen3.8-27B NVFP4 on a 5070 Ti + 5060, --draft 3: 127488 tokens with
+    // the head on the 5060, 52.5 tok/s, against 63.8 with it on the 5070 Ti.
+    // Give up to a quarter of the context to keep the head on the fast card.
+    let best = used.iter().map(|d| d.perf_score()).fold(0.0, f64::max);
+    let fastest = used.iter().find(|d| d.perf_score() >= best).map(|d| d.ordinal);
+    let unequal = used.iter().any(|d| d.perf_score() < 0.9 * best);
+    let head_fast_at = |ctx: usize| plan(config, &sizes_at(ctx), &used, &req_at(ctx, split.clone()))
+        .is_ok_and(|p| p.ctx == ctx && p.batch >= at_base.batch && Some(p.output_device()) == fastest);
+    if unequal && opts.main_gpu.is_none() && matches!(opts.split, SplitMode::Auto) && !head_fast_at(lo) {
+        let floor = (lo / 4 * 3).max(base);
+        let (mut a, mut b) = (floor, lo);
+        if head_fast_at(a) {
+            while b - a > 256 {
+                let mid = (a + (b - a) / 2) / 256 * 256;
+                if mid <= a {
+                    break;
+                }
+                if head_fast_at(mid) { a = mid } else { b = mid }
+            }
+            eprintln!("note: context {a} instead of {lo}, so the output head stays on the fastest GPU (decoding is faster; -c {lo} takes the larger context)");
+            lo = a;
         }
     }
     if lo > base {

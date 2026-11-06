@@ -160,6 +160,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_conv_oop(args.device, &stream, &mut report)?;
     test_delta_head_broadcast(args.device, &stream, &mut report)?;
     test_rows_batched(args.device, &stream, &mut report)?;
+    test_kv_in_ram(args.device, &stream, &mut report)?;
     test_rmsnorm_gated(args.device, &stream, &mut report)?;
     test_split_head_gate(args.device, &stream, &mut report)?;
 
@@ -530,7 +531,7 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     // Q8_0/Q4_K/Q5_K; K = 544 (Q8_0 only) is 17 groups, which it cannot chunk,
     // so the synchronous one runs.
     // 300 tokens take the 128-token tile, with a partial last tile.
-    for (n_tokens, odd_k) in [(1usize, false), (3, false), (8, false), (12, false), (100, false), (100, true), (300, false)] {
+    for (n_tokens, odd_k) in [(1usize, false), (3, false), (8, false), (12, false), (16, false), (100, false), (100, true), (300, false)] {
     for &ty in TYPES {
         let kty = ops::KernelType(ty.id() as i32);
         if !ops::matvec_supports_q8(kty) {
@@ -1415,6 +1416,49 @@ fn test_matvec_few_tokens(device: i32, stream: &Stream, report: &mut Report) -> 
         report.case(&format!("matvec 1..8 tokens {ty} ({n_rows} rows)"),
             format!("error/bound {worst:.3}x"), worst <= 1.0);
     }
+    Ok(())
+}
+
+/// A KV cache kept in RAM (mapped pinned memory): kv_stage brings cells
+/// [0, max position + 1) of every head into VRAM and leaves the rest alone,
+/// kv_unstage writes only the tokens' own cells back, and the ordinary copies
+/// read the RAM buffer. Rows of 144 bytes (16-byte path) and 72 (4-byte).
+fn test_kv_in_ram(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    let (heads, ctx) = (3usize, 40usize);
+    let mut rng = Rng::new(0x4B_56_0001);
+    let mut ok = true;
+    for row in [144usize, 72] {
+        let bytes = heads * ctx * row;
+        let host: Vec<u8> = (0..bytes).map(|_| (rng.unit().abs() * 255.0) as u8).collect();
+        let ram = DeviceBuffer::<u8>::in_ram(device, bytes)?;
+        ram.copy_from_host_at(0, &host, stream)?;
+        let stage = DeviceBuffer::<u8>::zeroed(device, bytes, stream)?;
+        let pos = DeviceBuffer::from_slice(device, &[9i32, 10, 11], stream)?;
+        ops::kv_stage(stage.as_mut_ptr(), ram.as_ptr(), pos.as_ptr(), 3, heads, ctx, row, true, stream)?;
+        let got = stage.to_vec(stream)?;
+        for h in 0..heads {
+            for c in 0..ctx {
+                let at = (h * ctx + c) * row;
+                let want: &[u8] = if c < 12 { &host[at..at + row] } else { &[0u8; 144][..row] };
+                ok &= &got[at..at + row] == want;
+            }
+        }
+        // New cells in the stage go back to RAM; nothing else changes.
+        let fresh: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+        stage.copy_from_host_at(0, &fresh, stream)?;
+        let two = DeviceBuffer::from_slice(device, &[4i32, 30], stream)?;
+        ops::kv_stage(ram.as_mut_ptr(), stage.as_ptr(), two.as_ptr(), 2, heads, ctx, row, false, stream)?;
+        let back = ram.to_vec(stream)?;
+        for h in 0..heads {
+            for c in 0..ctx {
+                let at = (h * ctx + c) * row;
+                let want = if c == 4 || c == 30 { &fresh[at..at + row] } else { &host[at..at + row] };
+                ok &= &back[at..at + row] == want;
+            }
+        }
+        ok &= ram.is_in_ram() && !stage.is_in_ram();
+    }
+    report.case("KV cache in RAM: stage in, write back", format!("exact {ok}"), ok);
     Ok(())
 }
 
