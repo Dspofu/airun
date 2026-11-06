@@ -77,8 +77,10 @@ impl Default for LoadOptions {
 }
 
 /// Drafts per step when `--draft` is not given, on dense models with an MTP
-/// head (80% accepted on Qwen3.8-27B; 26 -> 68 tok/s on an RTX 5060 Ti).
-pub const DEFAULT_DRAFT: usize = 3;
+/// head (Qwen3.8-27B: 26 -> 68 tok/s on an RTX 5060 Ti). 4 beat 3 in every
+/// alternated sweep (2026-11-05, 2x 5060 Ti, 128k q4_0): split 43.2 -> 45.0
+/// on prose and 47.6 -> 48.2 on code, one GPU 54.1 -> 55.0; 5 lost on prose.
+pub const DEFAULT_DRAFT: usize = 4;
 
 /// What the loader did, for reporting.
 pub struct LoadReport {

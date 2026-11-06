@@ -51,7 +51,7 @@ Os Qwen3.5/3.8 trazem uma camada extra, a "cabeça MTP", que adivinha os
 próximos tokens. O airun usa essa cabeça para rascunhar alguns tokens, e o
 modelo principal confere todos de uma vez. Os que ele aprova saem de graça.
 
-- **Padrão:** `run` usa 3 rascunhos nos modelos densos. Nos MoE fica desligado,
+- **Padrão:** `run` usa 4 rascunhos nos modelos densos. Nos MoE fica desligado,
   porque conferir 4 tokens acorda muito mais experts e ficou mais lento
   (35B-A3B: 115 → 91 tok/s); `--draft 3` liga mesmo assim. `serve` usa 0.
 - **Ganho:** no 27B, 26 → 68 tok/s em modo guloso (`--temp 0`) e 25,7 → 47,2

@@ -720,8 +720,8 @@ porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
 3. **KV cache paginado** para múltiplas sequências concorrentes. Hoje o
    servidor serializa requisições porque o cache é uma sequência só.
 
-4. **MTP — feito para o qwen35 denso (2026-10-31).** `--draft N` (padrão 3 no
-   `run`, 0 no `serve` — a flag existe nos dois desde 2026-11-03) carrega
+4. **MTP — feito para o qwen35 denso (2026-10-31).** `--draft N` (padrão 4 no
+   `run` desde 2026-11-05, antes 3; 0 no `serve` — a flag existe nos dois desde 2026-11-03) carrega
    `blk.{n_run}` como cabeça de rascunho e decodifica especulativamente
    quando a amostragem é gulosa pura (`--temp 0 --repeat-penalty 1`). A saída
    segue o decode normal, mas **não é garantidamente idêntica**: o verify roda
@@ -924,4 +924,37 @@ seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
   recusado, o token sai da distribuição sem ele; teste
   `sampling_against_a_draft_keeps_the_distribution` (200 mil sorteios).
   27B: 25,7 -> 47,2 tok/s a temp 0,7. Mirostat continua sem MTP.
+
+## Medições de decode com MTP: reserve, draft, cabeça (2026-11-05, 2× 5060 Ti)
+
+Máquina: 2× RTX 5060 Ti (gêmeas, sm_120; a de bus 03 desenha a tela).
+Qwen3.8-27B NVFP4, `-c 131072 -b 256 --kv-type q4_0 --temp 0
+--repeat-penalty 1 -n 300`, `AIRUN_SPEC_TIMING=1`, variantes sempre
+alternadas na mesma sessão. Nesta máquina as rodadas variaram < 1% (clock
+médio 2,8 GHz, sem quedas); o ruído de 20–40 t/s do PC antigo não apareceu.
+Dividido, o planner põe 32/32 camadas e cada GPU fica em ~9 GiB.
+
+- **`--vram-reserve` 384 contra 1024 (hipótese do WDDM):** não muda nada.
+  Dividido: 44,3–44,8 t/s nos dois. Para reproduzir a GPU do monitor cheia, o
+  modelo inteiro nela (`CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0
+  --alloc gpu`, contexto reduzido a 16k, pico de 15,7 de 16,3 GiB): 54,4 t/s
+  nos dois; a queda das rodadas 3–4 (para 48,1) pegou as duas variantes
+  igual. O reserve padrão fica em 384. Sem `--alloc gpu`, o `auto` mandou
+  2,4 GiB de pesos para a RAM e o decode caiu a 3 t/s (verify 882 ms): se um
+  usuário relatar decode lento com a GPU cheia, confira o "loaded X GiB".
+- **`--draft`** (t/s, aceitação do rascunho entre parênteses):
+
+  | Config | 2 | 3 | 4 | 5 |
+  |---|---|---|---|---|
+  | dividido, prosa (5+4 rodadas) | 40,3 (69%) | 43,2 (57%) | **45,0** (53%) | 42,9 (44%) |
+  | dividido, código (4 rodadas) | — | 47,6 (67%) | 48,2 (58%) | **49,0** (53%) |
+  | uma GPU, prosa (4 rodadas) | — | 54,1 | **55,0** | 51,4 |
+
+  Verify por passo: 52,7 / 56,2 / 58,4 ms (3/4/5) dividido; commit+absorb
+  10,2 / 13,0 / 15,7 ms. O 4 ganhou do 3 em toda configuração (e na varredura
+  do PC antigo, 61,4 contra 52,3), então `DEFAULT_DRAFT` passou a 4. O 5 só
+  ganha em texto muito previsível.
+- **Cópia Q8_0 da cabeça para o MTP: não vale.** A `output.weight` deste
+  arquivo é Q5_K (874 MB), não BF16 — o comentário antigo em `plan.rs`
+  estava errado. Uma Q8_0 (1,35 GB) leria mais bytes, não menos.
 

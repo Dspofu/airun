@@ -618,7 +618,7 @@ fn try_place(
                 // Between unequal cards the fastest takes the end of the model:
                 // the output head is read whole every token (and once more per
                 // MTP draft), while the embedding at the start is only gathered
-                // from. Qwen3.8-27B NVFP4 (2.5 GB BF16 head) on 5070 Ti + 5060,
+                // from. Qwen3.8-27B NVFP4 (874 MB Q5_K head) on 5070 Ti + 5060,
                 // MTP 3, 128k context: 44.1 -> 52.2 tok/s. A tied head needs
                 // the table on both ends, so those keep the old order.
                 let fast_last = (!twins && req.main_gpu.is_none() && req.alloc != AllocMode::Memory
