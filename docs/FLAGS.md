@@ -203,7 +203,7 @@ também no `serve`, como padrão dos pedidos. Na API: `reasoning_effort`
 
 | Flag | Padrão | Descrição |
 |---|---|---|
-| `--image <arquivo>` | — | Uma imagem (PNG, JPEG ou WebP) para o prompt; repita para várias. Precisa de `--mmproj`. Ponha `<__media__>` no prompt onde cada uma vai; sem marcador, elas vão antes do texto. |
+| `--image <arquivo>` | — | Uma imagem (PNG, JPEG ou WebP) para o prompt; repita para várias. Precisa de `--mmproj`. Ponha `<__media__>` no prompt onde cada uma vai; sem marcador, elas vão antes do texto. Sem `--image`, `<__media__>` é texto comum. |
 
 ```powershell
 airun run modelo.gguf --mmproj mmproj-BF16.gguf --image foto.jpg -p "O que tem nesta imagem?" --temp 0

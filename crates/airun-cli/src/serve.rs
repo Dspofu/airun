@@ -1724,7 +1724,8 @@ async fn native_completion(State(state): State<Arc<AppState>>, headers: HeaderMa
     let (prompt_text, tokens) = {
         let rt = &*state.tokenizer;
         match req.get("prompt") {
-            Some(Value::String(s)) if !images.is_empty() => match crate::media::tokenize(rt, s, &images, true) {
+            // multimodal_data: the prompt's <__media__> markers are the images' places.
+            Some(Value::String(s)) if !images.is_empty() => match crate::media::tokenize(rt, &crate::media::mark_slots(s), &images, true) {
                 Ok(t) => (s.clone(), t),
                 Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("{e:#}"), "invalid_request_error"),
             },
@@ -2034,7 +2035,7 @@ async fn attach_images(state: &AppState, mut req: Value) -> Result<Value, Respon
                         Some(Err(e)) => *err = Some(e),
                         None => *err = Some(format!("an {ty} part has no image data")),
                     }
-                    *v = json!({ "type": "text", "text": crate::media::MARKER });
+                    *v = json!({ "type": "text", "text": crate::media::slot() });
                     return;
                 }
                 o.values_mut().for_each(|x| walk(x, found, err));

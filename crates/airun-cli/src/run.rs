@@ -349,11 +349,14 @@ pub fn run(args: RunArgs) -> Result<()> {
                 t.elapsed().as_secs_f64() * 1000.0, vision.device);
         }
     }
-    // Images without a marker go before the text.
+    // With --image, each <__media__> is an image's place; images without one
+    // go before the text. Without images the marker is plain text.
     let mut prompt_text = prompt_text;
-    let marked = prompt_text.matches(crate::media::MARKER).count();
-    if marked == 0 && !image_ids.is_empty() {
-        prompt_text = format!("{}{prompt_text}", format!("{}\n", crate::media::MARKER).repeat(image_ids.len()));
+    if !image_ids.is_empty() {
+        prompt_text = crate::media::mark_slots(&prompt_text);
+        if !prompt_text.contains(crate::media::slot()) {
+            prompt_text = format!("{}{prompt_text}", format!("{}\n", crate::media::slot()).repeat(image_ids.len()));
+        }
     }
     // Thinking off, by switch or level: an empty block the model continues
     // after, as the Qwen templates write it with enable_thinking false.

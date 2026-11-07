@@ -1055,6 +1055,21 @@ procura o maior contexto, até 1/4 menor, em que ela fica na mais rápida, e
 avisa com uma `note:`. Aqui: 126.976 em vez de 127.488, e sem a flag passou a
 63,8–63,9 / 47,3–47,6, igual ao `--parallel 4`. `-c` explícito não muda.
 
+## Marcador de imagem (2026-11-07)
+
+**O erro:** um chat que só citava `<__media__>` (código, log, a documentação do airun) dava HTTP 400: "the prompt has 1 image markers (<__media__>) and 0 images were given".
+
+**A correção:**
+- `attach_images` agora põe no lugar de cada imagem um marcador sorteado por processo (`media::slot()`, como faz o llama-server). O `tokenize` divide o texto só por ele.
+- `<__media__>` só vira lugar de imagem onde o airun o documenta assim: `run --image` e o `/completion` com `multimodal_data`, via `media::mark_slots`.
+- No resto, `<__media__>` é texto comum.
+
+**Testado no `serve`** (27B com mmproj):
+- chat citando o marcador sem imagem;
+- imagem junto de texto citando o marcador;
+- `/completion` com `multimodal_data`;
+- imagem no formato Anthropic.
+
 ## Atenção do verify do MTP em contexto longo (2026-11-07)
 
 **O sintoma.** No `serve` com MTP, a geração caía com a conversa: ~50 tok/s até ~9k tokens, 26 tok/s aos 27k. O verify (1 + rascunhos tokens) ia para `attention_masked`, o kernel de prefill, com grid (tokens, cabeças): 96 blocos, cada um lendo o contexto inteiro.
