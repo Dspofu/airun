@@ -207,6 +207,9 @@ impl Runtime {
         for st in &mut self.states {
             device::set_device(st.device)?;
             let dev = st.device;
+            // The verify's queries split across the cache (split_verify).
+            st.verify_partial = Some(DeviceBuffer::new(dev,
+                rows * cfg.n_head * ops::attention_splits(self.ctx) * (cfg.head_dim + 2))?);
             // Room for a batched verify of every slot (verify_rows).
             let all = rows * self.slots.len().max(1);
             st.stash = st.layers.iter().map(|&l| -> Result<Option<DeltaStash>> {

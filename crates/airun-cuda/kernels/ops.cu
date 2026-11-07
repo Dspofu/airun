@@ -634,7 +634,8 @@ __device__ __forceinline__ int attention_active_splits(const int32_t* positions,
 // 17 us per layer at 3072 tokens, a sixth of the decode step's attention.
 #define MERGE_MAX_SPLITS 256
 __global__ void attention_merge_kernel(float* out, const float* partial,
-    int head_dim, int splits, const int32_t* positions, int window, int keys_per_split, int wave) {
+    int head_dim, int splits, const int32_t* positions, int window, int keys_per_split, int wave,
+    int pos_stride = 1) {
     __shared__ float s_m[MERGE_MAX_SPLITS];
     __shared__ float s_w[MERGE_MAX_SPLITS];
     __shared__ float s_total;
@@ -644,7 +645,9 @@ __global__ void attention_merge_kernel(float* out, const float* partial,
     const size_t row = blockIdx.y;
     partial += row * gridDim.x * splits * (head_dim + 2);
     out += row * gridDim.x * head_dim;
-    positions += row;
+    // A verify's queries share one partition of the cache (the first one's):
+    // pos_stride 0 with `positions` at that query.
+    positions += row * pos_stride;
     const float* base = partial + (size_t)head * splits * (head_dim + 2);
     const int active = min(MERGE_MAX_SPLITS,
                            attention_active_splits(positions, window, splits, keys_per_split, wave));
@@ -695,7 +698,14 @@ __global__ void attention_merge_kernel(float* out, const float* partial,
 // Output is the split kernel's partial (max, sum, unnormalized acc) per query
 // head, so attention_merge_kernel finishes the job.
 // ---------------------------------------------------------------------------
+// Keys per split of a speculative verify: fixed by the cache size alone, so
+// the boundaries do not move with the queries' positions.
+__host__ __device__ __forceinline__ int verify_split_keys(int max_seq, int splits) {
+    return max(GQA_KEYS_PER_SPLIT, (max_seq + splits - 1) / splits);
+}
+
 #define GQA_MAX 8        // query heads per KV head this kernel handles
+#define GQA_MULTI_MAX 8  // queries per block (warps) of a speculative verify
 #define GQA_TILE 32      // keys per staged tile
 
 template <int D>
@@ -707,9 +717,9 @@ struct GqaShape {
     static constexpr size_t SMEM = Q_BYTES + T_BYTES + P_BYTES;
 };
 
-// Stages rows [t0, t0 + n) of a cache head into `tile` as fp16. The warp's
-// lanes take consecutive 16-byte pieces, and a batch of them is loaded before
-// any is stored, so the requests overlap.
+// Stages rows [t0, t0 + n) of a cache head into `tile` as fp16 (rows past n
+// untouched). The warp's lanes take consecutive 16-byte pieces, and a batch of
+// them is loaded before any is stored, so the requests overlap.
 template <int D, int KV>
 __device__ __forceinline__ void gqa_stage(half* tile, const uint8_t* base, size_t row_bytes,
                                           int t0, int n, int lane, const int32_t* rows) {
@@ -745,7 +755,9 @@ __device__ __forceinline__ void gqa_stage(half* tile, const uint8_t* base, size_
         for (int u = 0; u < BATCH; ++u) {
             const int idx = (b0 + u) * 32 + lane;
             const int r = idx / PIECES, c = idx % PIECES;
-            *(uint4*)&tile[r * GqaShape<D>::LD + 8 * c] = v[u];
+            // Rows past n are left alone: their keys are masked out, and in
+            // a verify they are another warp's share of the tile.
+            if (r < n) *(uint4*)&tile[r * GqaShape<D>::LD + 8 * c] = v[u];
         }
     }
 }
@@ -753,7 +765,7 @@ __device__ __forceinline__ void gqa_stage(half* tile, const uint8_t* base, size_
 template <int D, int KV>
 // minBlocks = 1 lifts ptxas's register target: left to itself it stopped the
 // f16 D=128 build at 128 registers and spilled 64 bytes to local memory.
-__global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
+__global__ __launch_bounds__(32 * GQA_MULTI_MAX, 1) void attention_decode_gqa_kernel(
     float* __restrict__ partial,          // [n_heads][splits][D + 2]
     const float* __restrict__ q,          // [n_heads][D], one token
     const uint8_t* __restrict__ k_cache,
@@ -768,15 +780,18 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
     const int wave,                       // see attention_active_splits
     const uint8_t* const* __restrict__ kv_rows = nullptr) {  // rows mode: K then V cache per row
 
-    if (kv_rows) {
-        // Row blockIdx.z of a --parallel step: its query, position, partials
-        // and its own conversation's cache.
+    if (kv_rows || gridDim.z > 1) {
+        // Row blockIdx.z: its query, position and partials -- a --parallel
+        // step's conversation with its own cache (kv_rows), or one of a
+        // speculative verify's tokens over the one cache.
         const size_t r = blockIdx.z;
         q += r * n_heads * D;
         positions += r;
         partial += r * n_heads * gridDim.y * (D + 2);
-        k_cache = kv_rows[r];
-        v_cache = kv_rows[gridDim.z + r];
+        if (kv_rows) {
+            k_cache = kv_rows[r];
+            v_cache = kv_rows[gridDim.z + r];
+        }
     }
     using S = GqaShape<D>;
     constexpr int LD = S::LD;
@@ -785,23 +800,46 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
     // Sized for this model's group, not GQA_MAX: with 4 heads per KV head the
     // block needs 11 KB instead of 14, and more of them fit an SM.
     const int G = n_heads / n_kv_heads;
-    float* qs = (float*)gqa_smem;                                   // [G][D], pre-scaled
+    // Several warps (a speculative verify, attention_split_multi): warp w is
+    // query w over the same cache, sharing each staged tile; keys past a
+    // warp's own position are masked out of its sums. The splits there have
+    // fixed boundaries (verify_split_keys), so a token's sums are the same
+    // whichever query of whichever verify it is -- a lone request verifies 4
+    // tokens a pass, the same one in a --parallel step 2, and greedy text
+    // must not depend on that.
+    const int W = blockDim.x >> 5;
+    const int w = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (W > 1) {
+        q += (size_t)w * n_heads * D;
+        partial += (size_t)w * n_heads * gridDim.y * (D + 2);
+    }
+    float* qs = (float*)(gqa_smem + (size_t)w * G * D * 4);          // [G][D], pre-scaled
     // One tile buffer, K then V: a second buffer so both could load at once
     // measured slower (66 us against 52 at 3072 tokens) -- the extra shared
     // memory cost more resident blocks than the saved round trip bought.
-    half* tile = (half*)(gqa_smem + (size_t)G * D * 4);             // [TILE][LD], K then V
-    float* ps = (float*)(gqa_smem + (size_t)G * D * 4 + S::T_BYTES); // [G][TILE]
+    half* tile = (half*)(gqa_smem + (size_t)W * G * D * 4);         // [TILE][LD], K then V
+    float* ps = (float*)(gqa_smem + (size_t)W * G * D * 4 + S::T_BYTES) + (size_t)w * G * GQA_TILE; // [G][TILE]
 
     const int kvh = blockIdx.x;
     const int split = blockIdx.y;
-    const int lane = threadIdx.x;
-    const int pos = positions[0];
-    const int lo = sliding_window > 0 ? max(0, pos - sliding_window + 1) : 0;
-    const int span = pos + 1 - lo;
-    const int splits = attention_active_splits(positions, sliding_window, gridDim.y, GQA_KEYS_PER_SPLIT, wave);
-    if (split >= splits) return;   // the merge reads only the active ones
-    const int begin = lo + (int)((int64_t)span * split / splits);
-    const int end = lo + (int)((int64_t)span * (split + 1) / splits);
+    const int my_pos = positions[w];
+    int begin, end;
+    if (W > 1) {
+        const int keys = verify_split_keys(max_seq, gridDim.y);
+        const int last = positions[W - 1];
+        if (split > last / keys) return;   // past every query: the merge does not read it
+        begin = split * keys;
+        end = min((split + 1) * keys, last + 1);
+    } else {
+        const int pos = positions[0];
+        const int lo = sliding_window > 0 ? max(0, pos - sliding_window + 1) : 0;
+        const int span = pos + 1 - lo;
+        const int splits = attention_active_splits(positions, sliding_window, gridDim.y, GQA_KEYS_PER_SPLIT, wave);
+        if (split >= splits) return;   // the merge reads only the active ones
+        begin = lo + (int)((int64_t)span * split / splits);
+        end = lo + (int)((int64_t)span * (split + 1) / splits);
+    }
 
     for (int i = lane; i < G * D; i += 32) qs[i] = q[(size_t)(kvh * G) * D + i] * scale;
     __syncwarp();
@@ -821,8 +859,11 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
 
     for (int t0 = begin; t0 < end; t0 += GQA_TILE) {
         const int n = min(GQA_TILE, end - t0);
-        gqa_stage<D, KV>(tile, kbase, row_bytes, t0, n, lane, idx);
-        __syncwarp();
+        // Every warp stages its share of the tile's rows, so a verify's
+        // loads overlap rather than queue behind one warp.
+        const int per = (n + W - 1) / W, r0 = w * per, cnt = min(per, n - r0);
+        if (cnt > 0) gqa_stage<D, KV>(tile + (size_t)r0 * LD, kbase, row_bytes, t0 + r0, cnt, lane, idx);
+        __syncthreads();
 
         // Lane `lane` scores key t0 + lane against every query head.
         float s[GQA_MAX];
@@ -850,7 +891,7 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
                 s[h] = fmaf(q1.x, kf[4], fmaf(q1.y, kf[5], fmaf(q1.z, kf[6], fmaf(q1.w, kf[7], s[h]))));
             }
         }
-        const bool valid = lane < n;
+        const bool valid = lane < n && t0 + lane <= my_pos;
 #pragma unroll
         for (int h = 0; h < GQA_MAX; ++h) {
             if (h >= G) continue;
@@ -859,7 +900,9 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
             const float m_new = fmaxf(m[h], mt);
-            const float corr = __expf(m[h] - m_new);   // m[h] = -inf only before any key: corr = 0
+            // m[h] = -inf only before any key: corr = 0. Both -inf (a verify
+            // query with no key in this tile yet): nothing to rescale.
+            const float corr = m_new == -INFINITY ? 1.0f : __expf(m[h] - m_new);
             const float p = valid ? __expf(sv - m_new) : 0.0f;
             float sum = p;
 #pragma unroll
@@ -870,7 +913,8 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
             for (int i = 0; i < DP; ++i) { acc[h][i][0] *= corr; acc[h][i][1] *= corr; }
             ps[h * GQA_TILE + lane] = p;
         }
-        __syncwarp();   // every lane is done reading K, and ps is written
+        __syncwarp();      // ps is written
+        __syncthreads();   // every warp is done reading K
 
         // An f16 V row is read straight from the cache: lane l takes halves
         // 2l + 64i, so each i is one coalesced 128-byte load across the warp,
@@ -895,8 +939,8 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
                 }
             }
         } else {
-            gqa_stage<D, KV>(tile, vbase, row_bytes, t0, n, lane, idx);
-            __syncwarp();
+            if (cnt > 0) gqa_stage<D, KV>(tile + (size_t)r0 * LD, vbase, row_bytes, t0 + r0, cnt, lane, idx);
+            __syncthreads();
             for (int j = 0; j < n; ++j) {
                 const half* vr = tile + j * LD;
 #pragma unroll
@@ -912,7 +956,7 @@ __global__ __launch_bounds__(32, 1) void attention_decode_gqa_kernel(
                 }
             }
         }
-        __syncwarp();   // the next tile's K overwrites these rows
+        __syncthreads();   // the next tile's K overwrites these rows
     }
 
     // A compile-time trip count: indexing m/l/acc with a runtime bound put all
@@ -946,22 +990,22 @@ static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q
                                      const uint8_t* v, const int32_t* pos, int heads, int kv_heads,
                                      int max_seq, float scale, int window, int splits,
                                      const int32_t* idx, int* wave_out, cudaStream_t stream,
-                                     int rows = 1, const uint8_t* const* kv_rows = nullptr) {
+                                     int rows = 1, const uint8_t* const* kv_rows = nullptr, int warps = 1) {
     const dim3 grid(kv_heads, splits, rows);
     const int G = heads / kv_heads;
-    const size_t smem = (size_t)G * D * 4 + GqaShape<D>::T_BYTES + (size_t)G * GQA_TILE * 4;
+    const size_t smem = (size_t)warps * ((size_t)G * D * 4 + (size_t)G * GQA_TILE * 4) + GqaShape<D>::T_BYTES;
 #define GQA_LAUNCH(KVT)                                                                     \
     do {                                                                                   \
         cudaFuncSetAttribute(attention_decode_gqa_kernel<D, KVT>,                          \
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
         int per_sm = 0, dev = 0, sms = 0;                                                  \
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm,                             \
-            attention_decode_gqa_kernel<D, KVT>, 32, smem);                                \
+            attention_decode_gqa_kernel<D, KVT>, 32 * warps, smem);                                \
         cudaGetDevice(&dev);                                                               \
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);                 \
-        const int wave = split_waves_disabled() ? 0 : max(1, per_sm * sms / kv_heads);    \
+        /* A verify (warps > 1) keeps every split: rounding to the occupancy */                   /* of its block size would make the partition depend on the drafts. */                    const int wave = (split_waves_disabled() || warps > 1) ? 0 : max(1, per_sm * sms / kv_heads); \
         *wave_out = wave;                                                                  \
-        attention_decode_gqa_kernel<D, KVT><<<grid, 32, smem, stream>>>(                    \
+        attention_decode_gqa_kernel<D, KVT><<<grid, 32 * warps, smem, stream>>>(                    \
             partial, q, k, v, pos, heads, kv_heads, max_seq, scale, window, idx, wave, kv_rows); \
     } while (0)
     switch (kv_type) {
@@ -1821,6 +1865,43 @@ airun_status airun_attention_split_rows(
     AIRUN_TRY(e);
     attention_merge_kernel<<<dim3(heads, rows), dim, 0, stream>>>((float*)out, (const float*)partial, dim, splits,
         pp, window, GQA_KEYS_PER_SPLIT, wave);
+    AIRUN_CHECK_LAUNCH();
+}
+
+// Several queries over one cache, query r at positions[r]: a speculative
+// verify's tokens. Split across the cache like one-token decode, where the
+// prefill kernel gave each (token, head) one block walking the whole cache --
+// at 27k cells that was 15-30 ms a pass on the 27B. `partial` holds rows x the
+// one-row scratch. The GQA kernel's shapes only (else AIRUN_ERR_BAD_ARG).
+airun_status airun_attention_split_multi(
+    void* out, void* partial, const void* q, const void* k, const void* v,
+    const void* positions, int32_t heads, int32_t kv_heads, int32_t dim,
+    int32_t max_seq, float scale, int32_t window, int32_t splits, int32_t kv_type,
+    int32_t rows, cudaStream_t stream) {
+    if (rows <= 0) return AIRUN_OK;
+    if (dim <= 0 || dim % 32 || dim > 256 || kv_heads <= 0 || heads % kv_heads || splits <= 0)
+        return AIRUN_ERR_BAD_ARG;
+    if (kv_type < KV_F16 || kv_type > KV_Q4_0) return AIRUN_ERR_BAD_ARG;
+    const bool gqa = heads / kv_heads <= GQA_MAX && !gqa_decode_disabled() &&
+        (dim == 64 || dim == 128 || dim == 256);
+    // A sliding window would start each query's keys at its own position;
+    // the shared partition starts them at the last one's.
+    if (!gqa || rows > GQA_MULTI_MAX || window > 0) return AIRUN_ERR_BAD_ARG;
+    const float* qq = (const float*)q;
+    const uint8_t* kk = (const uint8_t*)k;
+    const uint8_t* vv = (const uint8_t*)v;
+    const int32_t* pp = (const int32_t*)positions;
+    float* part = (float*)partial;
+    int wave = 0;
+    cudaError_t e;
+    if (dim == 64)       e = launch_gqa_decode<64>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, 1, nullptr, rows);
+    else if (dim == 128) e = launch_gqa_decode<128>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, 1, nullptr, rows);
+    else                 e = launch_gqa_decode<256>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, 1, nullptr, rows);
+    AIRUN_TRY(e);
+    // Every row merges the splits up to the last query's (its own later ones
+    // are empty and weigh nothing).
+    attention_merge_kernel<<<dim3(heads, rows), dim, 0, stream>>>((float*)out, (const float*)partial, dim, splits,
+        pp + (rows - 1), window, verify_split_keys(max_seq, splits), 0, 0);
     AIRUN_CHECK_LAUNCH();
 }
 

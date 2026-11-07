@@ -23,21 +23,19 @@ procedimento de verificação. Este arquivo é só o resumo.
 
 ## Ambiente
 
-Rust fica em `E:\rust` (fora do padrão):
+- **Rust** 1.85+ (via rustup). Se ele estiver fora do PATH, defina
+  `CARGO_HOME`/`RUSTUP_HOME` para onde está — ou deixe o `build.ps1`/`build.sh`
+  descobrirem sozinhos.
+- **CUDA Toolkit** 12.x ou 13.x (sm_120 precisa de 12.8+). Com mais de um
+  CUDA instalado, aponte `CUDA_PATH` para o certo.
+- Durante o desenvolvimento, compile só para a sua GPU:
+  `$env:AIRUN_CUDA_ARCHS="120"` (ou `"86,120"`, etc.). Remova na build final.
 
-```powershell
-$env:RUSTUP_HOME="E:\rust\rustup"; $env:CARGO_HOME="E:\rust\cargo"
-$env:PATH="E:\rust\cargo\bin;$env:PATH"
-$env:AIRUN_CUDA_ARCHS="120"   # build rápido em dev; remova para a build final
-```
+GPUs de gerações diferentes no mesmo PC funcionam juntas; sem P2P entre as
+placas, cópias entre GPUs passam pela RAM.
 
-Hardware: RTX 5060 Ti + RTX 3060 (sm_120 + sm_86; às vezes 2× 5060 Ti ou
-5070 Ti), CUDA 13.x, MSVC 2022. Compile com `AIRUN_CUDA_ARCHS="86,120"` quando
-a 3060 estiver no PC.
-**Sem P2P entre as placas** — cópias entre GPUs passam pela RAM.
-
-Modelos de teste: `D:\modelsAI\gguf\` (Qwen3.8-27B NVFP4, 35B-A3B, Qwen4 Flash-Next,
-mmproj) e `E:\modelos IA\` (Qwen3-1.7B, Qwen3.5-9B e outros menores).
+Modelos de teste: qualquer GGUF da família Qwen que você tenha local (um
+pequeno, como o Qwen3-1.7B, serve para os testes rápidos abaixo).
 
 ## Verificação
 
@@ -45,7 +43,7 @@ mmproj) e `E:\modelos IA\` (Qwen3-1.7B, Qwen3.5-9B e outros menores).
 cargo test --release
 cargo build --release
 .\target\release\airun.exe selftest
-.\target\release\airun.exe run "E:\modelos IA\qwen3\Qwen3-1.7B-UD-Q8_K_XL.gguf" -p "2+2?" -n 20 --temp 0
+.\target\release\airun.exe run modelo-pequeno.gguf -p "2+2?" -n 20 --temp 0
 ```
 
 ## Git

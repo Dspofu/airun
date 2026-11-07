@@ -107,22 +107,17 @@ certo. Isso é muito pior que um crash, e o selftest é a única defesa.
 Sempre, nesta ordem:
 
 ```powershell
-$env:RUSTUP_HOME="E:\rust\rustup"; $env:CARGO_HOME="E:\rust\cargo"
-$env:PATH="E:\rust\cargo\bin;$env:PATH"
-$env:AIRUN_CUDA_ARCHS="120"     # só a arch local: build rápido durante dev
-# CUDA_PATH do sistema aponta para o 12.0, que não conhece sm_120:
-$env:CUDA_PATH="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
-$env:PATH="$env:CUDA_PATH\bin;$env:PATH"
+# Se Rust ou CUDA não estiverem no PATH, defina CARGO_HOME/RUSTUP_HOME/CUDA_PATH
+# (build.ps1 e build.sh descobrem sozinhos; um cargo manual precisa das variáveis).
+$env:AIRUN_CUDA_ARCHS="120"     # só a arch local: build rápido durante dev (tire na final)
 
 cargo test --release            # 60+ testes unitários
 cargo build --release
-.\target\release\airun.exe selftest        # 78 casos GPU vs CPU
-.\target\release\airun.exe run G:\modelsAI\gguf\qwen3\Qwen3-1.7B-UD-Q8_K_XL.gguf `
-    -p "What is 2+2?" -n 20 --temp 0
+.\target\release\airun.exe selftest        # cada kernel GPU contra a referência CPU
+.\target\release\airun.exe run <modelo-pequeno.gguf> -p "What is 2+2?" -n 20 --temp 0
 
-# e a métrica de qualidade, que é o que pega erro sutil:
-.\target\release\airun.exe perplexity E:\airun-models\Qwen3-8B-Q4_K.gguf
-# esperado: perda 2.2018 nats/token, top-1 50.9%
+# e a métrica de qualidade, que é o que pega erro sutil (qualquer modelo num texto conhecido):
+.\target\release\airun.exe perplexity <modelo.gguf>
 ```
 
 Se o selftest passar mas a geração virar lixo, o bug está no *runtime*
@@ -827,8 +822,7 @@ dp4a (decode), com o mesmo resultado; `fp4_supported()` decide por GPU
 
 ## Onde o tempo vai (2026-11-05, Nsight Systems 2026.3)
 
-O `nsys` em `C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.3.2\target-windows-x64\`
-perfila as RTX 50 (o Nsight Compute 2022.4 não). Decode só aparece kernel a
+O `nsys` do Nsight Systems 2026.x perfila as RTX 50 (o Nsight Compute 2022.4 não). Decode só aparece kernel a
 kernel com `AIRUN_NO_GRAPH=1 AIRUN_NO_DECODE_PIPELINE=1`.
 `nsys profile -t cuda -o x airun.exe bench ...` e depois
 `nsys stats -r cuda_gpu_kern_sum -f csv -o x x.nsys-rep`.
@@ -1060,6 +1054,34 @@ o layout bom cabia.
 procura o maior contexto, até 1/4 menor, em que ela fica na mais rápida, e
 avisa com uma `note:`. Aqui: 126.976 em vez de 127.488, e sem a flag passou a
 63,8–63,9 / 47,3–47,6, igual ao `--parallel 4`. `-c` explícito não muda.
+
+## Atenção do verify do MTP em contexto longo (2026-11-07)
+
+**O sintoma.** No `serve` com MTP, a geração caía com a conversa: ~50 tok/s até ~9k tokens, 26 tok/s aos 27k. O verify (1 + rascunhos tokens) ia para `attention_masked`, o kernel de prefill, com grid (tokens, cabeças): 96 blocos, cada um lendo o contexto inteiro.
+
+**A correção:**
+- **Caminho:** `ops::attention_split_multi`, escolhido em `runtime::split_verify`; também serve ao verify em lote e à cabeça MTP.
+- **Kernel:** `attention_decode_gqa_kernel` com W warps por bloco, um por query. Elas dividem cada tile de K/V em shared memory, carregado por todas as warps, e cada warp mascara as chaves depois da sua posição.
+- **Isolado** (`tests/attention_bench.rs`), por camada, 4 queries em cache q4_0, 5070 Ti:
+  - 25k células: 537 µs, contra 1520 no kernel antigo e 1205 dividindo por linha;
+  - 8k células: 167 µs, contra 490.
+
+**Determinismo:**
+- **Fronteiras fixas:** no modo de várias warps, os splits têm fronteiras fixas (`verify_split_keys` = máx(64, ⌈ctx/splits⌉)), não dependentes da posição.
+- **Sem arredondamento por ocupação:** não há "wave" no modo de várias warps.
+- **Merge:** junta até o split da última query, com `pos_stride` 0.
+- **Por que importa:** o mesmo token é a query 0 de um verify sozinho e a query 2 de um verify em lote. Com fronteiras que dependiam da posição, o texto guloso do `--parallel` divergia do texto sozinho; agora sai idêntico com 2, 3 e 4 pedidos.
+- **Testes:** `verify_attention_ignores_the_drafts_count` (bench) e `test_split_multi` (selftest).
+- **`gqa_stage`:** agora não escreve linhas além de n, porque as warps dividem o tile.
+
+**Medido** (27B NVFP4, 5070 Ti + 5060 Ti, `-c 32768 --kv-type q4_0 --draft 3`, 300 tokens):
+
+| prompt | antes | depois |
+|---|---|---|
+| 25k tokens | 34,2 tok/s (verify 75 ms) | 52,8 tok/s (verify 42 ms) |
+| curto | 54 tok/s | 54,8 tok/s |
+
+`AIRUN_NO_SPLIT_VERIFY=1` volta ao kernel antigo.
 
 ## Camadas na RAM multiplicadas na CPU (2026-11-06, RTX 5060 8 GB sozinha)
 

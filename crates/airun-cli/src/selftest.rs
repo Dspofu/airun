@@ -161,6 +161,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     test_delta_head_broadcast(args.device, &stream, &mut report)?;
     test_rows_batched(args.device, &stream, &mut report)?;
     test_kv_in_ram(args.device, &stream, &mut report)?;
+    test_split_multi(args.device, &stream, &mut report)?;
     test_rmsnorm_gated(args.device, &stream, &mut report)?;
     test_split_head_gate(args.device, &stream, &mut report)?;
 
@@ -1459,6 +1460,48 @@ fn test_kv_in_ram(device: i32, stream: &Stream, report: &mut Report) -> Result<(
         ok &= ram.is_in_ram() && !stage.is_in_ram();
     }
     report.case("KV cache in RAM: stage in, write back", format!("exact {ok}"), ok);
+    Ok(())
+}
+
+/// A speculative verify's queries over one cache: the split decode kernel
+/// (attention_split_multi) against the prefill kernel it replaces
+/// (attention_masked), 4 queries at consecutive positions near the end of a
+/// 1000-cell cache in every KV type. Different reduction orders, so held to
+/// f32 rounding rather than bit equality.
+fn test_split_multi(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    let (heads, kvh, dim, ctx, n) = (24usize, 4usize, 256usize, 1024usize, 4usize);
+    let mut rng = Rng::new(0x5B_17_0004);
+    let q = DeviceBuffer::from_slice(device, &rng.floats(n * heads * dim), stream)?;
+    let pos: Vec<i32> = (0..n as i32).map(|i| 990 + i).collect();
+    let d_pos = DeviceBuffer::from_slice(device, &pos, stream)?;
+    let splits = ops::attention_splits(ctx);
+    let partial = DeviceBuffer::<f32>::new(device, n * heads * splits * (dim + 2))?;
+    let scale = 1.0 / (dim as f32).sqrt();
+    let mut worst = 0f32;
+    for kv in [ops::KvType::F16, ops::KvType::Q8_0, ops::KvType::Q4_0] {
+        let row = kv.row_bytes(dim);
+        // Fill the caches through the cache writer, so every type holds valid blocks.
+        let kc = DeviceBuffer::<u8>::zeroed(device, kvh * ctx * row, stream)?;
+        let vc = DeviceBuffer::<u8>::zeroed(device, kvh * ctx * row, stream)?;
+        let ks = DeviceBuffer::from_slice(device, &rng.floats(ctx * kvh * dim), stream)?;
+        let vs = DeviceBuffer::from_slice(device, &rng.floats(ctx * kvh * dim), stream)?;
+        let all: Vec<i32> = (0..ctx as i32).collect();
+        let d_all = DeviceBuffer::from_slice(device, &all, stream)?;
+        ops::kv_store(kc.as_mut_ptr(), vc.as_mut_ptr(), ks.as_ptr(), vs.as_ptr(), d_all.as_ptr(), ctx, kvh, dim, ctx,
+            kv, stream)?;
+        let a = DeviceBuffer::<f32>::new(device, n * heads * dim)?;
+        let b = DeviceBuffer::<f32>::new(device, n * heads * dim)?;
+        ops::attention_masked(a.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), vc.as_ptr(), d_pos.as_ptr(), n, heads, kvh, dim,
+            ctx, scale, 0, kv, None, 994, stream)?;
+        ops::attention_split_multi(b.as_mut_ptr(), partial.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
+            d_pos.as_ptr(), heads, kvh, dim, ctx, scale, 0, splits, kv, n, stream)?;
+        let (a, b) = (a.to_vec(stream)?, b.to_vec(stream)?);
+        for (x, y) in a.iter().zip(&b) {
+            worst = worst.max((x - y).abs() / x.abs().max(1e-2));
+        }
+    }
+    report.case("verify attention split across the cache matches the prefill kernel",
+        format!("max relative difference {worst:.2e} (f16, q8_0, q4_0)"), worst < 5e-3);
     Ok(())
 }
 

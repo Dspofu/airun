@@ -842,7 +842,10 @@ pub fn spec_scratch_bytes(config: &Config, batch: usize, draft: usize) -> u64 {
         let per_row = (ssm.qkv_dim() + 2 * ssm.k_dim() + ssm.v_dim() + 2 * ssm.n_v_heads) as u64 * f;
         linear * slots * rows * per_row
     });
-    head_rows + logits + batched + stash + (32 << 20)
+    // The verify's split-attention scratch on each GPU (runtime::split_verify),
+    // at the most splits a context takes.
+    let verify_attn = rows * (config.n_head * 256 * (config.head_dim + 2)) as u64 * f;
+    head_rows + logits + batched + stash + verify_attn + (32 << 20)
 }
 
 /// Whether the file carries the MTP head's weights (see [`mtp_supported`]).

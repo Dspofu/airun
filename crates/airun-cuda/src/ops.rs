@@ -142,6 +142,25 @@ unsafe extern "C" {
         stream: ffi::Stream,
     ) -> Status;
 
+    fn airun_attention_split_multi(
+        out: *mut c_void,
+        partial: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        positions: *const c_void,
+        heads: i32,
+        kv_heads: i32,
+        dim: i32,
+        max_seq: i32,
+        scale: f32,
+        window: i32,
+        splits: i32,
+        kv_type: i32,
+        rows: i32,
+        stream: ffi::Stream,
+    ) -> Status;
+
     fn airun_kv_stage(
         dst: *mut c_void,
         src: *const c_void,
@@ -1132,6 +1151,28 @@ pub fn attention_split(out: *mut c_void, partial: &crate::DeviceBuffer<f32>,
     window: usize, splits: usize, kv_type: KvType, stream: &Stream) -> Result<()> {
     attention_split_sel(out, partial, q, k, v, positions, heads, kv_heads, dim, ctx, scale, window, splits,
         kv_type, std::ptr::null(), stream)
+}
+
+/// `rows` queries over one cache (a speculative verify's tokens), query r at
+/// `positions[r]` and causal up to it, split across the cache as one-token
+/// decode is. `partial` holds `rows` x heads x splits x (dim + 2) floats.
+/// Takes the shapes [`attention_split_rows_ok`] accepts.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_split_multi(out: *mut c_void, partial: *mut c_void, q: *const c_void, k: *const c_void,
+    v: *const c_void, positions: *const c_void, heads: usize, kv_heads: usize, dim: usize, ctx: usize,
+    scale: f32, window: usize, splits: usize, kv_type: KvType, rows: usize, stream: &Stream) -> Result<()> {
+    #[cfg(airun_cuda)]
+    // SAFETY: the caches hold kv_heads * ctx rows; q rows * heads * dim floats,
+    // positions rows ints, partial as documented; the kernels stay inside them.
+    unsafe {
+        ffi::check(airun_attention_split_multi(out, partial, q, k, v, positions, heads as i32, kv_heads as i32,
+            dim as i32, ctx as i32, scale, window as i32, splits as i32, kv_type.id(), rows as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (out, partial, q, k, v, positions, heads, kv_heads, dim, ctx, scale, window, splits, kv_type, rows, stream);
+        Err(CudaError::NotBuiltWithCuda)
+    }
 }
 
 /// Whether [`attention_split_rows`] takes these shapes (the GQA decode kernel's).

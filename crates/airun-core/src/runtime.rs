@@ -323,6 +323,9 @@ struct DeviceState {
     rows_tab: Option<DeviceBuffer<u64>>,
     /// attn_partial for every slot at once, for the batched attention.
     rows_partial: Option<DeviceBuffer<f32>>,
+    /// attn_partial for a speculative verify's 1 + drafts queries (see
+    /// split_verify), set up with the drafting.
+    verify_partial: Option<DeviceBuffer<f32>>,
     /// The VRAM copy (K, V) of one layer's cache that the attention layers
     /// whose KV cache stays in RAM run on (see Shard::kv_ram_layers).
     kv_stage: Option<(DeviceBuffer<u8>, DeviceBuffer<u8>)>,
@@ -397,6 +400,23 @@ fn mixed_graphs_disabled() -> bool {
 fn graphs_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var("AIRUN_NO_GRAPH").is_ok_and(|v| v.trim() != "0")) || crate::cpu::in_use()
+}
+
+/// Whether `n` queries over one cache (a speculative verify) take the split
+/// decode kernel (ops::attention_split_multi) on shard state `st`: its
+/// scratch holds them and the shape suits. The prefill kernel it replaces
+/// gave each (query, head) one block walking the whole cache, which on the
+/// 27B at 27k cells halved decoding. AIRUN_NO_SPLIT_VERIFY=1 keeps that one.
+fn split_verify(st: &DeviceState, n: usize, cfg: &Config, ctx: usize, window: usize) -> Option<*mut std::ffi::c_void> {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("AIRUN_NO_SPLIT_VERIFY").is_ok_and(|v| v.trim() != "0")) {
+        return None;
+    }
+    let per_row = cfg.n_head * ops::attention_splits(ctx) * (cfg.head_dim + 2);
+    st.verify_partial.as_ref()
+        .filter(|p| n > 1 && n <= 8 && window == 0 && p.len() >= n * per_row)
+        .filter(|_| ops::attention_split_rows_ok(cfg.n_head, cfg.n_head_kv, cfg.head_dim))
+        .map(|p| p.as_mut_ptr())
 }
 
 /// Whether `w`'s matmuls run on the CPU: its weights stay in RAM and
@@ -858,6 +878,7 @@ impl Runtime {
                 attn_partial: DeviceBuffer::new(dev, cfg.n_head * ops::attention_splits(ctx) * (cfg.head_dim + 2))?,
                 rows_tab: None,
                 rows_partial: None,
+                verify_partial: None,
                 kv_stage: if shard.kv_ram_layers.is_empty() { None } else {
                     let bytes = cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim);
                     Some((DeviceBuffer::new(dev, bytes)?, DeviceBuffer::new(dev, bytes)?))
@@ -3006,7 +3027,11 @@ impl Runtime {
                     cfg.kv_type, stream,
                 )?;
                 self.kv_stage_out(st, kc, vc, pos, t)?;
-                if t > 1 {
+                if let Some(partial) = split_verify(st, t, cfg, self.ctx, window) {
+                    ops::attention_split_multi(st.attn.offset_ptr(at * qw), partial, st.q.offset_ptr(at * qw), kp, vp,
+                        pos, cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(), window,
+                        ops::attention_splits(self.ctx), cfg.kv_type, t, stream)?;
+                } else if t > 1 {
                     // The cells come from `positions` on the device; `keys` only
                     // picks a long-context variant, and a constant keeps a
                     // captured verify valid at every position.
@@ -3127,6 +3152,10 @@ impl Runtime {
                     cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
                     window, ops::attention_splits(self.ctx), cfg.kv_type,
                     sparse.map_or(std::ptr::null(), |qs| qs.list.as_ptr()), stream)?;
+            } else if let Some(partial) = split_verify(st, n, cfg, self.ctx, window).filter(|_| sparse.is_none()) {
+                ops::attention_split_multi(st.attn.as_mut_ptr(), partial, st.q.as_ptr(), kp, vp,
+                    st.positions.as_ptr(), cfg.n_head, cfg.n_head_kv, cfg.head_dim, self.ctx, cfg.attn_scale(),
+                    window, ops::attention_splits(self.ctx), cfg.kv_type, n, stream)?;
             } else {
                 // A single query without the split kernel reads the mask too.
                 if n == 1 {

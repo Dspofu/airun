@@ -392,7 +392,7 @@ Normas ficam sempre em F32. É o mesmo raciocínio das variantes `_M` do
 llama.cpp.
 
 ```powershell
-airun convert G:\modelsAI\origin\Qwen3-8B -o E:\models\Qwen3-8B-Q4_K.gguf --type Q4_K
+airun convert pasta-do-modelo -o saida.gguf --type Q4_K
 ```
 
 ---
@@ -607,6 +607,7 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_SCHED_TIMING=1` | Uma linha por passo em lote do `serve --parallel`: forward, amostragem, entrega. Atrapalha a medição de velocidade. |
 | `AIRUN_HIDE_GPUS=<lista>` | Como `--hide-gpu`, para todo comando: GPUs que o airun nunca toca. Não combina com `CUDA_VISIBLE_DEVICES`. |
 | `AIRUN_NO_KV_RAM=1` | Quando o contexto pedido não cabe, tira pesos da VRAM em vez do cache KV (o comportamento antigo). |
+| `AIRUN_NO_SPLIT_VERIFY=1` | A atenção do verify do MTP (vários tokens sobre um cache) volta ao kernel de prefill, que lê o contexto inteiro por bloco: 27B a 25 mil tokens, 52,8 → 34,2 tok/s. |
 | `AIRUN_RAM_ON_GPU=1` | Camadas que ficam na RAM são sempre copiadas para a VRAM antes de rodar, em vez de multiplicadas na CPU na geração. |
 | `AIRUN_CPU_THREADS=<n>` | Threads dos matmuls na CPU (padrão: uma por núcleo lógico). Na memória DDR5 do 13700, 8 já saturam a banda. |
 | `AIRUN_CPU_MAX_TOKENS=<n>` | Passadas de até n tokens multiplicam as camadas da RAM na CPU; maiores copiam para a GPU (padrão 64). |
