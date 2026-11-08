@@ -254,6 +254,9 @@ pub struct Config {
     /// Conversations whose caches are kept at once (see Runtime::set_slots):
     /// the KV cache and recurrent state are counted this many times.
     pub slots: usize,
+    /// Tokens a speculative verify runs at once (drafts + 1) when the MTP
+    /// head is loaded, else 0: the verify's scratch on every GPU.
+    pub spec_rows: usize,
 
     /// Hyper-connection residual streams, on qwen4exp.
     pub hc: Option<HcConfig>,
@@ -505,6 +508,7 @@ impl Config {
             ffn_norm_name,
             kv_type: Default::default(),
             slots: 1,
+            spec_rows: 0,
             ssm_gate_sigmoid,
             hc,
             ple,
@@ -864,6 +868,7 @@ mod tests {
             ffn_norm_name: "ffn_norm",
             kv_type: Default::default(),
             slots: 1,
+            spec_rows: 0,
             hc: None,
             ple: None,
             ssm_gate_sigmoid: false,
@@ -887,6 +892,7 @@ mod tests {
             ffn_norm_name: "post_attention_norm",
             kv_type: Default::default(),
             slots: 1,
+            spec_rows: 0,
             ssm: Some(SsmConfig {
                 conv_kernel: 4,
                 inner_size: 4096,

@@ -128,10 +128,14 @@ impl LoadBar {
         self.drawn = true;
     }
 
-    /// Ends the line so what follows starts clean; reports the load time.
+    /// Ends the bar so what follows starts clean and reports the load time.
+    /// On a terminal the line replaces the bar; piped it is its own line, so
+    /// logs keep the timing too.
     pub fn finish(&mut self) {
         if self.tty && self.drawn {
             eprintln!("\r\x1b[Kloaded in {:.1}s", self.start.elapsed().as_secs_f64());
+        } else if !self.tty {
+            eprintln!("loaded in {:.1}s", self.start.elapsed().as_secs_f64());
         }
     }
 }

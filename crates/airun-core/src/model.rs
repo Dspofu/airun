@@ -475,6 +475,10 @@ impl Model {
             total_bytes += t.bytes() as u64;
             (t, None)
         };
+        // Each upload's file pages leave the working set as soon as they are
+        // on the GPU (GgufFile::release): the load holds one layer of RAM,
+        // not the whole model.
+        gguf.release("token_embd.");
         done += 1;
         progress(done, total_steps);
 
@@ -536,6 +540,8 @@ impl Model {
             total_bytes += t.bytes() as u64;
             t
         };
+        gguf.release("output");
+        gguf.release("token_embd.");
         done += 1;
         progress(done, total_steps);
 
@@ -680,6 +686,7 @@ impl Model {
             };
             total_bytes += layer_bytes(&w);
             layers.push(w);
+            gguf.release(&format!("blk.{l}."));
 
             done += 1;
             progress(done, total_steps);
@@ -836,16 +843,18 @@ pub fn spec_scratch_bytes(config: &Config, batch: usize, draft: usize) -> u64 {
     let head_rows = 4 * batch as u64 * d * f;
     let logits = rows * vocab * f + slots * (vocab + d) * f;
     let batched = if slots > 1 { slots * rows * vocab * f } else { 0 };
-    let stash = config.ssm.as_ref().map_or(0, |ssm| {
-        let linear = (0..config.n_run_layers())
-            .filter(|&l| config.layer_kind(l) == crate::config::LayerKind::LinearAttention).count() as u64;
-        let per_row = (ssm.qkv_dim() + 2 * ssm.k_dim() + ssm.v_dim() + 2 * ssm.n_v_heads) as u64 * f;
-        linear * slots * rows * per_row
-    });
-    // The verify's split-attention scratch on each GPU (runtime::split_verify),
-    // at the most splits a context takes.
-    let verify_attn = rows * (config.n_head * 256 * (config.head_dim + 2)) as u64 * f;
-    head_rows + logits + batched + stash + verify_attn + (32 << 20)
+    // The delta-net stash and the verify's attention scratch sit on every
+    // GPU: spec_stash_bytes per layer, plan::scratch_bytes per device.
+    head_rows + logits + batched + (32 << 20)
+}
+
+/// The delta-net stash one linear-attention layer keeps for a speculative
+/// verify (every slot's verified rows), on that layer's GPU.
+pub fn spec_stash_bytes(config: &Config, draft: usize) -> u64 {
+    config.ssm.as_ref().map_or(0, |ssm| {
+        let per_row = (ssm.qkv_dim() + 2 * ssm.k_dim() + ssm.v_dim() + 2 * ssm.n_v_heads) as u64 * 4;
+        config.slots.max(1) as u64 * (draft as u64 + 1) * per_row
+    })
 }
 
 /// Whether the file carries the MTP head's weights (see [`mtp_supported`]).

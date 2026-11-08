@@ -364,13 +364,18 @@ pub fn scratch_bytes(cfg: &Config, batch: usize, hosts_output: bool) -> u64 {
     }
 
     if hosts_output {
-        // Logits dominate for a large vocabulary, but only one row is ever
-        // needed: sampling looks at the last position.
-        total += cfg.vocab_size as u64 * f32_size;
+        // Logits dominate for a large vocabulary: one row for a lone
+        // conversation, one per slot for a batched step (runtime::decode_rows).
+        total += cfg.slots.max(1) as u64 * cfg.vocab_size as u64 * f32_size;
     }
     total += b * 4; // position ids
-    // Bound split-attention scratch at its maximum, including long contexts.
-    total += (cfg.n_head * 128 * (cfg.head_dim + 2) * 4) as u64;
+    // Split-attention scratch at its most splits (ops::attention_splits caps
+    // them at 256): the decode's, a speculative verify's (one per verified
+    // token, runtime::split_verify) and a batched step's (one per slot). The
+    // verify's sits on every GPU, not only the head's: left out, a 35B-A3B
+    // filled to the budget failed its first request with 16 MiB short.
+    let slot_rows = if cfg.slots > 1 { cfg.slots } else { 0 };
+    total += (1 + cfg.spec_rows + slot_rows) as u64 * (cfg.n_head * 256 * (cfg.head_dim + 2) * 4) as u64;
     // Hyper-connections widen the residual to `count` streams, and a mix
     // holds the normalized streams and their gate; the PLE layer's device
     // also keeps its key, gated value and embedding rows.
@@ -1096,6 +1101,7 @@ mod tests {
             ffn_norm_name: "ffn_norm",
             kv_type: Default::default(),
             slots: 1,
+            spec_rows: 0,
             hc: None,
             ple: None,
             ssm_gate_sigmoid: false,

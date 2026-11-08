@@ -190,6 +190,32 @@ impl Runtime {
         }
     }
 
+    /// Allocates up front what requests would otherwise allocate on first
+    /// use: the speculative verify's buffers and head caches, and the batched
+    /// step's logits at their largest. The loader calls it, so a model loaded
+    /// at the edge of VRAM fails (and falls back) while loading, not on a
+    /// user's first message; and the VRAM in use stays flat across requests.
+    pub fn reserve_buffers(&mut self) -> Result<()> {
+        let rows = if self.speculates() {
+            self.spec_init()?;
+            self.ensure_heads()?;
+            self.draft + 1
+        } else {
+            1
+        };
+        let n = self.slots.len();
+        if n > 1 {
+            let need = n * rows * self.model.config.vocab_size;
+            if self.rows_logits.as_ref().is_none_or(|(_, h)| h.len() < need) {
+                let st = self.states.last().expect("a runtime has at least one device");
+                device::set_device(st.device)?;
+                self.rows_logits = None;
+                self.rows_logits = Some((DeviceBuffer::<f32>::new(st.device, need)?, airun_cuda::PinnedBuffer::new(need)?));
+            }
+        }
+        Ok(())
+    }
+
     fn spec_init(&mut self) -> Result<()> {
         let k = self.draft;
         if self.spec.as_ref().is_some_and(|s| s.k == k) {

@@ -162,6 +162,7 @@ pub fn load(
     }
     mtp_src = mtp_src.filter(|_| draft > 0);
     let load_mtp = mtp_src.is_some();
+    config.spec_rows = if load_mtp { draft + 1 } else { 0 };
     if draft > 0 && !load_mtp && opts.draft.is_some() {
         let reason = if config.nextn_predict_layers == 0 {
             "the file has no MTP head, and no mtp-*.gguf for it sits next to it (--mtp names one)"
@@ -185,8 +186,15 @@ pub fn load(
         opts
     };
     if load_mtp {
-        // The head and its own KV cache sit with the output projection.
+        // The head and its own KV cache sit with the output projection; each
+        // linear-attention layer keeps the verify's stash on its own GPU.
         sizes.output += head_bytes + config.kv_bytes_per_layer(opts.ctx);
+        let stash = crate::model::spec_stash_bytes(&config, draft);
+        for l in 0..config.n_run_layers().min(sizes.per_layer.len()) {
+            if config.layer_kind(l) == crate::config::LayerKind::LinearAttention {
+                sizes.per_layer[l] += stash;
+            }
+        }
     }
     let mut split = opts.split.clone();
     let mut device_order: Vec<i32> = Vec::new();
@@ -352,6 +360,22 @@ pub fn load(
         let mut runtime = Runtime::new(model, tokenizer, streams, batch)?;
         runtime.set_draft(draft);
         runtime.set_slots(config_slots)?;
+        // Every buffer a request needs, now: one that fails here takes the
+        // next rung, where on the first request it was an error to the user.
+        match runtime.reserve_buffers() {
+            Ok(()) => {}
+            Err(e) if opts.allow_fallback && e.is_capacity_error() => {
+                drop(runtime);
+                match next_rung(&mut ctx, &mut batch, &mut reserve) {
+                    Some(note) => {
+                        fallbacks.push(format!("{note} (the decode buffers did not fit)"));
+                        continue;
+                    }
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
 
         return Ok((
             runtime,

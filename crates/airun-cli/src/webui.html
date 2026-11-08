@@ -127,8 +127,24 @@ kbd { font: 12px ui-monospace, monospace; padding: 1px 6px; border: 1px solid va
             font-size: 12px; color: var(--faint); }
 .codehead .lang { flex: 1; }
 .codehead .ibtn { width: 28px; height: 26px; } .codehead .icon { width: 15px; height: 15px; }
-.codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; }
+.codeblock pre { margin: 0; padding: 12px 14px; overflow: auto; max-height: min(56vh, 480px); }
 .codeblock pre code { background: none; padding: 0; }
+/* technical details modal */
+.tech-modal { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center;
+             background: rgba(8,10,16,.55); backdrop-filter: blur(2px); }
+.tech-panel { width: min(370px, calc(100vw - 32px)); max-height: 84vh; display: flex; flex-direction: column;
+             background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow);
+             animation: pop .12s ease-out; }
+@keyframes pop { from { transform: scale(.97) translateY(4px); opacity: 0; } }
+.tech-panel header { display: flex; align-items: center; gap: 8px; padding: 13px 16px;
+                    border-bottom: 1px solid var(--line); font-weight: 650; font-size: 14.5px; color: var(--text); }
+.tech-panel header .icon { width: 16px; height: 16px; color: var(--faint); flex: none; }
+.tech-panel header .ibtn { margin-left: auto; }
+.tech-body { padding: 8px 16px 14px; overflow-y: auto; font-size: 13px; color: var(--muted); }
+.tech-body dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 7px 20px; align-items: baseline; }
+.tech-body dt { color: var(--faint); }
+.tech-body dd { margin: 0; text-align: right; font-weight: 650; color: var(--text);
+               font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
@@ -607,6 +623,20 @@ function messageEl(t, index) {
   return el;
 }
 
+const fmtMs = (ms) => ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : Math.round(ms) + " ms";
+function techRows(t) {
+  const rows = [];
+  const add = (k, v) => { if (v != null && v !== "") rows.push(`<dt>${k}</dt><dd>${v}</dd>`); };
+  if (props.ctx) add("Contexto", `${t.prompt_n || 0}/${props.ctx} tok`);
+  add("Prompt", t.prompt_n ? `${t.prompt_n} tok · ${fmtMs(t.prompt_ms)}` : null);
+  add("Prefill", t.prompt_per_second ? `${t.prompt_per_second.toFixed(1)} tok/s` : null);
+  add("Cache", t.cache_n ? `${t.cache_n} tok reutilizados` : "0 tok");
+  add("Geração", t.predicted_n ? `${t.predicted_n} tok · ${fmtMs(t.predicted_ms)}` : null);
+  add("Velocidade", t.predicted_per_second ? `${t.predicted_per_second.toFixed(1)} tok/s` : null);
+  add("Latência/tok", t.predicted_per_token_ms ? `${t.predicted_per_token_ms.toFixed(1)} ms` : null);
+  if (t.draft_n) add("Rascunhos (MTP)", `${t.draft_n_accepted || 0}/${t.draft_n} aceitos (${Math.round(100 * (t.draft_n_accepted || 0) / t.draft_n)}%)`);
+  return `<dl>${rows.join("")}</dl>`;
+}
 function renderAssistant(el, raw, stats, live) {
   const body = el.querySelector(".body");
   const { think, answer, live: thinkingNow } = splitThink(raw);
@@ -626,6 +656,18 @@ function renderAssistant(el, raw, stats, live) {
   }
   const st = el.querySelector(".stats");
   if (st) st.textContent = stats?.tps ? `${stats.tokens} tokens · ${stats.tps.toFixed(1)} tok/s` + (stats.stopped ? " · interrompida" : "") : "";
+  // The gear appears with the server's final chunk, which carries the timings.
+  if (stats?.timings) {
+    const act = el.querySelector(".actions");
+    if (act && !act.querySelector('[data-act="tech"]')) {
+      const b = document.createElement("button");
+      b.className = "ibtn";
+      b.dataset.act = "tech";
+      b.title = "Detalhes técnicos";
+      b.innerHTML = icon("settings");
+      act.insertBefore(b, el.querySelector(".stats"));
+    }
+  }
 }
 
 function toast(text) {
@@ -718,8 +760,9 @@ function headers(extra) {
   return h;
 }
 
-// Reads an SSE stream of chat chunks, calling `each(reasoning, content)` per delta.
-async function readSse(res, each) {
+// Reads an SSE stream of chat chunks, calling `each(reasoning, content)` per delta and
+// `final(chunk)` for the closing chunk (usage/timings).
+async function readSse(res, each, final) {
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = "";
   for (;;) {
@@ -737,6 +780,7 @@ async function readSse(res, each) {
       if (j.error) throw new Error(j.error.message || "erro no servidor");
       const d = j.choices?.[0]?.delta || {};
       if (d.reasoning_content || d.content) each(d.reasoning_content || "", d.content || "");
+      else if (final && (j.usage || j.timings)) final(j);
     }
   }
 }
@@ -804,6 +848,13 @@ async function generate(c, resume) {
       reasoning += r; content += p;
       if (p && reasoning && thinkEnd === null) thinkEnd = performance.now();
       turn.content = reasoning ? "<think>\n" + reasoning + (content ? "\n</think>\n\n" + content : "") : content;
+      const el = performance.now() - first;
+      turn.stats = { tokens, tps: el > 0 ? tokens / (el / 1000) : 0 };
+      paint();
+      save();
+    }, (j) => {
+      if (!j.usage && !j.timings) return;
+      turn.stats = { ...turn.stats, usage: j.usage || null, timings: j.timings || null };
       paint();
       save();
     });
@@ -822,8 +873,16 @@ async function generate(c, resume) {
   const ms = performance.now() - (first ?? t0);
   if (c.turns[index] === turn) {
     if (!turn.content) c.turns.splice(index, 1);
-    else turn.stats = { ...turn.stats, tokens, tps: tokens && ms > 0 ? tokens / (ms / 1000) : 0,
+    else {
+      // The server's count and timing win over the browser's estimate: a
+      // stream chunk can carry several tokens (MTP), and the browser's clock
+      // includes the network. Same figures as the technical details.
+      const tm = turn.stats?.timings;
+      const n = tm?.predicted_n || tokens;
+      const tps = tm?.predicted_per_second || (tokens && ms > 0 ? tokens / (ms / 1000) : 0);
+      turn.stats = { ...turn.stats, tokens: n, tps,
                         thinkMs: reasoning ? (thinkEnd ?? performance.now()) - (first ?? t0) : 0 };
+    }
   }
   delete c.pending;
   c.updated = Date.now();
@@ -893,6 +952,21 @@ async function copyText(text, btn) {
 let previewHtml = "";
 function openPreview(html) { previewHtml = html; $("previewFrame").srcdoc = html; $("preview").hidden = false; }
 
+function openTech(timings) {
+  const old = document.querySelector(".tech-modal");
+  if (old) old.remove();
+  const m = document.createElement("div");
+  m.className = "tech-modal";
+  m.innerHTML = `<div class="tech-panel"><header>${icon("settings")}Detalhes técnicos` +
+    `<button class="ibtn close" title="Fechar (Esc)">${icon("x")}</button></header>` +
+    `<div class="tech-body">${techRows(timings)}</div></div>`;
+  const close = () => { m.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  m.addEventListener("click", (e) => { if (e.target === m || e.target.closest(".close")) close(); });
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(m);
+}
+
 wrap.addEventListener("click", (e) => {
   const b = e.target.closest("[data-act]");
   if (!b) return;
@@ -903,6 +977,11 @@ wrap.addEventListener("click", (e) => {
   if (act === "copy-code") return copyText(codeStore[+b.dataset.code], b);
   if (act === "preview") return openPreview(codeStore[+b.dataset.code]);
   if (act === "zoom") return openPreview(`<body style="margin:0;background:#111;display:grid;place-items:center;height:100vh"><img src="${b.src}" style="max-width:100%;max-height:100%"></body>`);
+  if (act === "tech") {
+    const t = c?.turns[index];
+    if (t?.stats?.timings) openTech(t.stats.timings);
+    return;
+  }
   if (!c || index < 0) return;
   const t = c.turns[index];
   if (act === "copy") return copyText(t.role === "assistant" ? splitThink(t.content).answer : t.content, b);
@@ -1089,6 +1168,7 @@ function modelInfo(p) {
 }
 
 // --- server ---------------------------------------------------------------------
+let propsRepainted = false;
 async function connect() {
   try {
     const res = await fetch("./props");
@@ -1102,7 +1182,9 @@ async function connect() {
     $("attach").hidden = !props.vision;
     $("maxTok").max = props.ctx || 131072;
     $("info").innerHTML = modelInfo(props);
-    if (!chat()?.turns.length) renderChat();
+    // A page reload draws the open chat before this arrives; repaint once so
+    // its tech panels can show the context from the server's props.
+    if (!propsRepainted) { propsRepainted = true; renderChat(); }
   } catch (_) {
     $("status").className = "status err";
     $("modelName").textContent = "servidor fora do ar";

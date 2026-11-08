@@ -26,6 +26,27 @@ pub const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_STRING_LEN: u64 = 64 << 20; // 64 MiB
 const MAX_ARRAY_LEN: u64 = 64 << 20; // 64M elements
 
+/// Takes a mapped range's pages out of the working set (see
+/// [`GgufFile::release`]). On Windows, VirtualUnlock on pages that were never
+/// locked does exactly that (and reports ERROR_NOT_LOCKED, which is expected).
+/// Elsewhere the kernel counts mapped file pages as reclaimable cache, so
+/// there is nothing to do.
+#[cfg(windows)]
+fn release_pages(bytes: &[u8]) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualUnlock(address: *const std::ffi::c_void, size: usize) -> i32;
+    }
+    if !bytes.is_empty() {
+        // SAFETY: the range is part of a live mapping; VirtualUnlock only
+        // changes which of its pages are resident, never their contents.
+        unsafe { VirtualUnlock(bytes.as_ptr().cast(), bytes.len()) };
+    }
+}
+
+#[cfg(not(windows))]
+fn release_pages(_bytes: &[u8]) {}
+
 /// Where one tensor lives inside the file.
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
@@ -395,6 +416,20 @@ impl GgufFile {
                 need: info.file_offset + info.nbytes,
                 have: shard.file_len,
             })
+    }
+
+    /// Drops the pages of every tensor whose name starts with `prefix` from
+    /// this process's working set, once they are uploaded. The data stays
+    /// valid (a later read faults it back in from the file); only the RAM the
+    /// read held goes back to the system. Without it, loading a 20 GB model
+    /// held 20 GB of RAM "in use" until the load ended, so on a machine with
+    /// little free RAM other apps had to be closed to load it.
+    pub fn release(&self, prefix: &str) {
+        for info in self.tensors.iter().filter(|t| t.name.starts_with(prefix)) {
+            if let Ok(bytes) = self.tensor_bytes(info) {
+                release_pages(bytes);
+            }
+        }
     }
 
     pub fn tensor_bytes_by_name(&self, name: &str) -> Result<&[u8]> {

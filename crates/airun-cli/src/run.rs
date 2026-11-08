@@ -323,11 +323,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     if !quiet {
         bar.finish();
         eprintln!("{}", report.config.summary());
-        eprintln!(
-            "loaded {} of weights in {:.1}s",
-            airun_cuda::human_bytes(report.weight_bytes),
-            report.load_ms / 1000.0
-        );
+        eprintln!("loaded {} of weights", airun_cuda::human_bytes(report.weight_bytes));
         for f in &report.fallbacks {
             eprintln!("  adjusted: {f}");
         }

@@ -1055,6 +1055,40 @@ procura o maior contexto, até 1/4 menor, em que ela fica na mais rápida, e
 avisa com uma `note:`. Aqui: 126.976 em vez de 127.488, e sem a flag passou a
 63,8–63,9 / 47,3–47,6, igual ao `--parallel 4`. `-c` explícito não muda.
 
+## RAM durante o carregamento (2026-11-07)
+
+**O sintoma:** ao carregar, a RAM subia até o tamanho do modelo e só baixava no fim. Num PC com outros apps abertos, era preciso fechá-los para carregar, mesmo cabendo depois.
+
+**A causa:** o GGUF é lido por mmap. Cada página lida para o upload ficava no working set do processo até o fim da carga. Medido no 35B-A3B Q4_K_M (5060 + 3060): working set até 25,6 GiB, e a RAM livre do sistema caiu de 47 para 24 GiB.
+
+**A correção:** `GgufFile::release(prefix)` (`airun-gguf/src/reader.rs`) tira do working set as páginas dos tensores já enviados, com `VirtualUnlock` em páginas não travadas. Os dados continuam válidos: uma leitura posterior, por exemplo de experts lidos do arquivo, os traz de volta. `Model::load` chama depois do embedding, da saída e de cada camada. Fora do Windows não faz nada, porque páginas mapeadas já são cache recuperável.
+
+**Depois:** o working set ficou estável em ~5 GiB (os experts fixados na RAM, que ficam durante o uso) e a RAM livre não caiu abaixo de 44,9 GiB. A carga foi de 19,6 s; antes, 25–55 s, conforme o cache de disco. O texto guloso é idêntico.
+
+**O que continua:** o "private bytes" chega a ~21,7 GiB. No WDDM, cada alocação de VRAM conta no commit do processo (um 4B inteiro na VRAM: 5,5 GiB de private com 286 MiB de working set), e somam-se os experts fixados. Isso não ocupa RAM física, mas precisa caber no limite de commit (RAM + arquivo de paginação). Com o arquivo de paginação desligado ou pequeno, a carga pode falhar mesmo com RAM livre.
+
+## Out of memory no primeiro pedido com MTP (2026-11-07)
+
+**O sintoma:** um 35B-A3B no limite da VRAM carregava, mas o primeiro pedido falhava com "out of memory on GPU 0: tried to allocate 16.12 MiB, but only 0 B of 0 B is free". Com `--draft 0`, funcionava. A VRAM também subia e descia entre pedidos.
+
+**As causas:**
+- **Scratch do verify fora do plano por GPU:** o `verify_partial` (`(draft+1) × n_head × 256 splits × (head_dim+2)` floats; 16,12 MiB com `--draft 3`) e o stash do delta-net são alocados em **toda** GPU, mas `spec_scratch_bytes` cobrava os dois só da GPU da cabeça de saída. A outra GPU, cheia até o orçamento, ficava sem eles.
+- **Alocação preguiçosa:** `spec_init`, os caches da cabeça por slot e o `rows_logits` do passo em lote só eram alocados no primeiro pedido. O `rows_logits` era solto e realocado maior a cada vez que o lote crescia: essa é a VRAM que sobe e desce. Uma falha ali chegava ao usuário, em vez de cair no próximo degrau do loader.
+- **A split-attention de decode** era contada com 128 splits; `attention_splits` vai até 256.
+- **"0 B of 0 B":** o `cudaMemGetInfo` logo após a falha às vezes não responde. A dica também citava flags do llama.cpp (`--gpu-layers`, `--split-mode`), que o airun não tem.
+
+**As correções:**
+- `Config::spec_rows`: o `plan::scratch_bytes` de cada GPU conta `(1 + spec_rows + slots se > 1) × 256 splits`, e o logits de um slot por linha.
+- `model::spec_stash_bytes` entra em `sizes.per_layer` de cada camada linear. `spec_scratch_bytes` ficou só com o que fica na GPU da cabeça.
+- `Runtime::reserve_buffers` (chamado no loader, depois de `set_slots`) aloca o MTP e o `rows_logits` no tamanho máximo. Falha de capacidade ali vai para `next_rung`.
+- A mensagem de OOM omite os números quando o driver não os dá, e sugere `-c`, `--kv-type`, `--draft 0`, `--vram-reserve`.
+
+**Testado** com o 35B-A3B Q4_K_M, `--expert-cache 200 --draft 3` (5060 + 3060; o plano enche a 3060 a 10,28 de 10,61 GiB):
+- 4 pedidos seguidos: todos OK, VRAM estável (+6 MiB por pedido, grafos).
+- `--parallel 2`, duas rodadas de 2 pedidos simultâneos: OK, VRAM igual entre as rodadas.
+
+**Achado à parte, não corrigido:** o `Qwen3.6-35B-A3B-NVFP4-MTP-HQ` com `--expert-cache` falha no primeiro pedido com "gate and up experts must share a type and layout".
+
 ## Marcador de imagem (2026-11-07)
 
 **O erro:** um chat que só citava `<__media__>` (código, log, a documentação do airun) dava HTTP 400: "the prompt has 1 image markers (<__media__>) and 0 images were given".
