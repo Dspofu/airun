@@ -1,22 +1,22 @@
-# build.ps1 — compila o airun para as GPUs desta máquina (Windows PowerShell).
-# No Linux, use ./build.sh (mesmas opções).
+# build.ps1 — builds airun for this machine's GPUs (Windows PowerShell).
+# On Linux, use ./build.sh (same options).
 #
-# Uso:
-#   .\build.ps1                  # detecta TODAS as GPUs e compila para as arquiteturas delas
-#   .\build.ps1 -Arch 120        # força uma arquitetura (ou "86,120" para várias)
-#   .\build.ps1 -All             # build universal (RTX 20 até 50, padrão do repo)
-#   .\build.ps1 -NoGpu           # sem CUDA (CPU only, para quem não tem GPU)
-#   .\build.ps1 -SkipCheck       # não roda gpu/selftest depois do build
-#   .\build.ps1 -Debug           # build de debug (compila mais rápido, roda mais devagar)
+# Usage:
+#   .\build.ps1                  # detects ALL GPUs and builds for their architectures
+#   .\build.ps1 -Arch 120        # forces an architecture (or "86,120" for several)
+#   .\build.ps1 -All             # universal build (RTX 20 through 50, the repo default)
+#   .\build.ps1 -NoGpu           # no CUDA (CPU only, for machines without a GPU)
+#   .\build.ps1 -SkipCheck       # does not run gpu/selftest after the build
+#   .\build.ps1 -Debug           # debug build (compiles faster, runs slower)
 #
-# Mapeia o compute capability do nvidia-smi para o código do airun:
+# Maps nvidia-smi's compute capability to airun's code:
 #   7.5 -> 75 (RTX 20)   8.0 -> 80 (A100)   8.6 -> 86 (RTX 30)
 #   8.9 -> 89 (RTX 40)   9.0 -> 90 (H100)   12.0 -> 120 (RTX 50)
 #
-# GPUs de gerações diferentes no mesmo PC (ex.: RTX 3060 + RTX 5060 Ti) são
-# detectadas juntas: o binário leva o código de cada uma ("86,120") e cada
-# placa roda o seu. O build dedicado é menor e mais rápido de compilar, mas SÓ
-# roda nessas GPUs. Para distribuir, use -All.
+# GPUs of different generations in the same PC (e.g. RTX 3060 + RTX 5060 Ti) are
+# detected together: the binary carries each one's code ("86,120") and each
+# card runs its own. The dedicated build is smaller and faster to compile, but
+# ONLY runs on those GPUs. To distribute, use -All.
 
 param(
     [string]$Arch = "",
@@ -29,10 +29,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
 
-# --- acha o Rust ------------------------------------------------------------
-# Com o Rust instalado fora do lugar padrao (ex.: E:\rust\cargo), um terminal
-# novo nao tem o cargo no PATH. O cargo.exe dessa pasta e o proxy do rustup, que
-# tambem precisa do RUSTUP_HOME para achar o toolchain.
+# --- find Rust --------------------------------------------------------------
+# With Rust installed outside the default location (e.g. E:\rust\cargo), a new
+# terminal does not have cargo on PATH. That folder's cargo.exe is the rustup
+# proxy, which also needs RUSTUP_HOME to find the toolchain.
 $savedPath = $env:PATH
 $savedCargoHome = $env:CARGO_HOME
 $savedRustupHome = $env:RUSTUP_HOME
@@ -45,15 +45,15 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     }
     $cargoHome = $homes | Where-Object { Test-Path (Join-Path $_ "bin\cargo.exe") } | Select-Object -First 1
     if (-not $cargoHome) {
-        Write-Error ("cargo nao encontrado no PATH nem em: " + ($homes -join ", ") +
-            ". Instale o Rust (https://rustup.rs) ou defina CARGO_HOME (e RUSTUP_HOME) para a pasta onde ele esta.")
+        Write-Error ("cargo not found on PATH nor in: " + ($homes -join ", ") +
+            ". Install Rust (https://rustup.rs) or set CARGO_HOME (and RUSTUP_HOME) to the folder where it lives.")
         exit 1
     }
     $env:CARGO_HOME = $cargoHome
     $env:PATH = (Join-Path $cargoHome "bin") + ";" + $env:PATH
     $rustupHome = Join-Path (Split-Path -Parent $cargoHome) "rustup"
     if (-not $env:RUSTUP_HOME -and (Test-Path $rustupHome)) { $env:RUSTUP_HOME = $rustupHome }
-    Write-Host "Rust: $cargoHome (fora do PATH; defina CARGO_HOME, RUSTUP_HOME e o PATH no Windows para nao depender disto)"
+    Write-Host "Rust: $cargoHome (not on PATH; set CARGO_HOME, RUSTUP_HOME and PATH in Windows to not depend on this)"
 }
 
 function ConvertTo-AirunArch([string]$cc) {
@@ -61,7 +61,7 @@ function ConvertTo-AirunArch([string]$cc) {
     return ($cc -replace '\.', '')
 }
 
-# --- decide as arquiteturas -------------------------------------------------
+# --- pick the architectures -------------------------------------------------
 $mode = "auto"
 if ($NoGpu) {
     $mode = "none"
@@ -70,7 +70,7 @@ if ($NoGpu) {
 } elseif ($Arch -ne "") {
     $mode = "manual"
 } elseif (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-    Write-Warning "nvidia-smi nao encontrado; usando build universal (-Arch escolhe as arquiteturas)."
+    Write-Warning "nvidia-smi not found; using the universal build (-Arch picks the architectures)."
     $mode = "all"
 }
 
@@ -79,7 +79,7 @@ $gpuCount = 0
 if ($mode -eq "auto") {
     $rows = & nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
     if ($LASTEXITCODE -ne 0 -or -not $rows) {
-        Write-Warning "nvidia-smi falhou; usando build universal (-Arch escolhe as arquiteturas)."
+        Write-Warning "nvidia-smi failed; using the universal build (-Arch picks the architectures)."
         $mode = "all"
     } else {
         $set = @{}
@@ -96,56 +96,56 @@ if ($mode -eq "auto") {
     }
 }
 
-# --- monta o ambiente (restaurado no fim) -----------------------------------
+# --- set up the environment (restored at the end) ---------------------------
 $savedArchs = $env:AIRUN_CUDA_ARCHS
 $savedSkip = $env:AIRUN_SKIP_CUDA
 $env:AIRUN_CUDA_ARCHS = $null
 $env:AIRUN_SKIP_CUDA = $null
 switch ($mode) {
-    "none"   { $env:AIRUN_SKIP_CUDA = "1"; Write-Host "Sem CUDA (CPU only)" }
-    "all"    { Write-Host "Archs: universal (padrao do repo: 75 80 86 89 120)" }
+    "none"   { $env:AIRUN_SKIP_CUDA = "1"; Write-Host "No CUDA (CPU only)" }
+    "all"    { Write-Host "Archs: universal (repo default: 75 80 86 89 120)" }
     default  {
         $env:AIRUN_CUDA_ARCHS = $archs
         Write-Host "Archs: $archs"
         if (($archs -split ',') -notcontains "120") {
-            Write-Host "  (sem 120: os kernels NVFP4 nativos das RTX 50 ficam de fora)"
+            Write-Host "  (no 120: the RTX 50 native NVFP4 kernels are left out)"
         }
     }
 }
 
 try {
-    # Daqui em diante os erros vêm dos códigos de saída, não do stderr.
+    # From here on errors come from exit codes, not from stderr.
     $ErrorActionPreference = "Continue"
 
-    # --- compila ------------------------------------------------------------
+    # --- build --------------------------------------------------------------
     $buildProfile = if ($Debug) { "debug" } else { "release" }
     $cargoArgs = @("build")
     if (-not $Debug) { $cargoArgs += "--release" }
     Write-Host "`ncargo $($cargoArgs -join ' ') ..."
-    Write-Host "(a etapa airun-cuda compila os kernels CUDA e leva alguns minutos sem mostrar nada)"
-    # O cargo escreve o progresso no stderr, e o PowerShell 5.1 transforma cada
-    # linha de stderr em um erro vermelho "NativeCommandError". O cmd junta o
-    # stderr no stdout antes do PowerShell ver; o código de saída é o do cargo.
+    Write-Host "(the airun-cuda step compiles the CUDA kernels and takes a few minutes without printing anything)"
+    # cargo writes progress to stderr, and PowerShell 5.1 turns every stderr
+    # line into a red "NativeCommandError". cmd merges stderr into stdout
+    # before PowerShell sees it; the exit code is cargo's.
     & cmd /c "cargo $($cargoArgs -join ' ') 2>&1"
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "Build falhou. Veja o erro acima; 'cargo build -vv' mostra o comando do nvcc."
+        Write-Error "Build failed. See the error above; 'cargo build -vv' shows the nvcc command."
         exit 1
     }
 
     $bin = Join-Path (Join-Path $PWD "target\$buildProfile") "airun.exe"
     Write-Host "`nOK: $bin"
 
-    # --- verifica: selftest em cada GPU (cada uma roda o código da sua arch) -
+    # --- verify: selftest on each GPU (each runs its own arch's code) -------
     if ($SkipCheck -or $mode -eq "none") { return }
     & $bin gpu
-    if ($LASTEXITCODE -ne 0) { Write-Warning "airun gpu falhou."; exit 1 }
+    if ($LASTEXITCODE -ne 0) { Write-Warning "airun gpu failed."; exit 1 }
     if ($gpuCount -eq 0) { $gpuCount = 1 }
     for ($d = 0; $d -lt $gpuCount; $d++) {
-        Write-Host "`nselftest na GPU $d (kernels vs referencia CPU) ..."
+        Write-Host "`nselftest on GPU $d (kernels vs CPU reference) ..."
         & $bin selftest --device $d
-        if ($LASTEXITCODE -ne 0) { Write-Error "selftest falhou na GPU $d."; exit 1 }
+        if ($LASTEXITCODE -ne 0) { Write-Error "selftest failed on GPU $d."; exit 1 }
     }
-    Write-Host "`nBuild verificado e pronto para usar."
+    Write-Host "`nBuild verified and ready to use."
 } finally {
     $env:AIRUN_CUDA_ARCHS = $savedArchs
     $env:AIRUN_SKIP_CUDA = $savedSkip

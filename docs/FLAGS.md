@@ -1,355 +1,369 @@
-# Opções do airun
+# airun options
 
-Todas as opções de todos os comandos. `airun <comando> --help` mostra a versão
-curta.
+Every option of every command. `airun <command> --help` shows the short
+version.
 
 ```
-airun run         gerar texto
-airun serve       servidor HTTP (OpenAI + Anthropic + llama.cpp)
-airun bench       medir prompt e geração
-airun perplexity  medir a qualidade num texto conhecido
-airun inspect     descrever um arquivo GGUF
-airun gpu         listar as GPUs
+airun run         generate text
+airun serve       HTTP server (OpenAI + Anthropic + llama.cpp)
+airun bench       measure prompt and generation
+airun perplexity  measure quality on a known text
+airun inspect     describe a GGUF file
+airun gpu         list the GPUs
 airun convert     safetensors (HuggingFace) -> GGUF
-airun quantize    GGUF -> GGUF em outra precisão
-airun selftest    conferir os kernels da GPU contra a referência em Rust
+airun quantize    GGUF -> GGUF at another precision
+airun selftest    check the GPU kernels against the Rust reference
 ```
 
 ---
 
-## Memória, GPUs e modelo (valem para `run`, `serve` e `bench`)
+## Memory, GPUs and model (apply to `run`, `serve` and `bench`)
 
-| Opção | Padrão | O que faz |
+| Option | Default | What it does |
 |---|---|---|
-| `-c`, `--ctx-size <N>` | automático | Tamanho do contexto, em tokens. É o que mais gasta VRAM depois dos pesos. Sem a opção, veja [Contexto automático](#contexto-automático). |
-| `-b`, `--batch-size <N>` | `512` | Quantos tokens do prompt são processados por vez. Maior = prompt mais rápido e mais VRAM. Não muda a geração. |
-| `--kv-type <tipo>` | `f16` | Formato do cache: `f16`, `q8_0` ou `q4_0`. Os dois últimos cabem 2x e 3,6x mais contexto, com perda de qualidade muito pequena. |
-| `--gpus <lista>` | todas | Quais GPUs usar, ex.: `--gpus 0,1`. O número é o do CUDA, que pode não bater com o do `nvidia-smi`: confira com `airun gpu`. |
-| `--hide-gpu <lista>` | nenhuma | GPUs que o airun **nunca** toca, nem para abrir contexto: número do CUDA (como `airun gpu` mostra sem nada oculto), UUID ou parte do nome, ex.: `--hide-gpu 5060`. Vale para qualquer comando. As outras passam a ser numeradas a partir de 0, e `--gpus`/`--main-gpu`/`--tensor-split` usam a numeração nova. Para ocultar sempre, defina `AIRUN_HIDE_GPUS` no ambiente. |
-| `--main-gpu <N>` | a mais rápida | A GPU que é enchida primeiro. Escolha a que está no slot PCIe mais rápido. |
-| `--alloc <modo>` | `auto` | Onde os pesos e o cache podem ficar. `auto`: nas GPUs necessárias e, só se faltar, na RAM (primeiro o cache, depois os pesos). `gpu`: só na VRAM (se não couber, reduz o contexto ou dá erro). `memory`: em todas as GPUs e depois na RAM. |
-| `--disk-offload` | desligado | Quando a VRAM e a RAM acabam, as camadas que sobram (ou, no MoE, os experts) são lidas **direto do arquivo .gguf no disco** enquanto rodam, em vez de a carga falhar. Veja [Offload para o disco](#offload-para-o-disco). |
-| `--ram-reserve <MiB>` | 1/10 da RAM (2–8 GiB) | RAM deixada livre para o sistema e outros programas ao decidir o que os pesos podem fixar. Com `--disk-offload`, o que passa disso vai para o disco. |
-| `--tensor-split <frações>` | — | Divide as camadas à mão, ex.: `0.7,0.3`. Desliga a divisão automática. |
-| `--single-gpu <N>` | — | Põe o modelo inteiro numa GPU. |
-| `--vram-reserve <MiB>` | `384` | VRAM deixada livre em cada GPU (o Windows não entrega os últimos megabytes). |
-| `--no-fallback` | desligado | Dá erro em vez de reduzir lote ou contexto para caber. Útil em testes automáticos. |
-| `--expert-cache <N>` | todos | Só MoE: quantos experts por camada ficam na VRAM; os outros são lidos do arquivo quando o modelo os pede. |
-| `--draft <N>` | veja [MTP](#mtp-geração-mais-rápida) | Quantos tokens a cabeça MTP rascunha por passo. `0` desliga. |
-| `--mtp <arquivo>` | — | A cabeça MTP num arquivo separado. Veja [MTP](#mtp-geração-mais-rápida). |
-| `--mmproj <arquivo>` | — | O codificador de visão do modelo. Veja [Imagens](#imagens). |
-| `--image-max-tokens <N>` | `1024` | Máximo de tokens que uma imagem pode ocupar. |
+| `-c`, `--ctx-size <N>` | automatic | Context size, in tokens. It is what uses the most VRAM after the weights. Without the option, see [Automatic context](#automatic-context). |
+| `-b`, `--batch-size <N>` | `512` | How many prompt tokens are processed at a time. Larger = faster prompt and more VRAM. Does not change generation. |
+| `--kv-type <type>` | `f16` | Cache format: `f16`, `q8_0` or `q4_0`. The last two fit 2x and 3.6x more context, with a very small quality loss. |
+| `--gpus <list>` | all | Which GPUs to use, e.g. `--gpus 0,1`. The number is CUDA's, which may not match `nvidia-smi`'s: check with `airun gpu`. |
+| `--hide-gpu <list>` | none | GPUs airun **never** touches, not even to open a context: CUDA number (as `airun gpu` shows with nothing hidden), UUID or part of the name, e.g. `--hide-gpu 5060`. Applies to any command. The others are renumbered from 0, and `--gpus`/`--main-gpu`/`--tensor-split` use the new numbering. To always hide, set `AIRUN_HIDE_GPUS` in the environment. |
+| `--main-gpu <N>` | the fastest | The GPU filled first. Pick the one in the fastest PCIe slot. |
+| `--alloc <mode>` | `auto` | Where weights and cache may live. `auto`: on the GPUs needed and, only if short, in RAM (cache first, then weights). `gpu`: VRAM only (if it does not fit, lowers the context or errors). `memory`: on every GPU and then in RAM. |
+| `--disk-offload` | off | When VRAM and RAM run out, the leftover layers (or, for MoE, the experts) are read **straight from the .gguf file on disk** as they run, instead of the load failing. See [Disk offload](#disk-offload). |
+| `--ram-reserve <MiB>` | 1/10 of RAM (2–8 GiB) | RAM left free for the system and other programs when deciding what the weights may pin. With `--disk-offload`, what exceeds it goes to disk. |
+| `--tensor-split <fractions>` | — | Splits the layers by hand, e.g. `0.7,0.3`. Turns off the automatic split. |
+| `--single-gpu <N>` | — | Puts the whole model on one GPU. |
+| `--vram-reserve <MiB>` | `384` | VRAM left free on each GPU (Windows does not hand out the last megabytes). |
+| `--no-fallback` | off | Errors instead of lowering batch or context to fit. Useful in automated tests. |
+| `--expert-cache <N>` | all | MoE only: how many experts per layer stay in VRAM; the others are read from the file when the model asks for them. |
+| `--draft <N>` | see [MTP](#mtp-faster-generation) | How many tokens the MTP head drafts per step. `0` turns it off. |
+| `--mtp <file>` | — | The MTP head in a separate file. See [MTP](#mtp-faster-generation). |
+| `--mmproj <file>` | — | The model's vision encoder. See [Images](#images). |
+| `--image-max-tokens <N>` | `1024` | Maximum tokens an image may take. |
 
-### Contexto automático
+### Automatic context
 
-Sem `-c`, `run` e `serve` usam **o maior contexto que cabe nas GPUs com todos
-os pesos na VRAM**, no mínimo 4096 e no máximo o contexto de treino do modelo.
-Um modelo que cabe numa GPU continua numa GPU: o airun não espalha o modelo
-por duas placas só para ganhar contexto. Se nem os pesos cabem (um MoE com
-experts na RAM), fica em 4096. `bench` e `perplexity` usam 4096.
+Without `-c`, `run` and `serve` use **the largest context that fits the GPUs
+with every weight in VRAM**, at least 4096 and at most the model's training
+context. A model that fits one GPU stays on one GPU: airun does not spread the
+model over two cards just to gain context. If not even the weights fit (a MoE
+with experts in RAM), it stays at 4096. `bench` and `perplexity` use 4096.
 
-### MTP (geração mais rápida)
+### MTP (faster generation)
 
-Os Qwen3.5/3.8 trazem uma camada extra, a "cabeça MTP", que adivinha os
-próximos tokens. O airun usa essa cabeça para rascunhar alguns tokens, e o
-modelo principal confere todos de uma vez. Os que ele aprova saem de graça.
+Qwen3.5/3.8 ship an extra layer, the "MTP head", that guesses the next tokens.
+airun uses that head to draft a few tokens, and the main model checks all of
+them at once. The ones it approves come for free.
 
-- **Padrão:** `run` usa 4 rascunhos nos modelos densos e 2 nos MoE que cabem
-  inteiros nas GPUs (35B-A3B em 2× 5060 Ti: 109,6 → 137,6 tok/s). Num MoE com
-  experts na RAM fica desligado, porque conferir vários tokens puxa muito mais
-  experts pela PCIe (35B-A3B numa 5060 Ti: 44,7 → 34,5 tok/s); `--draft 2`
-  liga mesmo assim. `serve` usa 0.
-- **Ganho:** no 27B, 26 → 68 tok/s em modo guloso (`--temp 0`) e 25,7 → 47,2
-  tok/s com `--temp 0.7`.
-- **Funciona com qualquer amostragem menos mirostat.** Com temperatura, cada
-  rascunho é aceito com a probabilidade que o modelo lhe dá, então o texto
-  segue a mesma distribuição de antes; o MTP só muda a velocidade.
-- **Em modo guloso** o texto pode, raramente, sair diferente do decode sem MTP:
-  a conferência soma os números em outra ordem, e num quase-empate a escolha
-  vira.
-- **Cabeça em arquivo separado:** o conversor do llama.cpp pode gravar o modelo
-  sem a cabeça (`--no-mtp`) e a cabeça num `mtp-<nome>.gguf` ao lado. O airun
-  acha esse arquivo sozinho na pasta do modelo (confere se é do mesmo modelo),
-  ou use `--mtp <arquivo>`.
-- **Sem MTP** quando há imagem no prompt. Com `serve --parallel` acima de 1, o
-  MTP só roda enquanto um pedido gera sozinho (veja abaixo).
-- Quando o MTP não pode rodar numa geração, o airun imprime uma `note:` dizendo
-  por quê.
+- **Default:** `run` uses 4 drafts on dense models and 2 on MoEs that fit the
+  GPUs whole (35B-A3B on 2× 5060 Ti: 109.6 → 137.6 tok/s). On a MoE with
+  experts in RAM it is off, because checking several tokens pulls many more
+  experts over PCIe (35B-A3B on one RTX 3060: 73–75 tok/s without, 65–69 with
+  `--draft 1`); `--draft 2` turns it on anyway. `serve` uses 0.
+- **Gain:** on the 27B, 26 → 68 tok/s greedy (`--temp 0`) and 25.7 → 47.2
+  tok/s with `--temp 0.7`.
+- **Works with any sampling except mirostat.** With temperature, each draft is
+  accepted with the probability the model gives it, so the text follows the
+  same distribution as before; MTP only changes the speed.
+- **In greedy mode** the text may, rarely, come out different from decoding
+  without MTP: the check adds the numbers in another order, and on a near-tie
+  the choice flips.
+- **Head in a separate file:** llama.cpp's converter can write the model
+  without the head (`--no-mtp`) and the head into an `mtp-<name>.gguf` next to
+  it. airun finds that file on its own in the model's folder (it checks it is
+  from the same model), or use `--mtp <file>`.
+- **No MTP** when there is an image in the prompt. With `serve --parallel`
+  above 1, MTP runs only while one request is generating alone (see below).
+- When MTP cannot run in a generation, airun prints a `note:` saying why.
 
-### MoE: o que é automático
+### MoE: what is automatic
 
-- **Experts na RAM:** um MoE que não cabe nas GPUs fica com os experts mais
-  usados na VRAM e o resto na RAM. A GPU lê da RAM os que faltam, num canal
-  paralelo enquanto calcula os outros.
-- **Perfil de uso:** o airun anota quais experts cada camada usa e guarda em
-  `%LOCALAPPDATA%\airun\profiles\` (ou `~/.cache/airun/profiles/`). Na
-  próxima vez os mais usados já começam na VRAM. `AIRUN_EXPERT_PROFILE=off`
-  desliga.
+- **Experts in RAM:** a MoE that does not fit the GPUs keeps the most used
+  experts in VRAM and the rest in RAM. The GPU reads the missing ones from RAM
+  on a parallel channel while it computes the others, and the hottest migrate
+  into VRAM as routing shifts.
+- **Experts in the unused KV cache:** a long context reserves its whole KV
+  cache up front. The rows the conversation has not reached yet hold copies of
+  more experts (35B-A3B at 262k in q8_0: ~1,100 experts, 2.6 GB), handed back
+  as the context fills. `AIRUN_NO_KV_LOAN=1` turns it off.
+- **Usage profile:** airun records which experts each layer uses and stores it
+  in `%LOCALAPPDATA%\airun\profiles\` (or `~/.cache/airun/profiles/`). Next
+  time the most used ones already start in VRAM. `AIRUN_EXPERT_PROFILE=off`
+  turns it off.
 
-### Como as camadas são divididas entre as GPUs
+### How layers are split across GPUs
 
-1. O airun lê o tamanho **exato** de cada tensor no arquivo e soma pesos,
-   cache e memória de trabalho.
-2. **Se cabe numa GPU, usa uma só** (a `--main-gpu`, ou a mais rápida). Passar
-   dados pela PCIe sem P2P custa mais do que a segunda placa rende.
-3. Se não cabe:
-   - **GPUs diferentes:** enche a mais rápida primeiro e dá à outra só o que
-     sobrar. Na geração as placas trabalham uma depois da outra, então cada
-     camada na placa lenta custa mais. (27B numa 5070 Ti + 5060 Ti: 33,7 →
-     43,0 tok/s em comparação a dividir ao meio.)
-   - **GPUs iguais** (até 10% de diferença): divide ao meio. A geração fica
-     igual e o prompt quase dobra, porque as duas trabalham juntas.
-4. Se o contexto pedido com `-c` não cabe, **o cache KV das últimas camadas de
-   atenção vai para a RAM** (só o necessário). A cada passada só as células já
-   preenchidas vêm para a VRAM, então numa conversa curta quase nada cruza a
-   PCIe. O resultado é idêntico. 27B NVFP4 na 5070 Ti + 5060, `-c 262144`:
-   15,7 → 63,0 tok/s; com `--parallel 4`, 6,1 → 60,9, e o contexto deixou de
-   cair para 131072. Numa conversa longa a cópia cresce: na posição 65536,
-   18,9 tok/s, o mesmo de antes. `AIRUN_NO_KV_RAM=1` volta ao comportamento
-   antigo.
-5. Se nem com todo o cache na RAM os pesos cabem, o cache volta para a VRAM e
-   as camadas que sobram ficam na RAM. **Na geração** (passadas de até 64
-   tokens), os matmuls dessas camadas rodam **na CPU**, lendo direto da RAM. Só
-   as ativações, de poucos KB, cruzam a PCIe; atenção, delta-net e normas
-   continuam na GPU. **No prompt** (blocos maiores), elas são copiadas para a
-   GPU como antes, porque a CPU fica limitada por cálculo com muitos tokens. O
-   resultado é o mesmo que copiando, com texto guloso idêntico.
+1. airun reads the **exact** size of each tensor in the file and adds up
+   weights, cache and working memory.
+2. **If it fits one GPU, it uses only one** (the `--main-gpu`, or the
+   fastest). Moving data over PCIe without P2P costs more than the second card
+   yields.
+3. If it does not fit:
+   - **Different GPUs:** fills the fastest first and gives the other only what
+     is left. During generation the cards work one after the other, so every
+     layer on the slow card costs more. (27B on a 5070 Ti + 5060 Ti: 33.7 →
+     43.0 tok/s compared with splitting in half.)
+   - **Equal GPUs** (within 10%): splits in half. Generation stays the same and
+     the prompt almost doubles, because both work together.
+4. If the context asked with `-c` does not fit, **the KV cache of the last
+   attention layers goes to RAM** (only what is needed). Each pass brings only
+   the cells already filled into VRAM, so in a short conversation almost
+   nothing crosses PCIe. The result is identical. 27B NVFP4 on 5070 Ti + 5060,
+   `-c 262144`: 15.7 → 63.0 tok/s; with `--parallel 4`, 6.1 → 60.9, and the
+   context no longer dropped to 131072. In a long conversation the copy grows:
+   at position 65536, 18.9 tok/s, the same as before. `AIRUN_NO_KV_RAM=1` goes
+   back to the old behavior.
+5. If not even with the whole cache in RAM the weights fit, the cache goes
+   back to VRAM and the leftover layers stay in RAM. **During generation**
+   (passes of up to 64 tokens), those layers' matmuls run **on the CPU**,
+   reading straight from RAM (AVX2 kernels for NVFP4, Q4_K, Q5_K, Q6_K and
+   Q8_0). Only the activations, a few KB, cross PCIe; attention, delta-net and
+   norms stay on the GPU. **During the prompt** (larger chunks), they are
+   copied to the GPU as before, because the CPU becomes compute-bound with many
+   tokens. The result is the same as copying, with identical greedy text.
 
-   27B NVFP4 numa RTX 5060 8 GB sozinha, ligada em PCIe 3.0 x1, i7-13700 com
+   27B NVFP4 on an RTX 5060 8 GB alone, on PCIe 3.0 x1, i7-13700 with
    DDR5-4800:
 
-   | | antes (camadas copiadas pelo link) | agora |
+   | | before (layers copied over the link) | now |
    |---|---|---|
-   | geração, sem rascunho | 0,1 tok/s | 3,2 |
-   | geração, `--draft 2` | — | 5,3 |
-   | prompt de 26 tokens | 1,1 tok/s | 10,7 |
-   | prompt de 2550 tokens | — | 40 (copiado, blocos de 512) |
+   | generation, no draft | 0.1 tok/s | 3.2 |
+   | generation, `--draft 2` | — | 5.3 |
+   | 26-token prompt | 1.1 tok/s | 10.7 |
+   | 2550-token prompt | — | 40 (copied, 512-token chunks) |
 
-   `AIRUN_RAM_ON_GPU=1` volta a copiar sempre. Com `--alloc gpu` nada disso
-   acontece (o contexto diminui). Modelos MoE seguem o plano de experts.
+   Qwen3.6-27B Q4_K_M on an RTX 3060 12 GB with ~7.5 GB in RAM: 0.2 → 4.6–4.8
+   tok/s (copying to the GPU: 2.8).
 
-   **Confira o slot da placa:** `nvidia-smi -q` mostra a largura do link em
-   "Link Width". Um slot x1 (ou riser) deixa a cópia de pesos 8–16× mais lenta
-   que um x8/x16, e é a cópia que pesa no prompt longo.
+   `AIRUN_RAM_ON_GPU=1` always copies again. With `--alloc gpu` none of this
+   happens (the context shrinks). MoE models follow the expert plan.
 
-Para tirar uma GPU do jogo de vez (por exemplo, a que fica para jogos ou para
-o monitor), use `--hide-gpu` ou `AIRUN_HIDE_GPUS`. O `--gpus` só escolhe onde o
-modelo vai, e o CUDA ainda pode abrir contexto (algumas centenas de MiB) nas
-outras.
+   **Check the card's slot:** `nvidia-smi -q` shows the link width under "Link
+   Width". An x1 slot (or riser) makes copying weights 8–16× slower than x8/x16,
+   and it is the copy that weighs on a long prompt.
 
-`--stats` mostra o que foi decidido.
+To take a GPU out for good (for example, the one kept for games or for the
+monitor), use `--hide-gpu` or `AIRUN_HIDE_GPUS`. `--gpus` only chooses where
+the model goes, and CUDA may still open a context (a few hundred MiB) on the
+others.
 
-### Quando não cabe
+`--stats` shows what was decided.
 
-O airun tenta nesta ordem e avisa o que mudou:
+### When it does not fit
 
-1. **Lote pela metade** (até 64): só o prompt fica mais lento.
-2. **Contexto pela metade** (até 512).
-3. **Reserva de VRAM em 128 MiB:** último recurso.
+airun tries in this order and says what changed:
 
-`--no-fallback` desliga essas reduções.
+1. **Half the batch** (down to 64): only the prompt gets slower.
+2. **Half the context** (down to 512).
+3. **VRAM reserve at 128 MiB:** last resort.
 
-### Offload para o disco
+`--no-fallback` turns these reductions off.
 
-Com `--disk-offload`, a ordem fica: **VRAM → RAM → disco**. As camadas que o
-planner manda para a RAM (veja acima) e que não cabem na RAM livre, depois de
-`--ram-reserve`, não são copiadas: ficam no próprio .gguf, mapeado em memória,
-e o sistema operacional as lê do SSD quando a CPU as multiplica, e as
-descarta quando outra coisa precisa da memória. Nada é fixado para elas, então
-não ocupam RAM nem o limite de commit do Windows.
+### Disk offload
 
-- Enquanto uma camada roda, 4 threads trazem as **2 seguintes** do disco
-  (`AIRUN_DISK_AHEAD`, `AIRUN_DISK_THREADS`), com leituras grandes
-  (`PrefetchVirtualMemory` no Windows, `madvise` no Linux).
-- **MoE:** se os experts que não cabem na VRAM não cabem na RAM, passam a ser
-  lidos do arquivo quando roteados (o mesmo caminho de `AIRUN_EXPERTS=stream`).
-- `--stats` mostra quais camadas ficaram no disco.
-- **MTP:** com camadas no disco e sem `--draft`, a cabeça rascunha 6 tokens por passo em vez de 4. Cada passada lê o disco uma vez, então mais tokens por passada é mais rápido (27B no NVMe: ~0,92 → ~1,05 tok/s).
-- **Prompt longo:** os blocos de `-b` tokens passam juntos por cada camada do disco, que é lida uma vez para todos (até 8192 tokens por vez), e não uma vez por bloco. Um prompt de 4096 tokens com `-b 512` lê o disco 2 vezes em vez de 8. O resultado é o mesmo.
+With `--disk-offload`, the order becomes: **VRAM → RAM → disk**. The layers the
+planner sends to RAM (see above) that do not fit the free RAM, after
+`--ram-reserve`, are not copied: they stay in the .gguf itself, memory-mapped,
+and the operating system reads them from the SSD when the CPU multiplies them,
+and drops them when something else needs the memory. Nothing is pinned for
+them, so they take neither RAM nor Windows' commit limit.
 
-**É lento.** Cada token relê essas camadas inteiras do disco: a velocidade é a
-do SSD dividida pelos bytes no disco (um NVMe de ~5 GB/s com 5 GB no disco dá
-~1 token/s, no melhor caso). Num HD fica inutilizável. Serve para rodar um
-modelo que de outro jeito não carregaria; para velocidade, prefira uma
-quantização menor ou menos contexto.
+- While a layer runs, 4 threads bring the **next 2** in from disk
+  (`AIRUN_DISK_AHEAD`, `AIRUN_DISK_THREADS`), with large reads
+  (`PrefetchVirtualMemory` on Windows, `madvise` on Linux).
+- **MoE:** if the experts that do not fit VRAM do not fit RAM either, they are
+  read from the file when routed (the same path as `AIRUN_EXPERTS=stream`).
+- `--stats` shows which layers ended up on disk.
+- **MTP:** with layers on disk and no `--draft`, the head drafts 6 tokens per
+  step instead of 4. Each pass reads the disk once, so more tokens per pass is
+  faster (27B on NVMe: ~0.92 → ~1.05 tok/s).
+- **Long prompt:** the `-b`-token chunks go together through each disk layer,
+  which is read once for all of them (up to 8192 tokens at a time), not once
+  per chunk. A 4096-token prompt with `-b 512` reads the disk 2 times instead
+  of 8. The result is the same.
 
-Sem a opção, quando a RAM não comporta o plano, o airun avisa e sugere
+**It is slow.** Every token rereads those whole layers from disk: the speed is
+the SSD's divided by the bytes on disk (an NVMe at ~5 GB/s with 5 GB on disk
+gives ~1 token/s, at best). On a hard disk it becomes unusable. It is for
+running a model that would not load otherwise; for speed, prefer a smaller
+quantization or less context.
+
+Without the option, when RAM cannot hold the plan, airun warns and suggests
 `--disk-offload`.
 
 ---
 
 ## `airun run`
 
-Gera texto e escreve no stdout.
+Generates text and writes it to stdout.
 
 ### Prompt
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `-p`, `--prompt <texto>` | stdin | O prompt. Sem esta flag, lê do stdin. |
-| `--system <texto>` | — | Mensagem de sistema, inserida antes do prompt. |
-| `--raw` | desligado | Envia o prompt exatamente como está, sem template de chat. Use quando estiver montando o ChatML você mesmo. |
-| `-n`, `--predict <N>` | `256` | Máximo de tokens a gerar. |
+| `-p`, `--prompt <text>` | stdin | The prompt. Without this flag, reads from stdin. |
+| `--system <text>` | — | System message, inserted before the prompt. |
+| `--raw` | off | Sends the prompt exactly as given, without a chat template. Use it when building ChatML yourself. |
+| `-n`, `--predict <N>` | `256` | Maximum tokens to generate. |
 
-### Amostragem
+### Sampling
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `--temp <f>` | `0.8` | Temperatura. **`0` = greedy determinístico.** |
-| `--top-k <N>` | `40` | Mantém só os N tokens mais prováveis. `0` desliga. |
-| `--top-p <f>` | `0.95` | Nucleus sampling. `1.0` desliga. |
-| `--min-p <f>` | `0.05` | Descarta tokens abaixo desta fração da probabilidade do melhor token. `0` desliga. |
-| `--typical-p <f>` | `1.0` | Amostragem localmente típica: mantém os tokens cuja surpresa está mais perto da entropia da distribuição, não os mais prováveis. `1.0` desliga. |
-| `--top-n-sigma <f>` | `0.0` | Mantém só os logits a até N desvios-padrão do melhor. `0` desliga. Ao contrário do top-p, o corte **não** se alarga com a temperatura — é a propriedade pela qual o filtro foi proposto. |
-| `--repeat-penalty <f>` | `1.1` | Penalidade multiplicativa em tokens recentes. `1.0` desliga. Aplicada **uma vez por token distinto** na janela, não uma vez por ocorrência. |
-| `--presence-penalty <f>` | `0.0` | Subtraído uma vez de qualquer token já visto. Escala aditiva da OpenAI. |
-| `--frequency-penalty <f>` | `0.0` | Subtraído por ocorrência do token. Escala aditiva da OpenAI. |
-| `--repeat-last-n <N>` | `64` | Janela que as três penalidades enxergam. |
-| `--seed <N>` | `0` | Semente do RNG. `0` sorteia uma. Um valor fixo torna a saída reproduzível. |
+| `--temp <f>` | `0.8` | Temperature. **`0` = deterministic greedy.** |
+| `--top-k <N>` | `40` | Keeps only the N most likely tokens. `0` turns it off. |
+| `--top-p <f>` | `0.95` | Nucleus sampling. `1.0` turns it off. |
+| `--min-p <f>` | `0.05` | Drops tokens below this fraction of the best token's probability. `0` turns it off. |
+| `--typical-p <f>` | `1.0` | Locally typical sampling: keeps the tokens whose surprise is closest to the distribution's entropy, not the most likely ones. `1.0` turns it off. |
+| `--top-n-sigma <f>` | `0.0` | Keeps only logits within N standard deviations of the best. `0` turns it off. Unlike top-p, the cut does **not** widen with temperature — the property the filter was proposed for. |
+| `--repeat-penalty <f>` | `1.1` | Multiplicative penalty on recent tokens. `1.0` turns it off. Applied **once per distinct token** in the window, not once per occurrence. |
+| `--presence-penalty <f>` | `0.0` | Subtracted once from any token already seen. OpenAI's additive scale. |
+| `--frequency-penalty <f>` | `0.0` | Subtracted per occurrence of the token. OpenAI's additive scale. |
+| `--repeat-last-n <N>` | `64` | Window the three penalties look at. |
+| `--seed <N>` | `0` | RNG seed. `0` draws one. A fixed value makes the output reproducible. |
 
-Os filtros são aplicados nesta ordem, a mesma do llama.cpp: viés →
-penalidades → top-n-sigma → top-k → typical → top-p → min-p → temperatura. A
-ordem muda o resultado (o top-p depois da temperatura, por exemplo, escolheria
-outros tokens). Nenhum filtro deixa a lista de candidatos vazia: sobra sempre
-pelo menos um.
+Filters are applied in this order, the same as llama.cpp: bias → penalties →
+top-n-sigma → top-k → typical → top-p → min-p → temperature. The order changes
+the result (top-p after temperature, for example, would pick other tokens). No
+filter leaves the candidate list empty: at least one always remains.
 
-### Raciocínio
+### Reasoning
 
-| Flag | Padrão | Descrição |
+| Flag | Default | Description |
 |---|---|---|
-| `--reasoning <on\|off\|auto>` | `auto` | Liga ou desliga o pensamento (o bloco `<think>`). `auto` deixa como o modelo faz por padrão. |
-| `--reasoning-effort <nível>` | — | Quanto o modelo pode pensar: `none` (nada), `low` (até 1024 tokens), `medium` (4096), `high` (16384) ou `max` (sem limite). |
-| `--reasoning-budget <N>` | — | Limite exato de tokens de pensamento; vale mais que o nível. `-1` = sem limite. |
+| `--reasoning <on\|off\|auto>` | `auto` | Turns thinking (the `<think>` block) on or off. `auto` leaves it as the model does by default. |
+| `--reasoning-effort <level>` | — | How much the model may think: `none` (nothing), `low` (up to 1024 tokens), `medium` (4096), `high` (16384) or `max` (no limit). |
+| `--reasoning-budget <N>` | — | Exact limit of thinking tokens; overrides the level. `-1` = no limit. |
 
-Quando o limite acaba, o airun fecha o `</think>` e o modelo passa direto
-para a resposta. Se o próprio template do modelo entende níveis (o do Qwen3.8
-tem `low`, `medium` e `xhigh`), o nível vai para ele. As três opções valem
-também no `serve`, como padrão dos pedidos. Na API: `reasoning_effort`
+When the limit runs out, airun closes `</think>` and the model goes straight
+to the answer. If the model's own template understands levels (Qwen3.8's has
+`low`, `medium` and `xhigh`), the level goes to it. All three options also
+apply to `serve`, as the request default. In the API: `reasoning_effort`
 (OpenAI), `reasoning.effort` (Responses), `thinking.budget_tokens`
-(Anthropic) e `reasoning_budget_tokens` (llama-server).
+(Anthropic) and `reasoning_budget_tokens` (llama-server).
 
-### Imagens
+### Images
 
-| Flag | Padrão | Descrição |
+| Flag | Default | Description |
 |---|---|---|
-| `--image <arquivo>` | — | Uma imagem (PNG, JPEG ou WebP) para o prompt; repita para várias. Precisa de `--mmproj`. Ponha `<__media__>` no prompt onde cada uma vai; sem marcador, elas vão antes do texto. Sem `--image`, `<__media__>` é texto comum. |
+| `--image <file>` | — | An image (PNG, JPEG or WebP) for the prompt; repeat for several. Needs `--mmproj`. Put `<__media__>` in the prompt where each goes; without a marker, they go before the text. Without `--image`, `<__media__>` is plain text. |
 
 ```powershell
-airun run modelo.gguf --mmproj mmproj-BF16.gguf --image foto.jpg -p "O que tem nesta imagem?" --temp 0
+airun run model.gguf --mmproj mmproj-BF16.gguf --image photo.jpg -p "What is in this image?" --temp 0
 ```
 
-O processamento da imagem segue o do llama.cpp (`tools/mtmd`), então a
-mesma imagem gera a mesma descrição nos dois. Hoje funciona o `mmproj` dos
-Qwen3.5/3.8. Com imagem no prompt o MTP fica desligado naquela geração.
+Image processing follows llama.cpp's (`tools/mtmd`), so the same image yields
+the same description in both. Today the Qwen3.5/3.8 `mmproj` works. With an
+image in the prompt MTP is off for that generation.
 
-### Saída
+### Output
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `--stats` | desligado | Imprime o plano de memória e o resumo de tempos. |
-| `-q`, `--quiet` | desligado | Silencia o progresso de carga no stderr. |
+| `--stats` | off | Prints the memory plan and the timing summary. |
+| `-q`, `--quiet` | off | Silences load progress on stderr. |
 
-**Exemplos**
+**Examples**
 
 ```powershell
-# Determinístico, uma GPU
-airun run modelo.gguf -p "Explique RoPE" -n 200 --temp 0
+# Deterministic, one GPU
+airun run model.gguf -p "Explain RoPE" -n 200 --temp 0
 
-# Contexto grande, forçando split entre duas placas
-airun run modelo.gguf -p "..." -c 32768 --tensor-split 0.6,0.4 --stats
+# Large context, forcing a split between two cards
+airun run model.gguf -p "..." -c 32768 --tensor-split 0.6,0.4 --stats
 
-# Prompt via pipe
-Get-Content prompt.txt | airun run modelo.gguf -n 500
+# Prompt through a pipe
+Get-Content prompt.txt | airun run model.gguf -n 500
 ```
 
 ---
 
 ## `airun serve`
 
-Sobe uma API HTTP no formato do llama-server: OpenAI (chat, completions,
-responses), Anthropic (messages), a nativa do llama.cpp (`/completion`,
-`/infill`) e os utilitários. Os campos de amostragem (`dry_*`, `xtc_*`,
+Starts an HTTP API in llama-server's format: OpenAI (chat, completions,
+responses), Anthropic (messages), llama.cpp's native one (`/completion`,
+`/infill`) and the utilities. The sampling fields (`dry_*`, `xtc_*`,
 `dynatemp_*`, `mirostat*`), `grammar`, `json_schema`, `response_format`,
-`n_probs`/`logprobs` e `ignore_eos` vão na requisição, como no llama-server;
-não há flags de servidor para eles.
+`n_probs`/`logprobs` and `ignore_eos` go in the request, as in llama-server;
+there are no server flags for them.
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `--host <ip>` | `127.0.0.1` | Endereço de bind. Use `0.0.0.0` para expor na rede. |
-| `--port <N>` | `8080` | Porta. |
-| `--parallel <N>` (ou `--np`) | `1` | Quantos pedidos são atendidos ao mesmo tempo. Veja [Vários pedidos ao mesmo tempo](#vários-pedidos-ao-mesmo-tempo). |
-| `--api-key <chave>` | — | Exige `Authorization: Bearer <chave>`. Também lida da variável `AIRUN_API_KEY`. **Sem esta flag não há autenticação nenhuma** — não use `--host 0.0.0.0` sem ela. |
-| `--served-model-name <nome>` (ou `--alias`) | o nome no arquivo | Nome mostrado em `/v1/models`. Sem a opção, vem dos metadados do GGUF; se não houver, do nome do arquivo. |
-| `--default-max-tokens <N>` | `512` | Limite das requisições OpenAI que não especificam um. O `/completion` nativo gera até o fim, como o llama-server. |
-| `--reasoning-format <deepseek\|none>` | `deepseek` | Onde vai o pensamento (`<think>`) das respostas de chat: em `reasoning_content` (padrão do llama-server) ou no `content`. O `reasoning_format` da requisição tem prioridade. |
-| `--repeat-penalty <f>` | `1.1` | Penalidade multiplicativa em tokens recentes quando a requisição não pede uma. `1.0` desliga. |
-| `--repeat-last-n <N>` | `64` | Quantos tokens recentes as penalidades consideram. |
-| `--reasoning-budget <N>` | `-1` | Tokens de pensamento antes de o `</think>` ser forçado; `-1` é sem limite. O `reasoning_budget_tokens` da requisição tem prioridade. |
-| `--reasoning-budget-message <texto>` | — | Texto escrito antes do `</think>` forçado. |
-| `--slot-save-path <dir>` | — | Habilita `POST /slots/0?action=save\|restore\|erase`, que gravam e carregam o cache da conversa nesse diretório. Sem ela, 501. |
-| `--embeddings` | desligado | Habilita `/embedding` e `/v1/embeddings`. Sem ela, 501. |
-| `--pooling <none\|mean\|cls\|last>` | do GGUF, senão `last` | Como os estados dos tokens viram um embedding. `none` devolve um vetor por token (só no endpoint nativo). |
+| `--host <ip>` | `127.0.0.1` | Bind address. Use `0.0.0.0` to expose on the network. |
+| `--port <N>` | `8080` | Port. |
+| `--parallel <N>` (or `--np`) | `1` | How many requests are served at once. See [Several requests at once](#several-requests-at-once). |
+| `--api-key <key>` | — | Requires `Authorization: Bearer <key>`. Also read from the `AIRUN_API_KEY` variable. **Without this flag there is no authentication at all** — do not use `--host 0.0.0.0` without it. |
+| `--served-model-name <name>` (or `--alias`) | the name in the file | Name shown in `/v1/models`. Without the option, it comes from the GGUF metadata; if absent, from the file name. |
+| `--default-max-tokens <N>` | `512` | Limit for OpenAI requests that do not set one. The native `/completion` generates to the end, like llama-server. |
+| `--reasoning-format <deepseek\|none>` | `deepseek` | Where chat responses' thinking (`<think>`) goes: in `reasoning_content` (llama-server's default) or in `content`. The request's `reasoning_format` takes priority. |
+| `--repeat-penalty <f>` | `1.1` | Multiplicative penalty on recent tokens when the request does not ask for one. `1.0` turns it off. |
+| `--repeat-last-n <N>` | `64` | How many recent tokens the penalties consider. |
+| `--reasoning-budget <N>` | `-1` | Thinking tokens before `</think>` is forced; `-1` is no limit. The request's `reasoning_budget_tokens` takes priority. |
+| `--reasoning-budget-message <text>` | — | Text written before the forced `</think>`. |
+| `--slot-save-path <dir>` | — | Enables `POST /slots/0?action=save\|restore\|erase`, which save and load the conversation cache in that directory. Without it, 501. |
+| `--embeddings` | off | Enables `/embedding` and `/v1/embeddings`. Without it, 501. |
+| `--pooling <none\|mean\|cls\|last>` | from the GGUF, else `last` | How token states become an embedding. `none` returns one vector per token (native endpoint only). |
 
-Mais todas as flags de memória e alocação da seção acima.
+Plus every memory and allocation flag from the section above.
 
-**Sobre as penalidades:** a API da OpenAI só tem `presence_penalty` e
-`frequency_penalty`. A `repeat_penalty` (que evita o modelo ficar repetindo)
-não tem campo lá, então vale a do servidor; um cliente pode mandar
-`repeat_penalty` no corpo para trocar.
+**About penalties:** the OpenAI API only has `presence_penalty` and
+`frequency_penalty`. `repeat_penalty` (which keeps the model from repeating
+itself) has no field there, so the server's applies; a client can send
+`repeat_penalty` in the body to change it.
 
-### Vários pedidos ao mesmo tempo
+### Several requests at once
 
-Com `--parallel N`, até N pedidos são atendidos juntos, como os slots do
-llama-server:
+With `--parallel N`, up to N requests are served together, like
+llama-server's slots:
 
-- Cada pedido ganha um **slot** com o próprio cache. A VRAM do cache cresce N
-  vezes, então o contexto automático fica menor.
-- Os que estão gerando avançam **juntos**: uma passada pelo modelo dá um token
-  para cada um, lendo os pesos uma vez só. No 27B (5060 Ti + 3060): 1 pedido
-  sozinho 22,7 tok/s; 4 juntos somam 50,3 tok/s (cada um a ~13).
-- Um pedido novo vai para o slot que já tem o começo da conversa em cache, então
-  o próximo turno de um chat não reprocessa o histórico.
-- **Um pedido sozinho roda como sem a flag:** sem ninguém gerando nem na fila,
-  ele passa pelo mesmo caminho do `--parallel 1` (MTP com `--draft`, escolha
-  gulosa na GPU, grafos de decode, snapshot de turno). Quando chega outro, ele
-  pausa no token que está entregando e os dois seguem juntos. No 27B NVFP4 com
-  `--draft 4` (5070 Ti + 5060): sozinho 38,3 tok/s com ou sem `--parallel 4`
-  (antes da mudança, 27,4 com a flag). `AIRUN_NO_PARALLEL_SOLO=1` desliga.
-- **Os passos em lote também usam o MTP.** Cada slot tem o próprio cache da
-  cabeça, e uma passada confere os rascunhos de todos os pedidos juntos. O
-  texto é o mesmo que cada pedido geraria sozinho (temp 0). Quanto mais
-  pedidos, menos rascunhos por pedido: conferir muitos tokens de uma vez custa
-  mais por token. São 2 rascunhos com 2 pedidos e 1 com 3 ou 4; com mais de 4,
-  o lote segue sem rascunho. 27B NVFP4 (5070 Ti + 5060, `--draft 3`), tok/s
-  somados:
+- Each request gets a **slot** with its own cache. The cache's VRAM grows N
+  times, so the automatic context gets smaller.
+- The ones generating advance **together**: one pass through the model gives
+  one token to each, reading the weights only once. On the 27B (5060 Ti +
+  3060): 1 request alone 22.7 tok/s; 4 together add up to 50.3 tok/s (~13
+  each).
+- A new request goes to the slot that already has the start of the
+  conversation cached, so a chat's next turn does not reprocess the history.
+- **A request alone runs as without the flag:** with nobody generating or
+  queued, it takes the same path as `--parallel 1` (MTP with `--draft`, greedy
+  pick on the GPU, decode graphs, turn snapshot). When another arrives, it
+  pauses at the token it is delivering and both continue together. On the 27B
+  NVFP4 with `--draft 4` (5070 Ti + 5060): alone 38.3 tok/s with or without
+  `--parallel 4` (before the change, 27.4 with the flag).
+  `AIRUN_NO_PARALLEL_SOLO=1` turns it off.
+- **Batched steps also use MTP.** Each slot has its own head cache, and one
+  pass checks the drafts of all requests together. The text is the same each
+  request would generate alone (temp 0). The more requests, the fewer drafts
+  per request: checking many tokens at once costs more per token. It is 2
+  drafts with 2 requests and 1 with 3 or 4; with more than 4, the batch runs
+  without drafts. 27B NVFP4 (5070 Ti + 5060, `--draft 3`), summed tok/s:
 
-  | pedidos | sem MTP no lote | com MTP no lote |
+  | requests | no MTP in the batch | MTP in the batch |
   |---|---|---|
-  | 2 | 59 | 81,5 |
+  | 2 | 59 | 81.5 |
   | 3 | 82 | 98 |
   | 4 | 106 | 117 |
-  | 4, `-c 262144` (KV na RAM) | 88,5 | 107 |
+  | 4, `-c 262144` (KV in RAM) | 88.5 | 107 |
 
-  `AIRUN_NO_ROWS_SPEC=1` desliga; `AIRUN_ROWS_DRAFT=2,1,1` escolhe os
-  rascunhos para 2, 3, 4... pedidos.
-- Cada slot guarda o próprio snapshot de turno (híbridos), então duas conversas
-  alternadas reaproveitam cada uma o seu histórico.
-- Modelos `qwen4exp` não aceitam N maior que 1.
+  `AIRUN_NO_ROWS_SPEC=1` turns it off; `AIRUN_ROWS_DRAFT=2,1,1` picks the
+  drafts for 2, 3, 4... requests.
+- Each slot keeps its own turn snapshot (hybrids), so two alternating
+  conversations each reuse their own history.
+- `qwen4exp` models do not accept N greater than 1.
 
-### Cache de prompt
+### Prompt cache
 
-O servidor reaproveita o prefixo do prompt que já está nas caches, então num
-chat só o último turno é processado a cada mensagem. O ganho é grande porque o
-prefill é lento (veja abaixo): num Qwen3.6-27B, o segundo turno de uma conversa
-de ~880 tokens caiu de ~78s para 1,5s.
+The server reuses the prompt prefix already in the caches, so in a chat only
+the last turn is processed on each message. The gain is large because prefill
+is slow (see below): on a Qwen3.6-27B, the second turn of a ~880-token
+conversation went from ~78 s to 1.5 s.
 
-Nos modelos **híbridos** (Qwen3.5/3.8/Next) há uma limitação que vem da
-arquitetura: o estado da delta-net é um resumo de tudo que ela leu, e não dá
-para "desler" um token. Então o cache só é aproveitado quando o prompt novo
-**continua exatamente** o anterior; editar uma mensagem antiga faz reprocessar
-tudo. Nos modelos densos (Qwen3) dá para voltar a qualquer ponto.
+On **hybrid** models (Qwen3.5/3.8/Next) there is a limitation that comes from
+the architecture: the delta-net state is a summary of everything it has read,
+and a token cannot be "unread". So the cache is only reused when the new
+prompt **continues exactly** the previous one; editing an old message
+reprocesses everything. On dense models (Qwen3) it can go back to any point.
 
-Cada requisição imprime uma linha no stderr dizendo quanto foi aproveitado:
+Each request prints a line on stderr saying how much was reused:
 
 ```
 prompt 884 tok (869 cached, 15 new)  prefill 1285 ms (11.7 tok/s)  decode 1 tok in 116 ms (8.6 tok/s)
@@ -357,296 +371,308 @@ prompt 884 tok (869 cached, 15 new)  prefill 1285 ms (11.7 tok/s)  decode 1 tok 
 
 ### Endpoints
 
-| Endpoint | Método | Observações |
+| Endpoint | Method | Notes |
 |---|---|---|
-| `/health` | GET | Sem autenticação. Para health checks. |
-| `/v1/models` | GET | Requer autenticação. |
-| `/v1/chat/completions` | POST | Suporta `stream: true` (SSE). |
-| `/v1/completions` | POST | Suporta `stream: true` (SSE). |
-| `/v1/stream/{id}?from=N` | GET | Relê uma geração a partir do byte N e continua ao vivo (veja abaixo). |
-| `/v1/streams/lookup` | POST | `{"conversation_ids": [...]}`: diz quais dessas gerações existem e se já acabaram. |
-| `/v1/stream/{id}` | DELETE | Para a geração e apaga o que estava guardado. |
+| `/health` | GET | No authentication. For health checks. |
+| `/v1/models` | GET | Requires authentication. |
+| `/v1/chat/completions` | POST | Supports `stream: true` (SSE). |
+| `/v1/completions` | POST | Supports `stream: true` (SSE). |
+| `/v1/stream/{id}?from=N` | GET | Replays a generation from byte N and continues live (see below). |
+| `/v1/streams/lookup` | POST | `{"conversation_ids": [...]}`: says which of these generations exist and whether they have finished. |
+| `/v1/stream/{id}` | DELETE | Stops the generation and deletes what was stored. |
 
-**Stream replay:** um pedido com o cabeçalho `X-Conversation-Id: <id>`
-continua gerando mesmo se o cliente cair (aba fechada, rede caiu). O cliente
-volta e relê o texto pelo `/v1/stream/<id>`. O servidor guarda os últimos 4
-MiB e apaga 5 minutos depois que a geração acaba. É o mesmo recurso do
-llama-server.
+**Stream replay:** a request with the `X-Conversation-Id: <id>` header keeps
+generating even if the client drops (tab closed, network down). The client
+comes back and rereads the text through `/v1/stream/<id>`. The server keeps
+the last 4 MiB and deletes it 5 minutes after the generation ends. It is the
+same feature as llama-server's.
 
-**Imagens (com `--mmproj`):** mande a imagem dentro do pedido, em base64:
-`image_url` com data URL (OpenAI), `input_image` (Responses), bloco `image`
-(Anthropic) ou `multimodal_data` (`/completion`). O servidor não baixa URLs
-http. A mesma imagem nos turnos seguintes de um chat não é processada de novo.
+**Images (with `--mmproj`):** send the image inside the request, in base64:
+`image_url` with a data URL (OpenAI), `input_image` (Responses), an `image`
+block (Anthropic) or `multimodal_data` (`/completion`). The server does not
+download http URLs. The same image in later turns of a chat is not processed
+again.
 
-Campos aceitos: `messages`, `prompt`, `max_tokens`, `max_completion_tokens`,
+Accepted fields: `messages`, `prompt`, `max_tokens`, `max_completion_tokens`,
 `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `top_n_sigma`, `seed`,
 `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`,
 `stream`, `stop`.
 
-`logit_bias` é o objeto da OpenAI — chave é o id do token, valor é o quanto
-somar ao logit dele. `-inf` (ou um valor bem negativo) bane o token. Entradas
-que não parseiam são ignoradas em vez de derrubar a requisição.
+`logit_bias` is OpenAI's object — the key is the token id, the value how much
+to add to its logit. `-inf` (or a very negative value) bans the token. Entries
+that do not parse are ignored instead of failing the request.
 
-`finish_reason` é `"stop"` quando o modelo emitiu um token de fim ou uma stop
-sequence bateu, e `"length"` quando o orçamento de tokens ou o contexto acabou.
+`finish_reason` is `"stop"` when the model emitted an end token or a stop
+sequence matched, and `"length"` when the token budget or the context ran
+out.
 
-Uma stop sequence que cai entre dois tokens **não vaza** para o cliente: o
-servidor segura o pedaço duvidoso até saber se ele vira a stop sequence.
+A stop sequence that falls between two tokens **does not leak** to the
+client: the server holds the doubtful piece until it knows whether it becomes
+the stop sequence.
 
-**Vários clientes:** com `--parallel 1` (o padrão) os pedidos são atendidos um
-de cada vez, e os outros esperam na fila. Para atender vários juntos, use
+**Several clients:** with `--parallel 1` (the default) requests are served one
+at a time, and the others wait in the queue. To serve several together, use
 `--parallel N`.
 
 ```powershell
-airun serve modelo.gguf --port 8080 --api-key minha-chave -c 8192
+airun serve model.gguf --port 8080 --api-key my-key -c 8192
 ```
 
 ---
 
 ## `airun convert`
 
-Converte um checkpoint HuggingFace (safetensors) em GGUF.
+Converts a HuggingFace checkpoint (safetensors) into GGUF.
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `<input>` | — | Diretório com `config.json` e os `.safetensors`. Shards são unidos automaticamente. |
-| `-o`, `--output <path>` | — | Arquivo `.gguf` de saída. Diretórios pai são criados. |
-| `--type <tipo>` | `F16` | Tipo alvo. Veja a tabela de tipos abaixo. |
-| `--pure` | desligado | Aplica `--type` a todas as matrizes, sem exceções por tensor. |
-| `--name <nome>` | nome da pasta | Nome gravado no arquivo. |
+| `<input>` | — | Directory with `config.json` and the `.safetensors`. Shards are joined automatically. |
+| `-o`, `--output <path>` | — | Output `.gguf` file. Parent directories are created. |
+| `--type <type>` | `F16` | Target type. See the type table below. |
+| `--pure` | off | Applies `--type` to every matrix, with no per-tensor exceptions. |
+| `--name <name>` | folder name | Name recorded in the file. |
 
-Por padrão (sem `--pure`), a precisão é elevada em tensores sensíveis:
-`token_embd` e `output` para Q6_K; `attn_v` e `ffn_down` um passo acima do alvo.
-Normas ficam sempre em F32. É o mesmo raciocínio das variantes `_M` do
-llama.cpp.
+By default (without `--pure`), precision is raised on sensitive tensors:
+`token_embd` and `output` to Q6_K; `attn_v` and `ffn_down` one step above the
+target. Norms always stay F32. It is the same reasoning as llama.cpp's `_M`
+variants.
 
 ```powershell
-airun convert pasta-do-modelo -o saida.gguf --type Q4_K
+airun convert model-folder -o out.gguf --type Q4_K
 ```
 
 ---
 
 ## `airun quantize`
 
-Reescreve um GGUF em outra precisão.
+Rewrites a GGUF at another precision.
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `<input>` `<output>` | — | Arquivos de origem e destino. |
-| `--type <tipo>` | `Q4_K` | Tipo alvo. |
-| `--pure` | desligado | Sem exceções por tensor. |
-| `--dry-run` | desligado | Mostra o que seria escrito, sem escrever. |
+| `<input>` `<output>` | — | Source and destination files. |
+| `--type <type>` | `Q4_K` | Target type. |
+| `--pure` | off | No per-tensor exceptions. |
+| `--dry-run` | off | Shows what would be written, without writing. |
 
-Nunca aumenta a precisão: um tensor já em 4 bits não ganha nada sendo reescrito
-em 8 — o arquivo só cresceria carregando o mesmo erro. Tensores cujo tipo não
-muda são copiados byte a byte, sem round-trip com perda.
+It never raises precision: a tensor already at 4 bits gains nothing from
+being rewritten at 8 — the file would only grow carrying the same error.
+Tensors whose type does not change are copied byte for byte, with no lossy
+round trip.
 
 ---
 
-## Tipos de quantização
+## Quantization types
 
-| Tipo | Bits/peso | Leitura | Escrita | Observação |
+| Type | Bits/weight | Read | Write | Note |
 |---|---|---|---|---|
-| `F32` | 32 | sim | sim | |
-| `F16` | 16 | sim | sim | |
-| `BF16` | 16 | sim | sim | Faixa maior, menos mantissa |
-| `Q8_0` | 8.5 | sim | sim | Quase sem perda |
-| `Q6_K` | 6.56 | sim | sim | |
-| `Q5_K` | 5.5 | sim | sim | |
-| `Q5_0` / `Q5_1` | 5.5 / 6.0 | sim | sim | |
-| `Q4_K` | 4.5 | sim | sim | Melhor equilíbrio geral |
-| `Q4_0` / `Q4_1` | 4.5 / 5.0 | sim | sim | Legados |
-| `Q2_K` / `Q3_K` | 2.63 / 3.44 | sim | não | |
-| `IQ4_NL` / `IQ4_XS` | 4.5 / 4.25 | sim | não | Codebook não-linear |
-| `MXFP4` | 4.25 | sim | não | Escala E8M0 |
+| `F32` | 32 | yes | yes | |
+| `F16` | 16 | yes | yes | |
+| `BF16` | 16 | yes | yes | Wider range, less mantissa |
+| `Q8_0` | 8.5 | yes | yes | Nearly lossless |
+| `Q6_K` | 6.56 | yes | yes | |
+| `Q5_K` | 5.5 | yes | yes | |
+| `Q5_0` / `Q5_1` | 5.5 / 6.0 | yes | yes | |
+| `Q4_K` | 4.5 | yes | yes | Best overall balance |
+| `Q4_0` / `Q4_1` | 4.5 / 5.0 | yes | yes | Legacy |
+| `Q2_K` / `Q3_K` | 2.63 / 3.44 | yes | no | |
+| `IQ4_NL` / `IQ4_XS` | 4.5 / 4.25 | yes | no | Non-linear codebook |
+| `MXFP4` | 4.25 | yes | no | E8M0 scale |
 
-`Q4_K_M` e `Q4_K_S` são aceitos como sinônimos de `Q4_K`: o sufixo nomeia uma
-política de mistura por tensor, não um formato de bloco.
+`Q4_K_M` and `Q4_K_S` are accepted as synonyms of `Q4_K`: the suffix names a
+per-tensor mixing policy, not a block format.
 
 ---
 
 ## `airun inspect`
 
-| Flag | O que faz |
+| Flag | What it does |
 |---|---|
-| `--tensors` | Lista cada tensor com forma, tipo e offset. |
-| `--all-metadata` | Inclui os arrays enormes do tokenizer. |
-| `--json` | Saída legível por máquina. |
+| `--tensors` | Lists each tensor with shape, type and offset. |
+| `--all-metadata` | Includes the huge tokenizer arrays. |
+| `--json` | Machine-readable output. |
 
 ---
 
 ## `airun bench`
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `--prefill <lista>` | `128,512` | Tamanhos de prompt a medir. |
-| `--decode <N>` | `128` | Tokens gerados na medição de decode. |
-| `--decode-at <lista>` | `16` | Profundidades de contexto onde medir o decode, ex.: `--decode-at 16,1024,3072`. O prompt é ingerido antes e só a geração é cronometrada. |
-| `--runs <N>` | `3` | Execuções medidas por configuração. |
-| `--warmup <N>` | `1` | Execuções descartadas (JIT de kernel, subida de clock). |
-| `--text-file <arquivo>` | — | Monta os prompts a partir deste texto em vez de um token repetido. Modelos MoE usam uma passagem embutida por padrão. |
-| `--temp <T>` | `0` | Temperatura da amostragem no decode; 0 é greedy. |
-| `--json` | — | Saída legível por máquina. |
+| `--prefill <list>` | `128,512` | Prompt sizes to measure. |
+| `--decode <N>` | `128` | Tokens generated in the decode measurement. |
+| `--decode-at <list>` | `16` | Context depths at which to measure decode, e.g. `--decode-at 16,1024,3072`. The prompt is ingested first and only generation is timed. |
+| `--runs <N>` | `3` | Measured runs per configuration. |
+| `--warmup <N>` | `1` | Discarded runs (kernel JIT, clock ramp-up). |
+| `--text-file <file>` | — | Builds the prompts from this text instead of a repeated token. MoE models use a built-in passage by default. |
+| `--temp <T>` | `0` | Sampling temperature in decode; 0 is greedy. |
+| `--json` | — | Machine-readable output. |
 
-**Em MoE com `--expert-cache`, meça com texto natural e `--temp 0.7`.** Um
-token repetido roteia sempre para os mesmos experts, e o greedy entra em laço;
-os dois fazem o cache parecer perfeito. A coluna *expert hit* mostra a taxa de
-acerto de cada teste.
+**On MoE with experts outside VRAM, measure with natural text and
+`--temp 0.7`.** A repeated token always routes to the same experts, and greedy
+falls into loops; both make the cache look perfect. The *expert hit* column
+shows each test's hit rate.
 
-Reporta a **mediana**, não a média: uma única interrupção de escalonamento
-distorce demais a média de três execuções.
+It reports the **median**, not the mean: a single scheduling interruption
+skews the mean of three runs too much.
 
-**O decode não é uma taxa só.** A atenção lê o cache inteiro a cada token, então
-a taxa cai com o contexto — num Qwen3-1.7B, de 234 t/s com o contexto vazio para
-128 t/s a 3072 tokens. O default (`--decode-at 16`) mede só o caso vazio, que é
-o melhor caso e não descreve uma conversa longa. Ao comparar duas versões,
-compare na mesma profundidade.
+**Decode is not a single rate.** Attention reads the whole cache on every
+token, so the rate drops with context — on a Qwen3-1.7B, from 234 t/s with an
+empty context to 128 t/s at 3072 tokens. The default (`--decode-at 16`)
+measures only the empty case, which is the best case and does not describe a
+long conversation. When comparing two versions, compare at the same depth.
 
 ---
 
 ## `airun perplexity`
 
-Pontua um texto conhecido e reporta a perda média, a perplexidade e a taxa de
-acerto top-1. Serve para responder "este modelo está *certo*?", que a geração de
-texto não responde: um decodificador com um layout trocado ainda escreve inglês
-fluente enquanto responde a outra pergunta.
+Scores a known text and reports the mean loss, the perplexity and the top-1
+hit rate. It answers "is this model *right*?", which text generation does not:
+a decoder with a swapped layout still writes fluent English while answering
+another question.
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `-t`, `--text <TEXTO>` | passagem embutida | Texto a pontuar. |
-| `-f`, `--file <ARQUIVO>` | — | Lê o texto de um arquivo. Conflita com `--text`. |
-| `-n`, `--limit <N>` | `0` (tudo) | Para depois de N tokens. |
-| `--worst <N>` | `0` | Lista os N tokens pior previstos, do pior para o melhor. |
-| `--batched` | desligado | Com `--chunk`: cada bloco numa passada só, pelos kernels de prefill (como o `llama-perplexity`), em vez de token a token. Mede o custo de qualidade do caminho de prefill (ex.: ativações FP4). |
-| `--chunk <N>` | `0` | Pontua como o `llama-perplexity -c N`: blocos de N tokens, contexto reiniciado em cada um, só a segunda metade conta. Mesmo texto e N dão números comparáveis entre os dois (normalize CRLF→LF antes: o llama.cpp lê `-f` em modo texto no Windows). |
-| `-c`, `--ctx-size <N>` | `4096` | Tamanho do contexto. |
-| `--gpus`, `--tensor-split`, `--single-gpu` | | Iguais às de `run`. |
+| `-t`, `--text <TEXT>` | built-in passage | Text to score. |
+| `-f`, `--file <FILE>` | — | Reads the text from a file. Conflicts with `--text`. |
+| `-n`, `--limit <N>` | `0` (all) | Stops after N tokens. |
+| `--worst <N>` | `0` | Lists the N worst-predicted tokens, worst first. |
+| `--batched` | off | With `--chunk`: each chunk in a single pass, through the prefill kernels (like `llama-perplexity`), instead of token by token. Measures the quality cost of the prefill path (e.g. FP4 activations). |
+| `--chunk <N>` | `0` | Scores like `llama-perplexity -c N`: chunks of N tokens, context reset in each, only the second half counts. Same text and N give comparable numbers between the two (normalize CRLF→LF first: llama.cpp reads `-f` in text mode on Windows). |
+| `-c`, `--ctx-size <N>` | `4096` | Context size. |
+| `--gpus`, `--tensor-split`, `--single-gpu` | | Same as `run`. |
 
-Os tokens são alimentados **um a um**, que é o caminho que a decodificação
-realmente toma — um estado recorrente atualizado errado seria invisível numa
-única passagem em lote.
+Tokens are fed **one at a time**, which is the path decoding actually takes —
+a wrongly updated recurrent state would be invisible in a single batched
+pass.
 
-Valores de referência nesta máquina, na passagem embutida:
+Reference values on this machine, on the built-in passage:
 
-| Modelo | Perda | Top-1 |
+| Model | Loss | Top-1 |
 |---|---|---|
-| Qwen3-8B Q4_K (denso, correto) | 2.20 | 50.9% |
-| Qwen3-1.7B Q8_K_XL (denso, correto) | 2.43 | 47.2% |
-| Qwen3.5-9B Q4_K_M (híbrido) | 4.40 | 20.1% |
-| Qwen3.6-35B-A3B Q4_K_XL (híbrido + MoE) | 11.86 | 1.9% |
+| Qwen3-8B Q4_K (dense, correct) | 2.20 | 50.9% |
+| Qwen3-1.7B Q8_K_XL (dense, correct) | 2.43 | 47.2% |
+| Qwen3.5-9B Q4_K_M (hybrid) | 4.40 | 20.1% |
+| Qwen3.6-35B-A3B Q4_K_XL (hybrid + MoE) | 11.86 | 1.9% |
 
-`ln(248320) = 12.4` é o valor de um modelo que chuta uniformemente.
+`ln(248320) = 12.4` is the value of a model guessing uniformly.
 
 ---
 
 ## `airun selftest`
 
-| Flag | Padrão | O que faz |
+| Flag | Default | What it does |
 |---|---|---|
-| `--device <ordinal>` | `0` | GPU a testar. |
-| `--verbose` | desligado | Mostra cada caso, inclusive os que passam. |
+| `--device <ordinal>` | `0` | GPU to test. |
+| `--verbose` | off | Shows every case, including the passing ones. |
 
-Compara os 16 decodificadores GPU, o matvec de cada tipo, rmsnorm, swiglu, rope
-e atenção contra a referência CPU. **Rode isto depois de mexer em qualquer
-kernel.**
+Compares the GPU decoders, the matvec of each type, rmsnorm, swiglu, rope,
+attention and the MoE expert kernels against the CPU reference. **Run it after
+touching any kernel.**
 
 ---
 
-## Variáveis de ambiente
+## Environment variables
 
-| Variável | O que faz |
+| Variable | What it does |
 |---|---|
-| `AIRUN_API_KEY` | Alternativa a `--api-key`. |
-| `AIRUN_CUDA_ARCHS` | Arquiteturas CUDA compiladas (build). Ex.: `120` durante desenvolvimento, para builds rápidas. Padrão: `75,80,86,89,120`. |
-| `AIRUN_NVCC_CCBIN` | Diretório do compilador host para o nvcc, se a detecção automática falhar. |
-| `AIRUN_SKIP_CUDA` | Compila sem kernels GPU (só parsing de arquivos). |
-| `CUDA_PATH` | Onde achar o toolkit CUDA. |
+| `AIRUN_API_KEY` | Alternative to `--api-key`. |
+| `AIRUN_CUDA_ARCHS` | CUDA architectures compiled (build). E.g. `120` during development, for fast builds. Default: `75,80,86,89,120`. |
+| `AIRUN_NVCC_CCBIN` | Host compiler directory for nvcc, if automatic detection fails. |
+| `AIRUN_SKIP_CUDA` | Builds without GPU kernels (file parsing only). |
+| `CUDA_PATH` | Where to find the CUDA toolkit. |
 
-### Variáveis de depuração dos híbridos
+### Hybrid debugging variables
 
-Existem porque várias ambiguidades de layout produzem tensores da **mesma
-forma**: nenhuma validação as distingue, só a saída do modelo. Cada uma liga a
-interpretação alternativa; meça a diferença com `airun perplexity`, não olhando
-o texto gerado. Todas as escolhas atuais foram medidas de novo depois da correção de 2026-09-26 e são as melhores.
+They exist because several layout ambiguities produce tensors of the **same
+shape**: no validation tells them apart, only the model's output. Each one
+turns on the alternative interpretation; measure the difference with `airun
+perplexity`, not by looking at the generated text. Every current choice was
+measured again after the 2026-09-26 fix and is the best.
 
-| Variável | Interpretação alternativa que liga |
+| Variable | Alternative interpretation it turns on |
 |---|---|
-| `AIRUN_ROPE_SCALING=none\|linear\|yarn` | Ignora o `rope.scaling.type` do arquivo, como o `--rope-scaling` do llama.cpp. Para A/B. |
-| `AIRUN_ROPE_MSCALE=<f>` | Substitui o fator de magnitude do YaRN (padrão `1 + 0.1 ln fator`). Para A/B. |
-| `AIRUN_EMBED_ON_GPU=1` | Mantém a tabela de embeddings na VRAM. Por padrão ela fica em RAM pinned (como no llama.cpp) quando não é amarrada à cabeça de saída: ~0,8 GiB a menos num vocabulário de 250k. |
-| `AIRUN_NO_FP4=1` | Prefill NVFP4 no MMQ int8 (ativações de 8 bits) em vez dos tensor cores FP4 do Blackwell (ativações de 4 bits). Mais lento, um pouco mais exato. |
-| `AIRUN_NO_Q8_WIDE=1` | Decode e verify NVFP4 voltam aos kernels de um warp por quatro linhas. |
-| `AIRUN_NO_Q8_MULTI=1` | Lotes de 2–8 tokens voltam ao kernel tiled em vez do que decodifica cada grupo uma vez para todos os tokens. |
-| `AIRUN_SPEC_TIMING=1` | Imprime o tempo médio de verify, commit e rascunho por passo especulativo. |
-| `AIRUN_MATVEC_F32=1` | Todos os matvecs no caminho f32 exato (o de referência). Sem ela, o decode já é exato; lotes pequenos usam dp4a sobre ativações Q8 e lotes grandes usam tensor cores int8 (MMQ) — ambos validados no selftest por limite de erro backward e fim-a-fim por perplexidade. Use quando "idêntico à referência" importa mais que velocidade. |
-| `AIRUN_NO_WMMA=1` | Mantém lotes grandes nos kernels de registrador (mede o caminho tensor-core contra eles sem rebuild). |
-| `AIRUN_NO_MMQ=1` | Lotes de 64+ tokens saem dos tensor cores int8 (MMQ) e voltam para o fp16 (WMMA). |
-| `AIRUN_NO_MMQ_ASYNC=1` | Mantém o MMQ, mas na versão síncrona (sem `cp.async`). |
-| `AIRUN_NO_FLASH=1` | O prefill usa o kernel de atenção antigo (um bloco por query) em vez da flash attention. |
-| `AIRUN_NO_GQA_DECODE=1` | O decode usa o kernel de atenção por head de query em vez do agrupado por head de KV. |
-| `AIRUN_ABLATE=ssm,attn,ffn` | Zera a contribuição desses blocos ao residual. Um bloco correto sempre pontua melhor que bloco nenhum. Sanidade: `ffn` no 8B denso leva a perda de 2.20 para 25.96 — se ela **não** se mexer, a flag não está ligada naquele caminho. |
-| `AIRUN_TRACE_LAYERS=1` | Imprime rms/média de cada bloco e do residual, camada a camada. |
-| `AIRUN_TRACE_SSM=<camada>` | Imprime as faixas de q, k, v, z, decay, beta, estado e saída dessa camada delta-net. |
-| `AIRUN_SSM_GATE_BEFORE_NORM=1` | Aplica o gate antes da normalização (a ordem antiga, errada). |
-| `AIRUN_SSM_GATE_SIGMOID=1` | Sigmoid em vez de SiLU no gate. |
-| `AIRUN_SSM_QKV_ORDER=<perm>` | Ordem dos três blocos em `attn_qkv`, ex.: `kqv`. Padrão `qkv`. |
-| `AIRUN_SSM_QKV_GROUPED=1` | `attn_qkv` agrupado por k-head em vez de blocos contíguos. |
-| `AIRUN_SSM_SWAP_AB=1` | Troca `ssm_alpha` e `ssm_beta`. |
-| `AIRUN_SSM_CONV_REVERSE=1` | Inverte a ordem dos taps da convolução. |
-| `AIRUN_SSM_NO_L2NORM=1` | Não normaliza q/k para norma unitária. |
-| `AIRUN_SSM_NO_QSCALE=1` | Não escala q por `1/sqrt(head_k_dim)`. |
-| `AIRUN_SSM_NO_CONV_SILU=1` | Sem SiLU depois da convolução. |
-| `AIRUN_SSM_A_IS_LOG=1` | Trata `ssm_a` como `A_log` cru mesmo já sendo negativo. |
-| `AIRUN_ATTN_GATE_BLOCKED=1` | `attn_q` como `[todos os q][todos os gates]` em vez de intercalado por head. |
-| `AIRUN_ATTN_GATE_FIRST=1` | O gate é a **primeira** metade da fatia de cada head. |
-| `AIRUN_ATTN_NO_GATE=1` | Não aplica o gate sigmoid na saída da atenção. |
-| `AIRUN_ROPE_FULL=1` | Rotaciona `head_dim` inteiro em vez de `rope.dimension_count`. |
-| `AIRUN_ROPE_INTERLEAVED=1` | Pareamento GPT-J `(2i, 2i+1)` em vez de NeoX `(i, i + dim/2)`. |
-| `AIRUN_ROPE_OFF=1` | Sem RoPE nenhum. O custo disso mede quanto o modelo usa posição: no 8B denso vale +2.75 nats, no 9B híbrido +0.04. |
-| `AIRUN_ATTN_WINDOW=<n>` | Força uma janela deslizante. Com `1` cada query só se vê; o custo mede quanto a atenção tira do histórico. |
+| `AIRUN_ROPE_SCALING=none\|linear\|yarn` | Ignores the file's `rope.scaling.type`, like llama.cpp's `--rope-scaling`. For A/B. |
+| `AIRUN_ROPE_MSCALE=<f>` | Replaces YaRN's magnitude factor (default `1 + 0.1 ln factor`). For A/B. |
+| `AIRUN_EMBED_ON_GPU=1` | Keeps the embedding table in VRAM. By default it stays in pinned RAM (as in llama.cpp) when not tied to the output head: ~0.8 GiB less on a 250k vocabulary. |
+| `AIRUN_NO_FP4=1` | NVFP4 prefill on the int8 MMQ (8-bit activations) instead of Blackwell's FP4 tensor cores (4-bit activations). Slower, slightly more exact. |
+| `AIRUN_NO_Q8_WIDE=1` | NVFP4 decode and verify go back to the one-warp-per-four-rows kernels. |
+| `AIRUN_NO_Q8_MULTI=1` | Batches of 2–8 tokens go back to the tiled kernel instead of the one that decodes each group once for all tokens. |
+| `AIRUN_SPEC_TIMING=1` | Prints the mean verify, commit and draft time per speculative step. |
+| `AIRUN_MATVEC_F32=1` | Every matvec on the exact f32 path (the reference one). Without it, decode is already exact; small batches use dp4a over Q8 activations and large ones int8 tensor cores (MMQ) — both validated in the selftest by a backward error bound and end to end by perplexity. Use it when "identical to the reference" matters more than speed. |
+| `AIRUN_NO_WMMA=1` | Keeps large batches on the register kernels (measures the tensor-core path against them without a rebuild). |
+| `AIRUN_NO_MMQ=1` | Batches of 64+ tokens leave the int8 tensor cores (MMQ) and go back to fp16 (WMMA). |
+| `AIRUN_NO_MMQ_ASYNC=1` | Keeps MMQ, but the synchronous version (no `cp.async`). |
+| `AIRUN_NO_FLASH=1` | Prefill uses the old attention kernel (one block per query) instead of flash attention. |
+| `AIRUN_NO_GQA_DECODE=1` | Decode uses the per-query-head attention kernel instead of the one grouped by KV head. |
+| `AIRUN_ABLATE=ssm,attn,ffn` | Zeroes these blocks' contribution to the residual. A correct block always scores better than no block. Sanity: `ffn` on the dense 8B takes the loss from 2.20 to 25.96 — if it does **not** move, the flag is not wired on that path. |
+| `AIRUN_TRACE_LAYERS=1` | Prints rms/mean of each block and of the residual, layer by layer. |
+| `AIRUN_TRACE_SSM=<layer>` | Prints the ranges of q, k, v, z, decay, beta, state and output of that delta-net layer. |
+| `AIRUN_SSM_GATE_BEFORE_NORM=1` | Applies the gate before normalization (the old, wrong order). |
+| `AIRUN_SSM_GATE_SIGMOID=1` | Sigmoid instead of SiLU in the gate. |
+| `AIRUN_SSM_QKV_ORDER=<perm>` | Order of the three blocks in `attn_qkv`, e.g. `kqv`. Default `qkv`. |
+| `AIRUN_SSM_QKV_GROUPED=1` | `attn_qkv` grouped by k-head instead of contiguous blocks. |
+| `AIRUN_SSM_SWAP_AB=1` | Swaps `ssm_alpha` and `ssm_beta`. |
+| `AIRUN_SSM_CONV_REVERSE=1` | Reverses the order of the convolution taps. |
+| `AIRUN_SSM_NO_L2NORM=1` | Does not normalize q/k to unit norm. |
+| `AIRUN_SSM_NO_QSCALE=1` | Does not scale q by `1/sqrt(head_k_dim)`. |
+| `AIRUN_SSM_NO_CONV_SILU=1` | No SiLU after the convolution. |
+| `AIRUN_SSM_A_IS_LOG=1` | Treats `ssm_a` as raw `A_log` even when it is already negative. |
+| `AIRUN_ATTN_GATE_BLOCKED=1` | `attn_q` as `[all q][all gates]` instead of interleaved per head. |
+| `AIRUN_ATTN_GATE_FIRST=1` | The gate is the **first** half of each head's slice. |
+| `AIRUN_ATTN_NO_GATE=1` | Does not apply the sigmoid gate on the attention output. |
+| `AIRUN_ROPE_FULL=1` | Rotates the whole `head_dim` instead of `rope.dimension_count`. |
+| `AIRUN_ROPE_INTERLEAVED=1` | GPT-J pairing `(2i, 2i+1)` instead of NeoX `(i, i + dim/2)`. |
+| `AIRUN_ROPE_OFF=1` | No RoPE at all. Its cost measures how much the model uses position: on the dense 8B +2.75 nats, on the hybrid 9B +0.04. |
+| `AIRUN_ATTN_WINDOW=<n>` | Forces a sliding window. With `1` each query sees only itself; the cost measures how much attention takes from the history. |
 
-### Variáveis de desempenho
+### Performance variables
 
-Cada uma desliga (ou força) uma otimização, para medir o ganho dela sem
-recompilar. Nenhuma muda o resultado além de arredondamento — as que mexem na
-ordem das somas estão cobertas pelo selftest e pela perplexidade. Meça sempre
-alternando as execuções (veja `benchmarks/2026-09-26/scoreboard.ps1`): nesta
-máquina, outro programa desenhando na GPU atrasa kernels em ~300 µs a cada 4 ms,
-e duas sessões separadas variam ~15%.
+Each one turns off (or forces) an optimization, to measure its gain without
+recompiling. None changes the result beyond rounding — the ones that change
+the order of sums are covered by the selftest and perplexity. Always measure
+alternating the runs (see `benchmarks/2026-09-26/scoreboard.ps1`): on this
+machine, another program drawing on the GPU delays kernels by ~300 µs every
+4 ms, and two separate sessions vary by ~15%.
 
-| Variável | Efeito |
+| Variable | Effect |
 |---|---|
-| `AIRUN_NO_MMQ_STREAMK=1` | O MMQ assíncrono volta à grade de tiles inteiros (com split-K onde ela ocupa mal a GPU). Com stream-K as últimas tiles são divididas em fatias de K iguais entre todos os SMs: prefill de 128 tokens no Qwen3-4B de 2767 para 3269 t/s. |
-| `AIRUN_NO_FP4_GLU=1` | Num FFN NVFP4 nas RTX 50, gate e up voltam a ser dois matmuls FP4, com o SwiGLU na quantização do down. Por padrão os três são um launch só (SwiGLU no epílogo): +2% de prefill no 27B. |
-| `AIRUN_NO_DELTA_CHUNK=1` | O prefill das camadas delta-net volta à recorrência token a token. Por padrão, lotes de 64+ tokens usam a forma em blocos nos tensor cores (bf16, acumulação fp32): +8,5% de prefill no 27B, +7% no 35B, perplexidade igual. |
-| `AIRUN_NO_MMQ_SPLIT=1` | Sem split-K no MMQ (onde o stream-K não roda: kernel síncrono, Q6_K). |
-| `AIRUN_MMQ_TC=64` ou `=128` | Força a largura da tile de tokens do MMQ. Padrão: 128 a partir de 128 tokens. |
-| `AIRUN_NO_MMQ_GLU=1` | Gate, up e SwiGLU do prefill em três lançamentos em vez de um. |
-| `AIRUN_ATTN_PV_F32=1` | O prefill soma P·V em fp32 também com contexto longo (a partir de 4096 chaves, o padrão é fp16 por tile de chaves, somado em fp32). |
-| `AIRUN_NO_SPLIT_WAVES=1` | O decode usa todas as divisões do cache que a posição permite, sem arredondar para ondas inteiras de blocos (veja `attention_active_splits`). |
-| `AIRUN_NO_FLASH2=1` | O prefill usa a flash attention WMMA antiga em vez da de `mma.sync` (head_dim 64/128). |
-| `AIRUN_NO_SPLIT_ATTN=1` | O decode usa o kernel de atenção de um bloco por head, sem dividir o contexto. |
-| `AIRUN_NO_FUSED_PROLOGUE=1` | q/k norm, RoPE e escrita no cache em lançamentos separados. |
-| `AIRUN_NO_FUSED_NORMS=1` | Soma residual e RMSNorm seguinte em dois lançamentos. |
-| `AIRUN_NO_GRAPH=1` | O decode lança os kernels um a um em vez de repetir um CUDA graph capturado. |
-| `AIRUN_NO_ROWS_GRAPH=1` | O passo em lote do `serve --parallel` (`decode_rows`) lança os kernels um a um. Por padrão é um grafo por lista de slots: 4 pedidos no 27B de 59 para 70 tok/s somados. |
-| `AIRUN_NO_ROWS_BATCH=1` | No passo em lote, atenção, delta-net e convolução rodam um kernel por linha em vez de um para todas (mesmo resultado; 4 pedidos no 4B: 300 contra 370 tok/s). |
-| `AIRUN_NO_TALLK_TOKENS=1` | Matrizes estreitas (menos de 512 linhas, como os portões da delta-net) com 2 a 16 tokens voltam ao kernel em blocos. Por padrão ficam no de um bloco por linha e token: verify do MTP no 27B +7%. |
-| `AIRUN_NO_HALF_MATVEC=1` | Matrizes BF16/F16 com 1 a 8 tokens (a cabeça de saída de vários GGUF) voltam aos kernels por grupo. |
-| `AIRUN_SCHED_TIMING=1` | Uma linha por passo em lote do `serve --parallel`: forward, amostragem, entrega. Atrapalha a medição de velocidade. |
-| `AIRUN_HIDE_GPUS=<lista>` | Como `--hide-gpu`, para todo comando: GPUs que o airun nunca toca. Não combina com `CUDA_VISIBLE_DEVICES`. |
-| `AIRUN_NO_KV_RAM=1` | Quando o contexto pedido não cabe, tira pesos da VRAM em vez do cache KV (o comportamento antigo). |
-| `AIRUN_NO_SPLIT_VERIFY=1` | A atenção do verify do MTP (vários tokens sobre um cache) volta ao kernel de prefill, que lê o contexto inteiro por bloco: 27B a 25 mil tokens, 52,8 → 34,2 tok/s. |
-| `AIRUN_RAM_ON_GPU=1` | Camadas que ficam na RAM são sempre copiadas para a VRAM antes de rodar, em vez de multiplicadas na CPU na geração. |
-| `AIRUN_CPU_THREADS=<n>` | Threads dos matmuls na CPU (padrão: uma por núcleo lógico). Na memória DDR5 do 13700, 8 já saturam a banda. |
-| `AIRUN_DISK_AHEAD=<n>` | Com `--disk-offload`, quantas camadas do disco são lidas adiantadas enquanto a atual roda (padrão 2). Cada uma ocupa sua parte do cache de arquivos. |
-| `AIRUN_DISK_THREADS=<n>` | Threads que leem essas camadas adiantadas (padrão 4). |
-| `AIRUN_NO_LAYERED=1` | Com camadas no disco, o prompt volta a passar bloco por bloco por todas as camadas (lendo o disco uma vez por bloco). |
-| `AIRUN_LAYERED_TOKENS=<n>` | Tokens do prompt que passam juntos por cada camada do disco (padrão 8192). Cada token custa 8 bytes × largura do modelo de memória temporária. |
-| `AIRUN_CPU_MAX_TOKENS=<n>` | Passadas de até n tokens multiplicam as camadas da RAM na CPU; maiores copiam para a GPU (padrão 64). |
-| `AIRUN_NO_ROWS_SPEC=1` | Com `serve --parallel`, os passos em lote seguem sem rascunhos do MTP (só o pedido sozinho rascunha). |
-| `AIRUN_ROWS_DRAFT=<k2,k3,...>` | Rascunhos por pedido num passo em lote de 2, 3... pedidos (padrão `2,1,1`; 0 = sem rascunho). |
-| `AIRUN_NO_SPLIT_FEW=1` | 2 a 16 tokens num tipo sem kernel de vários tokens (IQ4_XS, por exemplo) vão para o kernel em blocos em vez de uma chamada por token. |
-| `AIRUN_NO_PARALLEL_SOLO=1` | Com `serve --parallel`, um pedido sozinho também passa pelo passo em lote (sem MTP, logits copiados para o host). |
-| `AIRUN_NO_GPU_ARGMAX=1` | Decodificação gulosa copia os logits para o host e escolhe lá. |
-| `AIRUN_NO_DECODE_PIPELINE=1` | Decodificação gulosa espera cada token antes de enfileirar o passo seguinte. Com o pipeline o passo i+1 lê o token do passo i direto da GPU; o texto gerado é idêntico. Não roda em híbridos (o estado recorrente absorveria o passo especulativo). |
+| `AIRUN_NO_MMQ_STREAMK=1` | Async MMQ goes back to the whole-tile grid (with split-K where it fills the GPU poorly). With stream-K the last tiles are split into equal K slices across all SMs: 128-token prefill on Qwen3-4B from 2767 to 3269 t/s. |
+| `AIRUN_NO_FP4_GLU=1` | In an NVFP4 FFN on RTX 50, gate and up go back to two FP4 matmuls, with SwiGLU in the down's quantization. By default the three are one launch (SwiGLU in the epilogue): +2% prefill on the 27B. |
+| `AIRUN_NO_DELTA_CHUNK=1` | Delta-net layer prefill goes back to the token-by-token recurrence. By default, batches of 64+ tokens use the chunked form on the tensor cores (bf16, fp32 accumulation): +8.5% prefill on the 27B, +7% on the 35B, same perplexity. |
+| `AIRUN_NO_MMQ_SPLIT=1` | No split-K in MMQ (where stream-K does not run: synchronous kernel, Q6_K). |
+| `AIRUN_MMQ_TC=64` or `=128` | Forces MMQ's token tile width. Default: 128 from 128 tokens. |
+| `AIRUN_NO_MMQ_GLU=1` | Prefill gate, up and SwiGLU in three launches instead of one. |
+| `AIRUN_ATTN_PV_F32=1` | Prefill sums P·V in fp32 also with long context (from 4096 keys, the default is fp16 per key tile, summed in fp32). |
+| `AIRUN_NO_SPLIT_WAVES=1` | Decode uses every cache split the position allows, without rounding to whole waves of blocks, and keeps 64 keys per split at short contexts (see `attention_active_splits`; 35B-A3B on an RTX 3060: 69–72 against 74–75 tok/s). |
+| `AIRUN_NO_FLASH2=1` | Prefill uses the old WMMA flash attention instead of the `mma.sync` one (head_dim 64/128). |
+| `AIRUN_NO_SPLIT_ATTN=1` | Decode uses the one-block-per-head attention kernel, without splitting the context. |
+| `AIRUN_NO_FUSED_PROLOGUE=1` | q/k norm, RoPE and cache write in separate launches. |
+| `AIRUN_NO_FUSED_NORMS=1` | Residual add and the next RMSNorm in two launches. |
+| `AIRUN_NO_GRAPH=1` | Decode launches the kernels one by one instead of replaying a captured CUDA graph. |
+| `AIRUN_NO_ROWS_GRAPH=1` | The `serve --parallel` batched step (`decode_rows`) launches the kernels one by one. By default it is one graph per slot list: 4 requests on the 27B from 59 to 70 tok/s summed. |
+| `AIRUN_NO_ROWS_BATCH=1` | In the batched step, attention, delta-net and convolution run one kernel per row instead of one for all (same result; 4 requests on the 4B: 300 against 370 tok/s). |
+| `AIRUN_NO_TALLK_TOKENS=1` | Narrow matrices (fewer than 512 rows, like the delta-net gates) with 2 to 16 tokens go back to the tiled kernel. By default they stay on the one-block-per-row-and-token one: MTP verify on the 27B +7%. |
+| `AIRUN_NO_HALF_MATVEC=1` | BF16/F16 matrices with 1 to 8 tokens (the output head of several GGUFs) go back to the per-group kernels. |
+| `AIRUN_SCHED_TIMING=1` | One line per `serve --parallel` batched step: forward, sampling, delivery. Disturbs speed measurement. |
+| `AIRUN_HIDE_GPUS=<list>` | Like `--hide-gpu`, for every command: GPUs airun never touches. Does not combine with `CUDA_VISIBLE_DEVICES`. |
+| `AIRUN_NO_KV_RAM=1` | When the requested context does not fit, takes weights out of VRAM instead of the KV cache (the old behavior). |
+| `AIRUN_NO_SPLIT_VERIFY=1` | MTP verify attention (several tokens over one cache) goes back to the prefill kernel, which reads the whole context per block: 27B at 25k tokens, 52.8 → 34.2 tok/s. |
+| `AIRUN_RAM_ON_GPU=1` | Layers that stay in RAM are always copied to VRAM before running, instead of multiplied on the CPU during generation. |
+| `AIRUN_CPU_THREADS=<n>` | Threads for CPU matmuls (default: one per logical core). On the 13700's DDR5, 8 already saturate the bandwidth. |
+| `AIRUN_CPU_SPIN_US=<n>` | How long CPU worker threads spin waiting for the next matmul (default 200 µs). Much longer starves the thread driving the GPU (5 ms: 3.0 → 0.9 tok/s). |
+| `AIRUN_CPU_STATS=1` | Every 1000 CPU matmuls, prints the time inside them and the bandwidth. |
+| `AIRUN_DISK_AHEAD=<n>` | With `--disk-offload`, how many disk layers are read ahead while the current one runs (default 2). Each takes its share of the file cache. |
+| `AIRUN_DISK_THREADS=<n>` | Threads reading those layers ahead (default 4). |
+| `AIRUN_NO_LAYERED=1` | With layers on disk, the prompt goes back to passing chunk by chunk through all layers (reading the disk once per chunk). |
+| `AIRUN_LAYERED_TOKENS=<n>` | Prompt tokens that pass together through each disk layer (default 8192). Each token costs 8 bytes × model width of temporary memory. |
+| `AIRUN_CPU_MAX_TOKENS=<n>` | Passes of up to n tokens multiply the RAM layers on the CPU; larger ones copy to the GPU (default 64). |
+| `AIRUN_NO_ROWS_SPEC=1` | With `serve --parallel`, batched steps run without MTP drafts (only the lone request drafts). |
+| `AIRUN_ROWS_DRAFT=<k2,k3,...>` | Drafts per request in a batched step of 2, 3... requests (default `2,1,1`; 0 = no draft). |
+| `AIRUN_NO_SPLIT_FEW=1` | 2 to 16 tokens on a type without a multi-token kernel (IQ4_XS, for example) go to the tiled kernel instead of one call per token. |
+| `AIRUN_NO_PARALLEL_SOLO=1` | With `serve --parallel`, a lone request also goes through the batched step (no MTP, logits copied to the host). |
+| `AIRUN_NO_GPU_ARGMAX=1` | Greedy decoding copies the logits to the host and picks there. |
+| `AIRUN_NO_DECODE_PIPELINE=1` | Greedy decoding waits for each token before queuing the next step. With the pipeline step i+1 reads step i's token straight from the GPU; the generated text is identical. Does not run on hybrids (the recurrent state would absorb the speculative step). |
+| `AIRUN_NO_KV_LOAN=1` | MoE experts in RAM no longer borrow the KV cache's still-unused rows (see [MoE: what is automatic](#moe-what-is-automatic)). |
+| `AIRUN_MOE_OVERLAP=0` | MoE decode computes resident and copied experts in one pass on one stream, instead of the copy running beside the resident ones. Slower; makes the sum order independent of where experts live (use it to compare greedy text). |
+| `AIRUN_MOE_F32=1` | MoE decode experts on the float kernels instead of int8 (dp4a). |
+| `AIRUN_STAGE_BLOCKS=<n>` | Blocks per expert in the RAM→VRAM expert copy (default 4). |
+| `AIRUN_EXPERT_PREFETCH=1` | Predicts a layer's experts as it starts and copies the ones in RAM while attention runs. Off by default: it lost on an RTX 3060 (67–69 against 70 tok/s). |

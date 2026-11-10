@@ -1,1480 +1,1778 @@
-# Guia para agentes de IA que trabalham no airun
+# Guide for AI agents working on airun
 
-Leia este arquivo **antes** de alterar qualquer coisa. Ele descreve o que o
-projeto é, o que já funciona, onde estão as armadilhas, e como verificar que
-você não quebrou nada.
-
----
-
-## 1. O que é o airun
-
-Uma engine de inferência de LLMs **escrita do zero**, em Rust + CUDA.
-
-**Isto não é um wrapper.** Não há llama.cpp, ggml, PyTorch, ONNX ou cuBLAS no
-caminho de execução. Todo kernel CUDA em `crates/airun-cuda/kernels/` foi
-escrito para este projeto. Se você se pegar prestes a adicionar uma dependência
-de inferência externa, pare: essa foi uma decisão explícita do usuário.
-
-Dependências permitidas: utilitários (clap, serde, memmap2, half, thiserror,
-anyhow, tokio, axum). O CUDA Runtime é usado apenas para gerenciar memória,
-streams e lançar *nossos* kernels.
+Read this file **before** changing anything. It describes what the project
+is, what already works, where the pitfalls are, and how to verify you did
+not break anything.
 
 ---
 
-## 2. Estado atual (verificado neste dispositivo)
+## 1. What airun is
 
-O airun é feito para a **família Qwen**. Arquiteturas (`general.architecture`):
+An LLM inference engine **written from scratch**, in Rust + CUDA.
 
-| Arquitetura | Modelos | Estado |
+**This is not a wrapper.** There is no llama.cpp, ggml, PyTorch, ONNX or
+cuBLAS on the execution path. Every CUDA kernel in `crates/airun-cuda/kernels/`
+was written for this project. If you catch yourself about to add an external
+inference dependency, stop: that was an explicit decision of the user.
+
+Allowed dependencies: utilities (clap, serde, memmap2, half, thiserror,
+anyhow, tokio, axum). The CUDA Runtime is used only to manage memory, streams
+and launch *our* kernels.
+
+---
+
+## 2. Current state (verified on this device)
+
+airun is built for the **Qwen family**. Architectures (`general.architecture`):
+
+| Architecture | Models | State |
 |---|---|---|
-| `qwen35` | Qwen3.5 / Qwen3.8 densos híbridos (ex.: 27B) | foco principal: MTP, visão, `--parallel`, NVFP4 |
-| `qwen35moe` | Qwen3.5 / Qwen3.8 MoE (ex.: 35B-A3B) | completo (MTP desligado por padrão) |
-| `qwen4exp` | Qwen4 Flash-Next (hyper-connections, PLE, QSA) | completo, sem `--parallel` |
-| `qwen3next`, `qwen3nextmoe` | Qwen3-Next | mesmo bloco híbrido |
-| `qwen3` | Qwen3 denso | completo |
-| `qwen2`, `llama` | mesmo formato de bloco | funciona, pouco testado |
-| `qwen3moe` | Qwen3-30B-A3B / 235B | **não** (o loader recusa com mensagem) |
+| `qwen35` | Dense hybrid Qwen3.5 / Qwen3.8 (e.g. 27B) | main focus: MTP, vision, `--parallel`, NVFP4 |
+| `qwen35moe` | Qwen3.5 / Qwen3.8 MoE (e.g. 35B-A3B) | complete (MTP off by default) |
+| `qwen4exp` | Qwen4 Flash-Next (hyper-connections, PLE, QSA) | complete, no `--parallel` |
+| `qwen3next`, `qwen3nextmoe` | Qwen3-Next | same hybrid block |
+| `qwen3` | Dense Qwen3 | complete |
+| `qwen2`, `llama` | same block layout | works, lightly tested |
+| `qwen3moe` | Qwen3-30B-A3B / 235B | **no** (the loader refuses with a message) |
 
-| Componente | Estado |
+| Component | State |
 |---|---|
-| Leitura GGUF (v1–v3) e safetensors | funciona |
-| Decodificadores de quantização | bit-exatos contra a referência CPU |
-| Quantizadores (escrita) | round-trip testado |
-| Kernels CUDA | 282 casos no selftest (276 numa Ampere, sem os de FP4) |
-| Multi-GPU, inclusive de gerações diferentes (build `86,120`) | validado (2× 5060 Ti; 5060 Ti + 3060) |
-| Planner de VRAM | testado, com fallback e contexto automático |
-| API no formato do llama-server | 56/56 em `tests/api_conformance.py` |
-| Amostragem e geração restrita (GBNF, JSON schema) | testadas |
-| MTP (especulativo), também com temperatura | 27B: 26 → 68 tok/s guloso, 25,7 → 47,2 a temp 0,7 |
-| Visão (`mmproj` qwen3vl_merger) | lê texto em imagem como o llama.cpp |
-| `serve --parallel` | 4 pedidos no 27B: ~85 tok/s somados (um sozinho com MTP: 38); um pedido sozinho igual a sem a flag (MTP incluso) |
-| Stream replay, níveis de raciocínio, barra de carga | testados |
+| GGUF (v1–v3) and safetensors reading | works |
+| Quantization decoders | bit-exact against the CPU reference |
+| Quantizers (writing) | round-trip tested |
+| CUDA kernels | 289 cases in the selftest (fewer on Ampere, without the FP4 ones) |
+| Multi-GPU, including different generations (build `86,120`) | validated (2× 5060 Ti; 5060 Ti + 3060) |
+| VRAM planner | tested, with fallback and automatic context |
+| llama-server-format API | 56/56 in `tests/api_conformance.py` |
+| Sampling and constrained generation (GBNF, JSON schema) | tested |
+| MTP (speculative), also with temperature | 27B: 26 → 68 tok/s greedy, 25.7 → 47.2 at temp 0.7 |
+| Vision (`mmproj` qwen3vl_merger) | reads text in images like llama.cpp |
+| `serve --parallel` | 4 requests on the 27B: ~85 tok/s summed (one alone with MTP: 38); a lone request same as without the flag (MTP included) |
+| Stream replay, reasoning levels, load progress bar | tested |
 
-**Ainda não:** `qwen3moe`, áudio, LoRA, rerank, vídeo, Qwen3-VL com deepstack.
+**Not yet:** `qwen3moe`, audio, LoRA, rerank, video, Qwen3-VL with deepstack.
 
 ---
 
-## 3. Mapa do código
+## 3. Code map
 
 ```
 crates/
-  airun-gguf/          formato de arquivo — sem CUDA, sem I/O de rede
-    ggml_type.rs       tabela de tipos; IDs desconhecidos NÃO são erro
-    reader.rs          parser GGUF (mmap, tudo com bounds-check)
-    dequant.rs         decodificadores CPU — ORÁCULO dos kernels GPU
-    quantize.rs        codificadores (f32 -> blocos)
-    writer.rs          escrita GGUF em streaming
-    safetensors.rs     leitura de checkpoints HF
+  airun-gguf/          file format — no CUDA, no network I/O
+    ggml_type.rs       type table; unknown IDs are NOT an error
+    reader.rs          GGUF parser (mmap, everything bounds-checked)
+    dequant.rs         CPU decoders — the ORACLE for the GPU kernels
+    quantize.rs        encoders (f32 -> blocks)
+    writer.rs          streaming GGUF writer
+    safetensors.rs     HF checkpoint reading
 
   airun-cuda/          GPU
-    build.rs           acha CUDA + MSVC, compila kernels/*.cu -> .lib
-    kernels/*.cu       OS KERNELS. Escritos à mão.
-    kernels/dequant.cuh  decodificadores GPU — espelho de dequant.rs
-    src/ffi.rs         FFI (só tipos de largura fixa)
-    src/ops.rs         wrappers seguros
+    build.rs           finds CUDA + MSVC, compiles kernels/*.cu -> .lib
+    kernels/*.cu       THE KERNELS. Hand-written.
+    kernels/dequant.cuh  GPU decoders — mirror of dequant.rs
+    src/ffi.rs         FFI (fixed-width types only)
+    src/ops.rs         safe wrappers
 
   airun-core/          runtime
-    config.rs          hiperparâmetros a partir dos metadados GGUF
-    plan.rs            planner de VRAM / split multi-GPU
-    tokenizer.rs       BPE byte-level (GPT-2/Qwen)
-    model.rs           upload de pesos
+    config.rs          hyperparameters from the GGUF metadata
+    plan.rs            VRAM planner / multi-GPU split
+    tokenizer.rs       byte-level BPE (GPT-2/Qwen)
+    model.rs           weight upload
     runtime.rs         forward pass
-    sample.rs          amostragem
-    loader.rs          orquestração + escada de fallback
+    kv_loan.rs         KV cache rows lent to MoE experts
+    spec.rs            MTP speculative decoding
+    cpu.rs             CPU matmuls for layers kept in RAM
+    sample.rs          sampling
+    loader.rs          orchestration + fallback ladder
 
-  airun-cli/           comandos
+  airun-cli/           commands
 ```
 
 ---
 
-## 4. A regra mais importante
+## 4. The most important rule
 
-> **`crates/airun-gguf/src/dequant.rs` e
-> `crates/airun-cuda/kernels/dequant.cuh` implementam a MESMA coisa duas
-> vezes, de propósito.**
+> **`crates/airun-gguf/src/dequant.rs` and
+> `crates/airun-cuda/kernels/dequant.cuh` implement the SAME thing twice, on
+> purpose.**
 
-O arquivo Rust é a referência legível; o `.cuh` é a versão GPU. `airun selftest`
-compara os dois numericamente.
+The Rust file is the readable reference; the `.cuh` is the GPU version.
+`airun selftest` compares the two numerically.
 
-Se você mudar um, **precisa** mudar o outro e rodar o selftest. Um layout de
-quantização sutilmente errado não trava — ele produz texto que parece quase
-certo. Isso é muito pior que um crash, e o selftest é a única defesa.
+If you change one, you **must** change the other and run the selftest. A
+subtly wrong quantization layout does not crash — it produces text that looks
+almost right. That is much worse than a crash, and the selftest is the only
+defense.
 
 ---
 
-## 5. Como verificar seu trabalho
+## 5. How to verify your work
 
-Sempre, nesta ordem:
+Always, in this order:
 
 ```powershell
-# Se Rust ou CUDA não estiverem no PATH, defina CARGO_HOME/RUSTUP_HOME/CUDA_PATH
-# (build.ps1 e build.sh descobrem sozinhos; um cargo manual precisa das variáveis).
-$env:AIRUN_CUDA_ARCHS="120"     # só a arch local: build rápido durante dev (tire na final)
+# If Rust or CUDA are not on PATH, set CARGO_HOME/RUSTUP_HOME/CUDA_PATH
+# (build.ps1 and build.sh find them on their own; a manual cargo needs the variables).
+$env:AIRUN_CUDA_ARCHS="120"     # local arch only: fast build during dev (drop it for the final)
 
-cargo test --release            # 60+ testes unitários
+cargo test --release            # 60+ unit tests
 cargo build --release
-.\target\release\airun.exe selftest        # cada kernel GPU contra a referência CPU
-.\target\release\airun.exe run <modelo-pequeno.gguf> -p "What is 2+2?" -n 20 --temp 0
+.\target\release\airun.exe selftest        # every GPU kernel against the CPU reference
+.\target\release\airun.exe run <small-model.gguf> -p "What is 2+2?" -n 20 --temp 0
 
-# e a métrica de qualidade, que é o que pega erro sutil (qualquer modelo num texto conhecido):
-.\target\release\airun.exe perplexity <modelo.gguf>
+# and the quality metric, which is what catches subtle errors (any model on a known text):
+.\target\release\airun.exe perplexity <model.gguf>
 ```
 
-Se o selftest passar mas a geração virar lixo, o bug está no *runtime*
-(ordem das operações, formato do KV cache, RoPE), não nos kernels.
+If the selftest passes but generation turns to garbage, the bug is in the
+*runtime* (order of operations, KV cache format, RoPE), not in the kernels.
 
-**Decode não é uma taxa só.** Ele cai com o contexto (1.7B: 234 t/s vazio,
-128 t/s a 3072). Ao comparar medições, compare na mesma profundidade.
+**Decode is not a single rate.** It drops with context (1.7B: 234 t/s empty,
+128 t/s at 3072). When comparing measurements, compare at the same depth.
 
-**Não julgue correção lendo o texto gerado.** Um modelo com um layout trocado
-escreve inglês fluente respondendo outra coisa, e uma continuação curta acerta
-por sorte — isso já inverteu uma decisão neste projeto. Use
-`airun perplexity`: ele pontua uma passagem conhecida e devolve perda e top-1,
-então qualquer hipótese vira um número comparável contra um modelo denso de
-controle.
+**Do not judge correctness by reading the generated text.** A model with a
+swapped layout writes fluent English answering something else, and a short
+continuation gets lucky — this has already reversed a decision in this
+project. Use `airun perplexity`: it scores a known passage and returns loss
+and top-1, so any hypothesis becomes a number comparable against a dense
+control model.
 
-**Não remova `AIRUN_CUDA_ARCHS` da build final.** O padrão compila para
-sm_75/80/86/89/120 e leva vários minutos, mas é o que dá suporte a RTX 20 até 50.
+**Do not drop `AIRUN_CUDA_ARCHS` handling from the final build.** The default
+compiles for sm_75/80/86/89/120 and takes several minutes, but it is what
+supports RTX 20 through 50.
 
 ---
 
-### Os três caminhos de matvec
+### The three matvec paths
 
-O decode (n=1) roda no kernel f32 exato — geração é bit-idêntica à referência
-CPU. Lotes de 2–63 tokens usam dp4a sobre ativações quantizadas (block_q8a em
-`vecdotq.cuh`, espelho em `quantize_q8a_mirror` no selftest — mudou um, mude o
-outro). Lotes de 64+ vão para **tensor cores int8** (MMQ, `mmq.cuh`) em sm_80+
-para Q8_0/Q4_K/Q5_K/Q6_K — os pesos viram os mesmos códigos inteiros do dp4a;
-Q8_0/Q4_K/Q5_K usam a versão com `cp.async` (`matvec_mmq_async_kernel`).
-Outros tipos e GPUs mais antigas vão para tensor cores fp16
-(`matvec_wmma_kernel`). Cada caminho tem seus casos no selftest com limite de
-erro backward; `AIRUN_MATVEC_F32=1` força o exato em tudo, `AIRUN_NO_MMQ=1`,
-`AIRUN_NO_MMQ_ASYNC=1` e `AIRUN_NO_WMMA=1` desligam cada um.
+Decode (n=1) runs on the exact f32 kernel — generation is bit-identical to the
+CPU reference. Batches of 2–63 tokens use dp4a over quantized activations
+(block_q8a in `vecdotq.cuh`, mirrored in `quantize_q8a_mirror` in the
+selftest — changed one, change the other). Batches of 64+ go to **int8 tensor
+cores** (MMQ, `mmq.cuh`) on sm_80+ for Q8_0/Q4_K/Q5_K/Q6_K — the weights
+become the same integer codes as dp4a; Q8_0/Q4_K/Q5_K use the `cp.async`
+version (`matvec_mmq_async_kernel`). Other types and older GPUs go to fp16
+tensor cores (`matvec_wmma_kernel`). Each path has its selftest cases with a
+backward error bound; `AIRUN_MATVEC_F32=1` forces the exact one everywhere,
+`AIRUN_NO_MMQ=1`, `AIRUN_NO_MMQ_ASYNC=1` and `AIRUN_NO_WMMA=1` turn each off.
 
-**NVFP4** (Qwen3.8-27B NVFP4) segue o caminho inteiro em todos os tamanhos,
-inclusive no decode (`KernelType::prefers_q8_decode`): a 4,5 bits o vetor f32
-que cada warp relê pesa mais que os pesos. Os nibbles FP4 viram int8 com
-`__byte_perm` (`fp4_codes8` em `dequant.cuh`) — a tabela `__constant__` antiga,
-indexada por um nibble diferente em cada lane, serializava e deixava o 27B em
-5 tok/s. Lotes de 2–8 tokens (o verify do MTP) usam `matvec_q8_multi_kernel`,
-que decodifica cada grupo uma vez (`mmq_decode`) e o gasta em todos os tokens.
-NVFP4 tem MMQ assíncrono e gate/up fundido (`mmq_async<NVFP4>`, blocos de 36
-bytes copiados como os do Q8_0). O decode NVFP4 usa `matvec_q8_wide_kernel`
-(128 threads cobrem o K de 2 linhas: com um warp por 4 linhas, uma linha de 5120
-era só 5 iterações por lane e a banda ficava em 73%); o verify do MTP usa a
-versão com vários tokens (`matvec_q8_wide_multi_kernel`).
+**NVFP4** (Qwen3.8-27B NVFP4) takes the integer path at every size, decode
+included (`KernelType::prefers_q8_decode`): at 4.5 bits the f32 vector each
+warp rereads weighs more than the weights. FP4 nibbles become int8 with
+`__byte_perm` (`fp4_codes8` in `dequant.cuh`) — the old `__constant__` table,
+indexed by a different nibble in each lane, serialized and left the 27B at
+5 tok/s. Batches of 2–8 tokens (the MTP verify) use `matvec_q8_multi_kernel`,
+which decodes each group once (`mmq_decode`) and spends it on every token.
+NVFP4 has async MMQ and fused gate/up (`mmq_async<NVFP4>`, 36-byte blocks
+copied like Q8_0's). NVFP4 decode uses `matvec_q8_wide_kernel` (128 threads
+cover the K of 2 rows: with one warp per 4 rows, a 5120 row was only 5
+iterations per lane and bandwidth stayed at 73%); the MTP verify uses the
+multi-token version (`matvec_q8_wide_multi_kernel`).
 
-**Prefill NVFP4 no Blackwell (sm_120): tensor cores FP4.**
-`kernels/sm120a/fp4mma.cu`, compilado à parte para `compute_120a` (o
-`mma ... kind::mxf4nvf4` só existe no alvo específico; o `build.rs` gera
-`airun_fp4.lib`). Os pesos entram como estão: a palavra t de um bloco NVFP4 já
-é o registrador do fragmento A e a palavra de escalas `d[4]` é o registrador de
-escala; a ativação é quantizada para o mesmo layout de bloco, mais uma escala
-f32 por token. Ativação em 4 bits, como o llama.cpp faz: na perplexidade em lote
-do 27B (blocos de 128, texto LF) int8 2,0727, FP4 2,0838, llama.cpp GPU 2,0862.
-Lotes de 32+ tokens; `AIRUN_NO_FP4=1` volta ao MMQ int8. O SwiGLU vai dentro da
-quantização da entrada da `down` (`quantize_glu_nvfp4`). O quantizador tem duas
-formas bit-idênticas: a vetorizada (4 lanes por run de 16, float4 coalescido,
-linha em registradores até K = 20480) para linhas alinhadas em 16 bytes e a
-escalar para o resto; o selftest compara as duas. A vetorizada levou o SwiGLU
-de 214 para 66 µs por camada (512 tokens, K 17408) e o pp2048 de 3623 para
-3690 t/s. Pôr o SwiGLU no epílogo do GEMM do `up` (com amax por linha via
-atomicMax) foi medido mais lento: 3450/3380 t/s. Escalas `0x7F` (zero
-para o ggml, NaN para o hardware) são zeradas no carregamento.
+**NVFP4 prefill on Blackwell (sm_120): FP4 tensor cores.**
+`kernels/sm120a/fp4mma.cu`, compiled separately for `compute_120a` (`mma ...
+kind::mxf4nvf4` only exists on the specific target; `build.rs` produces
+`airun_fp4.lib`). Weights go in as they are: word t of an NVFP4 block already
+is the A fragment register and the scale word `d[4]` is the scale register;
+the activation is quantized to the same block layout, plus one f32 scale per
+token. 4-bit activations, as llama.cpp does: in the 27B's batched perplexity
+(128 chunks, LF text) int8 2.0727, FP4 2.0838, llama.cpp GPU 2.0862. Batches
+of 32+ tokens; `AIRUN_NO_FP4=1` goes back to int8 MMQ. SwiGLU goes inside the
+quantization of the `down` input (`quantize_glu_nvfp4`). The quantizer has two
+bit-identical forms: the vectorized one (4 lanes per run of 16, coalesced
+float4, row in registers up to K = 20480) for 16-byte-aligned rows and the
+scalar one for the rest; the selftest compares the two. The vectorized one
+took SwiGLU from 214 to 66 µs per layer (512 tokens, K 17408) and pp2048 from
+3623 to 3690 t/s. Putting SwiGLU in the epilogue of the `up` GEMM (with
+per-row amax via atomicMax) measured slower: 3450/3380 t/s. `0x7F` scales
+(zero for ggml, NaN for the hardware) are zeroed at load.
 
-O MMQ assíncrono usa **stream-K** quando as tiles não fecham ondas inteiras de
-SMs (`MmqStreamK` em `mmq.cuh`): as ondas cheias rodam tiles inteiras e as
-tiles que sobram são divididas em fatias de K iguais entre uma onda de blocos.
-O bloco que tem o começo de uma tile ("head") espera as flags dos blocos
-seguintes ("tails") e soma os parciais na ordem dos blocos — determinístico.
-As esperas só apontam para blocos de índice maior e o host limita o stream-K a
-uma onda residente, então não trava. Gate+up+SwiGLU do prefill são um
-lançamento só (`GLU=true`), inclusive no stream-K (os slots levam as somas
-cruas de gate e up; o SwiGLU roda no head). Não capture MMQ num CUDA graph: o
-`epoch` das flags congelaria (`mmq_streamk_plan` recusa em stream capturando).
+Async MMQ uses **stream-K** when the tiles do not close whole waves of SMs
+(`MmqStreamK` in `mmq.cuh`): full waves run whole tiles and the leftover tiles
+are split into equal K slices across one wave of blocks. The block holding the
+start of a tile ("head") waits for the flags of the following blocks
+("tails") and adds the partials in block order — deterministic. Waits only
+point at higher-index blocks and the host limits stream-K to one resident
+wave, so it does not deadlock. Prefill gate+up+SwiGLU are a single launch
+(`GLU=true`), stream-K included (the slots carry the raw gate and up sums;
+SwiGLU runs in the head). Do not capture MMQ in a CUDA graph: the flags'
+`epoch` would freeze (`mmq_streamk_plan` refuses on a capturing stream).
 
-No decode, o Q8_0 carrega os bytes de todas as linhas do warp antes de usar
-qualquer uma (`q8_0_load`/`q8_0_decode` em `dequant.cuh`). Com um `break` ou
-decodificação intercalada, o compilador segurava as cargas da linha seguinte
-atrás da aritmética da anterior — uma linha em voo por warp. O resultado segue
-bit-idêntico.
+In decode, Q8_0 loads the bytes of all the warp's rows before using any of
+them (`q8_0_load`/`q8_0_decode` in `dequant.cuh`). With a `break` or
+interleaved decoding, the compiler held the next row's loads behind the
+previous one's arithmetic — one row in flight per warp. The result stays
+bit-identical.
 
-A decodificação gulosa é um pipeline (`ChainGraph` em `runtime.rs`): o grafo
-lê token e posição da GPU, o argmax escreve o próximo token lá e avança a
-posição, e o host enfileira o passo i+1 antes de ler o token do passo i. Um
-passo especulativo que o fim da geração descarta não é confirmado (`n_past` e
-`history` não andam). Por isso não roda em híbridos: o estado recorrente não
-tem como desfazer um passo.
+Greedy decoding is a pipeline (`ChainGraph` in `runtime.rs`): the graph reads
+token and position from the GPU, the argmax writes the next token there and
+advances the position, and the host queues step i+1 before reading step i's
+token. A speculative step that the end of generation discards is not
+committed (`n_past` and `history` do not advance). That is why it does not
+run on hybrids: the recurrent state cannot undo a step.
 
-A atenção também tem caminhos por tamanho: prefill de 16+ tokens usa flash
-attention em tensor core fp16 (`AIRUN_NO_FLASH=1` desliga), e o decode usa um
-kernel por (head de KV, split) que lê o cache uma vez para todo o grupo GQA
-(`AIRUN_NO_GQA_DECODE=1` volta ao antigo). `crates/airun-core/tests/prefill.rs`
-(ignorado; `AIRUN_TEST_DENSE_GGUF`/`AIRUN_TEST_MOE_GGUF`) confere que um
-prefill em lote chega aos mesmos logits que alimentar token a token — é o
-único teste que roda esses kernels com pesos reais.
+Attention also has paths by size: prefill of 16+ tokens uses flash attention
+on fp16 tensor cores (`AIRUN_NO_FLASH=1` turns it off), and decode uses a
+kernel per (KV head, split) that reads the cache once for the whole GQA group
+(`AIRUN_NO_GQA_DECODE=1` goes back to the old one).
+`crates/airun-core/tests/prefill.rs` (ignored;
+`AIRUN_TEST_DENSE_GGUF`/`AIRUN_TEST_MOE_GGUF`) checks that a batched prefill
+reaches the same logits as feeding token by token — it is the only test that
+runs those kernels with real weights.
 
-**Prefill com contexto longo (2026-11-01).** O prefill de prompts longos
-perdia de 28% a 37% para o llama.cpp com o 27B dividido entre as duas GPUs.
-Duas causas, nessa ordem de peso:
+**Long-context prefill (2026-11-01).** Long-prompt prefill lost 28% to 37% to
+llama.cpp with the 27B split across the two GPUs. Two causes, in this order of
+weight:
 
-1. **As GPUs rodavam em série.** O `handoff` entre shards sincronizava a GPU
-   de origem pelo host, e o `airun bench` lia os logits de todo pedaço de
-   prompt, o que sincroniza também. Uma 5060 Ti (metade dos SMs) atrás da
-   5070 Ti derrubava 4k de prompt de 3653 (uma GPU) para 2501 tok/s; o
-   llama.cpp, que encadeia as GPUs, mantinha 3514.
-   - Agora o `handoff` só ordena por eventos: o stream de destino espera o
-     `sent` da origem, e a origem espera o `copied` do destino antes de
-     sobrescrever `x`. A GPU 0 roda o pedaço c+1 enquanto a GPU 1 roda o c.
-   - O bench usa `Runtime::prefill_chunk` nos pedaços intermediários, como o
+1. **The GPUs ran in series.** The `handoff` between shards synchronized the
+   source GPU through the host, and `airun bench` read the logits of every
+   prompt chunk, which also synchronizes. A 5060 Ti (half the SMs) behind the
+   5070 Ti dropped a 4k prompt from 3653 (one GPU) to 2501 tok/s; llama.cpp,
+   which chains the GPUs, kept 3514.
+   - Now `handoff` only orders by events: the destination stream waits on the
+     source's `sent`, and the source waits on the destination's `copied`
+     before overwriting `x`. GPU 0 runs chunk c+1 while GPU 1 runs chunk c.
+   - The bench uses `Runtime::prefill_chunk` for the middle chunks, like
      `generate`.
-   - Quem enche um buffer pinado no host precisa esperar o upload anterior,
-     porque o host não para mais entre os pedaços. O PLE tem o evento
-     `uploaded`; o MoE já sincronizava. Split: 4k a 3566 tok/s.
-2. **A atenção do prefill estava em 55 TFLOPS** com head_dim 256
-   (`crates/airun-cuda/tests/attention_bench.rs`, ignorado, mede isolado).
-   Com 255 registradores só cabe um bloco de 8 warps por SM, e os dois
-   warps de cada partição fazem a softmax juntos enquanto o tensor core
-   espera, então o que pesa é o custo por tile fora das MMAs. Três cortes
-   levaram a 72,7 TFLOPS:
-   - **P·V em fp16 por tile de chaves:** soma de no máximo 32 termos ≤ 1
-     vezes V, somada a um O em fp32. É a MMA de taxa dupla, sem guardar uma
-     soma longa em fp16; o llama.cpp guarda o O inteiro em fp16. O kernel
-     só usa isso quando o lote vê 4096+ chaves (`keys` de
-     `attention_masked`). Em prompt curto a soma em fp16 virava um token
-     quase empatado do Qwen4 contra a referência, e o ganho é pequeno.
-     Perplexidade com pedaços de 8k: 1,2960 contra 1,2999 em fp32.
-     `AIRUN_ATTN_PV_F32=1` desliga.
-   - **Caminho sem máscara:** um tile inteiro antes de todas as consultas
-     do warp não precisa de máscara nem das guardas de `-inf`.
-   - **Reescala preguiçosa:** o O só é reescalado quando o máximo de alguma
-     linha muda.
+   - Whoever fills a pinned host buffer must wait for the previous upload,
+     because the host no longer stops between chunks. PLE has the `uploaded`
+     event; MoE already synchronized. Split: 4k at 3566 tok/s.
+2. **Prefill attention was at 55 TFLOPS** with head_dim 256
+   (`crates/airun-cuda/tests/attention_bench.rs`, ignored, measures in
+   isolation). With 255 registers only one 8-warp block fits per SM, and the
+   two warps of each partition do the softmax together while the tensor core
+   waits, so what weighs is the per-tile cost outside the MMAs. Three cuts
+   took it to 72.7 TFLOPS:
+   - **P·V in fp16 per key tile:** a sum of at most 32 terms ≤ 1 times V,
+     added to an fp32 O. It is the double-rate MMA, without keeping a long
+     sum in fp16; llama.cpp keeps the whole O in fp16. The kernel only uses
+     it when the batch sees 4096+ keys (`keys` of `attention_masked`). On
+     short prompts the fp16 sum flipped a near-tied Qwen4 token against the
+     reference, and the gain is small. Perplexity with 8k chunks: 1.2960
+     against 1.2999 in fp32. `AIRUN_ATTN_PV_F32=1` turns it off.
+   - **Unmasked path:** a whole tile before all of the warp's queries needs
+     neither a mask nor the `-inf` guards.
+   - **Lazy rescale:** O is only rescaled when some row's maximum changes.
 
-**Alocação: `--alloc auto|gpu|memory` e `--main-gpu` (2026-11-02).**
+**Allocation: `--alloc auto|gpu|memory` and `--main-gpu` (2026-11-02).**
 
 - **Planner** (`plan.rs`):
-  - `AllocMode` decide se pesos podem ir para a RAM.
-  - `--main-gpu` vira o primeiro de `ordered`.
-  - `fill_fastest_first(.., fewest)` usa só as GPUs necessárias em `auto`.
-  - `spill_to_ram` enche as outras GPUs com as últimas camadas e deixa na
-    RAM, com o KV na VRAM da principal, o que a principal não comporta.
-  - O resultado fica no `Shard`: `ram_layers` e `staging_bytes`.
+  - `AllocMode` decides whether weights may go to RAM.
+  - `--main-gpu` becomes the first of `ordered`.
+  - `fill_fastest_first(.., fewest)` uses only the GPUs needed in `auto`.
+  - `spill_to_ram` fills the other GPUs with the last layers and leaves in
+    RAM, with the KV in the main GPU's VRAM, what the main GPU cannot hold.
+  - The result goes in the `Shard`: `ram_layers` and `staging_bytes`.
 - **Loader** (`model.rs`):
-  - `load_ram` guarda a matriz em RAM fixada, com o sanitize de NVFP4 feito
-    na CPU, e `GpuTensor::ptr()` aponta para o staging.
-  - `LayerWeights::ram_copies` lista as cópias da camada.
-- **Runtime:** `queue_shard` enfileira as cópias antes da camada, no mesmo
-  stream. No grafo de decode elas viram nós de cópia.
-- **Validado:** 120 tokens idênticos com 22 camadas em RAM contra o modelo
-  na VRAM, e o Qwen4 idêntico à referência.
-- **Limites:**
-  - Camadas MoE inteiras em RAM ainda não existem; para MoE o planner não
-    transborda e os experts usam o caminho antigo.
-  - A cópia não se sobrepõe ao cálculo. O link está no limite (~26 GB/s), e
-    sobrepor esconderia só os ~20% que o cálculo leva.
+  - `load_ram` keeps the matrix in pinned RAM, with the NVFP4 sanitize done
+    on the CPU, and `GpuTensor::ptr()` points at the staging.
+  - `LayerWeights::ram_copies` lists the layer's copies.
+- **Runtime:** `queue_shard` queues the copies before the layer, on the same
+  stream. In the decode graph they become copy nodes.
+- **Validated:** 120 identical tokens with 22 layers in RAM against the model
+  in VRAM, and Qwen4 identical to the reference.
+- **Limits:**
+  - Whole MoE layers in RAM do not exist yet; for MoE the planner does not
+    spill and the experts use the old path.
+  - The copy does not overlap the compute. The link is at its limit (~26
+    GB/s), and overlapping would hide only the ~20% the compute takes.
 
-**Decode com contexto longo.** `attention_decode_gqa_kernel` lê K e V a ~80%
-da banda (711 GB/s na 5070 Ti, 323 na 5060 Ti, em 128k;
-`decode_attention_bandwidth` em `attention_bench.rs`, com
-`AIRUN_BENCH_DEVICE`). Ele divide o cache em até 256 pedaços, e 4 KV heads ×
-256 dá 1024 blocos. Na 5060 Ti (144 blocos por vez) isso fazia 7,1 ondas, a
-oitava quase vazia. `attention_active_splits` agora arredonda para ondas
-inteiras, com a concorrência real da GPU: +2% no decode a 128k.
-`AIRUN_NO_SPLIT_WAVES=1` desliga.
-- **cp.async não ajudou:** tentei carregar o tile com `cp.async` (todas as
-  peças em voo) e caiu para 636 GB/s. A latência por tile não era o gargalo.
+**Long-context decode.** `attention_decode_gqa_kernel` reads K and V at ~80%
+of bandwidth (711 GB/s on the 5070 Ti, 323 on the 5060 Ti, at 128k;
+`decode_attention_bandwidth` in `attention_bench.rs`, with
+`AIRUN_BENCH_DEVICE`). It splits the cache into up to 256 pieces, and 4 KV
+heads × 256 make 1024 blocks. On the 5060 Ti (144 blocks at a time) that made
+7.1 waves, the eighth almost empty. `attention_active_splits` now rounds to
+whole waves, with the GPU's real concurrency: +2% decode at 128k.
+`AIRUN_NO_SPLIT_WAVES=1` turns it off.
+- **cp.async did not help:** I tried loading the tile with `cp.async` (every
+  piece in flight) and it dropped to 636 GB/s. Per-tile latency was not the
+  bottleneck.
 
-Agrupar as cabeças do GQA não reduziria o tráfego: a intensidade por tile
-de K/V é a mesma, porque o kernel é limitado por cálculo, não por memória.
+Grouping the GQA heads would not reduce traffic: the intensity per K/V tile
+is the same, because the kernel is compute-bound, not memory-bound.
 
-**Três armadilhas de kernel que custaram horas em 2026-09-26:**
-- Um array de registradores (`acc[h]`) indexado num laço com limite de tempo
-  de execução vai inteiro para a memória local. Use `#pragma unroll` com o
-  limite constante e `if (h >= G) continue`. Confira `STACK:` em
-  `cuobjdump --dump-resource-usage` — deve ser 0.
-- `(const half2*)&raw` sobre uma variável de registrador também a manda para
-  a memória local. Extraia com operações de bits.
-- Sem contadores de desempenho (exigem admin no Windows), meça com `clock64()`
-  dentro do kernel e `printf` de um bloco — foi o que achou os três gargalos.
+**Three kernel pitfalls that cost hours on 2026-09-26:**
+- A register array (`acc[h]`) indexed in a loop with a run-time bound goes
+  entirely to local memory. Use `#pragma unroll` with the constant bound and
+  `if (h >= G) continue`. Check `STACK:` in `cuobjdump --dump-resource-usage`
+  — it must be 0.
+- `(const half2*)&raw` over a register variable also sends it to local
+  memory. Extract with bit operations.
+- Without performance counters (they need admin on Windows), measure with
+  `clock64()` inside the kernel and one block's `printf` — that is what found
+  the three bottlenecks.
 
-**Ao ajustar tiles dos kernels: os tamanhos aparecem no template E na conta do
-grid.** Varrer um sem o outro computa fração da saída e parece um ganho enorme
-— `airun bench` não valida saídas. Mude as defines, nunca as instanciações, e
-rode o selftest a cada ponto medido. Isso já enganou uma sessão inteira.
+**When tuning kernel tiles: the sizes appear in the template AND in the grid
+math.** Sweeping one without the other computes a fraction of the output and
+looks like a huge gain — `airun bench` does not validate outputs. Change the
+defines, never the instantiations, and run the selftest at every measured
+point. This has already fooled a whole session.
 
-## 6. Armadilhas que já custaram tempo
+## 6. Pitfalls that have already cost time
 
-1. **Ordinal CUDA ≠ índice do nvidia-smi.** O CUDA ordena por velocidade por
-   padrão. Neste PC, CUDA 0 = RTX 5070 Ti, mas nvidia-smi 0 = RTX 5060 Ti.
-   Sempre mostre o PCI bus id junto do ordinal.
+1. **CUDA ordinal ≠ nvidia-smi index.** CUDA orders by speed by default. On
+   this PC, CUDA 0 = RTX 5070 Ti, but nvidia-smi 0 = RTX 5060 Ti. Always show
+   the PCI bus id next to the ordinal.
 
-2. **Estas GPUs não têm P2P.** `cudaDeviceCanAccessPeer` retorna 0. Cópias
-   entre GPUs passam pela RAM. Por isso o planner prefere uma GPU só quando o
-   modelo cabe e, quando não cabe, enche a mais rápida primeiro
-   (`fill_fastest_first`, em `plan.rs`) — salvo quando as GPUs são gêmeas
-   (nota de desempenho a até 10%): aí divide por igual (`split_by_fraction`
-   filtrado por `fits_budgets`), o que dobra o prefill e não muda o decode.
-   O `plan_experts` também ordena as GPUs lentas por último e passa essa
-   ordem ao planner (`PlacementRequest.device_order`), sem supor que o
-   ordinal mais alto é o mais lento. Dividir pela VRAM livre punha metade
-   do 27B na 5060 Ti, que tem metade da banda da 5070 Ti. Como o decode roda as
-   placas em série, isso custava 28%: decode @16 em 33,7 contra 43,0 tok/s e
-   @32k em 28,9 contra 37,1. No decode o split custa: no 1.7B, 94 t/s contra
-   234 t/s numa placa só, com o contexto vazio. No prefill as GPUs se sobrepõem (veja
-   "Prefill com contexto longo" acima) e o split quase não perde. Nunca
-   sincronize um stream pelo host entre shards: isso põe as GPUs em série.
-   **Atualizado (2026-11-05):** entre GPUs desiguais, sem `--main-gpu` e com
-   saída não amarrada, o planner usa `fill_fastest_last`. A mais rápida fica
-   com a SAÍDA e as últimas camadas, e a lenta com as primeiras camadas e o
-   embedding. A saída é lida inteira a cada token (e de novo a cada rascunho
-   do MTP); o embedding só é consultado por linha. Qwen3.8-27B NVFP4 com
-   lm_head BF16 de 2,5 GB, 5070 Ti + 5060, MTP 3, `-c 131072`: 44,1 → 52,2
-   tok/s (`run`); `serve` 34–36 → 43–47. Com o contexto automático (262k) o
-   layout novo não cabe (a 5070 Ti teria saída + KV) e o planner volta ao
-   antigo.
+2. **These GPUs have no P2P.** `cudaDeviceCanAccessPeer` returns 0. Copies
+   between GPUs go through RAM. That is why the planner prefers a single GPU
+   when the model fits and, when it does not, fills the fastest first
+   (`fill_fastest_first`, in `plan.rs`) — unless the GPUs are twins (perf
+   score within 10%): then it splits evenly (`split_by_fraction` filtered by
+   `fits_budgets`), which doubles prefill and does not change decode.
+   `plan_experts` also orders the slow GPUs last and passes that order to the
+   planner (`PlacementRequest.device_order`), without assuming the highest
+   ordinal is the slowest. Splitting by free VRAM put half of the 27B on the
+   5060 Ti, which has half the 5070 Ti's bandwidth. Since decode runs the cards
+   in series, that cost 28%: decode @16 at 33.7 against 43.0 tok/s and @32k at
+   28.9 against 37.1. In decode the split costs: on the 1.7B, 94 t/s against
+   234 t/s on a single card, with an empty context. In prefill the GPUs
+   overlap (see "Long-context prefill" above) and the split barely loses.
+   Never synchronize a stream through the host between shards: that puts the
+   GPUs in series.
+   **Updated (2026-11-05):** between unequal GPUs, without `--main-gpu` and
+   with an untied output, the planner uses `fill_fastest_last`. The fastest
+   gets the OUTPUT and the last layers, and the slow one the first layers and
+   the embedding. The output is read whole every token (and again for every
+   MTP draft); the embedding is only looked up by row. Qwen3.8-27B NVFP4 with
+   a 2.5 GB BF16 lm_head, 5070 Ti + 5060, MTP 3, `-c 131072`: 44.1 → 52.2
+   tok/s (`run`); `serve` 34–36 → 43–47. With the automatic context (262k)
+   the new layout does not fit (the 5070 Ti would have output + KV) and the
+   planner falls back to the old one.
 
-3. **CUDA 13 removeu campos de `cudaDeviceProp`** (`memoryClockRate`). Nunca
-   faça bind direto dessa struct do Rust — use o shim em `kernels/device.cu`.
+3. **CUDA 13 removed fields from `cudaDeviceProp`** (`memoryClockRate`). Never
+   bind that struct directly from Rust — use the shim in `kernels/device.cu`.
 
-4. **`gen` é keyword reservada na edition 2024.** Não use como nome de variável.
+4. **`gen` is a reserved keyword in edition 2024.** Do not use it as a
+   variable name.
 
-5. **Embeddings amarrados (tied).** Qwen3-1.7B não tem `output.weight`; a
-   projeção final reusa `token_embd.weight`. Em split multi-GPU isso obriga a
-   espelhar a tabela — o planner já contabiliza isso.
+5. **Tied embeddings.** Qwen3-1.7B has no `output.weight`; the final
+   projection reuses `token_embd.weight`. In a multi-GPU split that forces
+   mirroring the table — the planner already accounts for it.
 
-6. **Erro relativo é métrica errada para produto escalar.** Quando termos se
-   cancelam, o resultado pode ser arbitrariamente pequeno perto dos valores que
-   o geraram. O selftest usa erro *backward*: limite proporcional a
-   `sum|w*x|`. Não "conserte" isso afrouxando tolerância.
+6. **Relative error is the wrong metric for a dot product.** When terms
+   cancel, the result can be arbitrarily small next to the values that
+   produced it. The selftest uses *backward* error: a bound proportional to
+   `sum|w*x|`. Do not "fix" this by loosening the tolerance.
 
-7. **Dados de teste precisam ser fisicamente plausíveis.** Bytes aleatórios no
-   expoente E8M0 do MXFP4 geram escalas de 2^±127 e estouram f32. O decode
-   está certo; os dados é que eram irreais.
+7. **Test data must be physically plausible.** Random bytes in MXFP4's E8M0
+   exponent produce scales of 2^±127 and overflow f32. The decode is right;
+   the data was unrealistic.
 
-8. **Um teste GPU-vs-CPU não prova que a operação está certa** — prova que os
-   dois lados concordam. Se ambos codificam a mesma suposição errada, o teste
-   passa e o modelo continua quebrado. Aconteceu com o `rmsnorm_gated`, onde a
-   "referência CPU" repetia a ordem errada do gate. Quando um kernel passa mas
-   o modelo não presta, desconfie da referência antes do kernel.
+8. **A GPU-vs-CPU test does not prove the operation is right** — it proves
+   both sides agree. If both encode the same wrong assumption, the test passes
+   and the model stays broken. It happened with `rmsnorm_gated`, where the
+   "CPU reference" repeated the wrong gate order. When a kernel passes but the
+   model is no good, suspect the reference before the kernel.
 
-9. **Um token não é um caractere.** No BPE byte-level um acentuado costuma
-   ocupar dois tokens — `"Órbita"` sai como `<20 C3>` `<93>` `"r"`. Decodificar
-   token a token roda `from_utf8_lossy` em meio caractere, o que devolve
-   `U+FFFD` e **destrói os bytes**: nem quando a outra metade chega dá para
-   recuperar. Todo streaming tem que passar por `StreamDecoder`, que segura a
-   cauda incompleta. Vale para acentuação, CJK e emoji, em qualquer modelo —
-   não é problema de modelo quebrado.
+9. **A token is not a character.** In byte-level BPE an accented letter often
+   takes two tokens — `"Órbita"` comes out as `<20 C3>` `<93>` `"r"`.
+   Decoding token by token runs `from_utf8_lossy` on half a character, which
+   returns `U+FFFD` and **destroys the bytes**: not even when the other half
+   arrives can they be recovered. All streaming must go through
+   `StreamDecoder`, which holds the incomplete tail. It applies to accents,
+   CJK and emoji, on any model — it is not a broken-model problem.
 
-10. **NVFP4 tem um piso de magnitude absoluta.** O bloco não carrega escala por
-    tensor, só quatro escalas UE4M3 (uma por 16 elementos), e o menor passo do
-    UE4M3 é ~9.8e-4. Uma corrida de 16 pesos cujo pico esteja abaixo de ~5.9e-3
-    codifica como **zeros**, sem aviso nenhum. Isso é o formato do ggml, não um
-    bug do encoder — mas significa que um teste de round-trip com dados de
-    magnitude pequena "falha" por motivo errado (foi o que aconteceu na primeira
-    versão do teste). Pesos reais ficam bem acima do piso.
+10. **NVFP4 has an absolute magnitude floor.** The block carries no
+    per-tensor scale, only four UE4M3 scales (one per 16 elements), and the
+    smallest UE4M3 step is ~9.8e-4. A run of 16 weights whose peak is below
+    ~5.9e-3 encodes as **zeros**, without any warning. That is ggml's format,
+    not an encoder bug — but it means a round-trip test with small-magnitude
+    data "fails" for the wrong reason (which is what happened in the first
+    version of the test). Real weights stay well above the floor.
 
-11. **A penalidade de repetição não acumula mais por ocorrência.** Ela é
-    aplicada uma vez por token *distinto* na janela, que é o que o llama.cpp
-    moderno faz. A versão anterior dividia o logit uma vez por ocorrência, então
-    um token repetido 3 vezes era penalizado `penalty^3` — o efeito dependia de
-    quão cheia a janela estava. Se você comparar saídas com uma sessão antiga,
-    a diferença vem daqui, não de um bug novo.
+11. **The repeat penalty no longer accumulates per occurrence.** It is applied
+    once per *distinct* token in the window, which is what modern llama.cpp
+    does. The previous version divided the logit once per occurrence, so a
+    token repeated 3 times was penalized `penalty^3` — the effect depended on
+    how full the window was. If you compare outputs with an old session, the
+    difference comes from here, not from a new bug.
 
----
+12. **`llama-perplexity -f` on Windows reads the file in text mode** and turns
+    CRLF into LF; `airun perplexity -f` reads the bytes as they are. On a CRLF
+    file the two score different texts and llama.cpp looks ~0.1 nat better.
+    Normalize to LF before comparing. With the same text, airun's `--chunk N`
+    reproduces `llama-perplexity -c N` chunk by chunk (27B NVFP4, 128 chunks:
+    airun 7.9356, llama.cpp CPU 7.9438). An f64 numpy reference of the qwen35
+    forward (outside the repo) confirmed airun layer by layer.
 
-12. **`llama-perplexity -f` no Windows lê o arquivo em modo texto** e troca
-    CRLF por LF; o `airun perplexity -f` lê os bytes como estão. Num arquivo com
-    CRLF os dois pontuam textos diferentes e o llama.cpp parece ~0,1 nat melhor.
-    Normalize para LF antes de comparar. Com o mesmo texto, `--chunk N` do airun
-    reproduz o `llama-perplexity -c N` bloco a bloco (27B NVFP4, blocos de 128:
-    airun 7,9356, llama.cpp CPU 7,9438). Uma referência f64 em numpy do forward
-    qwen35 (fora do repo) confirmou o airun camada a camada.
+13. **YaRN is not linear scaling.** `rope.scaling.type = yarn` (the "yarn1m"
+    27B) only interpolates the slow dimensions and multiplies cos/sin by
+    `1 + 0.1 ln(factor)`; treating the factor as linear scaling changes the
+    model even at short context. `RopeParams` in `ops.rs`, mirrored in
+    `airun.cuh`.
 
-13. **YaRN não é escala linear.** `rope.scaling.type = yarn` (o 27B "yarn1m")
-    só interpola as dimensões lentas e multiplica cos/sin por
-    `1 + 0.1 ln(fator)`; tratar o fator como escala linear muda o modelo mesmo
-    em contexto curto. `RopeParams` em `ops.rs`, espelho em `airun.cuh`.
+14. **NVFP4 exists in two conventions; the loader reads both (2026-11-03).**
+    airun's encoder is *self-contained*: the block carries only the four
+    UE4M3 scales (item 10) and has no sibling tensor. But outside NVFP4 files
+    (vllm/NVIDIA — e.g. the "Cold Fusion" Qwen3.8-27B) use the *global-scale*
+    convention: each NVFP4 weight has a `<base>.scale` F32[1] sidecar (≈1e-4)
+    and the per-block dequant comes out ~10⁴ small without it. The loader
+    reads the sidecar and applies it in `GpuTensor::global_scale` (a scale
+    epilogue on every matvec; in the GLU fusions the scale turns the fusion
+    off, because SiLU is not scale-linear). Without it the vllm 27B gave
+    **NaN** (NaN perplexity, `!!!!` generation) and the selftest passed — the
+    selftest uses synthetic weights in the kernel's own layout, never reads
+    real bytes nor applies the sidecar. Diagnosis: dequantize the real bytes
+    with and without the `.scale` and see which gives a sensible weight
+    magnitude (`benchmarks/nvfp4_magnitude.py`).
 
-14. **NVFP4 existe em duas convenções; o loader lê as duas (2026-11-03).**
-    O encoder do airun é *autocontido*: o bloco carrega só as quatro escalas
-    UE4M3 (item 10) e não tem tensor-irmão. Mas os arquivos NVFP4 de fora
-    (vllm/NVIDIA — ex. o Qwen3.8-27B "Cold Fusion") usam a convenção
-    *global-scale*: cada peso NVFP4 tem um sidecar `<base>.scale` F32[1]
-    (≈1e-4) e o dequant por bloco sai ~10⁴ pequeno sem ele. O loader lê o
-    sidecar e aplica em `GpuTensor::global_scale` (epílogo de escala em todo
-    matvec; nas fusões GLU o scale desliga a fusão, porque SiLU não é
-    linear-escala). Sem isso o 27B vllm dava **NaN** (perplexidade NaN,
-    geração `!!!!`) e o selftest passava — o selftest usa pesos sintéticos no
-    layout do próprio kernel, nunca lê bytes reais nem aplica o sidecar.
-    Diagnóstico: dequantizar os bytes reais com e sem o `.scale` e ver qual
-    dá magnitude de peso sensata (`benchmarks/nvfp4_magnitude.py`).
+## 7. SSM/MoE hybrids — fixed on 2026-09-26
 
-## 7. Híbridos SSM/MoE — corrigidos em 2026-09-26
+**The output is correct now.** Two bugs masked each other:
 
-**A saída está correta agora.** Dois bugs se mascaravam um ao outro:
+1. **V-head → K-head mapping in the delta rule.** The GGUF repeats the whole
+   K-head axis to reach the number of V-heads (`kh = vh % n_k_heads`, pattern
+   `0,1,0,1…`), like llama.cpp's `ggml_repeat`. The kernel used adjacent
+   pairs (`kh = vh / groups`, pattern `0,0,1,1…`), which is HuggingFace's
+   `repeat_interleave` — but the converter reorders the V-heads precisely so
+   that the tile works. `ssm.cu`, two kernels.
+2. **Gate order in `rmsnorm_gated`.** It is norm → weight → gate (SiLU), like
+   Qwen3-Next's `RMSNormGated` and llama.cpp's `build_norm_gated`. The project
+   had chosen "gate first" because, **with bug 1 present**, that order scored
+   better (4.40 against 4.89). With bug 1 fixed, the right order goes to 1.43
+   and the old one stays at 5.12.
 
-1. **Associação V-head → K-head no delta rule.** O GGUF repete o eixo inteiro
-   de K-heads para chegar ao número de V-heads (`kh = vh % n_k_heads`, padrão
-   `0,1,0,1…`), como o `ggml_repeat` do llama.cpp. O kernel usava pares
-   adjacentes (`kh = vh / grupos`, padrão `0,0,1,1…`), que é o
-   `repeat_interleave` do HuggingFace — mas o conversor reordena as V-heads
-   justamente para que o tile funcione. `ssm.cu`, dois kernels.
-2. **Ordem do gate no `rmsnorm_gated`.** É norma → peso → gate (SiLU), como o
-   `RMSNormGated` do Qwen3-Next e o `build_norm_gated` do llama.cpp. O projeto
-   tinha escolhido "gate antes" porque, **com o bug 1 presente**, essa ordem
-   pontuava melhor (4.40 contra 4.89). Com o bug 1 corrigido, a ordem certa vai
-   a 1.43 e a antiga fica em 5.12.
-
-| Qwen3.8-35B-A3B Q4_K_M | Perda | Top-1 |
+| Qwen3.8-35B-A3B Q4_K_M | Loss | Top-1 |
 |---|---|---|
-| antes | 7.02 | 8.8% |
-| só a correção 1 | 5.12 | 14.5% |
-| correções 1 + 2 | **1.43** | **57.2%** |
-| Qwen3-4B Q8_0 (denso, controle) | 2.67 | 53.5% |
+| before | 7.02 | 8.8% |
+| fix 1 only | 5.12 | 14.5% |
+| fixes 1 + 2 | **1.43** | **57.2%** |
+| Qwen3-4B Q8_0 (dense, control) | 2.67 | 53.5% |
 
-A varredura de `docs/FLAGS.md` foi **refeita sobre a base corrigida** e todas
-as 15 alternativas pontuam pior (tabela em `benchmarks/2026-09-26/sweep2.txt`).
+The `docs/FLAGS.md` sweep was **redone on the fixed base** and all 15
+alternatives score worse (table in `benchmarks/2026-09-26/sweep2.txt`).
 
-**Lição que vale para o projeto inteiro:** uma decisão A/B tomada com outro bug
-presente não é confiável. Ao corrigir um layout, refaça as decisões de layout
-anteriores. O selftest não pega isso (armadilha 8): os dois lados codificavam a
-mesma suposição.
+**Lesson for the whole project:** an A/B decision taken with another bug
+present is not reliable. When fixing a layout, redo the earlier layout
+decisions. The selftest does not catch this (pitfall 8): both sides encoded
+the same assumption.
 
-Bugs anteriores, ainda válidos (não reintroduza):
-1. O planner deve alocar `cfg.n_run_layers()`; a última camada é MTP e não é
-   carregada.
-2. Os buffers `q/k/v` precisam de `group_count * state_size` nas camadas SSM.
-3. **`ssm_a` já vem como `-exp(A_log)`**; `load_delta_decay_coeff` normaliza
-   pelo sinal.
+Earlier bugs, still valid (do not reintroduce):
+1. The planner must allocate `cfg.n_run_layers()`; the last layer is MTP and
+   is not loaded.
+2. The `q/k/v` buffers need `group_count * state_size` in the SSM layers.
+3. **`ssm_a` already comes as `-exp(A_log)`**; `load_delta_decay_coeff`
+   normalizes by the sign.
 
-### Offload de experts (`--expert-cache N`)
+### Expert offload (`--expert-cache N`)
 
-Mantém N experts por camada na VRAM (LRU) e lê os que faltam do GGUF, sem
-requantizar — o teste `crates/airun-core/tests/offload.rs` (ignorado; rode com
-`AIRUN_TEST_MOE_GGUF=<35B>`) exige logits **idênticos** ao modelo residente.
+Keeps N experts per layer in VRAM (LRU) and reads the missing ones from the
+GGUF, without requantizing — the test `crates/airun-core/tests/offload.rs`
+(ignored; run with `AIRUN_TEST_MOE_GGUF=<35B>`) requires **identical** logits
+to the resident model.
 
-Os misses são lidos com leituras posicionais paralelas (`upload_experts` em
-`runtime.rs`, um handle de arquivo por thread). Pelo mmap eles chegavam um
-page fault de cada vez, à velocidade de fila-1 do SSD, e isso era quase todo o
-tempo de decode.
+Misses are read with parallel positional reads (`upload_experts` in
+`runtime.rs`, one file handle per thread). Through mmap they arrived one page
+fault at a time, at the SSD's queue-depth-1 speed, and that was almost all of
+the decode time.
 
-**Meça com texto natural.** `airun bench` usa um token repetido em modelos
-densos, mas num MoE isso roteia sempre para os mesmos experts e o cache parece
-perfeito (99,8% de acerto, 54 t/s) quando com texto real acerta ~88% (3 t/s
-antes do leitor paralelo). O bench agora usa uma passagem em inglês para MoE e
-mostra a taxa de acerto; use também `--temp 0.7`, porque o greedy entra em
-laço e flatteria o cache da mesma forma.
+**Measure with natural text.** `airun bench` uses a repeated token on dense
+models, but on a MoE that always routes to the same experts and the cache
+looks perfect (99.8% hits, 54 t/s) when with real text it hits ~88% (3 t/s
+before the parallel reader). The bench now uses an English passage for MoE and
+shows the hit rate; also use `--temp 0.7`, because greedy falls into loops and
+flatters the cache the same way.
 
-### Experts mapeados em RAM (padrão quando o MoE não cabe nas GPUs)
+### Experts mapped in RAM (default when the MoE does not fit the GPUs)
 
-Sem `--expert-cache`, um MoE grande demais vai para `plan_experts`
-(`loader.rs`): `slots` experts por camada ficam na VRAM e os demais numa
-alocação fixada e mapeada (`MappedExperts` em `model.rs`), que a GPU lê pelo
-PCIe. Os kernels acham cada expert por uma tabela de endereços
-(`moe_*_tab`), então nada espera o host e o decode cabe num CUDA graph. O
-streaming do arquivo (seção acima) continua com `AIRUN_EXPERTS=stream`.
+Without `--expert-cache`, a MoE too big goes to `plan_experts` (`loader.rs`):
+`slots` experts per layer stay in VRAM and the rest in a pinned, mapped
+allocation (`MappedExperts` in `model.rs`), which the GPU reads over PCIe. The
+kernels find each expert through an address table (`moe_*_tab`), so nothing
+waits on the host and decode fits in a CUDA graph. File streaming (section
+above) remains with `AIRUN_EXPERTS=stream`.
 
-- **Decode:** antes do MoE, `moe_stage_plan` + `moe_stage_copy` copiam para um
-  staging na VRAM só os experts roteados que estão na RAM (leituras de 16 B
-  coalescidas). Ler direto da RAM com os decodificadores (leituras estreitas)
-  era 5x mais lento.
-- **Lotes (≥ 16 tokens):** `moe_grouped` ordena os pares (token, slot) por
-  expert e lê os pesos de cada expert uma vez para todos os seus tokens,
-  copiando as linhas do bloco para a memória compartilhada com leituras
-  largas. É bit-idêntico ao caminho por token (selftest).
-- **Residência adaptativa:** o MoE conta o uso de cada expert na GPU
-  (`moe_count`); a cada 8 passos `rebalance_experts` troca os mais usados que
-  estão na RAM pelos menos usados da VRAM (até 16 por camada, com margem).
-- **Link lento:** `plan_experts` mede a banda host→GPU. Uma GPU abaixo de
-  8 GB/s (a 5060 Ti desta máquina está num slot PCIe 3.0 x4: 1,6 GB/s em
-  zero-copy) recebe só camadas inteiras, com todos os experts na VRAM; as
-  demais vão para a GPU de link rápido com experts parciais.
-- **Grafos por GPU:** o decode captura um grafo por shard; o resíduo passa
-  entre as GPUs fora dos grafos, só as linhas do lote. O PLE é preparado no
-  host num buffer fixado antes de cada replay.
+- **Decode:** before the MoE, `moe_stage_plan` + `moe_stage_copy` copy into a
+  VRAM staging area only the routed experts that are in RAM (coalesced 16 B
+  loads). Reading straight from RAM with the decoders (narrow loads) was 5x
+  slower.
+- **Batches (≥ 16 tokens):** `moe_grouped` sorts the (token, slot) pairs by
+  expert and reads each expert's weights once for all its tokens, copying the
+  block's rows into shared memory with wide loads. It is bit-identical to the
+  per-token path (selftest).
+- **Adaptive residency:** the MoE counts each expert's use on the GPU
+  (`moe_count`); every 8 steps `rebalance_experts` swaps the most used ones
+  in RAM for the least used in VRAM (up to 16 per layer, with a margin).
+- **Slow link:** `plan_experts` measures host→GPU bandwidth. A GPU below
+  8 GB/s (this machine's 5060 Ti is on a PCIe 3.0 x4 slot: 1.6 GB/s
+  zero-copy) only gets whole layers, with every expert in VRAM; the rest go
+  to the fast-link GPU with partial experts.
+- **Graphs per GPU:** decode captures one graph per shard; the residual moves
+  between GPUs outside the graphs, only the batch's rows. PLE is prepared on
+  the host in a pinned buffer before each replay.
 
-Qwen4 Flash-Next (78 GB, 5070 Ti + 5060 Ti, 64 GB de RAM), prompt de 792
-tokens + 128 gerados (`benchmarks/2026-11-01/qwen4.ps1`): veja os números em
-`benchmarks/2026-11-01/RESULTADOS.md`. O que levou a airun de 92 / 19 tok/s
-para ~287 / ~39 (à frente do Strata 0.1.44, ~270 / ~33):
+Qwen4 Flash-Next (78 GB, 5070 Ti + 5060 Ti, 64 GB of RAM), 792-token prompt +
+128 generated (`benchmarks/2026-11-01/qwen4.ps1`): see the numbers in
+`benchmarks/2026-11-01/RESULTS.md`. What took airun from 92 / 19 tok/s to
+~287 / ~39 (ahead of Strata 0.1.44, ~270 / ~33):
 
-- **Tabelas `__constant__`:** `kvalues_iq4nl` indexada por nibbles diferentes
-  em cada lane serializava até 16x. IQ4_NL/IQ4_XS agora usam `__byte_perm`
-  (`iq4_codes8`), como o FP4. Só isso valia ~5 ms por token.
-- **Perfil de roteamento** (`expert_profile.rs`): a carga põe na VRAM os
-  experts mais usados nas execuções anteriores, e as notas do rebalanceamento
-  partem do perfil. Uma troca só acontece com ~4 roteamentos de vantagem,
-  porque cada uma move os dois experts pela PCIe.
-- **Cópia sobreposta:** o decode copia os experts ausentes num stream lateral
-  (`DeviceState.side`, eventos `fork`/`join`, que funcionam dentro do CUDA
-  graph) enquanto os residentes calculam (`Staged.only`).
-- **Router em um warp** (`moe_router_warp_kernel`): 25 → 4 µs por camada.
-- **MoE agrupado em tensor cores** (`moe_mma_*`, lotes de 64+): decodifica
-  cada fatia de 64 de K uma vez para fp16 e usa `mma.sync`. Experts na VRAM
-  são lidos direto, sem copiar as linhas, o que dá ocupação 3x maior; os da
-  RAM são copiados com leituras largas. Abaixo de 64 tokens ficam os kernels
-  f32, o que mantém prompts curtos idênticos à referência.
-- **PLE em paralelo** (`gather_pool.rs`): a tabela de 26,8 GB não cabe no
-  cache de arquivos, então cada linha é uma leitura aleatória no SSD. Lidas
-  uma a uma, deixavam a GPU parada 1,4 s num prompt de 792 tokens. 32 threads
-  persistentes as leem juntas.
+- **`__constant__` tables:** `kvalues_iq4nl` indexed by different nibbles in
+  each lane serialized up to 16x. IQ4_NL/IQ4_XS now use `__byte_perm`
+  (`iq4_codes8`), like FP4. That alone was worth ~5 ms per token.
+- **Routing profile** (`expert_profile.rs`): the load puts in VRAM the
+  experts most used in previous runs, and the rebalance scores start from the
+  profile. A swap only happens with an advantage of ~4 routings, because each
+  one moves both experts over PCIe.
+- **Overlapped copy:** decode copies the missing experts on a side stream
+  (`DeviceState.side`, `fork`/`join` events, which work inside the CUDA graph)
+  while the resident ones compute (`Staged.only`).
+- **One-warp router** (`moe_router_warp_kernel`): 25 → 4 µs per layer.
+- **Grouped MoE on tensor cores** (`moe_mma_*`, batches of 64+): decodes each
+  64-wide slice of K once to fp16 and uses `mma.sync`. Experts in VRAM are
+  read directly, without copying the rows, which gives 3x higher occupancy;
+  the ones in RAM are copied with wide loads. Below 64 tokens the f32 kernels
+  stay, which keeps short prompts identical to the reference.
+- **Parallel PLE** (`gather_pool.rs`): the 26.8 GB table does not fit the file
+  cache, so each row is a random SSD read. Read one by one, they left the GPU
+  idle 1.4 s on a 792-token prompt. 32 persistent threads read them together.
 
-A carga leva ~80 s (fixar ~24 GB de RAM).
+Loading takes ~80 s (pinning ~24 GB of RAM).
 
-### Atenção esparsa QSA (qwen4exp)
+### QSA sparse attention (qwen4exp)
 
-As camadas de atenção com `compress_ratio` r > 0 só atendem a `top_k + r - 1`
-células (2051 no Qwen4): o bloco final incompleto e os blocos de r tokens com
-maior nota. Kernels em `kernels/qsa.cu`, wrappers em `airun-cuda/src/qsa.rs`,
-orquestração em `Runtime::qsa_select`:
+Attention layers with `compress_ratio` r > 0 only attend to `top_k + r - 1`
+cells (2051 on Qwen4): the incomplete last block and the r-token blocks with
+the highest score. Kernels in `kernels/qsa.cu`, wrappers in
+`airun-cuda/src/qsa.rs`, orchestration in `Runtime::qsa_select`:
 
-- `qsa_store`: a chave crua do indexador de cada token vai para um anel f16
-  (`QsaCache.ring`, como o cache do indexador do llama.cpp, que é f16).
-- `qsa_pool`: quando o último token de um bloco chega, média das r chaves →
-  RMSNorm (`indexer.k_norm`) → RoPE na primeira posição do bloco. Fica em
+- `qsa_store`: each token's raw indexer key goes into an f16 ring
+  (`QsaCache.ring`, like llama.cpp's indexer cache, which is f16).
+- `qsa_pool`: when a block's last token arrives, mean of the r keys →
+  RMSNorm (`indexer.k_norm`) → RoPE at the block's first position. Stored in
   `QsaCache.pooled` ([ctx/r][128] f32).
-- `qsa_score`: nota = Σ_cabeças relu(q_h · chave), q com RMSNorm e RoPE da
-  posição do token. Pulado quando o contexto da query cabe no orçamento.
-- `qsa_select`: radix select; empate vai para o bloco de menor índice e um
-  bloco pego em parte fica com as primeiras células (o mesmo que o
-  `qsa_select.cu` do Strata). Saída: lista `[count-1, células...]` no decode,
-  que `attention_split_sel` usa no lugar da posição (cabe no CUDA graph), ou
-  uma máscara de bits por query nos lotes (`attention_masked`, que o flash2 usa
-  para pular tiles sem nenhuma célula escolhida).
+- `qsa_score`: score = Σ_heads relu(q_h · key), q with RMSNorm and RoPE at the
+  token's position. Skipped when the query's context fits the budget.
+- `qsa_select`: radix select; ties go to the lower-index block and a block
+  taken in part keeps its first cells (the same as Strata's `qsa_select.cu`).
+  Output: a `[count-1, cells...]` list in decode, which `attention_split_sel`
+  uses instead of the position (fits the CUDA graph), or a bit mask per query
+  in batches (`attention_masked`, which flash2 uses to skip tiles with no
+  chosen cell).
 
-Com contexto ≤ 2051 a seleção é tudo, e a saída é idêntica à densa. O selftest
-compara pooling, notas, seleção e as duas atenções com a CPU. Perplexidade em
-pedaços de 4096 (posições 2048–4095 pontuadas) num texto de 25 mil tokens:
-referência 5,1563, airun com QSA 5,1684, airun densa (`AIRUN_QSA=off`) 5,1717.
-Em 2048 (tudo denso) a diferença de base airun vs referência já é ±0,5% por
-pedaço, por arredondamento.
+With context ≤ 2051 the selection is everything, and the output is identical
+to dense. The selftest compares pooling, scores, selection and both
+attentions with the CPU. Perplexity in 4096 chunks (positions 2048–4095
+scored) on a 25k-token text: reference 5.1563, airun with QSA 5.1684, airun
+dense (`AIRUN_QSA=off`) 5.1717. At 2048 (all dense) the baseline difference
+airun vs reference is already ±0.5% per chunk, from rounding.
 
-### API HTTP (`airun serve`) no formato do llama-server
+### HTTP API (`airun serve`) in llama-server's format
 
-As rotas, os campos de requisição e as respostas seguem os do `llama-server`,
-para que clientes feitos para ele funcionem sem mudança:
-- **Saúde e metadados:** `/health`, `/v1/health`, `/props`, `/models`,
-  `/v1/models`, `/slots` e `/metrics` (501, como o llama-server sem
+Routes, request fields and responses follow `llama-server`'s, so that clients
+built for it work unchanged:
+- **Health and metadata:** `/health`, `/v1/health`, `/props`, `/models`,
+  `/v1/models`, `/slots` and `/metrics` (501, like llama-server without
   `--metrics`).
-- **Geração:** `/completion` e `/completions` (nativos), `/infill`,
-  `/v1/completions`, `/chat/completions` e `/v1/chat/completions`,
-  `/v1/responses` (e `/responses`, OpenAI Responses) e `/v1/messages`
-  (Anthropic Messages), todos com stream.
-- **Contagem:** `/v1/chat/completions/input_tokens`,
-  `/v1/responses/input_tokens` e `/v1/messages/count_tokens` (com e sem
-  `/v1`).
-- **Utilitários:** `/tokenize` (com `with_pieces`), `/detokenize` e
+- **Generation:** `/completion` and `/completions` (native), `/infill`,
+  `/v1/completions`, `/chat/completions` and `/v1/chat/completions`,
+  `/v1/responses` (and `/responses`, OpenAI Responses) and `/v1/messages`
+  (Anthropic Messages), all with streaming.
+- **Counting:** `/v1/chat/completions/input_tokens`,
+  `/v1/responses/input_tokens` and `/v1/messages/count_tokens` (with and
+  without `/v1`).
+- **Utilities:** `/tokenize` (with `with_pieces`), `/detokenize` and
   `/apply-template`.
-- **Embeddings** (`--embeddings`): `/embedding(s)` nativo e
-  `/v1/embeddings` (float ou base64), do estado final (depois da norma de
-  saída) via `Runtime::hidden_states`; pooling `--pooling
-  none|mean|cls|last` (padrão: o `pooling_type` do GGUF, senão `last`, que
-  num modelo gerativo é o token que leu o texto todo), `embd_normalize` como
-  no llama.cpp. Sem a flag: 501.
+- **Embeddings** (`--embeddings`): native `/embedding(s)` and
+  `/v1/embeddings` (float or base64), from the final state (after the output
+  norm) via `Runtime::hidden_states`; pooling `--pooling none|mean|cls|last`
+  (default: the GGUF's `pooling_type`, else `last`, which in a generative
+  model is the token that read the whole text), `embd_normalize` as in
+  llama.cpp. Without the flag: 501.
 - **Slots** (`--slot-save-path DIR`): `POST /slots/0?action=save|restore|
-  erase` gravam/carregam o cache inteiro (`Runtime::save_state`/
-  `load_state`: linhas de KV usadas, matrizes delta-net, conv, anel QSA,
-  histórico PLE). Num híbrido é o único jeito de retomar um prompt longo sem
-  reprocessar; a continuação sai idêntica token a token. O arquivo do 27B é
-  grande (~283 MB em 1925 tokens: as 48 matrizes delta-net são f32). Nome de
-  arquivo sem diretório. Sem a flag: 501.
-- **Raciocínio controlado:** `reasoning_budget_tokens` (ou
-  `thinking_budget_tokens`, ou `--reasoning-budget`) e
-  `reasoning_budget_message` fecham o `<think>` à força depois de N tokens
-  (`ReasoningBudget` no amostrador); com `reasoning_control: true`,
+  erase` save/load the whole cache (`Runtime::save_state`/`load_state`: used
+  KV rows, delta-net matrices, conv, QSA ring, PLE history). On a hybrid it is
+  the only way to resume a long prompt without reprocessing; the continuation
+  comes out identical token by token. The 27B's file is large (~283 MB at
+  1925 tokens: the 48 delta-net matrices are f32). File name without a
+  directory. Without the flag: 501.
+- **Controlled reasoning:** `reasoning_budget_tokens` (or
+  `thinking_budget_tokens`, or `--reasoning-budget`) and
+  `reasoning_budget_message` force `<think>` closed after N tokens
+  (`ReasoningBudget` in the sampler); with `reasoning_control: true`,
   `POST /v1/chat/completions/control {"id", "action": "reasoning_end"}`
-  fecha o pensamento de uma geração em andamento (vale para chat, Responses
-  e Messages). Ambos desligam o argmax na GPU e o MTP daquela requisição.
-- **Sem suporte, respondendo como o llama-server sem a feature:** rerank
-  (`/rerank`, `/reranking`, `/v1/rerank(ing)`; precisa de um modelo
-  reranker com cabeça de classificação), `POST /props`,
-  `/v1/audio/transcriptions` (501; os modelos não têm encoder de áudio);
-  `/lora-adapters` (lista vazia / `success`). Esses handlers leem o corpo
-  antes de responder: sem isso a conexão fechava com o cliente ainda
-  enviando e ele via um reset em vez do 501.
+  closes the thinking of a generation in progress (works for chat, Responses
+  and Messages). Both turn off the GPU argmax and MTP for that request.
+- **Unsupported, answering like llama-server without the feature:** rerank
+  (`/rerank`, `/reranking`, `/v1/rerank(ing)`; needs a reranker model with a
+  classification head), `POST /props`, `/v1/audio/transcriptions` (501; the
+  models have no audio encoder); `/lora-adapters` (empty list / `success`).
+  These handlers read the body before answering: without that the connection
+  closed with the client still sending and it saw a reset instead of the 501.
 
-Cada resposta traz `timings`, `usage.prompt_tokens_details.cached_tokens` e
-`system_fingerprint`; o stream respeita `stream_options.include_usage`. Erros
-vêm como `{"error": {"code", "message", "type"}}`.
-
-- **Template:** o prompt de chat é o template Jinja do próprio GGUF
-  (`chat.rs`, minijinja com métodos de string do Python), como o `--jinja` do
-  llama.cpp. Ferramentas, respostas de ferramentas, `enable_thinking` e
-  `reasoning_effort` (no corpo ou em `chat_template_kwargs`) chegam ao
-  template. Argumentos de tool call enviados como string JSON viram objetos
-  antes.
-- **Resposta:** é dividida em `reasoning_content` (o bloco `<think>`),
-  `content` e `tool_calls` (`<tool_call>` no formato XML
-  `<function=..><parameter=..>` do Qwen3.5+ ou JSON do Qwen2.5/3), com
-  `finish_reason: tool_calls`. `reasoning_format: none` (ou
-  `--reasoning-format none`) deixa o pensamento no `content`.
-- **Responses e Messages** são convertidos para a forma de chat
+Every response carries `timings`, `usage.prompt_tokens_details.cached_tokens`
+and `system_fingerprint`; streaming honors `stream_options.include_usage`.
+Errors come as `{"error": {"code", "message", "type"}}`.
+- **Template:** the chat prompt is the GGUF's own Jinja template (`chat.rs`,
+  minijinja with Python string methods), like llama.cpp's `--jinja`. Tools,
+  tool responses, `enable_thinking` and `reasoning_effort` (in the body or in
+  `chat_template_kwargs`) reach the template. Tool call arguments sent as a
+  JSON string become objects first.
+- **Response:** it is split into `reasoning_content` (the `<think>` block),
+  `content` and `tool_calls` (`<tool_call>` in Qwen3.5+'s
+  `<function=..><parameter=..>` XML format or Qwen2.5/3's JSON), with
+  `finish_reason: tool_calls`. `reasoning_format: none` (or
+  `--reasoning-format none`) leaves the thinking in `content`.
+- **Responses and Messages** are converted into the chat form
   (`responses_to_chat`, `anthropic_to_chat`: `instructions`/`system`,
-  itens `function_call`/`function_call_output`, blocos `tool_use`/
-  `tool_result`/`thinking`, `text.format`, `thinking.type`,
-  `stop_sequences`) e passam pelo mesmo caminho (`chat_job`,
-  `stream_chat`); só a saída muda. Os eventos do Responses levam
-  `sequence_number`/`output_index` como os da OpenAI; os blocos do Messages
-  fecham um antes do próximo abrir, como na Anthropic.
-- **Amostragem:** a cadeia completa do llama.cpp (penalties → DRY →
-  top-n-sigma → top-k → typical → top-p → min-p → XTC → temperatura, com
-  temperatura dinâmica; mirostat 1/2 substitui o que vem depois do DRY). Os
-  `dry_sequence_breakers` viram uma máscara de tokens (o token cujo texto
-  contém um breaker). `ignore_eos` é `logit_bias` -inf nos tokens de fim
-  (reportado como `{"bias": null, "token"}`, como o llama-server).
-- **Gramática** (`airun-core/src/grammar.rs`): GBNF completo (regras,
-  grupos, classes, `* + ? {m,n}`, escapes), autômato com pilhas sobre code
-  points (um caractere partido entre tokens é carregado), e conversor de JSON
-  schema no estilo do llama.cpp (ordem das propriedades preservada; por isso
-  o `serde_json` usa `preserve_order`). `grammar` > `json_schema` >
-  `response_format`. A máscara testa os 256 tokens mais prováveis e só cai
-  para o vocabulário inteiro se nenhum servir. Com o prompt abrindo
-  `<think>`, a gramática espera o `</think>` (`Grammar::after`): o modelo
-  pensa livre e a restrição vale para a resposta. Custo: ~38 contra ~49
-  tok/s no 27B.
-- **Probabilidades:** `n_probs` (nativo), `logprobs: N` (/v1/completions) e
-  `logprobs` + `top_logprobs` (chat) vêm do softmax dos logits crus, antes
-  dos amostradores, como no llama.cpp, inclusive o token de fim; também no
-  stream.
-- **Infill:** `<|repo_name|>myproject`, cada `input_extra`, `<|file_sep|>
-  filename`, depois `<|fim_prefix|>…<|fim_suffix|>…<|fim_middle|>` — o
-  formato do llama.cpp. `<|fim_pad|>`, `<|repo_name|>` e `<|file_sep|>`
-  contam como fim de geração no tokenizer, como no llama.cpp.
-- **Verificação:** `tests/api_conformance.py` grava as respostas de um
-  servidor e as compara chave a chave (e os nomes de evento SSE) com as de
-  outro. Em 2026-11-01, com o Qwen3.8-27B, deu 56/56 contra o llama-server
-  b11760: gramática, JSON schema, `ignore_eos`, `tool_choice: none`,
-  `json_object`, tool calls e infill com o mesmo texto; `n_probs` dentro de
-  0,002–0,013. No prompt de chat curto sem pensamento o "Hi" sai com
-  logprob -0,175 contra -0,42 no llama.cpp, com prompt e ids idênticos. O
-  caminho todo em f32 do airun (`-b 1`, `AIRUN_MATVEC_F32=1
-  AIRUN_NO_FP4=1 AIRUN_NO_MMQ=1`) dá -0,183: o airun normal fica a 0,01 do
-  cálculo exato e o llama.cpp a 0,24 (quantização das ativações dele).
-- **Diferença de padrão:** pedidos OpenAI sem `repeat_penalty` usam o
-  `--repeat-penalty` do servidor (1,1); o llama-server usa 1,0. O
-  `/completion` nativo usa 1,0, como o llama-server.
-- **Ainda não implementado:** rerank, áudio e LoRA (nenhum dos modelos
-  alvo tem cabeça de rerank, encoder de áudio ou adaptadores).
-- **Bug corrigido junto (2026-11-01):** com `-b 1` o prefill passava token a
-  token pelo grafo de decode sem sincronizar, e cada replay lia o token e a
-  posição já sobrescritos no buffer pinado ("The capital of France is" →
-  "a 2013 American comedy"). `forward_decode_graphed` agora espera o replay
-  anterior antes de reescrever os slots; o decode não muda (48,4 tok/s).
+  `function_call`/`function_call_output` items, `tool_use`/`tool_result`/
+  `thinking` blocks, `text.format`, `thinking.type`, `stop_sequences`) and
+  take the same path (`chat_job`, `stream_chat`); only the output changes.
+  Responses events carry `sequence_number`/`output_index` like OpenAI's;
+  Messages blocks close one before the next opens, as at Anthropic.
+- **Sampling:** llama.cpp's full chain (penalties → DRY → top-n-sigma → top-k
+  → typical → top-p → min-p → XTC → temperature, with dynamic temperature;
+  mirostat 1/2 replaces what comes after DRY). The `dry_sequence_breakers`
+  become a token mask (the token whose text contains a breaker). `ignore_eos`
+  is a -inf `logit_bias` on the end tokens (reported as `{"bias": null,
+  "token"}`, like llama-server).
+- **Grammar** (`airun-core/src/grammar.rs`): full GBNF (rules, groups,
+  classes, `* + ? {m,n}`, escapes), a stack automaton over code points (a
+  character split across tokens is carried), and a llama.cpp-style JSON
+  schema converter (property order preserved; that is why `serde_json` uses
+  `preserve_order`). `grammar` > `json_schema` > `response_format`. The mask
+  tests the 256 most likely tokens and only falls back to the whole vocabulary
+  if none fits. With the prompt opening `<think>`, the grammar waits for
+  `</think>` (`Grammar::after`): the model thinks freely and the constraint
+  applies to the answer. Cost: ~38 against ~49 tok/s on the 27B.
+- **Probabilities:** `n_probs` (native), `logprobs: N` (/v1/completions) and
+  `logprobs` + `top_logprobs` (chat) come from the softmax of the raw logits,
+  before the samplers, as in llama.cpp, the end token included; also when
+  streaming.
+- **Infill:** `<|repo_name|>myproject`, each `input_extra`, `<|file_sep|>
+  filename`, then `<|fim_prefix|>…<|fim_suffix|>…<|fim_middle|>` —
+  llama.cpp's format. `<|fim_pad|>`, `<|repo_name|>` and `<|file_sep|>` count
+  as end of generation in the tokenizer, as in llama.cpp.
+- **Verification:** `tests/api_conformance.py` records one server's responses
+  and compares them key by key (and the SSE event names) with another's. On
+  2026-11-01, with Qwen3.8-27B, it gave 56/56 against llama-server b11760:
+  grammar, JSON schema, `ignore_eos`, `tool_choice: none`, `json_object`, tool
+  calls and infill with the same text; `n_probs` within 0.002–0.013. On the
+  short chat prompt without thinking "Hi" comes out with logprob -0.175
+  against -0.42 in llama.cpp, with identical prompt and ids. airun's all-f32
+  path (`-b 1`, `AIRUN_MATVEC_F32=1 AIRUN_NO_FP4=1 AIRUN_NO_MMQ=1`) gives
+  -0.183: normal airun stays within 0.01 of the exact computation and
+  llama.cpp 0.24 away (its activation quantization).
+- **Default difference:** OpenAI requests without `repeat_penalty` use the
+  server's `--repeat-penalty` (1.1); llama-server uses 1.0. The native
+  `/completion` uses 1.0, like llama-server.
+- **Not implemented yet:** rerank, audio and LoRA (none of the target models
+  has a rerank head, an audio encoder or adapters).
+- **Bug fixed alongside (2026-11-01):** with `-b 1` the prefill went token by
+  token through the decode graph without synchronizing, and each replay read
+  the token and position already overwritten in the pinned buffer ("The
+  capital of France is" → "a 2013 American comedy").
+  `forward_decode_graphed` now waits for the previous replay before rewriting
+  the slots; decode does not change (48.4 tok/s).
 
-### KV cache quantizado (`--kv-type f16|q8_0|q4_0`)
+### Quantized KV cache (`--kv-type f16|q8_0|q4_0`)
 
-Blocos Q8_0/Q4_0 do GGUF por linha de head, decodificados pelos mesmos
-`dequant`. O encoder GPU espelha `encode_q8_0`/`encode_q4_0` de `quantize.rs`
-**bit a bit** (selftest compara os bytes); os intrinsics `__f*_rn` existem
-porque o nvcc contrairia `x*id + 8.5` num FMA que arredonda diferente.
-## 8. Outras frentes
+GGUF Q8_0/Q4_0 blocks per head row, decoded by the same `dequant`. The GPU
+encoder mirrors `encode_q8_0`/`encode_q4_0` in `quantize.rs` **bit for bit**
+(the selftest compares the bytes); the `__f*_rn` intrinsics exist because nvcc
+would contract `x*id + 8.5` into an FMA that rounds differently.
 
-1. **Decode que não cai com o contexto — feito.** No decode a atenção divide o
-   intervalo de KV entre blocos (`gridDim.z`, `attention_splits(ctx)` blocos) e
-   combina os parciais `(max, sum, acc)` num segundo kernel, como o
-   `flash_attn_ext` do llama.cpp. Qwen3-4B Q8_0 numa RTX 3060: 38,9 → 53,4 t/s a
-   3072 tokens (llama.cpp: 49,0). `AIRUN_NO_SPLIT_ATTN=1` volta ao kernel de um
-   bloco por head. O selftest cobre até a posição 212991.
+## 8. Other fronts
 
-   Depois, em 2026-09-26/27: MMQ int8 com `cp.async`, flash attention com
-   `mma.sync`, stream-K, fusões (QKV, gate/up/SwiGLU, prólogo da atenção,
-   soma+norm), argmax na GPU e o pipeline do decode. Placar intercalado contra
-   o llama.cpp, Qwen3-4B Q8_0, RTX 3060, melhor de 3 rodadas
+1. **Decode that does not drop with context — done.** In decode, attention
+   splits the KV range across blocks (`gridDim.z`, `attention_splits(ctx)`
+   blocks) and combines the `(max, sum, acc)` partials in a second kernel,
+   like llama.cpp's `flash_attn_ext`. Qwen3-4B Q8_0 on an RTX 3060: 38.9 →
+   53.4 t/s at 3072 tokens (llama.cpp: 49.0). `AIRUN_NO_SPLIT_ATTN=1` goes
+   back to the one-block-per-head kernel. The selftest covers up to position
+   212991.
+
+   Later, on 2026-09-26/27: int8 MMQ with `cp.async`, flash attention with
+   `mma.sync`, stream-K, fusions (QKV, gate/up/SwiGLU, attention prologue,
+   add+norm), GPU argmax and the decode pipeline. Interleaved scoreboard
+   against llama.cpp, Qwen3-4B Q8_0, RTX 3060, best of 3 rounds
    (`benchmarks/2026-09-26/scoreboard.ps1`):
 
-   | Teste | airun | llama.cpp | razão |
+   | Test | airun | llama.cpp | ratio |
    |---|---|---|---|
-   | prefill 128 | 3535 t/s | 3118 t/s | 1,13x |
-   | prefill 512 | 3979 t/s | 3829 t/s | 1,04x |
-   | decode @16 | 70,3 t/s | 69,1 t/s | 1,02x |
-   | decode @3072 | 63,7 t/s | 62,9 t/s | 1,01x |
+   | prefill 128 | 3535 t/s | 3118 t/s | 1.13x |
+   | prefill 512 | 3979 t/s | 3829 t/s | 1.04x |
+   | decode @16 | 70.3 t/s | 69.1 t/s | 1.02x |
+   | decode @3072 | 63.7 t/s | 62.9 t/s | 1.01x |
 
-   O decode está no limite da memória: os matvecs rodam a 88–96% da banda real
-   (a 3060 fica em P2 durante compute, memória a 7301 MHz em vez de 7501). O
-   que ainda sobra: atenção de decode em contexto curto (~16 µs por camada
-   contra ~10 do llama.cpp, limitada por latência com 8 warps na GPU inteira)
-   e ~4 µs de rampa+cauda por matvec pequeno (o e QKV a 88%).
+   Decode is at the memory limit: the matvecs run at 88–96% of real bandwidth
+   (the 3060 sits in P2 during compute, memory at 7301 MHz instead of 7501).
+   What is still left: short-context decode attention (~16 µs per layer
+   against ~10 in llama.cpp, latency-bound with 8 warps on the whole GPU) and
+   ~4 µs of ramp+tail per small matvec (o and QKV at 88%).
 
-   **Tentado e descartado (medido, não repita sem motivo novo):** prefetch
-   para o L2 num segundo stream durante os kernels pequenos (1–2% mais lento: os
-   ramos extras do grafo custam mais do que o L2 poupa); prioridade de GPU do
-   processo via `D3DKMTSetProcessSchedulingPriorityClass` (nenhum efeito, nem
-   com outra carga CUDA na placa); 1 ou 2 linhas por warp no GLU do decode (1
-   cai para 85% da banda, 2 empata com 4); buffer duplo K/V na atenção de decode
-   (66 contra 52 µs a 3072).
+   **Tried and discarded (measured, do not repeat without a new reason):** L2
+   prefetch on a second stream during the small kernels (1–2% slower: the
+   graph's extra branches cost more than the L2 saves); process GPU priority
+   via `D3DKMTSetProcessSchedulingPriorityClass` (no effect, not even with
+   another CUDA load on the card); 1 or 2 rows per warp in the decode GLU (1
+   drops to 85% of bandwidth, 2 ties with 4); double K/V buffer in decode
+   attention (66 against 52 µs at 3072).
 
-   **Medir exige alternar.** Nesta máquina outro programa que desenha na GPU
-   (navegador, o próprio app de chat) estica um kernel em ~300 µs a cada ~4 ms —
-   ~8% do decode — e some quando o programa para. Os dois motores sofrem igual;
-   só execuções intercaladas na mesma janela de tempo são comparáveis.
-2. **Multi-modal.** `mmproj-f16.gguf` é um ViT de 27 blocos (patch 16, embd
-   1152, ffn 4304) com projetor `qwen3vl_merger`, merge espacial 2x2 e camadas
-   deepstack. Estrutura já mapeada via `inspect --tensors`. Depende do item
-   anterior porque o modelo de texto que o acompanha é qwen3.6.
+   **Measuring requires alternating.** On this machine another program
+   drawing on the GPU (a browser, the chat app itself) stretches a kernel by
+   ~300 µs every ~4 ms — ~8% of decode — and it goes away when the program
+   stops. Both engines suffer equally; only interleaved runs in the same time
+   window are comparable.
+2. **Multi-modal.** `mmproj-f16.gguf` is a 27-block ViT (patch 16, embd 1152,
+   ffn 4304) with a `qwen3vl_merger` projector, 2x2 spatial merge and
+   deepstack layers. Structure already mapped via `inspect --tensors`. It
+   depends on the previous item because the text model that comes with it is
+   qwen3.6.
 
-3. **KV cache paginado** para múltiplas sequências concorrentes. Hoje o
-   servidor serializa requisições porque o cache é uma sequência só.
+3. **Paged KV cache** for several concurrent sequences. Today the server
+   serializes requests because the cache is a single sequence.
 
-4. **MTP — feito para o qwen35 denso (2026-10-31).** `--draft N` (padrão 4 no
-   `run` desde 2026-11-05, antes 3; 0 no `serve` — a flag existe nos dois desde 2026-11-03) carrega
-   `blk.{n_run}` como cabeça de rascunho e decodifica especulativamente
-   quando a amostragem é gulosa pura (`--temp 0 --repeat-penalty 1`). A saída
-   segue o decode normal, mas **não é garantidamente idêntica**: o verify roda
-   lotes de 2–4 tokens em outros kernels (`matvec_q8_multi`, ordem de soma
-   diferente), e num quase-empate de logits o argmax pode virar — o texto
-   diverge dali em diante, igualmente plausível. `crates/airun-core/src/spec.rs`: o verify roda
-   as camadas delta-net sem gravar estado (guarda as entradas em `DeltaStash`) e
-   `commit` empurra só os tokens aceitos — `test_delta_defer` no selftest exige
-   igualdade bit a bit. A linha do KV do MTP na posição q é o par
-   (h_{q-1}, x_q), como no draft-mtp do llama.cpp. Entre dois verifies,
-   `advance_graphed` roda commit + cabeça sobre as linhas do verify + os k
-   rascunhos encadeados (o pick de cada passo vira o token do seguinte no
-   device) como um CUDA graph por contagem aceita m: um lançamento e uma
-   leitura, onde antes o host esperava cada passo da cabeça. Com grafos
-   ligados; em várias GPUs os grafos da cabeça e do advance são capturados
-   no stream da GPU de saída e só o `commit` (que mexe em todas) fica fora
-   (2026-11-05). O verify continua sem grafo em várias GPUs. 27B NVFP4 numa 5070 Ti: 93.8–113.6 tok/s contra 49 sem MTP
-   (llama.cpp com draft-mtp, mesmos prompts: 91.6–104.2).
-   **MoE (2026-11-05):** a cabeça dos MoE carrega pelo mesmo caminho de
-   experts (`load_mtp_weights` monta `FfnWeights::Moe`). Funciona, mas é mais
-   lenta: 35B-A3B numa 5060 Ti 115 → 91 tok/s com 64% aceitos, porque o
-   verify de 4 tokens acorda muito mais experts. Por isso `--draft` sem valor
-   (`LoadOptions.draft = None`) é `DEFAULT_DRAFT` em denso e 0 em MoE.
-   **Mudou em 2026-11-06:** com o verify em grafo por GPU, um MoE inteiro na
-   VRAM ganha com MTP, e o padrão passou a `MOE_DEFAULT_DRAFT` (2) nesse caso;
-   com experts na RAM continua 0 (veja "Medições de decode com MTP" adiante).
-   A cabeça é o bloco `n_run_layers()` (o `block_count` a conta); o bug antigo
-   procurava `blk.{n_layers}` e nunca a achava. 27B numa 5060 Ti: 26,4 → 68,4.
-   Falta: amostragem não gulosa.
+4. **MTP — done for dense qwen35 (2026-10-31).** `--draft N` (default 4 in
+   `run` since 2026-11-05, 3 before; 0 in `serve` — the flag exists in both
+   since 2026-11-03) loads `blk.{n_run}` as the draft head and decodes
+   speculatively when sampling is pure greedy (`--temp 0 --repeat-penalty
+   1`). The output follows normal decoding, but **is not guaranteed
+   identical**: the verify runs batches of 2–4 tokens in other kernels
+   (`matvec_q8_multi`, a different sum order), and on a near-tie of logits
+   the argmax may flip — the text diverges from there on, equally plausible.
+   `crates/airun-core/src/spec.rs`: the verify runs the delta-net layers
+   without writing state (it keeps the inputs in `DeltaStash`) and `commit`
+   pushes only the accepted tokens — `test_delta_defer` in the selftest
+   requires bit-for-bit equality. The MTP KV row at position q is the pair
+   (h_{q-1}, x_q), as in llama.cpp's draft-mtp. Between two verifies,
+   `advance_graphed` runs commit + head over the verify's rows + the k chained
+   drafts (each step's pick becomes the next one's token on the device) as one
+   CUDA graph per accepted count m: one launch and one read, where before the
+   host waited for each head step. With graphs on; on several GPUs the head
+   and advance graphs are captured on the output GPU's stream and only
+   `commit` (which touches all of them) stays outside (2026-11-05). The
+   verify still has no graph on several GPUs. 27B NVFP4 on a 5070 Ti:
+   93.8–113.6 tok/s against 49 without MTP (llama.cpp with draft-mtp, same
+   prompts: 91.6–104.2).
+   **MoE (2026-11-05):** the MoE head loads through the same expert path
+   (`load_mtp_weights` builds `FfnWeights::Moe`). It works, but it is slower:
+   35B-A3B on a 5060 Ti 115 → 91 tok/s with 64% accepted, because a 4-token
+   verify wakes many more experts. That is why `--draft` without a value
+   (`LoadOptions.draft = None`) is `DEFAULT_DRAFT` on dense and 0 on MoE.
+   **Changed on 2026-11-06:** with the verify in a graph per GPU, a MoE fully
+   in VRAM gains with MTP, and the default became `MOE_DEFAULT_DRAFT` (2) in
+   that case; with experts in RAM it stays 0 (see "Decode measurements with
+   MTP" below).
+   The head is block `n_run_layers()` (`block_count` counts it); the old bug
+   looked for `blk.{n_layers}` and never found it. 27B on a 5060 Ti: 26.4 →
+   68.4. Missing: non-greedy sampling.
 
-   **Ativação não silenciosa (2026-11-03):** `--draft` só engaja com amostragem
-   gulosa pura (`temp 0` e nenhuma penalidade — `run`/`serve` têm
-   `--repeat-penalty 1.1` por padrão, o que desliga). Quando o usuário pede
-   `--draft` mas a geração não vai especular, o runtime imprime uma `note:`
-   explicando o porquê (mesma no load, quando o arquivo não tem cabeça MTP
-   utilizável). Antes essa queda era silenciosa: o usuário passava
-   `--draft 3 --temp 0`, não recebia especulação e não sabia por quê.
+   **Non-silent activation (2026-11-03):** `--draft` only engages with pure
+   greedy sampling (`temp 0` and no penalty — `run`/`serve` default to
+   `--repeat-penalty 1.1`, which turns it off). When the user asks for
+   `--draft` but the generation will not speculate, the runtime prints a
+   `note:` explaining why (the same at load, when the file has no usable MTP
+   head). Before, that fallback was silent: the user passed `--draft 3 --temp
+   0`, got no speculation and did not know why.
 
-5. **Template Jinja.** O GGUF traz `tokenizer.chat_template`, que hoje é
-   armazenado mas não avaliado; usamos ChatML embutido.
+5. **Jinja template.** The GGUF carries `tokenizer.chat_template`, which today
+   is stored but not evaluated; we use built-in ChatML.
 
 ---
 
-## 8. Estilo
+## 8. Style
 
-- Comentários explicam **por quê**, não o quê. Se um comentário parafraseia o
-  código, apague.
-- Toda mensagem de erro deve dizer ao usuário **o que fazer**. Compare:
-  "failed to load model" (ruim) vs. a mensagem em `error.rs` que diz quanta
-  VRAM faltou e quais flags mudar (bom).
-- Todo bloco `unsafe` precisa de um comentário `// SAFETY:` justificando.
-- Testes verificam comportamento, não implementação. Prefira testes que
-  falhariam se a lógica estivesse errada, não só se ela mudasse.
+- Comments explain **why**, not what. If a comment paraphrases the code,
+  delete it.
+- Every error message must tell the user **what to do**. Compare: "failed to
+  load model" (bad) vs. the message in `error.rs` that says how much VRAM was
+  missing and which flags to change (good).
+- Every `unsafe` block needs a `// SAFETY:` comment justifying it.
+- Tests check behavior, not implementation. Prefer tests that would fail if
+  the logic were wrong, not just if it changed.
+- Code, comments and documentation are in English.
 
-## NVFP4 fora do Blackwell (2026-11-05)
+## NVFP4 outside Blackwell (2026-11-05)
 
-Sem os tensor cores FP4 (sm_120a), o NVFP4 roda no MMQ int8 (prefill) e no
-dp4a (decode), com o mesmo resultado; `fp4_supported()` decide por GPU
-(`cudaGetDevice`), então num PC misto cada placa usa o seu caminho.
+Without the FP4 tensor cores (sm_120a), NVFP4 runs on int8 MMQ (prefill) and
+dp4a (decode), with the same result; `fp4_supported()` decides per GPU
+(`cudaGetDevice`), so in a mixed PC each card uses its own path.
 
-- RTX 3060, Qwen3-1.7B NVFP4 (convertido pelo `airun quantize`), quente:
-  prefill 128/512/2048 em 6826/8031/7423 t/s, decode 226 tok/s. llama.cpp
-  b11760, mesmo arquivo e placa: pp512 5983, pp2048 6248, tg128 195.
-- 27B numa 5060 Ti: o caminho int8 dá 889 t/s no prefill de 512, igual ao
-  Q4_K do mesmo modelo (864), contra 2016 com FP4. Não há gargalo próprio
-  do formato.
-- Varredura no 3060 (`AIRUN_MMQ_TC=64`, `AIRUN_NO_MMQ_STREAMK`,
-  `AIRUN_NO_MMQ_SPLIT`): os padrões já são os melhores. A primeira medição
-  de cada sessão sai ~8% abaixo (clock da placa subindo); compare só depois
-  de uma rodada de aquecimento.
-- O Nsight Compute 2022.4 instalado perfila a 3060 (sm_86), não as RTX 50.
+- RTX 3060, Qwen3-1.7B NVFP4 (converted by `airun quantize`), warm: prefill
+  128/512/2048 at 6826/8031/7423 t/s, decode 226 tok/s. llama.cpp b11760,
+  same file and card: pp512 5983, pp2048 6248, tg128 195.
+- 27B on a 5060 Ti: the int8 path gives 889 t/s on a 512 prefill, the same as
+  the model's Q4_K (864), against 2016 with FP4. There is no bottleneck
+  specific to the format.
+- Sweep on the 3060 (`AIRUN_MMQ_TC=64`, `AIRUN_NO_MMQ_STREAMK`,
+  `AIRUN_NO_MMQ_SPLIT`): the defaults are already the best. Each session's
+  first measurement comes out ~8% lower (card clock ramping up); compare only
+  after a warm-up round.
+- The installed Nsight Compute 2022.4 profiles the 3060 (sm_86), not the RTX
+  50s.
 
-## Visão, MTP em arquivo próprio, stream replay (2026-11-05)
+## Vision, MTP in its own file, stream replay (2026-11-05)
 
-- **Visão** (`crates/airun-core/src/vision.rs`, `kernels/vision.cu`): o ViT do
-  `qwen3vl_merger` como o `tools/mtmd/models/qwen3vl.cpp` do llama.cpp. Roda
-  nos kernels do texto: matmuls BF16, a atenção do KV cache com toda query na
-  última posição (= atenção cheia) e as cabeças de 72 completadas com zeros
-  até 96; FFN de 4304 completado até 4352 (k % 64 do WMMA). Selftest: seção
-  "vision encoder and image positions".
-- **Posições de imagem no texto:** `airun_rope_params` ganhou `shift` (um i32
-  na GPU por shard; o texto depois de uma imagem roda em slot - shift, e os
-  grafos CUDA seguem o valor) e `mpos` (as posições (t, linha, coluna) dos
-  tokens da imagem, distribuídas pelas seções do M-RoPE intercalado). Sem
-  imagem o shift é 0 e tudo é bit-idêntico ao de antes.
-- **Imagens no prompt** são ids sentinela >= 2^31 (`IMAGE_TOKEN_BASE`), vindos
-  do hash dos embeddings (`Runtime::register_image`), então o
-  `reusable_prefix` reconhece a mesma imagem no turno seguinte. `generate`
-  roda as imagens por `prefill_images`; com imagem o MTP fica desligado.
-  `save_state` recusa conversas com imagem.
-- **MTP em arquivo próprio:** `loader::mtp_source` (`--mtp`, ou um
-  `mtp-*.gguf` compatível na pasta do modelo). `Model::load` recebe de onde ler
-  a cabeça.
-- **Stream replay** (`crates/airun-cli/src/replay.rs`): um middleware copia o
-  SSE de pedidos com `X-Conversation-Id` para a sessão e consome a geração
-  sem o cliente; `DELETE` derruba o corpo e a geração para no próximo token.
-- **MTP no prefill não espera mais a cabeça** a cada lote (`mtp_queue` no
-  lugar de `mtp_run`): o `synchronize` impedia a primeira GPU de começar o
-  lote seguinte. 27B em duas GPUs, prompt de 61k: 615 -> 899 tok/s.
-- **Decode GQA lê V direto do cache f16** (sem passar pela memória
-  compartilhada): 128k, 27B em 5060 Ti + 3060, 12,4 -> 13,4 tok/s. O
-  limite agora é a ocupação: o tile de K deixa 4 warps por SM.
+- **Vision** (`crates/airun-core/src/vision.rs`, `kernels/vision.cu`): the
+  `qwen3vl_merger` ViT as llama.cpp's `tools/mtmd/models/qwen3vl.cpp`. It runs
+  on the text kernels: BF16 matmuls, the KV cache attention with every query
+  at the last position (= full attention) and the 72-wide heads zero-padded to
+  96; FFN of 4304 padded to 4352 (WMMA's k % 64). Selftest: section "vision
+  encoder and image positions".
+- **Image positions in the text:** `airun_rope_params` gained `shift` (one i32
+  on the GPU per shard; the text after an image runs at slot - shift, and the
+  CUDA graphs follow the value) and `mpos` (the (t, row, column) positions of
+  the image tokens, spread over the interleaved M-RoPE sections). Without an
+  image the shift is 0 and everything is bit-identical to before.
+- **Images in the prompt** are sentinel ids >= 2^31 (`IMAGE_TOKEN_BASE`), from
+  the hash of the embeddings (`Runtime::register_image`), so
+  `reusable_prefix` recognizes the same image in the next turn. `generate`
+  runs the images through `prefill_images`; with an image MTP is off.
+  `save_state` refuses chats with images.
+- **MTP in its own file:** `loader::mtp_source` (`--mtp`, or a compatible
+  `mtp-*.gguf` in the model's folder). `Model::load` receives where to read
+  the head from.
+- **Stream replay** (`crates/airun-cli/src/replay.rs`): a middleware copies
+  the SSE of requests with `X-Conversation-Id` into the session and consumes
+  the generation without the client; `DELETE` drops the body and the
+  generation stops at the next token.
+- **MTP during prefill no longer waits for the head** on every batch
+  (`mtp_queue` instead of `mtp_run`): the `synchronize` kept the first GPU
+  from starting the next batch. 27B on two GPUs, 61k prompt: 615 -> 899
+  tok/s.
+- **GQA decode reads V straight from the f16 cache** (without going through
+  shared memory): 128k, 27B on 5060 Ti + 3060, 12.4 -> 13.4 tok/s. The limit
+  now is occupancy: the K tile leaves 4 warps per SM.
 
-## Onde o tempo vai (2026-11-05, Nsight Systems 2026.3)
+## Where the time goes (2026-11-05, Nsight Systems 2026.3)
 
-O `nsys` do Nsight Systems 2026.x perfila as RTX 50 (o Nsight Compute 2022.4 não). Decode só aparece kernel a
-kernel com `AIRUN_NO_GRAPH=1 AIRUN_NO_DECODE_PIPELINE=1`.
-`nsys profile -t cuda -o x airun.exe bench ...` e depois
+Nsight Systems 2026.x's `nsys` profiles the RTX 50s (Nsight Compute 2022.4
+does not). Decode only shows kernel by kernel with `AIRUN_NO_GRAPH=1
+AIRUN_NO_DECODE_PIPELINE=1` (or with `--cuda-graph-trace=node`).
+`nsys profile -t cuda -o x airun.exe bench ...` and then
 `nsys stats -r cuda_gpu_kern_sum -f csv -o x x.nsys-rep`.
 
-27B NVFP4, uma 5060 Ti:
-- **Decode:** `matvec_q8_wide<NVFP4>` 83% (~388 GB/s, 87% da banda), cabeça
-  de saída Q5_K 5% (~95% da banda), delta-net 2%, atenção 1,3% a 1k. Já está
-  no limite da memória; só ler menos bytes ajuda (MTP, KV/pesos menores).
-- **Prefill:** `matmul_nvfp4` 57% (~190 TFLOPS, metade do pico FP4),
-  `delta_rule_reg` 19% (recorrência token a token), quantização das
-  ativações para FP4 8%, `add_rmsnorm` 4%, atenção 2% a 2k.
+27B NVFP4, one 5060 Ti:
+- **Decode:** `matvec_q8_wide<NVFP4>` 83% (~388 GB/s, 87% of bandwidth),
+  Q5_K output head 5% (~95% of bandwidth), delta-net 2%, attention 1.3% at
+  1k. It is already at the memory limit; only reading fewer bytes helps (MTP,
+  smaller KV/weights).
+- **Prefill:** `matmul_nvfp4` 57% (~190 TFLOPS, half the FP4 peak),
+  `delta_rule_reg` 19% (token-by-token recurrence), activation quantization to
+  FP4 8%, `add_rmsnorm` 4%, attention 2% at 2k.
 
-## Delta-net do prefill em blocos, nos tensor cores (2026-11-05)
+## Chunked prefill delta-net, on the tensor cores (2026-11-05)
 
-`kernels/delta_chunk.cu`: a forma WY do gated delta rule (como o
-`chunk_gated_delta_rule` do flash-linear-attention) em blocos de 64 tokens.
-Um passo paralelo por (cabeça, bloco) monta W, U, Q e K decaídos e o Q K^T
-mascarado; um passo sequencial por (cabeça, 32 colunas) percorre os blocos.
-Produtos em bf16 com acumulação fp32 (WMMA, sm_80+); o estado fica em fp32.
-Entra quando o lote tem 64+ tokens e cabeças de 128; decode e verify do MTP
-seguem na recorrência. `AIRUN_NO_DELTA_CHUNK=1` desliga.
+`kernels/delta_chunk.cu`: the WY form of the gated delta rule (like
+flash-linear-attention's `chunk_gated_delta_rule`) in 64-token chunks. A
+parallel step per (head, chunk) builds W, U, decayed Q and K and the masked Q
+K^T; a sequential step per (head, 32 columns) walks the chunks. Products in
+bf16 with fp32 accumulation (WMMA, sm_80+); the state stays in fp32. It kicks
+in when the batch has 64+ tokens and 128-wide heads; decode and the MTP verify
+stay on the recurrence. `AIRUN_NO_DELTA_CHUNK=1` turns it off.
 
-- 27B numa 5060 Ti: prefill 512 2020 -> 2192 t/s, 2048 1987 -> 2157 (+8,5%).
-  35B-A3B nas duas GPUs: 1856 -> 1990, 2666 -> 2845 (+7%).
-- Perplexidade (16k tokens de código, `--chunk 1024 --batched`) igual: 2,00
-  no 27B, 2,06 no 35B. Selftest: 0,5% da faixa contra a recorrência em f64.
-- O texto guloso pode virar num quase-empate (não é mais bit-idêntico ao
-  decode token a token); a resposta de 61k tokens continuou certa.
-- O llama.cpp b11760 usa a recorrência aqui ("TODO: chunked kernel").
-- **Medição:** os tempos de kernel do `nsys` enganaram nesse kernel (davam o
-  bloco como mais lento); decida pelo `bench` alternando com a variável.
-- **Tentativas que não ganharam** (recorrência reorganizada): carregar k/q em
-  tiles de 4 ou 16 tokens (-3%), uma coluna por warp com redução por shuffle
-  (-7%), 4 fatias de 32 em vez de 8 de 16 (-2,5%). Matmul FP4 com estágios de
-  2 blocos e 4 buffers (cópias de 8 bytes): -26%.
-- O GPU 0 também desenha a tela: outro programa usando a GPU derrubou o
-  prefill de 2018 para ~1650 numa rodada. Compare sempre no mesmo momento.
+- 27B on a 5060 Ti: prefill 512 2020 -> 2192 t/s, 2048 1987 -> 2157 (+8.5%).
+  35B-A3B on the two GPUs: 1856 -> 1990, 2666 -> 2845 (+7%).
+- Perplexity (16k tokens of code, `--chunk 1024 --batched`) unchanged: 2.00 on
+  the 27B, 2.06 on the 35B. Selftest: 0.5% of range against the f64
+  recurrence.
+- Greedy text may flip on a near-tie (it is no longer bit-identical to
+  token-by-token decoding); the 61k-token answer stayed right.
+- llama.cpp b11760 uses the recurrence here ("TODO: chunked kernel").
+- **Measurement:** `nsys` kernel times misled on this kernel (they showed the
+  chunked one as slower); decide with `bench` alternating with the variable.
+- **Attempts that did not win** (reorganized recurrence): loading k/q in tiles
+  of 4 or 16 tokens (-3%), one column per warp with shuffle reduction (-7%), 4
+  slices of 32 instead of 8 of 16 (-2.5%). FP4 matmul with 2-block stages and
+  4 buffers (8-byte copies): -26%.
+- GPU 0 also draws the screen: another program using the GPU dropped prefill
+  from 2018 to ~1650 in one round. Always compare at the same moment.
 
-## Barra de carregamento e níveis de raciocínio (2026-11-05)
+## Load progress bar and reasoning levels (2026-11-05)
 
-- `crates/airun-cli/src/progress.rs`: a carga do modelo mostra etapa,
-  porcentagem, camadas, GiB e tempo restante (numa linha que se redesenha num
-  terminal; a cada 25% num log). `run`, `serve`, `bench` e `perplexity`.
-  Com várias GPUs, cada uma tem a sua linha ("GPU 1 RTX 5060, layers 0..15"),
-  que fica na tela com "ok" quando termina. Os rótulos vêm de
-  `loader::upload_labels`. Os GiB da barra são o tamanho do arquivo vezes a
-  fração de passos (não os bytes reais de cada GPU); o plano impresso depois
-  tem os valores certos.
-- `return_progress` (llama-server): com stream, o chat manda um chunk com
-  `prompt_progress` {total, cache, processed, time_ms} e `choices: []` a cada
-  lote do prefill (`Runtime::set_prefill_hook`, também no MTP e no
-  `--parallel`). Sem esperar a GPU: a fila de lançamentos já segura o host
-  no máximo um lote à frente. Clientes que acham que falam com llama.cpp (o
-  `/props` tem `default_generation_settings`) esperam isso.
-- **Cache em híbridos com pensamento: falta.** O template do Qwen tira o
-  `<think>` das respostas antigas, então o próximo prompt não começa com o
-  histórico inteiro e `reusable_prefix` dá 0 (o estado delta-net não volta
-  atrás). Num agente com pensamento, todo turno reprocessa o contexto
-  (medido: 7,5k tokens, turno 2 com 0 do cache; sem pensar, 7.537 do cache).
-  Caminho: guardar o estado delta-net no fim do prompt e restaurá-lo.
-- `/props` traz `details` (contexto de treino e iniciado, KV, camadas por
-  GPU/RAM, MoE com especialistas ativos/total, RoPE, MTP, notas do planner),
-  e o painel de configurações da web UI mostra tudo isso.
-- `crates/airun-cli/src/reasoning.rs`: níveis none/low/medium/high/xhigh/max
-  (xhigh = 32768 tokens; antes era sinônimo de max). A web UI mostra
-  desligado/padrão/baixo/médio/alto/muito alto/máximo; "padrão" não manda
-  nível (vale o `--reasoning-effort` do servidor, senão o template). O
-  `serve` tenta o nível no template (Qwen3.8 aceita low, medium, xhigh) e, se
-  o template não o lê ou recusa o nome, usa o orçamento de pensamento.
-- **`run` não pensava** com Qwen3.5/3.8: o prompt ChatML puro não abria o
-  `<think>` como o template abre. Agora segue a regra do template
-  (`Thinking::from_template`), como o `serve`.
-- FP4 gate/up/SwiGLU num launch (`matmul_nvfp4_kernel<true>`): +2% de prefill.
+- `crates/airun-cli/src/progress.rs`: model loading shows step, percentage,
+  layers, GiB and time left (on a line that redraws itself in a terminal;
+  every 25% in a log). `run`, `serve`, `bench` and `perplexity`. With several
+  GPUs, each has its own line ("GPU 1 RTX 5060, layers 0..15"), which stays on
+  screen with "ok" when it finishes. The labels come from
+  `loader::upload_labels`. The bar's GiB are the file size times the fraction
+  of steps (not each GPU's real bytes); the plan printed afterwards has the
+  right values.
+- `return_progress` (llama-server): when streaming, the chat sends a chunk
+  with `prompt_progress` {total, cache, processed, time_ms} and `choices: []`
+  on every prefill batch (`Runtime::set_prefill_hook`, also in MTP and
+  `--parallel`). Without waiting on the GPU: the launch queue already keeps
+  the host at most one batch ahead. Clients that think they talk to llama.cpp
+  (`/props` has `default_generation_settings`) expect this.
+- **Cache on hybrids with thinking: missing.** Qwen's template strips
+  `<think>` from old answers, so the next prompt does not start with the whole
+  history and `reusable_prefix` gives 0 (the delta-net state does not go
+  back). In an agent with thinking, every turn reprocesses the context
+  (measured: 7.5k tokens, turn 2 with 0 from cache; without thinking, 7,537
+  from cache). Path: save the delta-net state at the end of the prompt and
+  restore it.
+- `/props` carries `details` (training and started context, KV, layers per
+  GPU/RAM, MoE with active/total experts, RoPE, MTP, planner notes), and the
+  web UI's settings panel shows all of it.
+- `crates/airun-cli/src/reasoning.rs`: levels none/low/medium/high/xhigh/max
+  (xhigh = 32768 tokens; it used to be a synonym of max). The web UI shows
+  off/default/low/medium/high/very high/max; "default" sends no level (the
+  server's `--reasoning-effort` applies, else the template). `serve` tries the
+  level in the template (Qwen3.8 accepts low, medium, xhigh) and, if the
+  template does not read it or refuses the name, uses the thinking budget.
+- **`run` did not think** with Qwen3.5/3.8: the plain ChatML prompt did not
+  open `<think>` the way the template does. It now follows the template's
+  rule (`Thinking::from_template`), like `serve`.
+- FP4 gate/up/SwiGLU in one launch (`matmul_nvfp4_kernel<true>`): +2%
+  prefill.
+## Several requests at once and MTP with temperature (2026-11-05)
 
-## Várias requisições ao mesmo tempo e MTP com temperatura (2026-11-05)
+- **Slots** (`Runtime::set_slots`, `serve --parallel N`): each slot has its own
+  set of `LayerState` (KV and delta-net) per shard; the active one lives in
+  the shards and the others in `Runtime::slots`. `switch_slot` swaps the sets
+  and discards the decode graphs (they kept the addresses). The planner counts
+  the cache N times (`Config::slots`).
+- **`decode_rows`**: one token from each slot in a single pass. The matmuls
+  and the per-token work run batched; at the 4 stateful points (KV write and
+  attention, delta-net convolution and recurrence) the runtime calls the usual
+  kernel once per row with that row's slot state (`self.mixed`). The RoPE
+  position comes from `mpos` (all three axes equal), so each slot keeps its
+  own image shift. No CUDA graph on this path.
+- **Scheduler** (`crates/airun-cli/src/sched.rs`): one thread admits one
+  request per step (prefill into the free slot with the longest common
+  prefix) and advances the active ones together. `run_generation` sends the
+  request and receives the tokens over a channel; stop sequences and streaming
+  stay on the request's thread. With `--parallel 1` none of this runs.
+- Models with QSA, hyper-connections or PLE refuse `--parallel` > 1.
+- **MTP with temperature** (`Sampler::sample_draft`): the draft (the head's
+  argmax) is accepted with the probability the sampling chain gives it and,
+  when refused, the token comes from the distribution without it; test
+  `sampling_against_a_draft_keeps_the_distribution` (200k draws). 27B: 25.7
+  -> 47.2 tok/s at temp 0.7. Mirostat still has no MTP.
 
-- **Slots** (`Runtime::set_slots`, `serve --parallel N`): cada slot tem o seu
-  conjunto de `LayerState` (KV e delta-net) por shard; o ativo fica nos
-  shards e os outros em `Runtime::slots`. `switch_slot` troca os conjuntos e
-  descarta os grafos de decode (eles guardavam os endereços). O planner conta
-  N vezes o cache (`Config::slots`).
-- **`decode_rows`**: um token de cada slot num passe só. Os matmuls e o que é
-  por token rodam em lote; nos 4 pontos com estado (escrita do KV e atenção,
-  convolução e recorrência da delta-net) o runtime chama o kernel de sempre
-  uma vez por linha com o estado do slot dela (`self.mixed`). A posição da
-  RoPE vem do `mpos` (os três eixos iguais), então cada slot mantém o seu
-  deslocamento de imagem. Sem grafo CUDA nesse caminho.
-- **Agendador** (`crates/airun-cli/src/sched.rs`): uma thread admite um
-  pedido por passo (prefill no slot livre de maior prefixo em comum) e avança
-  os ativos juntos. `run_generation` manda o pedido e recebe os tokens por
-  canal; stop sequences e stream continuam na thread do pedido. Com
-  `--parallel 1` nada disso roda.
-- Modelos com QSA, hyper-connections ou PLE recusam `--parallel` > 1.
-- **MTP com temperatura** (`Sampler::sample_draft`): o rascunho (argmax da
-  cabeça) é aceito com a probabilidade que a cadeia de amostragem lhe dá e,
-  recusado, o token sai da distribuição sem ele; teste
-  `sampling_against_a_draft_keeps_the_distribution` (200 mil sorteios).
-  27B: 25,7 -> 47,2 tok/s a temp 0,7. Mirostat continua sem MTP.
+## `--parallel` without a loss for a lone request (2026-11-06, 5070 Ti + 5060)
 
-## `--parallel` sem perda para um pedido sozinho (2026-11-06, 5070 Ti + 5060)
+Measured with `serve`, requests of 200–300 tokens, base (`--parallel 1`) and
+`--parallel 4` alternated in the same session (the PC was in use; rounds with
+a general ~35% drop were discarded).
 
-Medido com `serve`, pedidos de 200–300 tokens, base (`--parallel 1`) e
-`--parallel 4` alternados na mesma sessão (o PC estava em uso; rodadas com
-queda geral de ~35% foram descartadas).
+- **What was lost:** with `--parallel` > 1 the loader did not load the MTP
+  head and every request went through `decode_rows` (whole logits to the host,
+  no GPU argmax, no graph chain). 27B NVFP4 `--draft 4`, lone request: greedy
+  38.6 -> 27.4 tok/s (-29%), temp 0.7 33.6 -> 27.4 (-18%). Qwen3-4B Q8_0:
+  greedy 134.5 -> 126.8 (-6%). Besides, `slot_prefix` ignored the turn
+  snapshot: the same prompt again went to an empty slot (0 of 23 tokens from
+  cache, prefill 340 against 75 ms).
+- **Solo mode** (`sched.rs`, `solo`): with nobody active or queued, the
+  request runs through `Runtime::generate_with` on its slot — the same path as
+  `--parallel 1`. The callback checks the channel on every token; when another
+  request arrives, it returns false, and the refused token (delivered, outside
+  the caches) becomes the batched step's `next`, as before. `generate_with`
+  receives the `StreamDecoder` from outside and does not flush the tail, so a
+  character cut at the pause continues. When the others finish, what is left
+  goes back to solo with prompt = slot history + `next` (a 1-token prefill).
+  MTP on that return only if the head covers the cache (`spec_keeps_prefix`)
+  or redoing costs up to 256 tokens (`REDO_FOR_DRAFTS`): there is one head and
+  it goes stale on every slot switch or batched step.
+  `AIRUN_NO_PARALLEL_SOLO=1` turns it off.
+- **Tokenizing without the runtime lock:** `Runtime::tokenizer` is an `Arc`
+  and `AppState` keeps a copy. Without it the solo, which holds the runtime
+  during generation, kept the new request from reaching the queue (the 4
+  concurrent ones dropped to 42.6 tok/s, one after the other).
+- **Snapshot per slot:** `SlotStore::turn_snap`, swapped in `switch_slot`
+  (which clears its `pending`: the head was written by others). `slot_begin`
+  also takes the snapshot, and `slot_prefix` uses the same rule as
+  `reusable_prefix` (`prefix_of`). 27B, `--parallel 2`, two chats with a
+  1,237-token system prompt, also at the same time: turn 2 with 1,243 from
+  cache in each.
+- **Graph for the batched step** (`queue_rows_graphed`, `MixedGraphs`):
+  everything that depends on position in the `mixed` path comes from GPU
+  buffers (`positions`, `mpos`) and each slot's state buffers never change
+  address (`switch_slot` moves the handles), so one graph per shard, per
+  ordered slot list, holds while the same slots advance together (up to 8
+  lists). If capture fails on the first shard, it goes back to the old path
+  with a `note:`. `AIRUN_NO_ROWS_GRAPH=1` turns it off. 4 requests (3
+  alternated rounds):
 
-- **O que se perdia:** com `--parallel` > 1 o loader não carregava a cabeça
-  MTP e todo pedido passava pelo `decode_rows` (logits inteiros para o host,
-  sem argmax na GPU, sem a cadeia de grafos). 27B NVFP4 `--draft 4`, pedido
-  sozinho: guloso 38,6 -> 27,4 tok/s (-29%), temp 0,7 33,6 -> 27,4 (-18%).
-  Qwen3-4B Q8_0: guloso 134,5 -> 126,8 (-6%). Além disso o `slot_prefix`
-  ignorava o snapshot de turno: o mesmo prompt de novo ia para um slot vazio
-  (0 de 23 tokens do cache, prefill 340 contra 75 ms).
-- **Modo solo** (`sched.rs`, `solo`): sem ninguém ativo nem na fila, o pedido
-  roda por `Runtime::generate_with` no slot dele — o mesmo caminho do
-  `--parallel 1`. O callback olha o canal a cada token; chegou outro pedido,
-  devolve false, e o token recusado (entregue, fora dos caches) vira o `next`
-  do passo em lote, como já era. `generate_with` recebe o `StreamDecoder` de
-  fora e não esvazia a cauda, para um caractere cortado na pausa continuar.
-  Quando os outros terminam, o que sobrou volta ao solo com o prompt =
-  histórico do slot + `next` (prefill de 1 token). MTP nessa volta só se a
-  cabeça cobre o cache (`spec_keeps_prefix`) ou se refazer custa até 256
-  tokens (`REDO_FOR_DRAFTS`): a cabeça é uma só e fica velha a cada troca de
-  slot ou passo em lote. `AIRUN_NO_PARALLEL_SOLO=1` desliga.
-- **Tokenizar sem o lock do runtime:** `Runtime::tokenizer` é `Arc` e o
-  `AppState` guarda uma cópia. Sem isso o solo, que segura o runtime durante a
-  geração, impedia o pedido novo de chegar à fila (os 4 simultâneos caíram a
-  42,6 tok/s, um atrás do outro).
-- **Snapshot por slot:** `SlotStore::turn_snap`, trocado no `switch_slot`
-  (que zera o `pending` dele: a cabeça foi escrita por outros). `slot_begin`
-  também tira o snapshot, e `slot_prefix` usa a mesma regra do
-  `reusable_prefix` (`prefix_of`). 27B, `--parallel 2`, duas conversas com
-  system prompt de 1.237 tokens, inclusive ao mesmo tempo: turno 2 com 1.243
-  do cache em cada uma.
-- **Grafo no passo em lote** (`queue_rows_graphed`, `MixedGraphs`): tudo que
-  depende da posição no caminho `mixed` vem de buffers na GPU (`positions`,
-  `mpos`) e os buffers de estado de cada slot nunca mudam de endereço (o
-  `switch_slot` move os handles), então um grafo por shard, por lista de slots
-  em ordem, vale enquanto os mesmos slots andam juntos (até 8 listas). Se a
-  captura falhar no primeiro shard, volta ao caminho antigo com uma `note:`.
-  `AIRUN_NO_ROWS_GRAPH=1` desliga. 4 pedidos (3 rodadas alternadas):
-
-  | Modelo | sem grafo | com grafo |
+  | Model | no graph | with graph |
   |---|---|---|
-  | 27B, temp 0,7 | 57,7–58,6 | **67,3–67,8** |
-  | 27B, guloso | 59,2–60,9 | **71,1–72,8** (texto idêntico ao sem grafo) |
-  | 4B, guloso | 146–217 | 161–246 (+10–13%, ruidoso) |
+  | 27B, temp 0.7 | 57.7–58.6 | **67.3–67.8** |
+  | 27B, greedy | 59.2–60.9 | **71.1–72.8** (text identical to no graph) |
+  | 4B, greedy | 146–217 | 161–246 (+10–13%, noisy) |
 
-- **Resultado, pedido sozinho:** 27B `--draft 4` guloso 38,2–38,7 contra
-  36,0–38,3 da base; temp 0,7 32,3–33,8 contra 32,8–33,6; 4B guloso
-  126,6/127,2 contra 123,9/127,6. Texto guloso idêntico ao da base.
-- **Ainda custa:** a VRAM do cache (N vezes, o contexto automático cai) e a
-  cabeça MTP, que agora carrega também com `--parallel` quando há `--draft`.
-  Atualizado na seção seguinte (passo em lote).
-- **Texto guloso com vários pedidos ao mesmo tempo difere do de um por vez**
-  (já era assim antes desta mudança, conferido com `AIRUN_NO_PARALLEL_SOLO=1`):
-  o lote soma em outra ordem e um quase-empate vira; depende também de quando
-  cada pedido entra. A frase "respostas iguais às de um por vez" da tabela do
-  §2 só vale para pedidos que não se sobrepõem.
+- **Result, lone request:** 27B `--draft 4` greedy 38.2–38.7 against
+  36.0–38.3 for the base; temp 0.7 32.3–33.8 against 32.8–33.6; 4B greedy
+  126.6/127.2 against 123.9/127.6. Greedy text identical to the base.
+- **Still costs:** the cache's VRAM (N times, the automatic context drops) and
+  the MTP head, which now also loads with `--parallel` when there is
+  `--draft`. Updated in the next section (batched step).
+- **Greedy text with several requests at once differs from one at a time**
+  (it was already so before this change, checked with
+  `AIRUN_NO_PARALLEL_SOLO=1`): the batch sums in another order and a near-tie
+  flips; it also depends on when each request comes in. The "answers equal to
+  one at a time" sentence in §2's table only holds for requests that do not
+  overlap.
 
-## Passo em lote do `--parallel`: onde ia o tempo (2026-11-06, 5070 Ti + 5060)
+## `--parallel` batched step: where the time went (2026-11-06, 5070 Ti + 5060)
 
-Perfilado com nsys (`--cuda-graph-trace=node`) e `AIRUN_SCHED_TIMING=1`.
-27B NVFP4 `--tensor-split 5,2` (a cabeça BF16 fica na 5060), 4 pedidos. Os
-kernels com estado somavam só ~5% da GPU; o que pesava:
+Profiled with nsys (`--cuda-graph-trace=node`) and `AIRUN_SCHED_TIMING=1`. 27B
+NVFP4 `--tensor-split 5,2` (the BF16 head stays on the 5060), 4 requests. The
+stateful kernels added up to only ~5% of the GPU; what weighed:
 
-- **Logits do lote: 13 ms por passo.** A saída BF16 (248k x 5120, 2,5 GB) com
-  4 linhas ia para o kernel em blocos de 16 tokens (`matvec_tiled`), e o
-  `decode_rows` alocava (`cudaMalloc`/`cudaFree`, que sincroniza) e copiava
-  para memória paginável a cada passo. Agora: `matvec_half_kernel` (BF16/F16,
-  1..8 tokens, 16 bytes por lane, cada peso lido uma vez para todos os
-  tokens; `AIRUN_NO_HALF_MATVEC=1` volta ao antigo) e buffers fixos
-  (`rows_logits`, GPU + host fixado), devolvidos como fatia. Com 1 token na
-  5070 Ti: 3,30 -> 3,02 ms (o antigo já dava 770 GB/s; ganho pequeno). Na 5060
-  os dois ficam em ~6 ms, que é a banda dela. **Cuidado:** o nsys deste PC
-  rotula as GPUs trocadas; confira pela banda.
-- **Matvec F32 estreito com várias linhas:** os portões da delta-net (48
-  saídas) com 4 tokens iam para o kernel em blocos com 3 blocos de grade:
-  55 us contra 5 com 1 token, ~2,8 ms por passo. `matvec_tallk_kernel` agora
-  pega até 16 tokens (`blockIdx.y`; `AIRUN_NO_TALLK_TOKENS=1` desliga). Isso
-  vale também para o **verify do MTP** (5 linhas), que caía no mesmo kernel de
-  3 blocos: 27B `--draft 4`, um pedido, 3 rodadas alternadas, guloso
-  41,2–41,9 -> **43,9–44,7** tok/s, temp 0,7 35,5–35,6 -> **37,3–38,3**; 4
-  pedidos 80–81 -> 84–86. O prefill de poucos tokens (o resto de um prompt
-  em cache) também passa por ele, então o texto guloso de um turno pode virar
-  num quase-empate em relação a antes (visto no 27B, no caractere 305).
-- **Atenção, delta-net e conv uma vez por linha:** `attention_split_rows`,
-  `delta_rule_rows`, `causal_conv1d_rows`, com a linha em `blockIdx.z`/`y` e
-  uma tabela de ponteiros por shard (`rows_tab`, K/estado das n linhas e
-  depois V/conv), reescrita antes de cada passo; os grafos guardam só o
-  endereço da tabela. A atenção de um token com contexto curto leva ~70 us
-  quase sem usar a GPU (4 blocos de um warp), então juntar as 4 linhas tira
-  ~3 ms por passo. Mesma aritmética: bit a bit igual (caso no selftest).
-  `AIRUN_NO_ROWS_BATCH=1` volta ao laço.
-- **Amostragem:** cada linha numa thread (`sample_rows`); custava pouco
-  (~1 ms para as 4), mas era serial.
+- **Batch logits: 13 ms per step.** The BF16 output (248k x 5120, 2.5 GB) with
+  4 rows went to the 16-token tiled kernel (`matvec_tiled`), and `decode_rows`
+  allocated (`cudaMalloc`/`cudaFree`, which synchronizes) and copied to
+  pageable memory on every step. Now: `matvec_half_kernel` (BF16/F16, 1..8
+  tokens, 16 bytes per lane, each weight read once for all tokens;
+  `AIRUN_NO_HALF_MATVEC=1` goes back to the old one) and fixed buffers
+  (`rows_logits`, GPU + pinned host), returned as a slice. With 1 token on the
+  5070 Ti: 3.30 -> 3.02 ms (the old one already did 770 GB/s; small gain). On
+  the 5060 both stay at ~6 ms, which is its bandwidth. **Careful:** this PC's
+  nsys labels the GPUs swapped; check by bandwidth.
+- **Narrow F32 matvec with several rows:** the delta-net gates (48 outputs)
+  with 4 tokens went to the tiled kernel with 3 grid blocks: 55 us against 5
+  with 1 token, ~2.8 ms per step. `matvec_tallk_kernel` now takes up to 16
+  tokens (`blockIdx.y`; `AIRUN_NO_TALLK_TOKENS=1` turns it off). This also
+  applies to the **MTP verify** (5 rows), which fell into the same 3-block
+  kernel: 27B `--draft 4`, one request, 3 alternated rounds, greedy 41.2–41.9
+  -> **43.9–44.7** tok/s, temp 0.7 35.5–35.6 -> **37.3–38.3**; 4 requests
+  80–81 -> 84–86. A few-token prefill (the rest of a cached prompt) also goes
+  through it, so a turn's greedy text may flip on a near-tie compared with
+  before (seen on the 27B, at character 305).
+- **Attention, delta-net and conv once per row:** `attention_split_rows`,
+  `delta_rule_rows`, `causal_conv1d_rows`, with the row in
+  `blockIdx.z`/`y` and a pointer table per shard (`rows_tab`, K/state of the n
+  rows and then V/conv), rewritten before each step; the graphs keep only the
+  table's address. One token's attention with short context takes ~70 us
+  barely using the GPU (4 one-warp blocks), so joining the 4 rows takes ~3 ms
+  off each step. Same arithmetic: bit-for-bit equal (case in the selftest).
+  `AIRUN_NO_ROWS_BATCH=1` goes back to the loop.
+- **Sampling:** each row on a thread (`sample_rows`); it cost little (~1 ms for
+  the 4), but it was serial.
 
-Resultado, sem log por passo, rodadas alternadas (t/s somados, guloso / temp
-0,7); texto guloso idêntico entre as variantes em todas as rodadas:
+Result, without per-step logging, alternated rounds (summed t/s, greedy /
+temp 0.7); greedy text identical across variants in every round:
 
-| | tudo | sem lote (`NO_ROWS_BATCH`) | sem `matvec_half` |
+| | all | no batching (`NO_ROWS_BATCH`) | no `matvec_half` |
 |---|---|---|---|
-| 27B, 4 pedidos (3 rodadas) | **81–86 / 89–92** | 75–80 / 84–88 | 79–82 / 85–90 |
-| 4B, 4 pedidos (2 rodadas) | **362–377 / 361–380** | 294–306 / 317–326 | 351 / 375–383 |
+| 27B, 4 requests (3 rounds) | **81–86 / 89–92** | 75–80 / 84–88 | 79–82 / 85–90 |
+| 4B, 4 requests (2 rounds) | **362–377 / 361–380** | 294–306 / 317–326 | 351 / 375–383 |
 
-Antes desta rodada o 4B com 4 pedidos dava 233–246, e o 27B 67–73
-(`-c 16384`, que deixa a atenção um pouco mais cara).
+Before this round the 4B with 4 requests did 233–246, and the 27B 67–73
+(`-c 16384`, which makes attention a bit more expensive).
 
-- **Medir sem log por passo.** Com `AIRUN_SCHED_TIMING=1` (uma linha de
-  stderr por passo), o intervalo entre passos crescia de 45 para 50–62 ms
-  (p90 de +26 ms) e o t/s caía para 51–60. Use o log para ver a divisão do
-  passo, não para medir velocidade.
-- **Falta:** a admissão faz um prefill por vez (4 prompts curtos: ~1,5 s antes
-  do primeiro passo em lote), e o resto do passo é matvec dos pesos, que já
-  lê cada peso uma vez para todas as linhas.
+- **Measure without per-step logging.** With `AIRUN_SCHED_TIMING=1` (one
+  stderr line per step), the interval between steps grew from 45 to 50–62 ms
+  (p90 +26 ms) and t/s dropped to 51–60. Use the log to see how the step
+  splits, not to measure speed.
+- **Missing:** admission does one prefill at a time (4 short prompts: ~1.5 s
+  before the first batched step), and the rest of the step is weight matvecs,
+  which already read each weight once for all rows.
 
-## Contexto automático e a cabeça na GPU rápida (2026-11-06, 5070 Ti + 5060)
+## Automatic context and the head on the fast GPU (2026-11-06, 5070 Ti + 5060)
 
-O usuário viu `--parallel 4` mais rápido que sem a flag com um pedido só.
-Medido (27B NVFP4, `--mmproj`, `--kv-type q4_0 -b 256 --draft 3`, sem `-c`, 3
-rodadas alternadas): 63,8 contra 52,5 tok/s guloso, 47,6 contra 36,4 a temp
-0,7. Não era o `--parallel`: sem a flag o contexto automático subia a 127.488,
-onde o layout com a GPU rápida no fim (`fill_fastest_last`) já não cabia, e o
-planner caía no "filling GPU 0 first", que deixa a cabeça de saída (e o MTP,
-que a lê a cada rascunho) na 5060. Com `--parallel 4` o contexto era 25.856 e
-o layout bom cabia.
+The user saw `--parallel 4` faster than without the flag with a single
+request. Measured (27B NVFP4, `--mmproj`, `--kv-type q4_0 -b 256 --draft 3`,
+no `-c`, 3 alternated rounds): 63.8 against 52.5 tok/s greedy, 47.6 against
+36.4 at temp 0.7. It was not `--parallel`: without the flag the automatic
+context rose to 127,488, where the layout with the fast GPU last
+(`fill_fastest_last`) no longer fit, and the planner fell back to "filling GPU
+0 first", which leaves the output head (and MTP, which reads it on every
+draft) on the 5060. With `--parallel 4` the context was 25,856 and the good
+layout fit.
 
-`auto_ctx` (`loader.rs`) agora, entre GPUs desiguais (sem `--main-gpu` nem
-`--tensor-split`), se o maior contexto põe a cabeça fora da GPU mais rápida,
-procura o maior contexto, até 1/4 menor, em que ela fica na mais rápida, e
-avisa com uma `note:`. Aqui: 126.976 em vez de 127.488, e sem a flag passou a
-63,8–63,9 / 47,3–47,6, igual ao `--parallel 4`. `-c` explícito não muda.
+`auto_ctx` (`loader.rs`) now, between unequal GPUs (without `--main-gpu` or
+`--tensor-split`), if the largest context puts the head off the fastest GPU,
+looks for the largest context, up to 1/4 smaller, at which it stays on the
+fastest, and warns with a `note:`. Here: 126,976 instead of 127,488, and
+without the flag it went to 63.8–63.9 / 47.3–47.6, the same as `--parallel
+4`. An explicit `-c` does not change.
 
-## RAM durante o carregamento (2026-11-07)
+## RAM during loading (2026-11-07)
 
-**O sintoma:** ao carregar, a RAM subia até o tamanho do modelo e só baixava no fim. Num PC com outros apps abertos, era preciso fechá-los para carregar, mesmo cabendo depois.
+**The symptom:** while loading, RAM rose up to the model's size and only came
+down at the end. On a PC with other apps open, they had to be closed to load,
+even though it fit afterwards.
 
-**A causa:** o GGUF é lido por mmap. Cada página lida para o upload ficava no working set do processo até o fim da carga. Medido no 35B-A3B Q4_K_M (5060 + 3060): working set até 25,6 GiB, e a RAM livre do sistema caiu de 47 para 24 GiB.
+**The cause:** the GGUF is read through mmap. Every page read for the upload
+stayed in the process's working set until the end of the load. Measured on
+the 35B-A3B Q4_K_M (5060 + 3060): working set up to 25.6 GiB, and the system's
+free RAM dropped from 47 to 24 GiB.
 
-**A correção:** `GgufFile::release(prefix)` (`airun-gguf/src/reader.rs`) tira do working set as páginas dos tensores já enviados, com `VirtualUnlock` em páginas não travadas. Os dados continuam válidos: uma leitura posterior, por exemplo de experts lidos do arquivo, os traz de volta. `Model::load` chama depois do embedding, da saída e de cada camada. Fora do Windows não faz nada, porque páginas mapeadas já são cache recuperável.
+**The fix:** `GgufFile::release(prefix)` (`airun-gguf/src/reader.rs`) takes the
+pages of the tensors already uploaded out of the working set, with
+`VirtualUnlock` on unlocked pages. The data stays valid: a later read, for
+example of experts read from the file, brings it back. `Model::load` calls it
+after the embedding, the output and each layer. Outside Windows it does
+nothing, because mapped pages are already reclaimable cache.
 
-**Depois:** o working set ficou estável em ~5 GiB (os experts fixados na RAM, que ficam durante o uso) e a RAM livre não caiu abaixo de 44,9 GiB. A carga foi de 19,6 s; antes, 25–55 s, conforme o cache de disco. O texto guloso é idêntico.
+**After:** the working set stayed stable at ~5 GiB (the experts pinned in RAM,
+which stay during use) and free RAM did not drop below 44.9 GiB. The load took
+19.6 s; before, 25–55 s, depending on the disk cache. Greedy text is
+identical.
 
-**O que continua:** o "private bytes" chega a ~21,7 GiB. No WDDM, cada alocação de VRAM conta no commit do processo (um 4B inteiro na VRAM: 5,5 GiB de private com 286 MiB de working set), e somam-se os experts fixados. Isso não ocupa RAM física, mas precisa caber no limite de commit (RAM + arquivo de paginação). Com o arquivo de paginação desligado ou pequeno, a carga pode falhar mesmo com RAM livre.
+**What remains:** "private bytes" reach ~21.7 GiB. On WDDM, every VRAM
+allocation counts against the process's commit (a whole 4B in VRAM: 5.5 GiB
+private with 286 MiB working set), and the pinned experts add up. That does
+not take physical RAM, but it must fit the commit limit (RAM + page file).
+With the page file off or small, loading can fail even with free RAM.
 
-## Out of memory no primeiro pedido com MTP (2026-11-07)
+## Out of memory on the first request with MTP (2026-11-07)
 
-**O sintoma:** um 35B-A3B no limite da VRAM carregava, mas o primeiro pedido falhava com "out of memory on GPU 0: tried to allocate 16.12 MiB, but only 0 B of 0 B is free". Com `--draft 0`, funcionava. A VRAM também subia e descia entre pedidos.
+**The symptom:** a 35B-A3B at the VRAM limit loaded, but the first request
+failed with "out of memory on GPU 0: tried to allocate 16.12 MiB, but only 0 B
+of 0 B is free". With `--draft 0`, it worked. VRAM also rose and fell between
+requests.
 
-**As causas:**
-- **Scratch do verify fora do plano por GPU:** o `verify_partial` (`(draft+1) × n_head × 256 splits × (head_dim+2)` floats; 16,12 MiB com `--draft 3`) e o stash do delta-net são alocados em **toda** GPU, mas `spec_scratch_bytes` cobrava os dois só da GPU da cabeça de saída. A outra GPU, cheia até o orçamento, ficava sem eles.
-- **Alocação preguiçosa:** `spec_init`, os caches da cabeça por slot e o `rows_logits` do passo em lote só eram alocados no primeiro pedido. O `rows_logits` era solto e realocado maior a cada vez que o lote crescia: essa é a VRAM que sobe e desce. Uma falha ali chegava ao usuário, em vez de cair no próximo degrau do loader.
-- **A split-attention de decode** era contada com 128 splits; `attention_splits` vai até 256.
-- **"0 B of 0 B":** o `cudaMemGetInfo` logo após a falha às vezes não responde. A dica também citava flags do llama.cpp (`--gpu-layers`, `--split-mode`), que o airun não tem.
+**The causes:**
+- **Verify scratch outside the per-GPU plan:** `verify_partial`
+  (`(draft+1) × n_head × 256 splits × (head_dim+2)` floats; 16.12 MiB with
+  `--draft 3`) and the delta-net stash are allocated on **every** GPU, but
+  `spec_scratch_bytes` charged both only to the output head's GPU. The other
+  GPU, full up to its budget, went without them.
+- **Lazy allocation:** `spec_init`, the per-slot head caches and the batched
+  step's `rows_logits` were only allocated on the first request. `rows_logits`
+  was freed and reallocated larger every time the batch grew: that is the VRAM
+  that rises and falls. A failure there reached the user, instead of falling
+  to the loader's next rung.
+- **Decode split-attention** was counted with 128 splits; `attention_splits`
+  goes up to 256.
+- **"0 B of 0 B":** `cudaMemGetInfo` right after the failure sometimes does
+  not answer. The hint also cited llama.cpp flags (`--gpu-layers`,
+  `--split-mode`), which airun does not have.
 
-**As correções:**
-- `Config::spec_rows`: o `plan::scratch_bytes` de cada GPU conta `(1 + spec_rows + slots se > 1) × 256 splits`, e o logits de um slot por linha.
-- `model::spec_stash_bytes` entra em `sizes.per_layer` de cada camada linear. `spec_scratch_bytes` ficou só com o que fica na GPU da cabeça.
-- `Runtime::reserve_buffers` (chamado no loader, depois de `set_slots`) aloca o MTP e o `rows_logits` no tamanho máximo. Falha de capacidade ali vai para `next_rung`.
-- A mensagem de OOM omite os números quando o driver não os dá, e sugere `-c`, `--kv-type`, `--draft 0`, `--vram-reserve`.
+**The fixes:**
+- `Config::spec_rows`: each GPU's `plan::scratch_bytes` counts `(1 +
+  spec_rows + slots if > 1) × 256 splits`, and one slot's logits per row.
+- `model::spec_stash_bytes` goes into `sizes.per_layer` of each linear layer.
+  `spec_scratch_bytes` kept only what stays on the head's GPU.
+- `Runtime::reserve_buffers` (called in the loader, after `set_slots`)
+  allocates MTP and `rows_logits` at maximum size. A capacity failure there
+  goes to `next_rung`.
+- The OOM message omits the numbers when the driver does not give them, and
+  suggests `-c`, `--kv-type`, `--draft 0`, `--vram-reserve`.
 
-**Testado** com o 35B-A3B Q4_K_M, `--expert-cache 200 --draft 3` (5060 + 3060; o plano enche a 3060 a 10,28 de 10,61 GiB):
-- 4 pedidos seguidos: todos OK, VRAM estável (+6 MiB por pedido, grafos).
-- `--parallel 2`, duas rodadas de 2 pedidos simultâneos: OK, VRAM igual entre as rodadas.
+**Tested** with the 35B-A3B Q4_K_M, `--expert-cache 200 --draft 3` (5060 +
+3060; the plan fills the 3060 to 10.28 of 10.61 GiB):
+- 4 requests in a row: all OK, VRAM stable (+6 MiB per request, graphs).
+- `--parallel 2`, two rounds of 2 concurrent requests: OK, VRAM the same
+  between rounds.
 
-**Achado à parte, não corrigido:** o `Qwen3.6-35B-A3B-NVFP4-MTP-HQ` com `--expert-cache` falha no primeiro pedido com "gate and up experts must share a type and layout".
+**Side finding, not fixed:** `Qwen3.6-35B-A3B-NVFP4-MTP-HQ` with
+`--expert-cache` fails on the first request with "gate and up experts must
+share a type and layout".
 
-## Marcador de imagem (2026-11-07)
+## Image marker (2026-11-07)
 
-**O erro:** um chat que só citava `<__media__>` (código, log, a documentação do airun) dava HTTP 400: "the prompt has 1 image markers (<__media__>) and 0 images were given".
+**The error:** a chat that only quoted `<__media__>` (code, a log, airun's
+documentation) gave HTTP 400: "the prompt has 1 image markers (<__media__>)
+and 0 images were given".
 
-**A correção:**
-- `attach_images` agora põe no lugar de cada imagem um marcador sorteado por processo (`media::slot()`, como faz o llama-server). O `tokenize` divide o texto só por ele.
-- `<__media__>` só vira lugar de imagem onde o airun o documenta assim: `run --image` e o `/completion` com `multimodal_data`, via `media::mark_slots`.
-- No resto, `<__media__>` é texto comum.
+**The fix:**
+- `attach_images` now puts a per-process random marker in place of each image
+  (`media::slot()`, as llama-server does). `tokenize` splits the text only on
+  it.
+- `<__media__>` only becomes an image slot where airun documents it that way:
+  `run --image` and `/completion` with `multimodal_data`, via
+  `media::mark_slots`.
+- Elsewhere, `<__media__>` is plain text.
 
-**Testado no `serve`** (27B com mmproj):
-- chat citando o marcador sem imagem;
-- imagem junto de texto citando o marcador;
-- `/completion` com `multimodal_data`;
-- imagem no formato Anthropic.
+**Tested in `serve`** (27B with mmproj):
+- chat quoting the marker without an image;
+- image together with text quoting the marker;
+- `/completion` with `multimodal_data`;
+- image in Anthropic's format.
 
-## Atenção do verify do MTP em contexto longo (2026-11-07)
+## MTP verify attention at long context (2026-11-07)
 
-**O sintoma.** No `serve` com MTP, a geração caía com a conversa: ~50 tok/s até ~9k tokens, 26 tok/s aos 27k. O verify (1 + rascunhos tokens) ia para `attention_masked`, o kernel de prefill, com grid (tokens, cabeças): 96 blocos, cada um lendo o contexto inteiro.
+**The symptom.** In `serve` with MTP, generation dropped with the
+conversation: ~50 tok/s up to ~9k tokens, 26 tok/s at 27k. The verify (1 +
+drafts tokens) went to `attention_masked`, the prefill kernel, with grid
+(tokens, heads): 96 blocks, each reading the whole context.
 
-**A correção:**
-- **Caminho:** `ops::attention_split_multi`, escolhido em `runtime::split_verify`; também serve ao verify em lote e à cabeça MTP.
-- **Kernel:** `attention_decode_gqa_kernel` com W warps por bloco, um por query. Elas dividem cada tile de K/V em shared memory, carregado por todas as warps, e cada warp mascara as chaves depois da sua posição.
-- **Isolado** (`tests/attention_bench.rs`), por camada, 4 queries em cache q4_0, 5070 Ti:
-  - 25k células: 537 µs, contra 1520 no kernel antigo e 1205 dividindo por linha;
-  - 8k células: 167 µs, contra 490.
+**The fix:**
+- **Path:** `ops::attention_split_multi`, chosen in `runtime::split_verify`;
+  it also serves the batched verify and the MTP head.
+- **Kernel:** `attention_decode_gqa_kernel` with W warps per block, one per
+  query. They share each K/V tile in shared memory, loaded by all the warps,
+  and each warp masks the keys past its own position.
+- **In isolation** (`tests/attention_bench.rs`), per layer, 4 queries over a
+  q4_0 cache, 5070 Ti:
+  - 25k cells: 537 µs, against 1520 in the old kernel and 1205 splitting per
+    row;
+  - 8k cells: 167 µs, against 490.
 
-**Determinismo:**
-- **Fronteiras fixas:** no modo de várias warps, os splits têm fronteiras fixas (`verify_split_keys` = máx(64, ⌈ctx/splits⌉)), não dependentes da posição.
-- **Sem arredondamento por ocupação:** não há "wave" no modo de várias warps.
-- **Merge:** junta até o split da última query, com `pos_stride` 0.
-- **Por que importa:** o mesmo token é a query 0 de um verify sozinho e a query 2 de um verify em lote. Com fronteiras que dependiam da posição, o texto guloso do `--parallel` divergia do texto sozinho; agora sai idêntico com 2, 3 e 4 pedidos.
-- **Testes:** `verify_attention_ignores_the_drafts_count` (bench) e `test_split_multi` (selftest).
-- **`gqa_stage`:** agora não escreve linhas além de n, porque as warps dividem o tile.
+**Determinism:**
+- **Fixed boundaries:** in multi-warp mode, the splits have fixed boundaries
+  (`verify_split_keys` = max(64, ⌈ctx/splits⌉)), not dependent on position.
+- **No occupancy rounding:** there is no "wave" in multi-warp mode.
+- **Merge:** joins up to the last query's split, with `pos_stride` 0.
+- **Why it matters:** the same token is query 0 of a lone verify and query 2
+  of a batched verify. With boundaries that depended on position,
+  `--parallel`'s greedy text diverged from the lone text; now it comes out
+  identical with 2, 3 and 4 requests.
+- **Tests:** `verify_attention_ignores_the_drafts_count` (bench) and
+  `test_split_multi` (selftest).
+- **`gqa_stage`:** now does not write rows past n, because the warps share
+  the tile.
 
-**Medido** (27B NVFP4, 5070 Ti + 5060 Ti, `-c 32768 --kv-type q4_0 --draft 3`, 300 tokens):
+**Measured** (27B NVFP4, 5070 Ti + 5060 Ti, `-c 32768 --kv-type q4_0 --draft
+3`, 300 tokens):
 
-| prompt | antes | depois |
+| prompt | before | after |
 |---|---|---|
-| 25k tokens | 34,2 tok/s (verify 75 ms) | 52,8 tok/s (verify 42 ms) |
-| curto | 54 tok/s | 54,8 tok/s |
+| 25k tokens | 34.2 tok/s (verify 75 ms) | 52.8 tok/s (verify 42 ms) |
+| short | 54 tok/s | 54.8 tok/s |
 
-`AIRUN_NO_SPLIT_VERIFY=1` volta ao kernel antigo.
+`AIRUN_NO_SPLIT_VERIFY=1` goes back to the old kernel.
 
-## Camadas na RAM multiplicadas na CPU (2026-11-06, RTX 5060 8 GB sozinha)
+## RAM layers multiplied on the CPU (2026-11-06, RTX 5060 8 GB alone)
 
-**O problema:** a máquina ficou só com a 5060, num link PCIe 3.0 x1 (~0,8 GB/s; `nvidia-smi -q`: Link Width Current 1x, Max 16x). O 27B NVFP4 deixava 47 camadas (9,4 GiB) na RAM, copiadas para a VRAM a cada passada: 11 s por token, 0,1 tok/s.
+**The problem:** the machine was left with only the 5060, on a PCIe 3.0 x1
+link (~0.8 GB/s; `nvidia-smi -q`: Link Width Current 1x, Max 16x). The 27B
+NVFP4 left 47 layers (9.4 GiB) in RAM, copied to VRAM on every pass: 11 s per
+token, 0.1 tok/s.
 
-**A solução (`cpu.rs`):**
-- **Kernel NVFP4 em AVX2:** `pshufb` com a LUT de e2m1, `sign`/`maddubs`/`madd`, escala UE4M3 × escala da ativação, int8 a cada 32 como o `quantize_act` da GPU. Pega 4 tokens por vez, decodificando o bloco uma vez só para os 4.
-- **Fallback:** `dequantize` mais produto f32, para F32 e os demais tipos.
-- **Pool de threads próprio:** pedaços de 32 linhas tomados dinamicamente (P-cores e E-cores rendem diferente) e espera ativa de 200 µs entre jobs, porque são ~300 matmuls por token.
-- **Medição isolada** (`tests/cpu_bench.rs`, matriz 17408×5120): 50–58 GB/s de 1 a 4 tokens; 26 GB/s com 8 tokens, já limitado por cálculo.
+**The solution (`cpu.rs`):**
+- **AVX2 NVFP4 kernel:** `pshufb` with the e2m1 LUT, `sign`/`maddubs`/`madd`,
+  UE4M3 scale × activation scale, int8 per 32 like the GPU's `quantize_act`.
+  It takes 4 tokens at a time, decoding the block only once for the 4.
+- **Fallback:** `dequantize` plus an f32 product, for F32 and the other types.
+- **Own thread pool:** 32-row chunks taken dynamically (P-cores and E-cores
+  perform differently) and 200 µs of spinning between jobs, because there are
+  ~300 matmuls per token.
+- **Isolated measurement** (`tests/cpu_bench.rs`, 17408×5120 matrix): 50–58
+  GB/s from 1 to 4 tokens; 26 GB/s with 8 tokens, already compute-bound.
 
-**Integração no runtime:**
-- **Decisão por tensor:** `on_cpu(w)` vale para `w.ram` presente e `cpu::pass_on_cpu()`. O `queue_shard` chama `cpu::set_pass(n)`, que liga a CPU para passadas de até `AIRUN_CPU_MAX_TOKENS` (64) tokens.
-- **Prompt:** blocos maiores copiam as camadas como antes. No x1, um prompt de 2550 tokens fez 40 tok/s copiando e 10,6 na CPU; o empate fica em ~150 tokens por bloco.
-- **`cpu_matvec`:** ativação para memória pinned (uma vez para q/k/v: `host_valid`), sync, CPU, produto de volta.
-- **`cpu_ffn`:** gate, up, SwiGLU e down de uma vez.
-- **Caminhos fundidos desviados:** qkv fundido, GLU fundido e FP4 de prefill pulam esses tensores.
-- **Grafos CUDA:** desligados quando há camadas na CPU (`graphs_disabled() || cpu::in_use()`).
+**Runtime integration:**
+- **Per-tensor decision:** `on_cpu(w)` holds for `w.ram` present and
+  `cpu::pass_on_cpu()`. `queue_shard` calls `cpu::set_pass(n)`, which turns
+  the CPU on for passes of up to `AIRUN_CPU_MAX_TOKENS` (64) tokens.
+- **Prompt:** larger chunks copy the layers as before. On x1, a 2550-token
+  prompt did 40 tok/s copying and 10.6 on the CPU; the break-even is at ~150
+  tokens per chunk.
+- **`cpu_matvec`:** activation to pinned memory (once for q/k/v:
+  `host_valid`), sync, CPU, product back.
+- **`cpu_ffn`:** gate, up, SwiGLU and down at once.
+- **Fused paths bypassed:** fused qkv, fused GLU and prefill FP4 skip these
+  tensors.
+- **CUDA graphs:** off when there are layers on the CPU (`graphs_disabled()
+  || cpu::in_use()`).
 
-**Planner:** quando os pesos vão para a RAM de qualquer jeito, o KV fica na VRAM antes. Num link lento, o KV na RAM custava ~100 ms por token com 4096 células.
+**Planner:** when weights go to RAM anyway, the KV stays in VRAM first. On a
+slow link, the KV in RAM cost ~100 ms per token with 4096 cells.
 
-**Medido** (27B NVFP4, 5060 x1, i7-13700, DDR5-4800):
+**Measured** (27B NVFP4, 5060 x1, i7-13700, DDR5-4800):
 
-| | antes | depois |
+| | before | after |
 |---|---|---|
-| geração sem rascunho | 0,1 tok/s | 3,2 |
-| geração com `--draft 2` | — | 5,3 (74% aceitos) |
-| prompt curto | 1,1 tok/s | 10,7 |
+| generation without drafting | 0.1 tok/s | 3.2 |
+| generation with `--draft 2` | — | 5.3 (74% accepted) |
+| short prompt | 1.1 tok/s | 10.7 |
 
-- **Exatidão:** texto guloso idêntico ao de `AIRUN_RAM_ON_GPU=1`.
-- **Threads:** 8, 16 e 24 dão o mesmo resultado, porque a banda da RAM satura.
-- **Onde vai o tempo:** ~70% é cálculo na CPU, perto da banda; ~20% é esperar a GPU (17 camadas, cabeça BF16 e as idas e voltas pelo link x1).
+- **Exactness:** greedy text identical to `AIRUN_RAM_ON_GPU=1`.
+- **Threads:** 8, 16 and 24 give the same result, because RAM bandwidth
+  saturates.
+- **Where the time goes:** ~70% is CPU compute, close to bandwidth; ~20% is
+  waiting for the GPU (17 layers, BF16 head and the round trips over the x1
+  link).
 
-## MTP nos passos em lote do `serve --parallel` (2026-11-06)
+## MTP in `serve --parallel`'s batched steps (2026-11-06)
 
-**Cabeça por slot.**
-- `spec::SlotHead` (KV, `pending`, `synced`) fica em `SlotStore::head`; a do slot ativo continua em `Spec`.
-- `switch_slot` troca as cabeças (`Spec::swap_head`) em vez de marcar a cabeça como fora de sincronia.
-- `decode_rows` só tira de sincronia as linhas que avançou.
-- `slot_begin` alimenta a cabeça no prefill (`head_prefill_chunk`) quando há rascunho, com as mesmas regras do `generate_spec`.
-- O planner já contava uma cabeça por slot (`kv_bytes_per_layer` × slots).
+**Head per slot.**
+- `spec::SlotHead` (KV, `pending`, `synced`) lives in `SlotStore::head`; the
+  active slot's stays in `Spec`.
+- `switch_slot` swaps the heads (`Spec::swap_head`) instead of marking the
+  head as out of sync.
+- `decode_rows` only marks out of sync the rows it advanced.
+- `slot_begin` feeds the head during prefill (`head_prefill_chunk`) when there
+  are drafts, with the same rules as `generate_spec`.
+- The planner already counted one head per slot (`kv_bytes_per_layer` ×
+  slots).
 
-**Passo especulativo em lote** (`sched::spec_step`):
-1. `draft_rows`: primeiros rascunhos de quem não tem, a partir do `pending` do slot.
-2. `verify_rows`: passada mista com `mixed_t = 1 + k` tokens por linha, `defer` ligado e stash do delta-net para todas as linhas. É capturada como grafo em `MixedGraphs`, com a chave incluindo `t`.
-3. O scheduler escolhe os aceitos (greedy pelos picks da GPU; amostrando, `sample_draft` em threads).
-4. `accept_rows` faz três coisas:
-   - `commit_rows` avança cada delta-net só com os m aceitos;
-   - a cabeça absorve as t linhas de cada slot (linhas extras são reescritas antes de alguém atender a elas);
-   - `chain_rows` gera os próximos rascunhos.
+**Batched speculative step** (`sched::spec_step`):
+1. `draft_rows`: first drafts for whoever has none, from the slot's `pending`.
+2. `verify_rows`: a mixed pass with `mixed_t = 1 + k` tokens per row, `defer`
+   on and delta-net stash for every row. It is captured as a graph in
+   `MixedGraphs`, with the key including `t`.
+3. The scheduler picks the accepted ones (greedy from the GPU's picks;
+   sampling, `sample_draft` on threads).
+4. `accept_rows` does three things:
+   - `commit_rows` advances each delta-net with only the m accepted;
+   - the head absorbs each slot's t rows (extra rows are rewritten before
+     anyone attends to them);
+   - `chain_rows` generates the next drafts.
 
-Quem não tem cabeça sincronizada entra com rascunhos de enchimento, o que continua exato.
+Whoever has no synced head goes in with filler drafts, which stays exact.
 
-**Mudanças no runtime em modo misto:**
-- **Atenção** (`run_attention`, `mixed_t > 1`): cada linha grava t células e usa `attention_masked`. O argumento `keys` é constante (`ctx`), para o grafo valer em qualquer posição.
-- **`mixed_head`:** troca o cache pela cabeça do slot.
-- **Delta-net:** conv `oop` e `delta_rule_ex` por linha, com t tokens.
+**Runtime changes in mixed mode:**
+- **Attention** (`run_attention`, `mixed_t > 1`): each row writes t cells and
+  uses `attention_masked`. The `keys` argument is constant (`ctx`), so the
+  graph holds at any position.
+- **`mixed_head`:** swaps the cache for the slot's head.
+- **Delta-net:** `oop` conv and `delta_rule_ex` per row, with t tokens.
 
 **Kernels:**
-- **NVFP4, 9 a 16 tokens:** duas passadas de até 8 no `matvec_q8_wide_multi_kernel` (~175 µs na FFN 17408×5120 com 16 tokens). O kernel em blocos levava 734 µs; uma passada de 16, 204 µs.
-- **MMQ:** faria 147 µs, mas o stream-K numera os lançamentos (época passada como argumento) e não serve em grafo.
-- **Tipos sem kernel de vários tokens** (IQ4_XS, que é a camada da cabeça MTP desse 27B): de 2 a 16 tokens, uma chamada por token. Antes, 1,67 ms para 16 tokens no kernel em blocos.
-- **Medição isolada:** `crates/airun-cuda/tests/matvec_bench.rs`.
+- **NVFP4, 9 to 16 tokens:** two passes of up to 8 in
+  `matvec_q8_wide_multi_kernel` (~175 µs on the 17408×5120 FFN with 16
+  tokens). The tiled kernel took 734 µs; one 16-token pass, 204 µs.
+- **MMQ:** would take 147 µs, but stream-K numbers the launches (epoch passed
+  as an argument) and does not work in a graph.
+- **Types without a multi-token kernel** (IQ4_XS, which is this 27B's MTP head
+  layer): from 2 to 16 tokens, one call per token. Before, 1.67 ms for 16
+  tokens in the tiled kernel.
+- **Isolated measurement:** `crates/airun-cuda/tests/matvec_bench.rs`.
 
-**Medições** (27B NVFP4, 5070 Ti + 5060, `--mmproj ... --kv-type q4_0 -b 256 --draft 3 --parallel 4`, 200 tokens, guloso, tok/s somados):
-- **Rascunhos por número de pedidos** (`ROWS_DRAFT = [2, 1, 1]`):
-  - 2 pedidos: 81,5 com 2 rascunhos, 78,5 com 3, contra 59 sem MTP;
-  - 3 pedidos: 98 com 1, 81 com 2, contra 82;
-  - 4 pedidos: 117 com 1, 98 com 2, contra 106;
-  - 4 pedidos, temp 0,7: 118 contra 106.
-- **`-c 262144` com KV na RAM:** 2 pedidos 78 contra 54; 4 pedidos 107 contra 88,5.
-- **Exatidão:** a temp 0, o texto de cada pedido no lote é idêntico ao dele sozinho (2 e 4 pedidos).
+**Measurements** (27B NVFP4, 5070 Ti + 5060, `--mmproj ... --kv-type q4_0 -b
+256 --draft 3 --parallel 4`, 200 tokens, greedy, summed tok/s):
+- **Drafts by number of requests** (`ROWS_DRAFT = [2, 1, 1]`):
+  - 2 requests: 81.5 with 2 drafts, 78.5 with 3, against 59 without MTP;
+  - 3 requests: 98 with 1, 81 with 2, against 82;
+  - 4 requests: 117 with 1, 98 with 2, against 106;
+  - 4 requests, temp 0.7: 118 against 106.
+- **`-c 262144` with KV in RAM:** 2 requests 78 against 54; 4 requests 107
+  against 88.5.
+- **Exactness:** at temp 0, each request's text in the batch is identical to
+  its text alone (2 and 4 requests).
 
-**Armadilha de VRAM.**
-- **O que acontece:** o layout que põe a cabeça de saída na GPU rápida enche essa GPU até o orçamento. Buffers alocados depois do plano a empurraram ~125 MiB além dele: stash por slot, logits do lote, linhas da cabeça e grafos.
-- **Efeito:** o Windows começou a paginar a VRAM. Passos de 110 ms foram para 300–650 ms, de repente e no meio da geração, com uma GPU a 100% e a outra ociosa. Até o pedido sozinho caiu de 57–63 para 45–55 t/s.
-- **Correção:** `model::spec_scratch_bytes` entra no plano junto com a cabeça.
-- **Diagnóstico:** se reaparecer, teste `--vram-reserve 900`. Se resolver, é alocação fora do plano.
+**VRAM pitfall.**
+- **What happens:** the layout that puts the output head on the fast GPU
+  fills that GPU up to its budget. Buffers allocated after the plan pushed it
+  ~125 MiB past it: per-slot stash, batch logits, head rows and graphs.
+- **Effect:** Windows started paging VRAM. Steps of 110 ms went to 300–650 ms,
+  suddenly and mid-generation, with one GPU at 100% and the other idle. Even
+  the lone request dropped from 57–63 to 45–55 t/s.
+- **Fix:** `model::spec_scratch_bytes` goes into the plan together with the
+  head.
+- **Diagnosis:** if it shows up again, try `--vram-reserve 900`. If that
+  solves it, it is an allocation outside the plan.
 
-## Cache KV na RAM antes dos pesos, e `--hide-gpu` (2026-11-06)
+## KV cache in RAM before weights, and `--hide-gpu` (2026-11-06)
 
-**KV na RAM.** Com `-c` explícito que não cabe, o planner (`plan.rs`, `plan()` → `place`) tenta, nesta ordem:
-1. tudo na VRAM;
-2. o cache KV das últimas k camadas de atenção na RAM, com k crescendo;
-3. todo o KV na RAM mais os pesos que sobrarem (`spill_to_ram`).
+**KV in RAM.** With an explicit `-c` that does not fit, the planner
+(`plan.rs`, `plan()` → `place`) tries, in this order:
+1. everything in VRAM;
+2. the KV cache of the last k attention layers in RAM, with k growing;
+3. all the KV in RAM plus the weights left over (`spill_to_ram`).
 
-Como funciona:
-- **Por que o KV vai primeiro:** pesos são lidos inteiros a cada passada; do cache só as células preenchidas.
+How it works:
+- **Why the KV goes first:** weights are read whole on every pass; of the
+  cache only the filled cells.
 - **Planner:** `try_place(.., kv_ram, spill)`.
-  - O stage (K+V de uma camada de **um** slot, `Config::kv_stage_bytes`) é cobrado da última camada movida durante a divisão e, no fim, de cada shard que tem alguma (`Shard::kv_stage_bytes`).
-  - Só para `alloc` que permite RAM, sem MoE, e com linhas de cache múltiplas de 4 bytes.
-- **Memória:** `DeviceBuffer::in_ram` (pinned mapeada; `is_in_ram`).
+  - The stage (K+V of one layer of **one** slot, `Config::kv_stage_bytes`) is
+    charged to the last layer moved during the split and, at the end, to each
+    shard that has any (`Shard::kv_stage_bytes`).
+  - Only for an `alloc` that allows RAM, without MoE, and with cache rows that
+    are multiples of 4 bytes.
+- **Memory:** `DeviceBuffer::in_ram` (mapped pinned; `is_in_ram`).
 - **Runtime:**
-  - `kv_stage_in` usa `ops::kv_stage(to_stage=true)` para copiar as células `[0, max pos+1)` de cada cabeça para `DeviceState::kv_stage`. A escrita no cache e a atenção usam o stage.
-  - `kv_stage_out` devolve só as células novas.
-  - O comprimento vem de `positions` na GPU, então os grafos de decode valem para qualquer posição.
-  - No passo em lote (`mixed`), camadas com KV na RAM vão linha a linha, sem o kernel batched.
-- **Cópias de memória:** passaram a usar `cudaMemcpyDefault` (`device.cu`), porque um buffer "de device" pode ser RAM mapeada.
+  - `kv_stage_in` uses `ops::kv_stage(to_stage=true)` to copy cells `[0, max
+    pos+1)` of each head into `DeviceState::kv_stage`. The cache write and the
+    attention use the stage.
+  - `kv_stage_out` returns only the new cells.
+  - The length comes from `positions` on the GPU, so the decode graphs hold at
+    any position.
+  - In the batched step (`mixed`), layers with KV in RAM go row by row,
+    without the batched kernel.
+- **Memory copies:** now use `cudaMemcpyDefault` (`device.cu`), because a
+  "device" buffer can be mapped RAM.
 
-Medido no 27B NVFP4 (5070 Ti + 5060, `--kv-type q4_0 -b 256 --draft 3`):
+Measured on the 27B NVFP4 (5070 Ti + 5060, `--kv-type q4_0 -b 256 --draft 3`):
 
-| Caso | Antes | Depois |
+| Case | Before | After |
 |---|---|---|
-| `-c 262144`, serve | 15,7 tok/s (13 camadas de pesos na RAM) | 63,0 (KV de 10 das 16 camadas na RAM) |
-| `-c 262144`, temp 0,7 | 12,3 | 49,3 |
-| `-c 262144 --parallel 4` | 6,1 (contexto cortado para 131072, 43 camadas na RAM) | 60,9 (contexto mantido, 18 GiB de KV pinned) |
-| Decode na posição 65536 | 18,9 | 18,9 |
+| `-c 262144`, serve | 15.7 tok/s (13 weight layers in RAM) | 63.0 (KV of 10 of the 16 layers in RAM) |
+| `-c 262144`, temp 0.7 | 12.3 | 49.3 |
+| `-c 262144 --parallel 4` | 6.1 (context cut to 131072, 43 layers in RAM) | 60.9 (context kept, 18 GiB of pinned KV) |
+| Decode at position 65536 | 18.9 | 18.9 |
 
-- Com `run` greedy o texto sai idêntico ao de `AIRUN_NO_KV_RAM=1`.
-- O prefill do prompt de 921 tokens caiu de 1526 para 1249 tok/s, porque o layout mudou.
-- Selftest: `test_kv_in_ram`. Teste do planner: `the_kv_cache_goes_to_ram_before_weights`.
+- With greedy `run` the text comes out identical to `AIRUN_NO_KV_RAM=1`.
+- The 921-token prompt's prefill dropped from 1526 to 1249 tok/s, because the
+  layout changed.
+- Selftest: `test_kv_in_ram`. Planner test:
+  `the_kv_cache_goes_to_ram_before_weights`.
 
-**`--hide-gpu` / `AIRUN_HIDE_GPUS`** (`airun-cli/src/hide.rs`, chamado no início do `main`):
-- Um filho `airun gpu --json` lista as GPUs. Depois `CUDA_VISIBLE_DEVICES` recebe os UUIDs das que ficam, então o runtime nunca abre contexto nas ocultas (medido: 5060 com 0 MiB).
-- Cada item aceita:
-  - um número, que é ordinal se alguma GPU o tem, senão parte do nome (`5060`);
-  - um UUID;
-  - parte do nome.
-- As restantes são renumeradas a partir de 0. Uma `note:` diz a numeração nova, e `airun gpu` lista as ocultas.
-- Não combina com `CUDA_VISIBLE_DEVICES` já definido.
+**`--hide-gpu` / `AIRUN_HIDE_GPUS`** (`airun-cli/src/hide.rs`, called at the
+start of `main`):
+- A child `airun gpu --json` lists the GPUs. Then `CUDA_VISIBLE_DEVICES`
+  receives the UUIDs of the ones that stay, so the runtime never opens a
+  context on the hidden ones (measured: 5060 with 0 MiB).
+- Each item accepts:
+  - a number, which is an ordinal if some GPU has it, else part of the name
+    (`5060`);
+  - a UUID;
+  - part of the name.
+- The rest are renumbered from 0. A `note:` gives the new numbering, and
+  `airun gpu` lists the hidden ones.
+- Does not combine with an already-set `CUDA_VISIBLE_DEVICES`.
 
-## Medições de decode com MTP: reserve, draft, cabeça (2026-11-05, 2× 5060 Ti)
+## Decode measurements with MTP: reserve, draft, head (2026-11-05, 2× 5060 Ti)
 
-Máquina: 2× RTX 5060 Ti (gêmeas, sm_120; a de bus 03 desenha a tela).
-Qwen3.8-27B NVFP4, `-c 131072 -b 256 --kv-type q4_0 --temp 0
---repeat-penalty 1 -n 300`, `AIRUN_SPEC_TIMING=1`, variantes sempre
-alternadas na mesma sessão. Nesta máquina as rodadas variaram < 1% (clock
-médio 2,8 GHz, sem quedas); o ruído de 20–40 t/s do PC antigo não apareceu.
-Dividido, o planner põe 32/32 camadas e cada GPU fica em ~9 GiB.
+Machine: 2× RTX 5060 Ti (twins, sm_120; the one on bus 03 draws the screen).
+Qwen3.8-27B NVFP4, `-c 131072 -b 256 --kv-type q4_0 --temp 0 --repeat-penalty
+1 -n 300`, `AIRUN_SPEC_TIMING=1`, variants always alternated in the same
+session. On this machine the rounds varied < 1% (mean clock 2.8 GHz, no
+drops); the old PC's 20–40 t/s noise did not appear. Split, the planner puts
+32/32 layers and each GPU sits at ~9 GiB.
 
-- **`--vram-reserve` 384 contra 1024 (hipótese do WDDM):** não muda nada.
-  Dividido: 44,3–44,8 t/s nos dois. Para reproduzir a GPU do monitor cheia, o
-  modelo inteiro nela (`CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0
-  --alloc gpu`, contexto reduzido a 16k, pico de 15,7 de 16,3 GiB): 54,4 t/s
-  nos dois; a queda das rodadas 3–4 (para 48,1) pegou as duas variantes
-  igual. O reserve padrão fica em 384. Sem `--alloc gpu`, o `auto` mandou
-  2,4 GiB de pesos para a RAM e o decode caiu a 3 t/s (verify 882 ms): se um
-  usuário relatar decode lento com a GPU cheia, confira o "loaded X GiB".
-- **`--draft`** (t/s, aceitação do rascunho entre parênteses):
+- **`--vram-reserve` 384 against 1024 (WDDM hypothesis):** changes nothing.
+  Split: 44.3–44.8 t/s in both. To reproduce the monitor GPU full, the whole
+  model on it (`CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 --alloc
+  gpu`, context reduced to 16k, peak 15.7 of 16.3 GiB): 54.4 t/s in both; the
+  drop in rounds 3–4 (to 48.1) hit both variants equally. The default reserve
+  stays at 384. Without `--alloc gpu`, `auto` sent 2.4 GiB of weights to RAM
+  and decode dropped to 3 t/s (verify 882 ms): if a user reports slow decode
+  with the GPU full, check the "loaded X GiB".
+- **`--draft`** (t/s, draft acceptance in parentheses):
 
   | Config | 2 | 3 | 4 | 5 |
   |---|---|---|---|---|
-  | dividido, prosa (5+4 rodadas) | 40,3 (69%) | 43,2 (57%) | **45,0** (53%) | 42,9 (44%) |
-  | dividido, código (4 rodadas) | — | 47,6 (67%) | 48,2 (58%) | **49,0** (53%) |
-  | uma GPU, prosa (4 rodadas) | — | 54,1 | **55,0** | 51,4 |
+  | split, prose (5+4 rounds) | 40.3 (69%) | 43.2 (57%) | **45.0** (53%) | 42.9 (44%) |
+  | split, code (4 rounds) | — | 47.6 (67%) | 48.2 (58%) | **49.0** (53%) |
+  | one GPU, prose (4 rounds) | — | 54.1 | **55.0** | 51.4 |
 
-  Verify por passo: 52,7 / 56,2 / 58,4 ms (3/4/5) dividido; commit+absorb
-  10,2 / 13,0 / 15,7 ms. O 4 ganhou do 3 em toda configuração (e na varredura
-  do PC antigo, 61,4 contra 52,3), então `DEFAULT_DRAFT` passou a 4. O 5 só
-  ganha em texto muito previsível.
-- **Verify dividido com um grafo por GPU (2026-11-06):** `verify_sharded`
-  em `spec.rs` captura a parte de cada shard (e os picks no último) como um
-  grafo CUDA por GPU, com o resíduo passando entre elas fora dos grafos
-  (`handoff`), como o decode. Antes, dividido, o verify era lançado kernel a
-  kernel (só uma GPU tinha grafo). `AIRUN_NO_VERIFY_SHARD_GRAPHS=1` volta ao
-  antigo. O `switch_slot` agora também descarta os grafos do MTP.
-  - 27B, 128k q4_0, draft 4, 4 rodadas alternadas: 44,4 → **51,8 t/s**,
-    verify 57,1 → 46,9 ms, texto idêntico ao caminho antigo.
-  - 35B-A3B Q5_K_M, `-c 32768`, 2 rodadas alternadas (antes do grafo,
-    draft 4 dava 96):
+  Verify per step: 52.7 / 56.2 / 58.4 ms (3/4/5) split; commit+absorb 10.2 /
+  13.0 / 15.7 ms. 4 beat 3 in every configuration (and in the old PC's sweep,
+  61.4 against 52.3), so `DEFAULT_DRAFT` became 4. 5 only wins on very
+  predictable text.
+- **Split verify with one graph per GPU (2026-11-06):** `verify_sharded` in
+  `spec.rs` captures each shard's part (and the picks on the last one) as one
+  CUDA graph per GPU, with the residual moving between them outside the
+  graphs (`handoff`), like decode. Before, split, the verify was launched
+  kernel by kernel (only one GPU had a graph).
+  `AIRUN_NO_VERIFY_SHARD_GRAPHS=1` goes back to the old one. `switch_slot`
+  now also discards the MTP graphs.
+  - 27B, 128k q4_0, draft 4, 4 alternated rounds: 44.4 → **51.8 t/s**, verify
+    57.1 → 46.9 ms, text identical to the old path.
+  - 35B-A3B Q5_K_M, `-c 32768`, 2 alternated rounds (before the graph, draft
+    4 gave 96):
 
-    | 35B-A3B | sem MTP | draft 2 | draft 3 |
+    | 35B-A3B | no MTP | draft 2 | draft 3 |
     |---|---|---|---|
-    | 2 GPUs, tudo na VRAM, prosa | 109,6 | **137,6** (76%) | 128,2 (62%) |
-    | 2 GPUs, tudo na VRAM, código | 108,8 | **132,1** (71%) | 127,4 (62%) |
-    | 1 GPU, experts na RAM | **44,7** | 34,5 | 32,0 |
+    | 2 GPUs, all in VRAM, prose | 109.6 | **137.6** (76%) | 128.2 (62%) |
+    | 2 GPUs, all in VRAM, code | 108.8 | **132.1** (71%) | 127.4 (62%) |
+    | 1 GPU, experts in RAM | **44.7** | 34.5 | 32.0 |
 
-    Por isso `MOE_DEFAULT_DRAFT = 2` (`loader.rs`) vale só quando o
-    `plan_experts`, contando a cabeça e o cache dela, diz que o modelo cabe
-    inteiro; senão o MTP fica desligado, com uma `note:`. `--alloc gpu` liga
-    (nada vai para a RAM); `--expert-cache` desliga.
-  - O Qwen4 Flash-Next não tem cabeça MTP; não passa por aqui.
-  - Esta máquina: GPU 0 (bus 03, a do monitor) está num PCIe 3.0 x4; a GPU 1
-    em 4.0 x8. Decode simples dividido 25,1 contra 26,4 t/s numa GPU só.
-- **Rascunho com vocabulário cortado (FR-Spec, arXiv 2502.14856):**
-  `AIRUN_DRAFT_VOCAB=K` faz a cabeça escolher só entre as K primeiras linhas
-  da `output.weight` (no BPE, ids baixos ≈ fusões mais frequentes); o verify
-  segue com o vocabulário inteiro, então a saída não muda. **Desligado por
-  padrão**, porque depende do idioma (27B dividido, draft 4, t/s e aceitação):
+    That is why `MOE_DEFAULT_DRAFT = 2` (`loader.rs`) only applies when
+    `plan_experts`, counting the head and its cache, says the model fits
+    whole; otherwise MTP stays off, with a `note:`. `--alloc gpu` turns it on
+    (nothing goes to RAM); `--expert-cache` turns it off.
+  - Qwen4 Flash-Next has no MTP head; it does not go through here.
+  - This machine: GPU 0 (bus 03, the monitor's) is on PCIe 3.0 x4; GPU 1 on
+    4.0 x8. Plain split decode 25.1 against 26.4 t/s on a single GPU.
+- **Draft with a cut vocabulary (FR-Spec, arXiv 2502.14856):**
+  `AIRUN_DRAFT_VOCAB=K` makes the head choose only among the first K rows of
+  `output.weight` (in BPE, low ids ≈ most frequent merges); the verify keeps
+  the whole vocabulary, so the output does not change. **Off by default**,
+  because it depends on the language (27B split, draft 4, t/s and
+  acceptance):
 
-  | Prompt | inteiro | K=151643 | K=65536 |
+  | Prompt | whole | K=151643 | K=65536 |
   |---|---|---|---|
-  | código (EN) | 55,3 (58%) | 58,6 (58%) | **59,5** (55%) |
-  | conto em inglês | 44,2 (41%) | 46,9 | **49,1** (40%) |
-  | prosa em português | **51,8** (53%) | 49,7 (45%) | 52,2 (45%) |
+  | code (EN) | 55.3 (58%) | 58.6 (58%) | **59.5** (55%) |
+  | English story | 44.2 (41%) | 46.9 | **49.1** (40%) |
+  | Portuguese prose | **51.8** (53%) | 49.7 (45%) | 52.2 (45%) |
 
-  O advance cai de 13,2 para 6,9 ms com K=65536. Português usa os tokens da
-  extensão do vocabulário (ids > 151k), que o prefixo corta. O caminho para
-  ligar por padrão: prefixo + os tokens já vistos na conversa (linhas copiadas
-  para um buffer próprio, com um mapa índice → id depois do argmax).
-- **Cache entre turnos nos híbridos (2026-11-06):** `TurnSnapshot` em
-  `runtime.rs`. As linhas do KV valem até qualquer posição, mas o estado
-  recorrente (delta-net, conv, anel QSA e `pooled`, histórico PLE) só anda
-  para a frente; como o template reescreve o `<think>` da resposta anterior,
-  o pedido seguinte divergia logo depois do cabeçalho do assistente e um
-  híbrido reprocessava a conversa inteira a cada turno. Agora o prefill para
-  exatamente antes do último `<|im_start|>` do prompt (`snapshot_point`),
-  copia esse estado para um buffer fixado reaproveitado (`take_snapshot`,
-  cópias assíncronas no stream de cada GPU, sem esperar) e segue; no turno
-  seguinte `reusable_prefix` aceita esse ponto e `rewind_to` restaura o
-  estado (`restore_snapshot`), mais a linha `pending` da cabeça MTP quando o
-  prefill que tirou o snapshot rodou a cabeça. `walk_state(false, ..)` é o
-  `save_state` sem as linhas de KV. `AIRUN_NO_STATE_SNAPSHOT=1` desliga.
-  - 27B dividido, `serve`, system prompt de ~2.760 tokens, 3 turnos: turno 2
-    reaproveitou 2.760 (prefill 443 ms, a maior parte montando o grafo de
-    decode pela primeira vez) contra 878 ms sem o snapshot; turno 3
-    reaproveitou 2.788, prefill **160 ms** contra 895.
-  - Correção: o mesmo pedido duas vezes (o segundo restaura e reprocessa da
-    mesma fronteira) sai **idêntico** no 27B (MTP ligado e desligado) e no
-    35B-A3B inteiro na VRAM.
-  - Partir o prefill nesse ponto muda as fronteiras de lote do primeiro
-    turno, então o texto guloso dele pode virar num quase-empate (como o MTP).
-- **Bug à parte, achado no teste acima (não corrigido):** MoE com experts na
-  RAM e lotes de 2–15 tokens não é determinístico. 35B-A3B numa GPU,
-  `AIRUN_NO_STATE_SNAPSHOT=1 -b 4`: três pedidos iguais, três textos
-  diferentes (com lotes grandes o mesmo teste sai idêntico). Suspeitos: a
-  residência dos experts muda entre execuções (`rebalance_experts`) e esse
-  caminho (`moe_stage_*`, `Staged.only` no stream lateral) dá resultados
-  diferentes conforme ela, ou há uma corrida entre o stream lateral e o
-  cálculo. Por isso o Qwen4 (experts na RAM) não serve para validar o
-  snapshot.
-- **Cópia Q8_0 da cabeça para o MTP: não vale.** A `output.weight` deste
-  arquivo é Q5_K (874 MB), não BF16 — o comentário antigo em `plan.rs`
-  estava errado. Uma Q8_0 (1,35 GB) leria mais bytes, não menos.
+  The advance drops from 13.2 to 6.9 ms with K=65536. Portuguese uses the
+  vocabulary extension's tokens (ids > 151k), which the prefix cuts. The path
+  to turn it on by default: prefix + the tokens already seen in the chat
+  (rows copied into their own buffer, with an index → id map after the
+  argmax). On the 35B-A3B with experts in RAM (2026-11-10), K=16384/32768 cut
+  the head from 2.7 to 1.3 ms but acceptance fell to 34–57%: no gain.
+- **Cache between turns on hybrids (2026-11-06):** `TurnSnapshot` in
+  `runtime.rs`. KV rows hold up to any position, but the recurrent state
+  (delta-net, conv, QSA ring and `pooled`, PLE history) only moves forward;
+  since the template rewrites the previous answer's `<think>`, the next
+  request diverged right after the assistant header and a hybrid reprocessed
+  the whole conversation every turn. Now the prefill stops exactly before the
+  prompt's last `<|im_start|>` (`snapshot_point`), copies that state into a
+  reused pinned buffer (`take_snapshot`, asynchronous copies on each GPU's
+  stream, without waiting) and continues; in the next turn `reusable_prefix`
+  accepts that point and `rewind_to` restores the state
+  (`restore_snapshot`), plus the MTP head's `pending` row when the prefill
+  that took the snapshot ran the head. `walk_state(false, ..)` is
+  `save_state` without the KV rows. `AIRUN_NO_STATE_SNAPSHOT=1` turns it off.
+  - 27B split, `serve`, ~2,760-token system prompt, 3 turns: turn 2 reused
+    2,760 (prefill 443 ms, most of it building the decode graph for the first
+    time) against 878 ms without the snapshot; turn 3 reused 2,788, prefill
+    **160 ms** against 895.
+  - Correctness: the same request twice (the second restores and reprocesses
+    from the same boundary) comes out **identical** on the 27B (MTP on and
+    off) and on the 35B-A3B fully in VRAM.
+  - Splitting the prefill at that point changes the first turn's batch
+    boundaries, so its greedy text may flip on a near-tie (like MTP).
+- **Side bug, found in the test above:** MoE with experts in RAM and batches
+  of 2–15 tokens is not deterministic. 35B-A3B on one GPU,
+  `AIRUN_NO_STATE_SNAPSHOT=1 -b 4`: three equal requests, three different
+  texts (with large batches the same test comes out identical). Cause, as
+  confirmed on 2026-11-10: with the two passes (resident, then copied) the sum
+  order depends on which experts are resident, and residency changes between
+  runs (`rebalance_experts`). With `AIRUN_MOE_OVERLAP=0` the text is
+  identical. That is why Qwen4 (experts in RAM) is not good for validating the
+  snapshot without that variable.
+- **A Q8_0 copy of the head for MTP: not worth it.** This file's
+  `output.weight` is Q5_K (874 MB), not BF16 — the old comment in `plan.rs`
+  was wrong. A Q8_0 (1.35 GB) would read more bytes, not fewer.
 
 
-## Offload para o disco: `--disk-offload` (2026-11-09)
+## Disk offload: `--disk-offload` (2026-11-09)
 
-**O que faz:** a ordem passa a ser VRAM → RAM → disco. As camadas que o planner já mandaria para a RAM (`Shard::ram_layers`) e que não cabem na RAM livre ficam no próprio GGUF, sem cópia.
+**What it does:** the order becomes VRAM → RAM → disk. The layers the planner
+would already send to RAM (`Shard::ram_layers`) that do not fit the free RAM
+stay in the GGUF itself, without a copy.
 
-- **Decisão** (`loader.rs`, `place_on_disk`, depois do `plan()`): orçamento = RAM disponível agora (`disk::available_ram`: `GlobalMemoryStatusEx` / `MemAvailable`) menos `--ram-reserve` (padrão 1/10 da RAM, 2–8 GiB), menos o KV na RAM, a embedding no host e os experts mapeados. `plan::spill_to_disk` mantém fixadas as primeiras camadas da RAM que cabem e põe o resto em `Shard::disk_layers` (subconjunto de `ram_layers`, bytes também em `ram_bytes`). Sem a flag, só uma `note:` sugerindo `--disk-offload`.
-- **Carga** (`model.rs`, `load_disk`): `RamWeights::host` virou `HostBytes::{Pinned, File}`. `File` guarda o `Arc<GgufFile>` e o `TensorInfo`, e `as_slice()` é a fatia do mmap. Nada é lido na carga (27B: 4,3 s contra 23 s fixando 6,2 GiB).
-- **CPU (geração):** `cpu::matvec` lê a fatia do mmap; o SO pagina do SSD. Não precisa de sanitize: `ue4m3_to_f32(0x7F)` já é 0.
-- **GPU (blocos de prompt > `AIRUN_CPU_MAX_TOKENS`, ou `AIRUN_RAM_ON_GPU=1`):** `RamCopy` (substitui a tupla de `ram_copies`) copia da memória paginável e roda `nvfp4_sanitize` no staging quando `nvfp4_blocks > 0`. Cópia de memória paginável não entra em grafo: `disk::in_use()` desliga os grafos.
-- **Prefetch** (`disk.rs`, `Prefetcher`): `queue_shard` chama `before(layer)`; 4 threads (`AIRUN_DISK_THREADS`) fazem `PrefetchVirtualMemory`/`madvise(WILLNEED)` e tocam uma página a cada 4 KiB das 2 próximas camadas do disco (`AIRUN_DISK_AHEAD`), em pedaços de 8 MiB, voltando ao início para o próximo token. As threads seguram um `Arc` do arquivo, então o mmap vive enquanto elas rodam.
-- **MoE:** se os experts que iriam para RAM mapeada (`MappedExperts`) passam do orçamento, `model::stream_experts()` força o caminho de `AIRUN_EXPERTS=stream` (misses lidos do arquivo). É tudo ou nada; não há metade mapeada, metade do arquivo.
+- **Decision** (`loader.rs`, `place_on_disk`, after `plan()`): budget = RAM
+  available now (`disk::available_ram`: `GlobalMemoryStatusEx` /
+  `MemAvailable`) minus `--ram-reserve` (default 1/10 of RAM, 2–8 GiB), minus
+  the KV in RAM, the host embedding and the mapped experts.
+  `plan::spill_to_disk` keeps pinned the first RAM layers that fit and puts
+  the rest in `Shard::disk_layers` (a subset of `ram_layers`, bytes also in
+  `ram_bytes`). Without the flag, only a `note:` suggesting `--disk-offload`.
+- **Load** (`model.rs`, `load_disk`): `RamWeights::host` became
+  `HostBytes::{Pinned, File}`. `File` keeps the `Arc<GgufFile>` and the
+  `TensorInfo`, and `as_slice()` is the mmap slice. Nothing is read at load
+  (27B: 4.3 s against 23 s pinning 6.2 GiB).
+- **CPU (generation):** `cpu::matvec` reads the mmap slice; the OS pages from
+  the SSD. No sanitize needed: `ue4m3_to_f32(0x7F)` is already 0.
+- **GPU (prompt chunks > `AIRUN_CPU_MAX_TOKENS`, or `AIRUN_RAM_ON_GPU=1`):**
+  `RamCopy` (replaces the `ram_copies` tuple) copies from pageable memory and
+  runs `nvfp4_sanitize` on the staging when `nvfp4_blocks > 0`. A copy from
+  pageable memory does not go into a graph: `disk::in_use()` turns graphs
+  off.
+- **Prefetch** (`disk.rs`, `Prefetcher`): `queue_shard` calls
+  `before(layer)`; 4 threads (`AIRUN_DISK_THREADS`) do
+  `PrefetchVirtualMemory`/`madvise(WILLNEED)` and touch one page every 4 KiB
+  of the next 2 disk layers (`AIRUN_DISK_AHEAD`), in 8 MiB pieces, wrapping
+  around for the next token. The threads hold an `Arc` of the file, so the
+  mmap lives while they run.
+- **MoE:** if the experts that would go to mapped RAM (`MappedExperts`)
+  exceed the budget, `model::stream_experts()` forces the
+  `AIRUN_EXPERTS=stream` path (misses read from the file). It is all or
+  nothing; there is no half mapped, half from the file.
 
-**Validado** (5070 Ti, `--alloc memory --vram-reserve` para empurrar camadas, `--ram-reserve 1000000` para pôr todas no disco), texto guloso idêntico ao de RAM fixada:
-- Qwen3-1.7B Q8_K_XL, 26 camadas no disco: prompt de 12 e de 358 tokens, com e sem `AIRUN_RAM_ON_GPU=1`.
-- 27B NVFP4 (MTP ligado), 31 camadas / 6,19 GiB no disco: prompt de 14 e de 360 tokens. Geração 9,6–9,7 tok/s contra 10,0 na RAM.
-- Teste do planner: `what_the_ram_cannot_hold_goes_to_disk`.
+**Validated** (5070 Ti, `--alloc memory --vram-reserve` to push layers out,
+`--ram-reserve 1000000` to put all of them on disk), greedy text identical to
+pinned RAM:
+- Qwen3-1.7B Q8_K_XL, 26 layers on disk: 12- and 358-token prompts, with and
+  without `AIRUN_RAM_ON_GPU=1`.
+- 27B NVFP4 (MTP on), 31 layers / 6.19 GiB on disk: 14- and 360-token
+  prompts. Generation 9.6–9.7 tok/s against 10.0 in RAM.
+- Planner test: `what_the_ram_cannot_hold_goes_to_disk`.
 
-**Não medido:** cache de arquivos frio. Nos testes acima o arquivo estava no cache do Windows (RAM sobrando), então o número é o de RAM, não o de SSD. Com a RAM de fato cheia, o teto é a banda do SSD dividida pelos bytes no disco, por token. O caminho de experts do MoE com a flag também não foi rodado (não há MoE pequeno nesta máquina); usa o streaming que já existia.
+**Not measured:** a cold file cache. In the tests above the file was in the
+Windows cache (spare RAM), so the number is RAM's, not the SSD's. With RAM
+actually full, the ceiling is the SSD bandwidth divided by the bytes on disk,
+per token. The MoE expert path with the flag was not run either (there is no
+small MoE on this machine); it uses the streaming that already existed.
 
-**Análise de velocidade (2026-11-09, NVMe SK hynix HFS256GEJ9X110N no D:, leitura a frio; `tests/disk_bench.rs`):**
+**Speed analysis (2026-11-09, SK hynix HFS256GEJ9X110N NVMe on D:, cold read;
+`tests/disk_bench.rs`):**
 
-| Método | GB/s |
+| Method | GB/s |
 |---|---|
-| page faults, 1 thread | 0,93 |
-| page faults, 8 threads | 1,58 |
-| dica + toque, 4 threads, 8 MiB (o `Prefetcher`) | 1,61 |
-| dica + toque, 8 threads | 1,61 |
-| dica + toque, 16 threads, 4 MiB | 1,23 |
-| ReadFile com cache, 8 threads | 1,20 |
-| ReadFile sem cache (`FILE_FLAG_NO_BUFFERING`), 8 / 16 threads | 1,32 / 1,38 |
+| page faults, 1 thread | 0.93 |
+| page faults, 8 threads | 1.58 |
+| hint + touch, 4 threads, 8 MiB (the `Prefetcher`) | 1.61 |
+| hint + touch, 8 threads | 1.61 |
+| hint + touch, 16 threads, 4 MiB | 1.23 |
+| cached ReadFile, 8 threads | 1.20 |
+| unbuffered ReadFile (`FILE_FLAG_NO_BUFFERING`), 8 / 16 threads | 1.32 / 1.38 |
 
-- **Leitura:** o `Prefetcher` já está no teto do disco. Ler sem cache num anel fixado não ganha banda; só deixaria o uso de memória fixo.
-- **Decode:** com o disco frio, o tempo por passada é bytes no disco ÷ banda (27B: 6,65 GB → ~4,1 s). O que acelera é mais tokens por passada. Tokens por passada do MTP (27B, 160 tokens de código): draft 2 → 2,8; 4 → 3,8; 6 → 4,3; 8 → 4,3. Por isso `DISK_DEFAULT_DRAFT = 6` (loader.rs): com camadas no disco e sem `--draft`, projeta 1,05 contra 0,92 tok/s. Os buffers do MTP são dimensionados para 6 antes do plano; se nada vai para o disco, o runtime usa 4 dentro deles. Com o arquivo no cache do SO (RAM sobrando, como nos testes daqui), o draft menor ganha (9,9 / 9,1 / 8,0 tok/s com 2 / 4 / 6); mas camadas no disco só existem quando a RAM acabou.
-- **Prefill camada por camada (`step_layered`, runtime.rs):** um bloco de `-b` tokens relia todas as camadas do disco; um prompt de 4096 com `-b 512` lia o disco 8 vezes. Agora `layered_take` separa os blocos inteiros antes do último (ou antes do ponto de snapshot), até `AIRUN_LAYERED_TOKENS` (8192), e `step_layered` os roda camada por camada: as camadas na VRAM em bloco por lote, cada camada da RAM/disco sozinha sobre todos os lotes. Entre um trecho e outro, `x` e `xb` de cada lote ficam num buffer (VRAM, ou RAM mapeada se faltar), porque com normas fundidas o `xb` deixado pela camada anterior é a entrada da próxima. `n_past` é ajustado por lote (a atenção usa `n_past + n`), e as posições são reenviadas. O `queue_shard` virou `shard_input` + `shard_layers` + `shard_output`. No `generate_spec`, o callback roda `stage_h`/`save_pending`/`mtp_queue` de cada lote logo depois da norma final. Prompt de 4420 tokens: o disco é lido 2 vezes em vez de 9; a frio, a 1,6 GB/s, ~8 s em vez de ~37 s de leitura no 27B (projeção; aqui o arquivo estava no cache).
-  - **Exatidão:** texto guloso idêntico a `AIRUN_NO_LAYERED=1` com 4420 tokens: 1.7B com disco; 27B com disco com e sem MTP; 27B com disco em duas GPUs.
-  - **Só com camadas no disco:** com camadas só na RAM fixada perdia (27B, 4420 tokens: 3,7 → 3,8 s numa GPU, 3,2 → 3,9 s em duas, que deixam de se sobrepor), então `layered_take` exige `model.disk`. Fora também: hyper-connections, PLE, imagens e o prefill em lote do `serve --parallel`.
-- **Achado à parte:** no Qwen3-1.7B Q8_K_XL, as camadas na RAM multiplicadas na CPU deram 2,5 tok/s e copiadas para a GPU (`AIRUN_RAM_ON_GPU=1`) 16,7 tok/s. O fallback `dequantize` + f32 de `cpu.rs` (tipos fora do NVFP4) é lento, e com PCIe rápido copiar ganha. A escolha CPU × cópia não olha o tipo nem a banda do link.
+- **Reading:** the `Prefetcher` is already at the disk's ceiling. Reading
+  unbuffered into a pinned ring gains no bandwidth; it would only make memory
+  use fixed.
+- **Decode:** with a cold disk, the time per pass is bytes on disk ÷ bandwidth
+  (27B: 6.65 GB → ~4.1 s). What speeds it up is more tokens per pass. MTP
+  tokens per pass (27B, 160 tokens of code): draft 2 → 2.8; 4 → 3.8; 6 → 4.3;
+  8 → 4.3. That is why `DISK_DEFAULT_DRAFT = 6` (loader.rs): with layers on
+  disk and no `--draft`, it projects 1.05 against 0.92 tok/s. The MTP buffers
+  are sized for 6 before the plan; if nothing goes to disk, the runtime uses 4
+  within them. With the file in the OS cache (spare RAM, as in the tests
+  here), the smaller draft wins (9.9 / 9.1 / 8.0 tok/s with 2 / 4 / 6); but
+  layers on disk only exist when RAM has run out.
+- **Layer-by-layer prefill (`step_layered`, runtime.rs):** a `-b`-token chunk
+  reread every disk layer; a 4096 prompt with `-b 512` read the disk 8 times.
+  Now `layered_take` sets aside the whole chunks before the last one (or
+  before the snapshot point), up to `AIRUN_LAYERED_TOKENS` (8192), and
+  `step_layered` runs them layer by layer: the VRAM layers batched per chunk,
+  each RAM/disk layer alone over all chunks. Between one stretch and the
+  next, each chunk's `x` and `xb` stay in a buffer (VRAM, or mapped RAM if
+  short), because with fused norms the `xb` left by the previous layer is the
+  next one's input. `n_past` is adjusted per chunk (attention uses `n_past +
+  n`), and the positions are re-sent. `queue_shard` became `shard_input` +
+  `shard_layers` + `shard_output`. In `generate_spec`, the callback runs
+  `stage_h`/`save_pending`/`mtp_queue` of each chunk right after the final
+  norm. 4420-token prompt: the disk is read 2 times instead of 9; cold, at 1.6
+  GB/s, ~8 s instead of ~37 s of reading on the 27B (projection; here the file
+  was cached).
+  - **Exactness:** greedy text identical to `AIRUN_NO_LAYERED=1` with 4420
+    tokens: 1.7B with disk; 27B with disk with and without MTP; 27B with disk
+    on two GPUs.
+  - **Only with layers on disk:** with layers only in pinned RAM it lost (27B,
+    4420 tokens: 3.7 → 3.8 s on one GPU, 3.2 → 3.9 s on two, which stop
+    overlapping), so `layered_take` requires `model.disk`. Also excluded:
+    hyper-connections, PLE, images and `serve --parallel`'s batched prefill.
+- **Side finding:** on Qwen3-1.7B Q8_K_XL, the RAM layers multiplied on the CPU
+  gave 2.5 tok/s and copied to the GPU (`AIRUN_RAM_ON_GPU=1`) 16.7 tok/s. The
+  `dequantize` + f32 fallback in `cpu.rs` (types other than NVFP4) is slow,
+  and with fast PCIe copying wins. The CPU × copy choice does not look at the
+  type or the link's bandwidth. (Q4_K/Q5_K/Q6_K/Q8_0 got their own kernels on
+  2026-11-10; see below.)
 
-## Camadas na RAM em K-quants e MoE com experts na RAM (2026-11-10, RTX 3060 12 GB sozinha)
+## RAM layers in K-quants and MoE with experts in RAM (2026-11-10, RTX 3060 12 GB alone)
 
-**Matmuls na CPU para Q4_K, Q5_K, Q6_K e Q8_0** (`cpu.rs`, `avx2::q4k_row4`/`q5k_row4`/`q6k_row4`/`q8_0_row4`):
-- Antes só o NVFP4 tinha kernel; os outros tipos iam para `dequantize` + f32, a ~1,5 GB/s. Qwen3.6-27B Q4_K_M (84% Q4_K/Q6_K) com 7,5 GB na RAM gerava a 0,2 tok/s.
-- Os pesos são decodificados em registradores e multiplicados como int8 (`maddubs`), como no NVFP4. O mínimo dos K-quants entra como `dmin * mn * soma do bloco de ativação` (`quantize_sums`).
-- `tests/cpu_bench.rs`: 1 token a 49–52 GB/s (Q4_K/Q5_K/Q6_K), Q8_0 a 27 GB/s.
-- Matmul com menos de 1 MiB de pesos roda na thread que chamou (`run_sized`): acordar o pool custava 205 µs para 138 KB.
-- **Não** aumente a espera ativa das threads (`AIRUN_CPU_SPIN_US`): a 5 ms a geração caiu de 3,0 para 0,9 tok/s, porque 23 threads girando tiram CPU da thread que dirige a GPU.
-- `AIRUN_CPU_STATS=1`: a cada 1000 matmuls, o tempo dentro delas e a banda.
-- **Resultado** (27B Q4_K_M, 3060, `--draft 0`): geração 0,2 → 4,6–4,8 tok/s; copiando para a GPU (`AIRUN_RAM_ON_GPU=1`), 2,8. Texto guloso idêntico nos dois caminhos.
-- Medir em sequência inflou rodadas: uma execução logo depois de outra que soltou muita memória fixada saiu a ~3 tok/s. Repita a medição.
+**CPU matmuls for Q4_K, Q5_K, Q6_K and Q8_0** (`cpu.rs`,
+`avx2::q4k_row4`/`q5k_row4`/`q6k_row4`/`q8_0_row4`):
+- Before, only NVFP4 had a kernel; the other types went to `dequantize` + f32,
+  at ~1.5 GB/s. Qwen3.6-27B Q4_K_M (84% Q4_K/Q6_K) with 7.5 GB in RAM
+  generated at 0.2 tok/s.
+- Weights are decoded in registers and multiplied as int8 (`maddubs`), as in
+  NVFP4. The K-quants' minimum goes in as `dmin * mn * activation block sum`
+  (`quantize_sums`).
+- `tests/cpu_bench.rs`: 1 token at 49–52 GB/s (Q4_K/Q5_K/Q6_K), Q8_0 at 27
+  GB/s.
+- A matmul with less than 1 MiB of weights runs on the calling thread
+  (`run_sized`): waking the pool cost 205 µs for 138 KB.
+- **Do not** raise the threads' spin wait (`AIRUN_CPU_SPIN_US`): at 5 ms
+  generation dropped from 3.0 to 0.9 tok/s, because 23 spinning threads take
+  CPU away from the thread driving the GPU.
+- `AIRUN_CPU_STATS=1`: every 1000 matmuls, the time inside them and the
+  bandwidth.
+- **Result** (27B Q4_K_M, 3060, `--draft 0`): generation 0.2 → 4.6–4.8 tok/s;
+  copying to the GPU (`AIRUN_RAM_ON_GPU=1`), 2.8. Greedy text identical on
+  both paths.
+- Measuring in sequence inflated rounds: a run right after another that freed
+  a lot of pinned memory came out at ~3 tok/s. Repeat the measurement.
 
-**Experts do MoE na decodificação com o caminho inteiro** (`moe.cu`, `moe_gate_up_q8_kernel`, `moe_down_q8_kernel`):
-- Os kernels de expert decodificavam cada peso para float: no 35B-A3B liam ~566 MB por token a ~18% da banda.
-- Com o buffer `q8` (`MoeScratch::q8`, `hybrid::moe_q8_scratch_bytes`), até 4 tokens quantizam a entrada (e o `h`) para int8 por 32 e usam `q8dot` (`dp4a`), como as matrizes densas. `AIRUN_MOE_F32=1` volta aos kernels float.
-- Selftest: "moe expert ffn, int8 decode kernels" (1,1% do pico com dados aleatórios). Texto guloso do 35B idêntico ao do caminho float.
+**MoE experts in decode on the integer path** (`moe.cu`,
+`moe_gate_up_q8_kernel`, `moe_down_q8_kernel`):
+- The expert kernels decoded each weight to float: on the 35B-A3B they read
+  ~566 MB per token at ~18% of bandwidth.
+- With the `q8` buffer (`MoeScratch::q8`, `hybrid::moe_q8_scratch_bytes`), up
+  to 4 tokens quantize the input (and `h`) to int8 per 32 and use `q8dot`
+  (`dp4a`), like the dense matrices. `AIRUN_MOE_F32=1` goes back to the float
+  kernels.
+- Selftest: "moe expert ffn, int8 decode kernels" (1.1% of peak with random
+  data). The 35B's greedy text identical to the float path's.
 
-**Cópia dos experts que faltam com poucos blocos** (`moe_stage_copy_kernel`, `AIRUN_STAGE_BLOCKS`, padrão 4):
-- A cópia RAM → VRAM roda numa fila paralela aos experts residentes. Com 32 blocos por expert (até 256 ao mesmo tempo, cada um preso esperando o PCIe), ela ocupava a GPU e atrasava os kernels da outra fila.
-- Agora são 4 blocos por expert, com 8 leituras de 16 bytes em voo por thread.
+**Copying the missing experts with few blocks** (`moe_stage_copy_kernel`,
+`AIRUN_STAGE_BLOCKS`, default 4):
+- The RAM → VRAM copy runs on a queue parallel to the resident experts. With
+  32 blocks per expert (up to 256 at a time, each stuck waiting on PCIe), it
+  took the GPU and delayed the other queue's kernels.
+- Now it is 4 blocks per expert, with 8 16-byte loads in flight per thread.
 
-**Resultado no 35B-A3B Q4_K_M** (`-c 246000 --kv-type q8_0 --temp 0.7`, 7,16 GiB de pesos na VRAM, ~78% dos experts na VRAM):
+**Result on the 35B-A3B Q4_K_M** (`-c 246000 --kv-type q8_0 --temp 0.7`, 7.16
+GiB of weights in VRAM, ~78% of experts in VRAM):
 
-| Etapa | tok/s |
+| Step | tok/s |
 |---|---|
-| antes | 42–44 |
-| experts em int8 | 48 |
-| cópia: 32 → 4 blocos por expert | 58,7–60,6 |
+| before | 42–44 |
+| int8 experts | 48 |
+| copy: 32 → 4 blocks per expert | 58.7–60.6 |
 
-- Varredura dos blocos: 32 → 51,6; 8 → 55; 4 → 58,7–60,6; 3 → 60,0–60,4; 1 → 55,7–57,4.
-- MTP continua perdendo com experts na RAM: `--draft 1` 56,4–56,8; `--draft 2` 48,3–49,3 (aceitação 45–65% a temp 0,7).
-- Chaves por divisão da atenção (`GQA_KEYS_PER_SPLIT`) 64 / 32 / 16: 60,3–60,7 / 61,3–62,2 / 57,8–64,0, dentro do ruído; ficou 64.
+- Block sweep: 32 → 51.6; 8 → 55; 4 → 58.7–60.6; 3 → 60.0–60.4; 1 →
+  55.7–57.4.
+- MTP still lost with experts in RAM: `--draft 1` 56.4–56.8; `--draft 2`
+  48.3–49.3 (acceptance 45–65% at temp 0.7).
+- Keys per attention split (`GQA_KEYS_PER_SPLIT`) 64 / 32 / 16: 60.3–60.7 /
+  61.3–62.2 / 57.8–64.0, within noise; it stayed 64 (superseded by the
+  adaptive split below).
 
-**Onde vai o tempo agora** (nsys com `--cuda-graph-trace=node`, ms por token):
-- cópia dos experts 4,9, na fila paralela;
-- matvecs densos f32 5,8, perto da banda (Q6_K a ~338 GB/s);
-- experts em int8 3,2;
-- atenção 1,07 (107 µs por camada com ~230 tokens: 2 cabeças de KV dão poucos blocos);
-- `matvec_tallk` 0,8.
+With the context full, just reading the KV every token already costs ~7.5 ms
+on the 3060. So 90 tok/s is only reachable with a short conversation.
 
-Com o contexto cheio, só ler o KV a cada token já custa ~7,5 ms na 3060. Então 90 tok/s só é alcançável com a conversa curta.
+## KV lent to experts, short-context attention and MTP with experts in RAM (2026-11-10, afternoon)
 
-## KV emprestado aos experts, atenção com contexto curto e MTP com experts na RAM (2026-11-10, tarde)
+Same scenario (35B-A3B Q4_K_M, RTX 3060 12 GB, `-c 246000 --kv-type q8_0`).
+Result, alternated rounds in the same session, 300 tokens:
 
-Mesmo cenário (35B-A3B Q4_K_M, RTX 3060 12 GB, `-c 246000 --kv-type q8_0`). Resultado, rodadas alternadas na mesma sessão, 300 tokens:
-
-| | temp 0,7 | guloso |
+| | temp 0.7 | greedy |
 |---|---|---|
-| antes (`AIRUN_NO_KV_LOAN=1 AIRUN_NO_SPLIT_WAVES=1`) | 59,9–62,2 | 59,8–62,0 |
-| agora | 73,0–73,6 | 73,7–74,7 |
-| agora + `--draft 1` | 64,8–67,3 | 68,2–69,4 |
+| before (`AIRUN_NO_KV_LOAN=1 AIRUN_NO_SPLIT_WAVES=1`) | 59.9–62.2 | 59.8–62.0 |
+| now | 73.0–73.6 | 73.7–74.7 |
+| now + `--draft 1` | 64.8–67.3 | 68.2–69.4 |
 
-**KV emprestado aos experts** (`kv_loan.rs`, `model::Loan`, `MappedExperts::{fill, release_below}`):
-- O KV de 246k reserva ~2,7 GB que uma conversa curta não toca. As linhas ainda não alcançadas guardam cópias de experts da RAM (1013 experts, 2,43 GiB no 35B): acerto do cache 82% → 89%, 56 → 66 tok/s sozinho.
-- Layout do KV é `[cabeça][posição][linha]`; cada pedaço emprestado fica numa posição `p0` de uma cabeça e vale enquanto a sequência escreve abaixo dela. O host mantém a cópia original do expert, então devolver é só apontar a tabela de volta (nada atravessa o PCIe).
-- `kv_loan_guard(upto)` roda antes de qualquer escrita no KV: `step_inner`, `step_layered`, `chain_launch`, `decode_rows`, `load_state`, `spec::verify`, `verify_rows` e, de rede de segurança, `queue_forward_with`. Ao chegar a `margin` (= lote + 1024) linhas do empréstimo mais baixo, devolve tudo abaixo de `upto + 2 * margin`.
-- O rebalanceamento preenche empréstimos livres acima de `max(n_past, history.len()) + 2 * margin` com os experts mais quentes (uma cópia, contra três de uma troca). `reset()` libera as linhas de novo.
-- Fora com `--parallel` > 1 (cada slot teria de ter os seus), KV na RAM, índice de atenção esparsa, ou `AIRUN_NO_KV_LOAN=1`.
-- **Exatidão:** texto guloso idêntico com e sem empréstimo, inclusive com a devolução no meio da geração (4964 tokens de prompt, 2200 gerados, `-c 12288`), **desde que** `AIRUN_MOE_OVERLAP=0`. Com as duas passadas (residentes, depois copiados), um expert que muda de lado muda a ordem da soma em float e o texto pode divergir numa quase-empate. Isso não é corrupção: compare sempre com `AIRUN_MOE_OVERLAP=0`.
+With `serve ... --kv-type q8_0 -b 256 -c 262144` and ~2.3k-token prompts
+(400 generated, 5 requests): prefill 553 tok/s, generation 61.0 tok/s.
 
-**MTP: as verificações não rebalanceavam os experts** (`spec.rs`): `rebalance_experts` só rodava em `step()`; com `--draft` a escolha de experts na VRAM congelava no prompt. Agora roda após cada `verify` e `accept_rows`. `--draft 1`: 56 → 60–67 tok/s.
+**KV lent to experts** (`kv_loan.rs`, `model::Loan`,
+`MappedExperts::{fill, release_below}`):
+- The 246k KV reserves ~2.7 GB that a short conversation does not touch. The
+  rows not yet reached hold copies of experts from RAM (1013 experts, 2.43
+  GiB on the 35B): cache hits 82% → 89%, 56 → 66 tok/s on its own.
+- The KV layout is `[head][position][row]`; each lent piece sits at a
+  position `p0` of a head and holds while the sequence writes below it. The
+  host keeps the expert's original copy, so giving it back is just pointing
+  the table back (nothing crosses PCIe).
+- `kv_loan_guard(upto)` runs before any KV write: `step_inner`,
+  `step_layered`, `chain_launch`, `decode_rows`, `load_state`,
+  `spec::verify`, `verify_rows` and, as a safety net, `queue_forward_with`.
+  On coming within `margin` (= batch + 1024) rows of the lowest loan, it gives
+  back everything below `upto + 2 * margin`.
+- Rebalancing fills free loans above `max(n_past, history.len()) + 2 *
+  margin` with the hottest experts (one copy, against three for a swap).
+  `reset()` frees the rows again.
+- Off with `--parallel` > 1 (each slot would need its own), KV in RAM, a
+  sparse-attention index, or `AIRUN_NO_KV_LOAN=1`.
+- **Exactness:** greedy text identical with and without loans, including the
+  give-back in the middle of generation (4964 prompt tokens, 2200 generated,
+  `-c 12288`), **as long as** `AIRUN_MOE_OVERLAP=0`. With the two passes
+  (resident, then copied), an expert that changes sides changes the float sum
+  order and the text may diverge at a near-tie. That is not corruption:
+  always compare with `AIRUN_MOE_OVERLAP=0`.
 
-**Atenção de decode com contexto curto** (`attention_decode_gqa_kernel`, `gqa_decode_tail<D, KV, GS>`):
-- Com ~300 tokens eram 5 divisões × 2 cabeças de KV = 10 warps na GPU inteira, ~90 µs por camada (~1 ms por token, 0,8% da banda). Nsight Compute: ~18k instruções por warp a ~9,5 ciclos cada, metade da espera em falta de instrução (o código desenrolado é percorrido uma vez só por bloco).
-- O laço das cabeças desenrolava `GQA_MAX` = 8 com `if (h >= G) continue` em tempo de execução: o corpo agora é instanciado com 1/2/4/8 cabeças fixas (genérico para outros G e para a verificação com vários warps, cuja numérica não pode depender do caminho).
-- `attention_active_splits` escolhe de 16 a 64 chaves por divisão, o menor que ainda cabe numa onda (`wave`). Atenção e merge chamam a mesma função, então concordam. Sem efeito no contexto longo (as divisões chegam ao teto de 256). `AIRUN_NO_SPLIT_WAVES=1` volta ao fixo: 69–72 contra 74–75 tok/s.
-- Muda a ordem da soma: texto guloso do Qwen3-4B diverge do fixo numa quase-empate (caractere 501 de 1627); os dois coerentes.
-- **Testado e descartado:** espalhar as 8 cabeças de query de um grupo por vários blocos. Com o corpo especializado ficou 72,4–73,3 contra 73,6–74,1: o tempo do bloco é a passada fria pelo código e a decodificação byte a byte do q8_0 (74% de setores excedentes), não as cabeças.
+**MTP: the verifies did not rebalance the experts** (`spec.rs`):
+`rebalance_experts` only ran in `step()`; with `--draft` the choice of experts
+in VRAM froze at the prompt. Now it runs after every `verify` and
+`accept_rows`. `--draft 1`: 56 → 60–67 tok/s.
 
-**Prefetch dos experts antes do FFN** (`Prefetch`, `moe_prefetch`, `moe_stage_plan_pre_kernel`), **opcional** com `AIRUN_EXPERT_PREFETCH=1`:
-- No início da camada, o roteador dela aplicado ao residual que entra (normalizado com o peso do FFN) prevê os experts. Os previstos que estão na RAM começam a ser copiados enquanto a atenção roda, nas primeiras posições da área de cópia; no FFN só se copia o que a previsão errou (`first` em `moe_stage_copy`).
-- Acerta 72% das cópias e corta a espera pelo PCIe de 2,1 para 0,8 ms por token (nsys), mas perde: 67–69 contra 70 tok/s. A previsão custa ~20 µs por camada, e as cópias ao lado da atenção deixam os outros kernels ~2 ms mais lentos por token. Prevendo só 4 experts (31% de acerto, quase sem desperdício), perde igual.
+**Short-context decode attention** (`attention_decode_gqa_kernel`,
+`gqa_decode_tail<D, KV, GS>`):
+- With ~300 tokens there were 5 splits × 2 KV heads = 10 warps on the whole
+  GPU, ~90 µs per layer (~1 ms per token, 0.8% of bandwidth). Nsight Compute:
+  ~18k instructions per warp at ~9.5 cycles each, half the wait in
+  instruction-fetch misses (the unrolled code is walked only once per block).
+- The heads loop unrolled `GQA_MAX` = 8 with a run-time `if (h >= G)
+  continue`: the body is now instantiated with 1/2/4/8 fixed heads (generic
+  for other G and for the multi-warp verify, whose numerics must not depend on
+  the path).
+- `attention_active_splits` picks 16 to 64 keys per split, the smallest that
+  still fits a wave (`wave`). Attention and merge call the same function, so
+  they agree. No effect at long context (the splits reach the 256 ceiling).
+  `AIRUN_NO_SPLIT_WAVES=1` goes back to fixed: 69–72 against 74–75 tok/s.
+- It changes the sum order: Qwen3-4B's greedy text diverges from the fixed
+  one at a near-tie (character 501 of 1627); both coherent.
+- **Tried and discarded:** spreading a group's 8 query heads over several
+  blocks. With the specialized body it came to 72.4–73.3 against 73.6–74.1:
+  the block's time is the cold pass through the code and the q8_0 byte-by-byte
+  decoding (74% excess sectors), not the heads.
 
-**Onde vai o tempo agora** (nsys, sem prefetch, ~14 ms por token fora do profiler):
-- cálculo ~11,7 ms: matvecs densos 5,4 (a saída de 248k × 2048 em Q6_K sozinha ~1,2), experts 2,8, `matvec_tallk` 0,9, atenção ~0,5;
-- GPU esperando a cópia de experts ~2,1 ms;
-- o profiler inflava a folga entre tokens: `cudaGraphLaunch` 1,2 ms por token com rastreamento. Sem ele a folga real é ~0,6 ms. Sortear na CPU com temp 0,7 custa só ~0,25 ms a mais que o guloso.
+**Expert prefetch before the FFN** (`Prefetch`, `moe_prefetch`,
+`moe_stage_plan_pre_kernel`), **optional** with `AIRUN_EXPERT_PREFETCH=1`:
+- At the start of the layer, its router applied to the incoming residual
+  (normalized with the FFN weight) predicts the experts. The predicted ones in
+  RAM start copying while attention runs, into the copy area's first slots; in
+  the FFN only what the prediction missed is copied (`first` in
+  `moe_stage_copy`).
+- It predicts 72% of the copies and cuts the PCIe wait from 2.1 to 0.8 ms per
+  token (nsys), but loses: 67–69 against 70 tok/s. The prediction costs ~20
+  µs per layer, and the copies beside the attention make the other kernels
+  ~2 ms slower per token. Predicting only 4 experts (31% hits, almost no
+  waste), it loses the same.
 
-**MTP ainda perde com experts na RAM:** verificar 2 tokens custa 22 ms contra 14–15 de 1 (cada token escolhe os próprios 8 experts, então quase dobram as cópias e o cálculo dos experts), e a cabeça mais o commit, 2,7 ms. Com 58–66% de aceitação fica abaixo do decode simples. `AIRUN_DRAFT_VOCAB=16384/32768` corta a cabeça para 1,3 ms, mas a aceitação cai para 34–57%: sem ganho.
+**Where the time goes now** (nsys, without prefetch, ~14 ms per token outside
+the profiler):
+- compute ~11.7 ms: dense matvecs 5.4 (the 248k × 2048 Q6_K output alone
+  ~1.2), experts 2.8, `matvec_tallk` 0.9, attention ~0.5;
+- GPU waiting on the expert copy ~2.1 ms;
+- the profiler inflated the gap between tokens: `cudaGraphLaunch` 1.2 ms per
+  token with tracing. Without it the real gap is ~0.6 ms. Sampling on the CPU
+  at temp 0.7 costs only ~0.25 ms more than greedy.
 
-**Próximas alavancas:**
-- a espera pelo PCIe (~2,1 ms): só esconde se a cópia sair do caminho sem disputar a GPU. Um prefetch só ganha se a previsão custar quase nada (por exemplo o roteador da camada seguinte junto do da atual, num matvec só) e as cópias não atrasarem a atenção;
-- desquantizar a linha q8_0 do KV na atenção com leituras largas, em vez de byte a byte;
-- matvecs densos já estão perto da banda; a saída de 248k linhas é ~8% do token.
+**MTP still loses with experts in RAM:** verifying 2 tokens costs 22 ms
+against 14–15 for 1 (each token picks its own 8 experts, so copies and expert
+compute almost double), and the head plus commit, 2.7 ms. With 58–66%
+acceptance it stays below plain decoding.
+
+**Next levers:**
+- the PCIe wait (~2.1 ms): it only hides if the copy gets off the path without
+  competing for the GPU. A prefetch only wins if the prediction costs almost
+  nothing (for example the next layer's router together with the current
+  one's, in a single matvec) and the copies do not slow the attention;
+- dequantizing the q8_0 KV row in attention with wide loads, instead of byte
+  by byte;
+- dense matvecs are already close to bandwidth; the 248k-row output is ~8% of
+  the token.

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="pt-BR">
+<html lang="en-US">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -228,93 +228,93 @@ details.think.live > summary { color: var(--think); }
 <aside id="side">
   <div class="side-top">
     <div class="brand">ai<span>run</span></div>
-    <button class="ibtn" id="sideClose" title="Fechar" hidden data-icon="x"></button>
+    <button class="ibtn" id="sideClose" title="Close" hidden data-icon="x"></button>
   </div>
-  <button class="newchat" id="newChat" title="Nova conversa (Ctrl+Shift+O)"><span data-icon="plus"></span>Nova conversa</button>
-  <div class="search"><span data-icon="search"></span><input id="search" placeholder="Buscar conversas"></div>
+  <button class="newchat" id="newChat" title="New chat (Ctrl+Shift+O)"><span data-icon="plus"></span>New chat</button>
+  <div class="search"><span data-icon="search"></span><input id="search" placeholder="Search chats"></div>
   <div id="chats"></div>
   <div class="side-foot">
     <div class="status" id="status"></div>
-    <div class="model" id="modelName">conectando…</div>
-    <button class="ibtn" id="settingsBtn" title="Configurações" data-icon="settings"></button>
+    <div class="model" id="modelName">connecting…</div>
+    <button class="ibtn" id="settingsBtn" title="Settings" data-icon="settings"></button>
   </div>
 </aside>
 
 <main>
   <header>
-    <button class="ibtn" id="menu" title="Conversas" data-icon="menu"></button>
-    <div id="chatTitle">Nova conversa</div>
+    <button class="ibtn" id="menu" title="Chats" data-icon="menu"></button>
+    <div id="chatTitle">New chat</div>
     <div class="think-ctl" id="thinkCtl" hidden>
-      <button class="ibtn on" id="thinkBtn" title="Pensar antes de responder" data-icon="brain"></button>
-      <select id="effort" title="Quanto o modelo pode pensar">
-        <option value="none">desligado</option>
-        <option value="default" selected title="O que o servidor ou o modelo usam por padrão">padrão</option>
-        <option value="low" title="até 1.024 tokens de pensamento">baixo</option>
-        <option value="medium" title="até 4.096 tokens de pensamento">médio</option>
-        <option value="high" title="até 16.384 tokens de pensamento">alto</option>
-        <option value="xhigh" title="até 32.768 tokens de pensamento">muito alto</option>
-        <option value="max" title="sem limite de tokens de pensamento">máximo</option>
+      <button class="ibtn on" id="thinkBtn" title="Think before answering" data-icon="brain"></button>
+      <select id="effort" title="How much the model may think">
+        <option value="none">off</option>
+        <option value="default" selected title="What the server or the model uses by default">default</option>
+        <option value="low" title="up to 1,024 thinking tokens">low</option>
+        <option value="medium" title="up to 4,096 thinking tokens">medium</option>
+        <option value="high" title="up to 16,384 thinking tokens">high</option>
+        <option value="xhigh" title="up to 32,768 thinking tokens">very high</option>
+        <option value="max" title="no limit on thinking tokens">max</option>
       </select>
     </div>
   </header>
   <div id="log">
     <div id="wrap"></div>
-    <button class="ibtn" id="toBottom" hidden title="Ir para o fim" data-icon="down"></button>
+    <button class="ibtn" id="toBottom" hidden title="Go to the end" data-icon="down"></button>
   </div>
   <div class="composer">
     <div class="box">
       <div class="chips" id="chips"></div>
       <div class="row-in">
-        <button class="ibtn" id="attach" title="Anexar imagem" hidden data-icon="image"></button>
+        <button class="ibtn" id="attach" title="Attach image" hidden data-icon="image"></button>
         <input type="file" id="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
-        <textarea id="input" rows="1" placeholder="Escreva uma mensagem…"></textarea>
-        <button class="ibtn" id="send" title="Enviar (Enter)" data-icon="send" disabled></button>
-        <button class="ibtn" id="stop" title="Parar (Esc)" data-icon="stop" hidden></button>
+        <textarea id="input" rows="1" placeholder="Write a message…"></textarea>
+        <button class="ibtn" id="send" title="Send (Enter)" data-icon="send" disabled></button>
+        <button class="ibtn" id="stop" title="Stop (Esc)" data-icon="stop" hidden></button>
       </div>
     </div>
-    <div class="hint"><kbd>Enter</kbd> envia · <kbd>Shift+Enter</kbd> nova linha · <kbd>Esc</kbd> para · as conversas ficam salvas neste navegador</div>
+    <div class="hint"><kbd>Enter</kbd> sends · <kbd>Shift+Enter</kbd> new line · <kbd>Esc</kbd> stops · chats are saved in this browser</div>
   </div>
 </main>
 
 <div class="overlay" id="settings" hidden>
   <div class="panel">
-    <div class="panel-head"><span>Configurações</span><button class="ibtn" id="closeSettings" title="Fechar" data-icon="x"></button></div>
+    <div class="panel-head"><span>Settings</span><button class="ibtn" id="closeSettings" title="Close" data-icon="x"></button></div>
     <div class="panel-body">
-      <h4>Informações</h4>
+      <h4>Information</h4>
       <div class="info" id="info"></div>
-      <h4>Pensamento</h4>
+      <h4>Thinking</h4>
       <div class="field">
-        <label for="thinkBudget">limite exato de tokens <b id="thinkBudgetV">∞</b></label>
+        <label for="thinkBudget">exact token limit <b id="thinkBudgetV">∞</b></label>
         <input type="number" id="thinkBudget" min="0" max="65536" step="256" value="0">
-        <div class="note">0 = usa o nível escolhido no topo. Um valor aqui vale mais que o nível.</div>
+        <div class="note">0 = uses the level chosen at the top. A value here overrides the level.</div>
       </div>
-      <h4>Amostragem</h4>
-      <div class="field"><label for="temp">temperatura <b id="tempV"></b></label>
+      <h4>Sampling</h4>
+      <div class="field"><label for="temp">temperature <b id="tempV"></b></label>
         <input type="range" id="temp" min="0" max="2" step="0.05" value="0.7">
-        <div class="note">0 = sempre a mesma resposta; mais alto = mais variado.</div></div>
+        <div class="note">0 = always the same answer; higher = more varied.</div></div>
       <div class="field"><label for="top_p">top-p <b id="top_pV"></b></label>
         <input type="range" id="top_p" min="0" max="1" step="0.01" value="0.95"></div>
       <div class="field"><label for="top_k">top-k <b id="top_kV"></b></label>
         <input type="range" id="top_k" min="0" max="200" step="1" value="40"></div>
       <div class="field"><label for="min_p">min-p <b id="min_pV"></b></label>
         <input type="range" id="min_p" min="0" max="0.5" step="0.01" value="0.05"></div>
-      <div class="field"><label for="rep">penalidade de repetição <b id="repV"></b></label>
+      <div class="field"><label for="rep">repeat penalty <b id="repV"></b></label>
         <input type="range" id="rep" min="1" max="1.5" step="0.01" value="1.1"></div>
-      <div class="field"><label for="maxTok">máximo de tokens na resposta</label>
+      <div class="field"><label for="maxTok">maximum tokens in the answer</label>
         <input type="number" id="maxTok" min="1" max="131072" value="4096"></div>
-      <div class="field"><label for="seed">semente</label>
-        <input type="text" id="seed" placeholder="aleatória" inputmode="numeric"></div>
-      <h4>Conversa</h4>
-      <div class="field"><label for="sys">mensagem de sistema</label>
-        <textarea id="sys" placeholder="(nenhuma)"></textarea></div>
-      <div class="field"><label for="apiKey">chave da API</label>
-        <input type="password" id="apiKey" placeholder="(não exigida)" autocomplete="off"></div>
-      <h4>Dados</h4>
+      <div class="field"><label for="seed">seed</label>
+        <input type="text" id="seed" placeholder="random" inputmode="numeric"></div>
+      <h4>Chat</h4>
+      <div class="field"><label for="sys">system message</label>
+        <textarea id="sys" placeholder="(none)"></textarea></div>
+      <div class="field"><label for="apiKey">API key</label>
+        <input type="password" id="apiKey" placeholder="(not required)" autocomplete="off"></div>
+      <h4>Data</h4>
       <div class="panel-actions">
-        <button class="btn" id="exportChats">Exportar conversas</button>
-        <button class="btn" id="importChats">Importar</button>
+        <button class="btn" id="exportChats">Export chats</button>
+        <button class="btn" id="importChats">Import</button>
         <input type="file" id="importFile" accept="application/json" hidden>
-        <button class="btn" id="clearChats">Apagar todas</button>
+        <button class="btn" id="clearChats">Delete all</button>
       </div>
     </div>
   </div>
@@ -322,9 +322,9 @@ details.think.live > summary { color: var(--think); }
 
 <div class="overlay preview" id="preview" hidden>
   <div class="panel">
-    <div class="panel-head"><span>Pré-visualização</span>
-      <button class="ibtn" id="previewTab" title="Abrir em nova aba" data-icon="external"></button>
-      <button class="ibtn" id="previewClose" title="Fechar" data-icon="x"></button></div>
+    <div class="panel-head"><span>Preview</span>
+      <button class="ibtn" id="previewTab" title="Open in a new tab" data-icon="external"></button>
+      <button class="ibtn" id="previewClose" title="Close" data-icon="x"></button></div>
     <iframe id="previewFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups"></iframe>
   </div>
 </div>
@@ -382,8 +382,8 @@ function save(now) {
       // Over the browser's quota: keep the text, drop the oldest images.
       for (const c of db.chats.slice().sort((a, b) => a.updated - b.updated))
         for (const t of c.turns) if (t.images?.length) { t.images = []; t.imagesDropped = true; }
-      try { localStorage.setItem(STORE, JSON.stringify(db)); toast("Espaço do navegador cheio: imagens antigas foram descartadas."); }
-      catch (_) { toast("Não foi possível salvar a conversa (espaço do navegador cheio)."); }
+      try { localStorage.setItem(STORE, JSON.stringify(db)); toast("Browser storage full: old images were discarded."); }
+      catch (_) { toast("Could not save the chat (browser storage full)."); }
     }
   };
   if (now) write(); else saveTimer = setTimeout(write, 300);
@@ -392,7 +392,7 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const chat = () => db.chats.find((c) => c.id === db.current) || null;
 
 function newChat() {
-  const c = { id: uid(), title: "Nova conversa", created: Date.now(), updated: Date.now(), turns: [] };
+  const c = { id: uid(), title: "New chat", created: Date.now(), updated: Date.now(), turns: [] };
   db.chats.unshift(c);
   db.current = c.id;
   save();
@@ -428,7 +428,7 @@ function syncLabels() {
   for (const [id, d] of Object.entries(fix)) $(id + "V").textContent = (+$(id).value).toFixed(d);
   $("thinkBudgetV").textContent = +$("thinkBudget").value > 0 ? $("thinkBudget").value : "∞";
   $("thinkBtn").classList.toggle("on", thinkingOn());
-  $("thinkBtn").title = thinkingOn() ? "Pensando antes de responder (clique para desligar)" : "Sem pensar (clique para ligar)";
+  $("thinkBtn").title = thinkingOn() ? "Thinking before answering (click to turn off)" : "Not thinking (click to turn on)";
 }
 for (const id of CONTROLS) {
   $(id).addEventListener("input", () => { syncLabels(); saveSettings(); });
@@ -468,9 +468,9 @@ const codeStore = [];
 function codeBlock(lang, code) {
   const id = codeStore.push(code) - 1;
   const preview = isHtml(lang, code)
-    ? `<button class="ibtn" data-act="preview" data-code="${id}" title="Pré-visualizar">${icon("eye")}</button>` : "";
+    ? `<button class="ibtn" data-act="preview" data-code="${id}" title="Preview">${icon("eye")}</button>` : "";
   return `<div class="codeblock"><div class="codehead"><span class="lang">${esc(lang || "texto")}</span>${preview}` +
-    `<button class="ibtn" data-act="copy-code" data-code="${id}" title="Copiar código">${icon("copy")}</button></div>` +
+    `<button class="ibtn" data-act="copy-code" data-code="${id}" title="Copy code">${icon("copy")}</button></div>` +
     `<pre><code>${esc(code)}</code></pre></div>`;
 }
 function splitRow(line) {
@@ -561,29 +561,29 @@ function renderSidebar() {
   const list = db.chats.filter((c) => !q || c.title.toLowerCase().includes(q) ||
     c.turns.some((t) => (t.content || "").toLowerCase().includes(q)));
   list.sort((a, b) => b.updated - a.updated);
-  const day = 864e5, now = Date.now(), groups = [["Hoje", day], ["Últimos 7 dias", 7 * day], ["Últimos 30 dias", 30 * day], ["Mais antigas", Infinity]];
+  const day = 864e5, now = Date.now(), groups = [["Today", day], ["Last 7 days", 7 * day], ["Last 30 days", 30 * day], ["Older", Infinity]];
   let html = "", g = -1;
   for (const c of list) {
     const age = now - c.updated;
     const k = groups.findIndex(([, max]) => age < max);
     if (k !== g) { g = k; html += `<div class="group">${groups[k][0]}</div>`; }
     html += `<div class="chat${c.id === db.current ? " active" : ""}" data-id="${c.id}">` +
-      (c.pending ? '<span class="dotlive" title="Gerando"></span>' : "") +
+      (c.pending ? '<span class="dotlive" title="Generating"></span>' : "") +
       `<span class="title">${esc(c.title)}</span>` +
-      `<button class="ibtn" data-act="rename" title="Renomear">${icon("edit")}</button>` +
-      `<button class="ibtn" data-act="delete" title="Apagar">${icon("trash")}</button></div>`;
+      `<button class="ibtn" data-act="rename" title="Rename">${icon("edit")}</button>` +
+      `<button class="ibtn" data-act="delete" title="Delete">${icon("trash")}</button></div>`;
   }
-  $("chats").innerHTML = html || '<div class="group" style="text-transform:none">Nenhuma conversa ainda</div>';
+  $("chats").innerHTML = html || '<div class="group" style="text-transform:none">No chats yet</div>';
 }
 
 function renderChat() {
   const c = chat();
-  $("chatTitle").textContent = c ? c.title : "Nova conversa";
+  $("chatTitle").textContent = c ? c.title : "New chat";
   wrap.innerHTML = "";
   codeStore.length = 0;
   if (!c || !c.turns.length) {
     wrap.innerHTML = '<div class="empty"><div class="logo">ai<span>run</span></div>' +
-      `<p>${esc(props.model || "")}</p><p>Pergunte qualquer coisa.</p></div>`;
+      `<p>${esc(props.model || "")}</p><p>Ask anything.</p></div>`;
     return;
   }
   c.turns.forEach((t, i) => wrap.appendChild(messageEl(t, i)));
@@ -602,21 +602,21 @@ function messageEl(t, index) {
   el.dataset.index = index;
   if (t.role === "user") {
     if (t.images?.length) el.insertAdjacentHTML("beforeend", '<div class="imgs">' +
-      t.images.map((src) => `<img src="${src}" alt="imagem" data-act="zoom">`).join("") + "</div>");
+      t.images.map((src) => `<img src="${src}" alt="image" data-act="zoom">`).join("") + "</div>");
     const b = document.createElement("div");
     b.className = "body";
-    b.textContent = t.content + (t.imagesDropped ? "\n(imagens não guardadas)" : "");
+    b.textContent = t.content + (t.imagesDropped ? "\n(images not kept)" : "");
     el.appendChild(b);
     el.insertAdjacentHTML("beforeend", '<div class="actions">' +
-      `<button class="ibtn" data-act="copy" title="Copiar">${icon("copy")}</button>` +
-      `<button class="ibtn" data-act="edit" title="Editar e reenviar">${icon("edit")}</button></div>`);
+      `<button class="ibtn" data-act="copy" title="Copy">${icon("copy")}</button>` +
+      `<button class="ibtn" data-act="edit" title="Edit and resend">${icon("edit")}</button></div>`);
   } else if (t.role === "error") {
-    el.innerHTML = `<div class="body"></div><div class="actions"><button class="ibtn" data-act="regen" title="Tentar de novo">${icon("refresh")}</button></div>`;
+    el.innerHTML = `<div class="body"></div><div class="actions"><button class="ibtn" data-act="regen" title="Try again">${icon("refresh")}</button></div>`;
     el.querySelector(".body").textContent = t.content;
   } else {
     el.innerHTML = '<div class="body"></div><div class="actions">' +
-      `<button class="ibtn" data-act="copy" title="Copiar resposta">${icon("copy")}</button>` +
-      `<button class="ibtn" data-act="regen" title="Gerar de novo">${icon("refresh")}</button>` +
+      `<button class="ibtn" data-act="copy" title="Copy answer">${icon("copy")}</button>` +
+      `<button class="ibtn" data-act="regen" title="Regenerate">${icon("refresh")}</button>` +
       `<span class="stats"></span></div>`;
     renderAssistant(el, t.content, t.stats, false);
   }
@@ -627,14 +627,14 @@ const fmtMs = (ms) => ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : Math.round(ms
 function techRows(t) {
   const rows = [];
   const add = (k, v) => { if (v != null && v !== "") rows.push(`<dt>${k}</dt><dd>${v}</dd>`); };
-  if (props.ctx) add("Contexto", `${t.prompt_n || 0}/${props.ctx} tok`);
+  if (props.ctx) add("Context", `${t.prompt_n || 0}/${props.ctx} tok`);
   add("Prompt", t.prompt_n ? `${t.prompt_n} tok · ${fmtMs(t.prompt_ms)}` : null);
   add("Prefill", t.prompt_per_second ? `${t.prompt_per_second.toFixed(1)} tok/s` : null);
-  add("Cache", t.cache_n ? `${t.cache_n} tok reutilizados` : "0 tok");
-  add("Geração", t.predicted_n ? `${t.predicted_n} tok · ${fmtMs(t.predicted_ms)}` : null);
-  add("Velocidade", t.predicted_per_second ? `${t.predicted_per_second.toFixed(1)} tok/s` : null);
-  add("Latência/tok", t.predicted_per_token_ms ? `${t.predicted_per_token_ms.toFixed(1)} ms` : null);
-  if (t.draft_n) add("Rascunhos (MTP)", `${t.draft_n_accepted || 0}/${t.draft_n} aceitos (${Math.round(100 * (t.draft_n_accepted || 0) / t.draft_n)}%)`);
+  add("Cache", t.cache_n ? `${t.cache_n} tok reused` : "0 tok");
+  add("Generation", t.predicted_n ? `${t.predicted_n} tok · ${fmtMs(t.predicted_ms)}` : null);
+  add("Speed", t.predicted_per_second ? `${t.predicted_per_second.toFixed(1)} tok/s` : null);
+  add("Latency/tok", t.predicted_per_token_ms ? `${t.predicted_per_token_ms.toFixed(1)} ms` : null);
+  if (t.draft_n) add("Drafts (MTP)", `${t.draft_n_accepted || 0}/${t.draft_n} accepted (${Math.round(100 * (t.draft_n_accepted || 0) / t.draft_n)}%)`);
   return `<dl>${rows.join("")}</dl>`;
 }
 function renderAssistant(el, raw, stats, live) {
@@ -643,8 +643,8 @@ function renderAssistant(el, raw, stats, live) {
   const wasOpen = body.querySelector("details.think")?.open;
   let html = "";
   if (think !== null) {
-    const secs = stats?.thinkMs ? ` por ${(stats.thinkMs / 1000).toFixed(1)}s` : "";
-    const label = thinkingNow && live ? "Pensando…" : `Pensou${secs}`;
+    const secs = stats?.thinkMs ? ` for ${(stats.thinkMs / 1000).toFixed(1)}s` : "";
+    const label = thinkingNow && live ? "Thinking…" : `Thought${secs}`;
     html += `<details class="think${thinkingNow && live ? " live" : ""}"${wasOpen || (thinkingNow && live) ? " open" : ""}>` +
       `<summary>${icon("brain")}${label}</summary><div class="think-body">${esc(think)}</div></details>`;
   }
@@ -655,7 +655,7 @@ function renderAssistant(el, raw, stats, live) {
     if (tb) tb.scrollTop = tb.scrollHeight;
   }
   const st = el.querySelector(".stats");
-  if (st) st.textContent = stats?.tps ? `${stats.tokens} tokens · ${stats.tps.toFixed(1)} tok/s` + (stats.stopped ? " · interrompida" : "") : "";
+  if (st) st.textContent = stats?.tps ? `${stats.tokens} tokens · ${stats.tps.toFixed(1)} tok/s` + (stats.stopped ? " · stopped" : "") : "";
   // The gear appears with the server's final chunk, which carries the timings.
   if (stats?.timings) {
     const act = el.querySelector(".actions");
@@ -663,7 +663,7 @@ function renderAssistant(el, raw, stats, live) {
       const b = document.createElement("button");
       b.className = "ibtn";
       b.dataset.act = "tech";
-      b.title = "Detalhes técnicos";
+      b.title = "Technical details";
       b.innerHTML = icon("settings");
       act.insertBefore(b, el.querySelector(".stats"));
     }
@@ -706,7 +706,7 @@ function submit() {
   let c = chat();
   if (!c) c = newChat();
   c.turns.push({ role: "user", content: text, images: attached.slice() });
-  if (c.title === "Nova conversa") c.title = (text || "Imagem").replace(/\s+/g, " ").slice(0, 48);
+  if (c.title === "New chat" || c.title === "New chat") c.title = (text || "Image").replace(/\s+/g, " ").slice(0, 48);
   attached = [];
   renderChips();
   input.value = "";
@@ -735,7 +735,7 @@ function requestBody(c) {
     top_k: +$("top_k").value, min_p: +$("min_p").value, repeat_penalty: +$("rep").value,
   };
   if (props.thinking) {
-    // "padrão" sends nothing: the server's --reasoning-effort, else the
+    // "default" sends nothing: the server's --reasoning-effort, else the
     // template's own default, decides. Any other level is explicit.
     const level = $("effort").value;
     const budget = +$("thinkBudget").value;
@@ -777,7 +777,7 @@ async function readSse(res, each, final) {
       if (payload === "[DONE]") continue;
       let j;
       try { j = JSON.parse(payload); } catch (_) { continue; }
-      if (j.error) throw new Error(j.error.message || "erro no servidor");
+      if (j.error) throw new Error(j.error.message || "server error");
       const d = j.choices?.[0]?.delta || {};
       if (d.reasoning_content || d.content) each(d.reasoning_content || "", d.content || "");
       else if (final && (j.usage || j.timings)) final(j);
@@ -910,19 +910,19 @@ function readImage(file) {
       URL.revokeObjectURL(img.src);
       resolve(cv.toDataURL("image/jpeg", 0.88));
     };
-    img.onerror = () => reject(new Error("não foi possível ler a imagem"));
+    img.onerror = () => reject(new Error("could not read the image"));
     img.src = URL.createObjectURL(file);
   });
 }
 function renderChips() {
   $("chips").innerHTML = attached.map((src, i) =>
-    `<div class="chip"><img src="${src}" alt=""><button data-rm="${i}" title="Remover">${icon("x")}</button></div>`).join("");
+    `<div class="chip"><img src="${src}" alt=""><button data-rm="${i}" title="Remove">${icon("x")}</button></div>`).join("");
   syncComposer();
 }
 async function addFiles(files) {
   for (const f of files) {
     if (!f.type.startsWith("image/")) continue;
-    if (!props.vision) { toast("Este servidor não tem visão: inicie com --mmproj para mandar imagens."); return; }
+    if (!props.vision) { toast("This server has no vision: start it with --mmproj to send images."); return; }
     try { attached.push(await readImage(f)); } catch (e) { toast(e.message); }
   }
   renderChips();
@@ -957,8 +957,8 @@ function openTech(timings) {
   if (old) old.remove();
   const m = document.createElement("div");
   m.className = "tech-modal";
-  m.innerHTML = `<div class="tech-panel"><header>${icon("settings")}Detalhes técnicos` +
-    `<button class="ibtn close" title="Fechar (Esc)">${icon("x")}</button></header>` +
+  m.innerHTML = `<div class="tech-panel"><header>${icon("settings")}Technical details` +
+    `<button class="ibtn close" title="Close (Esc)">${icon("x")}</button></header>` +
     `<div class="tech-body">${techRows(timings)}</div></div>`;
   const close = () => { m.remove(); document.removeEventListener("keydown", onKey); };
   const onKey = (e) => { if (e.key === "Escape") close(); };
@@ -1001,8 +1001,8 @@ function startEdit(c, index, msg) {
   const t = c.turns[index];
   const box = document.createElement("div");
   box.className = "edit-box";
-  box.innerHTML = '<textarea></textarea><div class="row"><button class="btn" data-x="cancel">Cancelar</button>' +
-    '<button class="btn primary" data-x="send">Enviar</button></div>';
+  box.innerHTML = '<textarea></textarea><div class="row"><button class="btn" data-x="cancel">Cancel</button>' +
+    '<button class="btn primary" data-x="send">Send</button></div>';
   const ta = box.querySelector("textarea");
   ta.value = t.content;
   msg.querySelector(".body").replaceWith(box);
@@ -1029,13 +1029,13 @@ $("chats").addEventListener("click", (e) => {
   const c = db.chats.find((x) => x.id === row.dataset.id);
   const act = e.target.closest("[data-act]")?.dataset.act;
   if (act === "rename") {
-    const name = prompt("Nome da conversa", c.title);
+    const name = prompt("Chat name", c.title);
     if (name && name.trim()) { c.title = name.trim().slice(0, 80); save(true); renderSidebar(); if (c.id === db.current) $("chatTitle").textContent = c.title; }
     return;
   }
   if (act === "delete") {
     if (streamingChat === c.id) stop();
-    if (!confirm(`Apagar "${c.title}"?`)) return;
+    if (!confirm(`Delete "${c.title}"?`)) return;
     db.chats = db.chats.filter((x) => x.id !== c.id);
     if (db.current === c.id) db.current = db.chats[0]?.id || null;
     save(true); renderSidebar(); renderChat();
@@ -1079,7 +1079,7 @@ $("exportChats").addEventListener("click", () => {
   const blob = new Blob([JSON.stringify(db, null, 1)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "airun-conversas.json";
+  a.download = "airun-chats.json";
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
@@ -1091,22 +1091,22 @@ $("importFile").addEventListener("change", async (e) => {
     const add = (data.chats || []).filter((c) => c && c.id && Array.isArray(c.turns) && !known.has(c.id));
     db.chats.push(...add);
     save(true); renderSidebar();
-    toast(`${add.length} conversa(s) importada(s).`);
-  } catch (_) { toast("Arquivo inválido."); }
+    toast(`${add.length} chat(s) imported.`);
+  } catch (_) { toast("Invalid file."); }
   e.target.value = "";
 });
 $("clearChats").addEventListener("click", () => {
-  if (!confirm("Apagar todas as conversas deste navegador?")) return;
+  if (!confirm("Delete every chat in this browser?")) return;
   db = { chats: [], current: null };
   save(true); renderSidebar(); renderChat();
 });
 
 // --- model details (settings panel) ---------------------------------------------
-const num = (n) => Number(n).toLocaleString("pt-BR");
-const gib = (b) => (b / 2 ** 30).toLocaleString("pt-BR", { maximumFractionDigits: 2 }) + " GiB";
+const num = (n) => Number(n).toLocaleString("en-US");
+const gib = (b) => (b / 2 ** 30).toLocaleString("en-US", { maximumFractionDigits: 2 }) + " GiB";
 const mib = (b) => b >= 2 ** 30 ? gib(b) : Math.round(b / 2 ** 20) + " MiB";
-const params = (n) => n >= 1e9 ? (n / 1e9).toLocaleString("pt-BR", { maximumFractionDigits: 1 }) + " B"
-                               : (n / 1e6).toLocaleString("pt-BR", { maximumFractionDigits: 0 }) + " M";
+const params = (n) => n >= 1e9 ? (n / 1e9).toLocaleString("en-US", { maximumFractionDigits: 1 }) + " B"
+                               : (n / 1e6).toLocaleString("en-US", { maximumFractionDigits: 0 }) + " M";
 const span = (r) => r ? (r.first === r.last ? `${r.first}` : `${r.first}–${r.last}`) + ` (${r.count})` : "";
 
 function modelInfo(p) {
@@ -1117,52 +1117,52 @@ function modelInfo(p) {
     if (ok.length) sections.push(`<span class="info-h">${esc(title)}</span>` +
       ok.map(([k, v]) => `<span class="k">${esc(k)}</span><span>${esc(String(v))}</span>`).join(""));
   };
-  sec("Modelo", [
-    ["nome", p.model], ["arquitetura", p.arch],
-    ["parâmetros", d.params ? params(d.params) : ""],
-    ["quantização", d.ftype], ["arquivo", d.file_bytes ? gib(d.file_bytes) : ""],
-    ["pesos carregados", d.weight_bytes ? gib(d.weight_bytes) : ""],
+  sec("Model", [
+    ["name", p.model], ["architecture", p.arch],
+    ["parameters", d.params ? params(d.params) : ""],
+    ["quantization", d.ftype], ["file", d.file_bytes ? gib(d.file_bytes) : ""],
+    ["weights loaded", d.weight_bytes ? gib(d.weight_bytes) : ""],
   ]);
-  const trainNote = d.train_ctx && d.ctx > d.train_ctx ? " (acima do treino)" : "";
-  sec("Contexto", [
-    ["de treino", d.train_ctx ? num(d.train_ctx) + " tokens" : ""],
-    ["iniciado", (d.ctx || p.ctx) ? num(d.ctx || p.ctx) + " tokens" + trainNote : ""],
-    ["cache KV", d.kv_type], ["lote (prefill)", d.batch ? num(d.batch) : ""],
-    ["requisições paralelas", d.parallel > 1 ? d.parallel : ""],
+  const trainNote = d.train_ctx && d.ctx > d.train_ctx ? " (above training)" : "";
+  sec("Context", [
+    ["training", d.train_ctx ? num(d.train_ctx) + " tokens" : ""],
+    ["started", (d.ctx || p.ctx) ? num(d.ctx || p.ctx) + " tokens" + trainNote : ""],
+    ["KV cache", d.kv_type], ["batch (prefill)", d.batch ? num(d.batch) : ""],
+    ["parallel requests", d.parallel > 1 ? d.parallel : ""],
   ]);
   const layers = d.layers ?? p.n_layers;
-  const hybrid = d.linear_layers ? ` (${d.linear_layers} lineares + ${d.attention_layers} de atenção)` : "";
+  const hybrid = d.linear_layers ? ` (${d.linear_layers} linear + ${d.attention_layers} attention)` : "";
   const moe = d.moe;
-  sec("Arquitetura", [
-    ["camadas", layers !== undefined ? layers + hybrid : ""],
-    ["dimensão", d.n_embd ? num(d.n_embd) : ""],
-    ["cabeças de atenção", d.n_head ? `${d.n_head} (${d.n_head_kv} KV, GQA ${d.n_head / d.n_head_kv}×), dim ${d.head_dim}` : ""],
+  sec("Architecture", [
+    ["layers", layers !== undefined ? layers + hybrid : ""],
+    ["width", d.n_embd ? num(d.n_embd) : ""],
+    ["attention heads", d.n_head ? `${d.n_head} (${d.n_head_kv} KV, GQA ${d.n_head / d.n_head_kv}×), dim ${d.head_dim}` : ""],
     ["FFN", moe ? "" : (d.ffn ? num(d.ffn) : "")],
-    ["especialistas (MoE)", moe ? `${moe.active} ativos de ${moe.experts} por token` : ""],
-    ["FFN do especialista", moe ? num(moe.expert_ffn) + (moe.shared_ffn ? ` + compartilhado ${num(moe.shared_ffn)}` : "") : ""],
-    ["vocabulário", d.vocab ? num(d.vocab) : ""],
-    ["RoPE", d.rope_base ? `base ${num(d.rope_base)}` + (d.rope_scale ? `, escala ${d.rope_scale.toFixed(1)}×` : "") : ""],
-    ["janela deslizante", d.sliding_window ? num(d.sliding_window) : ""],
+    ["experts (MoE)", moe ? `${moe.active} active of ${moe.experts} per token` : ""],
+    ["expert FFN", moe ? num(moe.expert_ffn) + (moe.shared_ffn ? ` + shared ${num(moe.shared_ffn)}` : "") : ""],
+    ["vocabulary", d.vocab ? num(d.vocab) : ""],
+    ["RoPE", d.rope_base ? `base ${num(d.rope_base)}` + (d.rope_scale ? `, scale ${d.rope_scale.toFixed(1)}×` : "") : ""],
+    ["sliding window", d.sliding_window ? num(d.sliding_window) : ""],
   ]);
   const where = (d.gpus || []).map((g) => {
     const parts = [];
-    if (g.layers) parts.push("camadas " + span(g.layers));
+    if (g.layers) parts.push("layers " + span(g.layers));
     if (g.embedding) parts.push("+embed");
-    if (g.output) parts.push("+saída");
-    const mem = `pesos ${mib(g.weight_bytes)} · KV ${mib(g.kv_bytes)} · ${mib(g.weight_bytes + g.kv_bytes + g.scratch_bytes)} de ${mib(g.budget_bytes)}`;
+    if (g.output) parts.push("+output");
+    const mem = `weights ${mib(g.weight_bytes)} · KV ${mib(g.kv_bytes)} · ${mib(g.weight_bytes + g.kv_bytes + g.scratch_bytes)} of ${mib(g.budget_bytes)}`;
     const rows = [[`GPU ${g.device}`, `${g.name.replace(/^NVIDIA (GeForce )?/, "")}: ${parts.join(" ")}`], ["", mem]];
-    if (g.ram_layers) rows.push(["RAM", `camadas ${span(g.ram_layers)}, ${mib(g.ram_bytes)} (lidas pela GPU ${g.device})`]);
+    if (g.ram_layers) rows.push(["RAM", `layers ${span(g.ram_layers)}, ${mib(g.ram_bytes)} (read by GPU ${g.device})`]);
     return rows;
   }).flat();
   if (!where.length && p.gpus) where.push(["GPUs", p.gpus.join(", ")]);
-  sec("Onde está", where);
-  sec("Servidor", [
-    ["MTP (especulativo)", d.mtp ? (d.mtp.draft > 0 ? `${d.mtp.draft} rascunhos por passo` : (d.mtp.head ? "cabeça presente, desligado (--draft)" : "")) : ""],
-    ["raciocínio", p.thinking ? "sim" : "não"], ["visão", p.vision ? "sim" : "não"],
-    ["autenticação", p.auth_required ? "chave de API" : "aberta"],
-    ["carregado em", d.load_ms ? (d.load_ms / 1000).toFixed(1) + " s" : ""],
+  sec("Placement", where);
+  sec("Server", [
+    ["MTP (speculative)", d.mtp ? (d.mtp.draft > 0 ? `${d.mtp.draft} drafts per step` : (d.mtp.head ? "head present, off (--draft)" : "")) : ""],
+    ["reasoning", p.thinking ? "yes" : "no"], ["vision", p.vision ? "yes" : "no"],
+    ["authentication", p.auth_required ? "API key" : "open"],
+    ["loaded in", d.load_ms ? (d.load_ms / 1000).toFixed(1) + " s" : ""],
   ]);
-  if ((d.notes || []).length) sections.push(`<span class="info-h">Notas</span>` +
+  if ((d.notes || []).length) sections.push(`<span class="info-h">Notes</span>` +
     d.notes.map((n) => `<span class="info-note">${esc(n)}</span>`).join(""));
   return sections.join("");
 }
@@ -1176,7 +1176,7 @@ async function connect() {
     props = await res.json();
     props.vision = !!props.modalities?.vision;
     $("status").className = "status ok";
-    $("modelName").textContent = props.model || "modelo";
+    $("modelName").textContent = props.model || "model";
     $("modelName").title = props.model || "";
     $("thinkCtl").hidden = !props.thinking;
     $("attach").hidden = !props.vision;
@@ -1187,7 +1187,7 @@ async function connect() {
     if (!propsRepainted) { propsRepainted = true; renderChat(); }
   } catch (_) {
     $("status").className = "status err";
-    $("modelName").textContent = "servidor fora do ar";
+    $("modelName").textContent = "server offline";
     setTimeout(connect, 3000);
   }
 }
