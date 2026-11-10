@@ -18,6 +18,8 @@ use airun_cuda::qsa;
 
 #[path = "spec.rs"]
 mod spec;
+#[path = "kv_loan.rs"]
+mod kv_loan;
 pub use spec::RowsVerify;
 
 /// What a layer carries from one token to the next.
@@ -234,6 +236,9 @@ struct MoeScratch {
     weights: DeviceBuffer<f32>,
     h: DeviceBuffer<f32>,
     shared_logit: DeviceBuffer<f32>,
+    /// int8 activations for the decode's integer expert kernels
+    /// (hybrid::moe_q8_scratch_bytes).
+    q8: DeviceBuffer<u8>,
     upload: Option<std::cell::RefCell<airun_cuda::PinnedBuffer<u8>>>,
     cached_ids: DeviceBuffer<i32>,
     cached_host_ids: std::cell::RefCell<airun_cuda::PinnedBuffer<i32>>,
@@ -259,6 +264,49 @@ struct MoeScratch {
     /// offsets, the sorted pairs, and per-pair down projections.
     /// (counts, offsets, perm, ypair, fp16 activations) of the expert-major batch path.
     grouped: Option<(DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<f32>, DeviceBuffer<u16>)>,
+    /// With mapped experts: the prediction of a layer's experts made as the
+    /// layer starts (see Runtime::moe_prefetch).
+    pre: Option<Prefetch>,
+}
+
+/// A decode's host-side experts copied while the layer's attention runs.
+///
+/// Routing is only known at the feed-forward, and copying the experts it
+/// picks from RAM then left the expert kernels waiting on PCIe. The layer's
+/// own router applied to the residual entering the layer (normed with the
+/// feed-forward's weights) predicts most of them -- only the attention's
+/// contribution is missing -- so their copy starts a whole token-mixing block
+/// earlier, into the staging area's first slots. The feed-forward then copies
+/// only what the prediction missed (moe_stage_plan_pre).
+///
+/// Off unless AIRUN_EXPERT_PREFETCH=1: on the RTX 3060 (35B-A3B, 87% of
+/// experts in VRAM) it predicted 72% of the misses and cut the wait on PCIe
+/// from 2.1 to 0.8 ms a token, but the prediction (norm, router, top-k, plan:
+/// ~20 us a layer) and the copies running beside the attention cost more:
+/// 67-69 against 70 tok/s, also predicting only 4 experts.
+struct Prefetch {
+    x: DeviceBuffer<f32>,
+    logits: DeviceBuffer<f32>,
+    ids: DeviceBuffer<i32>,
+    weights: DeviceBuffer<f32>,
+    sidx: DeviceBuffer<i32>,
+    list: DeviceBuffer<i32>,
+    n_list: DeviceBuffer<i32>,
+    /// Where the feed-forward's own copy starts.
+    first: DeviceBuffer<i32>,
+    /// Prefetched experts used, missed, unused (u32 each).
+    stats: DeviceBuffer<u32>,
+    /// The layer whose prediction is in the staging area.
+    armed: std::cell::Cell<Option<usize>>,
+}
+
+/// Tokens per pass the prefetch runs for: the prediction and the misses
+/// share the staging area, 2 * PRE_MAX * top_k <= STAGE_CAP.
+const PRE_MAX: usize = 4;
+
+fn prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AIRUN_EXPERT_PREFETCH").is_ok_and(|v| v.trim() != "0"))
 }
 
 /// What a delta-net layer saw during a speculative verify, so the accepted
@@ -594,6 +642,8 @@ pub struct Runtime {
     since_rebalance: usize,
     /// Rebalances so far; every PROFILE_SAVE_EVERY of them saves the profile.
     rebalances: usize,
+    /// Experts in the KV cache's unused rows (see kv_loan.rs).
+    loan: Option<kv_loan::LoanState>,
 }
 
 /// Greedy decode as a chain of graph launches (see [`Runtime::generate`]): the
@@ -748,6 +798,8 @@ impl Runtime {
                     weights: DeviceBuffer::new(dev, b * moe.n_experts_used)?,
                     h: DeviceBuffer::new(dev, b * moe.n_experts_used * moe.expert_ff)?,
                     shared_logit: DeviceBuffer::new(dev, b)?,
+                    q8: DeviceBuffer::new(dev, hybrid::moe_q8_scratch_bytes(cfg.n_embd, moe.n_experts_used,
+                        moe.expert_ff))?,
                     upload: {
                         let staging_bytes = model.layers.iter().filter_map(|l| match &l.ffn {
                             FfnWeights::Moe { gate_exps, up_exps, down_exps, .. }
@@ -808,6 +860,23 @@ impl Runtime {
                               DeviceBuffer::new(dev, b * moe.n_experts_used)?,
                               DeviceBuffer::new(dev, b * moe.n_experts_used * cfg.n_embd)?,
                               DeviceBuffer::new(dev, b * cfg.n_embd)?))
+                    } else {
+                        None
+                    },
+                    pre: if mapped_layers > 0 && prefetch_enabled() && 2 * PRE_MAX * moe.n_experts_used <= STAGE_CAP {
+                        let k = PRE_MAX * moe.n_experts_used;
+                        Some(Prefetch {
+                            x: DeviceBuffer::new(dev, PRE_MAX * cfg.n_embd)?,
+                            logits: DeviceBuffer::new(dev, PRE_MAX * moe.n_experts)?,
+                            ids: DeviceBuffer::new(dev, k)?,
+                            weights: DeviceBuffer::new(dev, k)?,
+                            sidx: DeviceBuffer::new(dev, k)?,
+                            list: DeviceBuffer::new(dev, k)?,
+                            n_list: DeviceBuffer::zeroed(dev, 1, &stream)?,
+                            first: DeviceBuffer::zeroed(dev, 1, &stream)?,
+                            stats: DeviceBuffer::zeroed(dev, 3, &stream)?,
+                            armed: std::cell::Cell::new(None),
+                        })
                     } else {
                         None
                     },
@@ -927,7 +996,7 @@ impl Runtime {
             });
         }
 
-        Ok(Self {
+        let mut rt = Self {
             model,
             tokenizer: std::sync::Arc::new(tokenizer),
             states,
@@ -962,7 +1031,10 @@ impl Runtime {
             prefill_hook: None,
             since_rebalance: 0,
             rebalances: 0,
-        })
+            loan: None,
+        };
+        rt.setup_kv_loans()?;
+        Ok(rt)
     }
 
     /// Installs (or with None removes) a callback told after each prefill
@@ -1096,6 +1168,7 @@ impl Runtime {
         let (hist, rest) = input.split_at_checked(n_hist * 4).ok_or_else(|| bad("it is truncated"))?;
         let history: Vec<u32> = hist.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         input = rest;
+        self.kv_loan_guard(n_past)?;
         // The rows written depend on the position, so it must be set first.
         self.n_past = n_past;
         self.turn_snap = None;
@@ -1337,6 +1410,7 @@ impl Runtime {
 
     /// Queues one chained step; returns the slot its pick lands in.
     fn chain_launch(&mut self) -> Result<usize> {
+        self.kv_loan_guard(self.n_past + 2)?;
         let mut ch = self.chain.take().ok_or_else(|| {
             CoreError::Other("chained decode launched before it was seeded; this is a bug".into())
         })?;
@@ -1389,7 +1463,7 @@ impl Runtime {
     /// layers accumulated on the device. Runs every few forward passes: the
     /// counts read back is a synchronization, and each swap moves three
     /// experts each way across PCIe.
-    fn rebalance_experts(&mut self) -> Result<()> {
+    pub(crate) fn rebalance_experts(&mut self) -> Result<()> {
         const MAX_SWAPS: usize = 16;
         self.since_rebalance += 1;
         if self.since_rebalance < REBALANCE_EVERY {
@@ -1422,6 +1496,10 @@ impl Runtime {
                 if let Some(p) = &self.model.expert_profile {
                     p.borrow_mut().add(layer, c);
                 }
+                // A free loan takes a hot expert for one copy, a third of a
+                // swap's.
+                let filled = self.loan_fill(st, layer, sc, MAX_SWAPS, SWAP_MARGIN)?;
+                let place = if filled > 0 { gm.place.borrow().clone() } else { place };
                 let mut resident: Vec<usize> = (0..ne).filter(|&e| place[e].is_ok()).collect();
                 let mut outside: Vec<usize> = (0..ne).filter(|&e| place[e].is_err()).collect();
                 resident.sort_by(|&a, &b| sc[a].total_cmp(&sc[b]));
@@ -1442,7 +1520,7 @@ impl Runtime {
                     }
                     swapped += 1;
                 }
-                if swapped > 0 {
+                if swapped + filled > 0 {
                     for t in tensors {
                         if let Some(tm) = &t.mapped {
                             tm.publish(&t.data, t.expert_stride, &st.stream)?;
@@ -1454,6 +1532,7 @@ impl Runtime {
             // The table mirrors are reused by the next publish.
             st.stream.synchronize()?;
         }
+        self.loan_filled();
         if self.rebalances % PROFILE_SAVE_EVERY == 0 {
             self.save_expert_profile();
         }
@@ -1505,6 +1584,8 @@ impl Runtime {
                 self.ctx
             )));
         }
+
+        self.kv_loan_guard(self.n_past + tokens.len())?;
 
         // The MTP head's cache does not follow a plain pass.
         if let Some(sp) = self.spec.as_mut() {
@@ -1585,6 +1666,7 @@ impl Runtime {
     /// device, with the batch and its first position.
     pub(crate) fn step_layered(&mut self, tokens: &[u32],
                                after: &mut dyn FnMut(&mut Self, &[u32], usize) -> Result<()>) -> Result<()> {
+        self.kv_loan_guard(self.n_past + tokens.len())?;
         let cfg = self.model.config.clone();
         if let Some(sp) = self.spec.as_mut() {
             sp.synced = false;
@@ -1769,6 +1851,11 @@ impl Runtime {
     /// [`Self::queue_forward`]; with `upload` false the tokens and positions are
     /// already in the device buffers, and the slices only give their count.
     fn queue_forward_with(&mut self, token_ids: &[i32], positions: &[i32], upload: bool) -> Result<()> {
+        // Callers guard before any capture; this catches the rest.
+        if upload {
+            let upto = positions.iter().max().map_or(0, |&p| p.max(0) as usize + 1);
+            self.kv_loan_guard(upto)?;
+        }
         // The previous batch's PLE upload may still be queued behind a shard
         // that runs asynchronously (see handoff); its staging is refilled
         // below. (The decode graph path synchronizes every stream instead.)
@@ -2163,6 +2250,10 @@ impl Runtime {
             return Err(CoreError::Other(format!(
                 "--parallel {n} exceeds the prompt batch of {}; raise --batch-size", self.max_batch)));
         }
+        if n > 1 {
+            // Each slot's cache would need loans of its own.
+            self.drop_kv_loans()?;
+        }
         while self.slots.len() < n {
             let mut sets = Vec::with_capacity(self.states.len());
             for si in 0..self.states.len() {
@@ -2349,6 +2440,7 @@ impl Runtime {
     /// weight once for all the rows -- what makes serving several requests
     /// faster than taking them in turn.
     pub fn decode_rows(&mut self, rows: &[(usize, u32)]) -> Result<&mut [f32]> {
+        self.kv_loan_guard(self.n_past + 1)?;
         if rows.len() == 1 {
             self.switch_slot(rows[0].0)?;
             return self.forward_pinned(&[rows[0].1]);
@@ -2738,6 +2830,8 @@ impl Runtime {
                 stream,
             )?;
         }
+
+        self.moe_prefetch(si, w, layer, n, cfg)?;
 
         let kind = match &w.block {
             Block::Attention(_) => "attn",
@@ -3663,6 +3757,66 @@ impl Runtime {
     /// Sparse feed-forward: route each token to a few experts, plus the shared
     /// expert every token passes through.
     #[allow(clippy::too_many_arguments)]
+    /// Predicts the experts layer `layer`'s feed-forward will route the `n`
+    /// rows to and starts copying the host-side ones into the staging area,
+    /// on the side stream (see [`Prefetch`]). Runs as the layer starts, with
+    /// the residual entering it in x.
+    fn moe_prefetch(&self, si: usize, w: &crate::model::LayerWeights, layer: usize, n: usize, cfg: &Config)
+        -> Result<()> {
+        let st = &self.states[si];
+        let Some(m) = st.moe.as_ref() else { return Ok(()) };
+        let Some(p) = m.pre.as_ref() else { return Ok(()) };
+        p.armed.set(None);
+        let FfnWeights::Moe { router, gate_exps, up_exps, down_exps, .. } = &w.ffn else { return Ok(()) };
+        let (Some(gm), Some(moe), Some((areas, ..))) = (&gate_exps.mapped, cfg.moe.as_ref(), m.stage.as_ref()) else {
+            return Ok(());
+        };
+        if n > PRE_MAX || !moe_overlap() || m.upload.is_some()
+            || up_exps.mapped.is_none() || down_exps.mapped.is_none() || ablated("ffn") {
+            return Ok(());
+        }
+        let stream = &st.stream;
+        let k = moe.n_experts_used;
+        ops::rmsnorm(p.x.as_mut_ptr(), st.x.as_ptr(), w.ffn_norm.as_ptr(), cfg.n_embd, n, cfg.rms_eps, stream)?;
+        matvec(router, &p.x, &p.logits, n, &st.q8act, stream)?;
+        // The token mixing quantizes xb afresh, not this.
+        st.q8act.valid.set(false);
+        st.q8act.fp4_valid.set(false);
+        st.q8act.host_valid.set(false);
+        hybrid::moe_router(p.logits.as_ptr(), p.ids.as_mut_ptr(), p.weights.as_mut_ptr(), n, moe.n_experts, k,
+            moe.norm_topk, stream)?;
+        hybrid::moe_stage_plan(p.ids.as_ptr(), n * k, gm.resident.as_ptr(), moe.n_experts, p.sidx.as_mut_ptr(),
+            p.list.as_mut_ptr(), p.n_list.as_mut_ptr(), stream)?;
+        // The area's last reader, the previous layer's feed-forward, is
+        // already queued on this stream.
+        st.fork.record(stream)?;
+        st.side.wait_for(&st.fork)?;
+        let cap = n * k;
+        for (t, area) in [gate_exps, up_exps, down_exps].iter().zip(areas) {
+            let tm = t.mapped.as_ref().expect("checked above");
+            hybrid::moe_stage_copy(tm.table.as_ptr(), p.list.as_ptr(), p.n_list.as_ptr(), std::ptr::null(),
+                area.as_mut_ptr(), t.expert_stride, cap, &st.side)?;
+        }
+        p.armed.set(Some(layer));
+        Ok(())
+    }
+
+    /// Prefetched experts the feed-forward used, the ones the prediction
+    /// missed, and prefetched ones it did not route to, since load.
+    pub fn expert_prefetch_stats(&self) -> Option<(u64, u64, u64)> {
+        let mut out = None;
+        for st in &self.states {
+            let Some(p) = st.moe.as_ref().and_then(|m| m.pre.as_ref()) else { continue };
+            if device::set_device(st.device).is_err() {
+                continue;
+            }
+            let Ok(v) = p.stats.to_vec(&st.stream) else { continue };
+            let (a, b, c) = out.unwrap_or((0, 0, 0));
+            out = Some((a + u64::from(v[0]), b + u64::from(v[1]), c + u64::from(v[2])));
+        }
+        out
+    }
+
     fn run_moe(
         &self,
         si: usize,
@@ -3759,11 +3913,23 @@ impl Runtime {
             // Tokens per pass, so the host-side experts they route to fit
             // the staging area even if none of them is resident.
             let per = (STAGE_CAP / k).max(1);
+            let pre = m.pre.as_ref().filter(|p| p.armed.take() == Some(layer) && n <= PRE_MAX);
             for t0 in (0..n).step_by(per) {
                 let cnt = per.min(n - t0);
                 let ids = m.ids.offset_ptr(t0 * k);
-                hybrid::moe_stage_plan(ids, cnt * k, gm.resident.as_ptr(), moe.n_experts, sidx.as_mut_ptr(),
-                    list.as_mut_ptr(), n_list.as_mut_ptr(), stream)?;
+                let first = match pre {
+                    Some(p) => {
+                        hybrid::moe_stage_plan_pre(ids, cnt * k, gm.resident.as_ptr(), moe.n_experts,
+                            p.list.as_ptr(), p.n_list.as_ptr(), sidx.as_mut_ptr(), list.as_mut_ptr(),
+                            n_list.as_mut_ptr(), p.first.as_mut_ptr(), p.stats.as_mut_ptr(), stream)?;
+                        p.first.as_ptr()
+                    }
+                    None => {
+                        hybrid::moe_stage_plan(ids, cnt * k, gm.resident.as_ptr(), moe.n_experts, sidx.as_mut_ptr(),
+                            list.as_mut_ptr(), n_list.as_mut_ptr(), stream)?;
+                        std::ptr::null()
+                    }
+                };
                 // The copy crosses PCIe on the side stream while the resident
                 // experts compute here; the staged ones follow once it lands.
                 // AIRUN_MOE_OVERLAP=0 keeps it all on one stream.
@@ -3777,8 +3943,8 @@ impl Runtime {
                 };
                 for (t, area) in [gate_exps, up_exps, down_exps].iter().zip(areas) {
                     let tm = t.mapped.as_ref().expect("checked above");
-                    hybrid::moe_stage_copy(tm.table.as_ptr(), list.as_ptr(), n_list.as_ptr(), area.as_mut_ptr(),
-                        t.expert_stride, cnt * k, copy_on)?;
+                    hybrid::moe_stage_copy(tm.table.as_ptr(), list.as_ptr(), n_list.as_ptr(), first.cast(),
+                        area.as_mut_ptr(), t.expert_stride, cnt * k, copy_on)?;
                 }
                 let staged = |t: &GpuTensor, only: i32| hybrid::Staged { sidx: sidx.as_ptr(), stride: t.expert_stride, only };
                 let passes: &[i32] = if overlap { &[1, 2] } else { &[0] };
@@ -3790,10 +3956,11 @@ impl Runtime {
                     hybrid::moe_gate_up_tab(gate_exps.kernel_type(), gm.table.as_ptr(), um.table.as_ptr(),
                         st.xb.offset_ptr(t0 * cfg.n_embd), ids, m.h.as_mut_ptr(), cfg.n_embd, moe.expert_ff, cnt, k,
                         gate_exps.row_bytes, Some((staged(gate_exps, only), areas[0].as_ptr(), areas[1].as_ptr())),
-                        stream)?;
+                        m.q8.as_mut_ptr().cast(), stream)?;
                     hybrid::moe_down_tab(down_exps.kernel_type(), dm.table.as_ptr(), m.h.as_ptr(), ids,
                         m.weights.offset_ptr(t0 * k), st.xb2.offset_ptr(t0 * cfg.n_embd), moe.expert_ff, cfg.n_embd,
-                        cnt, k, down_exps.row_bytes, Some((staged(down_exps, only), areas[2].as_ptr())), stream)?;
+                        cnt, k, down_exps.row_bytes, Some((staged(down_exps, only), areas[2].as_ptr())),
+                        m.q8.as_mut_ptr().cast(), stream)?;
                 }
             }
             return Ok(());
@@ -3842,13 +4009,14 @@ impl Runtime {
                     gate_exps.kernel_type(), gate_exps.ptr(), up_exps.ptr(),
                     st.xb.offset_ptr(t * cfg.n_embd), m.cached_ids.as_ptr(), m.h.as_mut_ptr(),
                     cfg.n_embd, moe.expert_ff, count, moe.n_experts_used,
-                    gate_exps.row_bytes, gate_exps.expert_stride, stream,
+                    gate_exps.row_bytes, gate_exps.expert_stride, m.q8.as_mut_ptr().cast(), stream,
                 )?;
                 hybrid::moe_down(
                     down_exps.kernel_type(), down_exps.ptr(), m.h.as_ptr(),
                     m.cached_ids.as_ptr(), m.weights.offset_ptr(t * moe.n_experts_used),
                     st.xb2.offset_ptr(t * cfg.n_embd), moe.expert_ff, cfg.n_embd,
-                    count, moe.n_experts_used, down_exps.row_bytes, down_exps.expert_stride, stream,
+                    count, moe.n_experts_used, down_exps.row_bytes, down_exps.expert_stride,
+                    m.q8.as_mut_ptr().cast(), stream,
                 )?;
                 // Both staging arrays belong to the runtime. The next routing
                 // read synchronizes before either is reused by another layer.
@@ -3869,6 +4037,7 @@ impl Runtime {
             moe.n_experts_used,
             gate_exps.row_bytes,
             gate_exps.expert_stride,
+            m.q8.as_mut_ptr().cast(),
             stream,
         )?;
 
@@ -3885,6 +4054,7 @@ impl Runtime {
             moe.n_experts_used,
             down_exps.row_bytes,
             down_exps.expert_stride,
+            m.q8.as_mut_ptr().cast(),
             stream,
         )?;
 

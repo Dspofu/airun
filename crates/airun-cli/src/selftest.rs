@@ -2066,6 +2066,7 @@ fn test_moe_ffn(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
         TOP_K,
         gate_row_bytes,
         gate_stride,
+        std::ptr::null_mut(),
         stream,
     )?;
     airun_cuda::hybrid::moe_down(
@@ -2081,6 +2082,7 @@ fn test_moe_ffn(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
         TOP_K,
         down_row_bytes,
         down_stride,
+        std::ptr::null_mut(),
         stream,
     )?;
     let gpu = d_y.to_vec(stream)?;
@@ -2095,6 +2097,24 @@ fn test_moe_ffn(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
         rel <= 1e-3 && peak > 1e-3,
     );
 
+    // The decode's integer kernels (activations as int8 per 32): close to the
+    // reference within that rounding, measured against the output's peak.
+    let q8 = DeviceBuffer::<u8>::new(device, airun_cuda::hybrid::moe_q8_scratch_bytes(N_EMBD, TOP_K, FF))?;
+    let d_yq = DeviceBuffer::<f32>::zeroed(device, N_TOKENS * N_EMBD, stream)?;
+    airun_cuda::hybrid::moe_gate_up(ops::KernelType(ty.id() as i32), d_gate.as_ptr(), d_up.as_ptr(), d_x.as_ptr(),
+        d_ids.as_ptr(), d_h.as_mut_ptr(), N_EMBD, FF, N_TOKENS, TOP_K, gate_row_bytes, gate_stride,
+        q8.as_mut_ptr().cast(), stream)?;
+    airun_cuda::hybrid::moe_down(ops::KernelType(ty.id() as i32), d_down.as_ptr(), d_h.as_ptr(), d_ids.as_ptr(),
+        d_w.as_ptr(), d_yq.as_mut_ptr(), FF, N_EMBD, N_TOKENS, TOP_K, down_row_bytes, down_stride,
+        q8.as_mut_ptr().cast(), stream)?;
+    let gpu_q8 = d_yq.to_vec(stream)?;
+    let (abs_q8, _) = compare(&cpu, &gpu_q8);
+    report.case(
+        "moe expert ffn, int8 decode kernels",
+        format!("max_abs {abs_q8:.3e} ({:.2}% of the output peak {peak:.3e})", 100.0 * abs_q8 / peak),
+        abs_q8 <= 0.02 * peak && peak > 1e-3,
+    );
+
     // Routing must actually matter: sending every token to a different expert
     // has to change the answer, or the expert offset is being ignored.
     let shifted: Vec<i32> = ids.iter().map(|&e| (e + 1) % N_EXPERTS as i32).collect();
@@ -2103,12 +2123,12 @@ fn test_moe_ffn(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
     airun_cuda::hybrid::moe_gate_up(
         ops::KernelType(ty.id() as i32),
         d_gate.as_ptr(), d_up.as_ptr(), d_x.as_ptr(), d_ids2.as_ptr(), d_h.as_mut_ptr(),
-        N_EMBD, FF, N_TOKENS, TOP_K, gate_row_bytes, gate_stride, stream,
+        N_EMBD, FF, N_TOKENS, TOP_K, gate_row_bytes, gate_stride, std::ptr::null_mut(), stream,
     )?;
     airun_cuda::hybrid::moe_down(
         ops::KernelType(ty.id() as i32),
         d_down.as_ptr(), d_h.as_ptr(), d_ids2.as_ptr(), d_w.as_ptr(), d_y2.as_mut_ptr(),
-        FF, N_EMBD, N_TOKENS, TOP_K, down_row_bytes, down_stride, stream,
+        FF, N_EMBD, N_TOKENS, TOP_K, down_row_bytes, down_stride, std::ptr::null_mut(), stream,
     )?;
     let other = d_y2.to_vec(stream)?;
     let (diff, _) = compare(&gpu, &other);
@@ -2135,9 +2155,9 @@ fn test_moe_ffn(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
     let kt = ops::KernelType(ty.id() as i32);
     let token_major = DeviceBuffer::<f32>::zeroed(device, n2 * N_EMBD, stream)?;
     airun_cuda::hybrid::moe_gate_up(kt, d_gate.as_ptr(), d_up.as_ptr(), d_x2.as_ptr(), d_ids2.as_ptr(),
-        d_h2.as_mut_ptr(), N_EMBD, FF, n2, TOP_K, gate_row_bytes, gate_stride, stream)?;
+        d_h2.as_mut_ptr(), N_EMBD, FF, n2, TOP_K, gate_row_bytes, gate_stride, std::ptr::null_mut(), stream)?;
     airun_cuda::hybrid::moe_down(kt, d_down.as_ptr(), d_h2.as_ptr(), d_ids2.as_ptr(), d_w2.as_ptr(),
-        token_major.as_mut_ptr(), FF, N_EMBD, n2, TOP_K, down_row_bytes, down_stride, stream)?;
+        token_major.as_mut_ptr(), FF, N_EMBD, n2, TOP_K, down_row_bytes, down_stride, std::ptr::null_mut(), stream)?;
     let grouped = DeviceBuffer::<f32>::zeroed(device, n2 * N_EMBD, stream)?;
     let scratch = DeviceBuffer::<i32>::new(device, N_EXPERTS)?;
     let offsets = DeviceBuffer::<i32>::new(device, N_EXPERTS + 1)?;

@@ -140,6 +140,7 @@ unsafe extern "C" {
         top_k: i32,
         row_bytes: u64,
         expert_stride: u64,
+        q8: *mut c_void,
         stream: ffi::Stream,
     ) -> Status;
 
@@ -156,21 +157,27 @@ unsafe extern "C" {
         top_k: i32,
         row_bytes: u64,
         expert_stride: u64,
+        q8: *mut c_void,
         stream: ffi::Stream,
     ) -> Status;
 
     fn airun_moe_gate_up_tab(type_id: i32, gate_w: *const c_void, up_w: *const c_void, x: *const c_void,
         ids: *const c_void, h: *mut c_void, k: i32, ff: i32, n_tokens: i32, top_k: i32, row_bytes: u64,
         expert_stride: u64, gate_tab: *const c_void, up_tab: *const c_void, sidx: *const c_void,
-        gate_stage: *const c_void, up_stage: *const c_void, only: i32, stream: ffi::Stream) -> Status;
+        gate_stage: *const c_void, up_stage: *const c_void, only: i32, q8: *mut c_void, stream: ffi::Stream)
+        -> Status;
     fn airun_moe_down_tab(type_id: i32, down_w: *const c_void, h: *const c_void, ids: *const c_void,
         weights: *const c_void, y: *mut c_void, ff: i32, n_embd: i32, n_tokens: i32, top_k: i32, row_bytes: u64,
         expert_stride: u64, down_tab: *const c_void, sidx: *const c_void, down_stage: *const c_void,
-        only: i32, stream: ffi::Stream) -> Status;
+        only: i32, q8: *mut c_void, stream: ffi::Stream) -> Status;
+    fn airun_moe_q8_scratch_bytes(k: i32, top_k: i32, ff: i32) -> u64;
     fn airun_moe_stage_plan(ids: *const c_void, n_ids: i32, resident: *const c_void, n_experts: i32,
         sidx: *mut c_void, list: *mut c_void, n_list: *mut c_void, stream: ffi::Stream) -> Status;
-    fn airun_moe_stage_copy(tab: *const c_void, list: *const c_void, n_list: *const c_void, stage: *mut c_void,
-        stride: u64, cap: i32, stream: ffi::Stream) -> Status;
+    fn airun_moe_stage_copy(tab: *const c_void, list: *const c_void, n_list: *const c_void, first: *const c_void,
+        stage: *mut c_void, stride: u64, cap: i32, stream: ffi::Stream) -> Status;
+    fn airun_moe_stage_plan_pre(ids: *const c_void, n_ids: i32, resident: *const c_void, n_experts: i32,
+        pre_list: *const c_void, n_pre: *const c_void, sidx: *mut c_void, list: *mut c_void, n_list: *mut c_void,
+        first: *mut c_void, stats: *mut c_void, stream: ffi::Stream) -> Status;
     fn airun_moe_count(ids: *const c_void, counts: *mut c_void, n: i32, stream: ffi::Stream) -> Status;
     fn airun_moe_sort(ids: *const c_void, n: i32, n_experts: i32, scratch: *mut c_void, offsets: *mut c_void,
         perm: *mut c_void, stream: ffi::Stream) -> Status;
@@ -667,6 +674,7 @@ pub fn moe_gate_up(
     top_k: usize,
     row_bytes: usize,
     expert_stride: usize,
+    q8: *mut c_void,
     stream: &Stream,
 ) -> Result<()> {
     if k % 32 != 0 {
@@ -691,11 +699,12 @@ pub fn moe_gate_up(
             top_k as i32,
             row_bytes as u64,
             expert_stride as u64,
+            q8,
             stream.raw(),
         ))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(gate_w, up_w, x, ids, h, ff, n_tokens, top_k, row_bytes, expert_stride, stream)
+    needs_cuda!(gate_w, up_w, x, ids, h, ff, n_tokens, top_k, row_bytes, expert_stride, q8, stream)
 }
 
 /// `y += sum_k weight_k * (down_e @ h_k)`, accumulating into `y`.
@@ -713,6 +722,7 @@ pub fn moe_down(
     top_k: usize,
     row_bytes: usize,
     expert_stride: usize,
+    q8: *mut c_void,
     stream: &Stream,
 ) -> Result<()> {
     if ff % 32 != 0 {
@@ -737,11 +747,28 @@ pub fn moe_down(
             top_k as i32,
             row_bytes as u64,
             expert_stride as u64,
+            q8,
             stream.raw(),
         ))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(down_w, h, ids, weights, y, n_embd, n_tokens, top_k, row_bytes, expert_stride, stream)
+    needs_cuda!(down_w, h, ids, weights, y, n_embd, n_tokens, top_k, row_bytes, expert_stride, q8, stream)
+}
+
+/// Bytes of the `q8` scratch the expert kernels take: with it, a decode (up to
+/// four tokens) runs their integer kernels (activations as int8 per 32,
+/// __dp4a dots); null keeps the float kernels.
+pub fn moe_q8_scratch_bytes(k: usize, top_k: usize, ff: usize) -> usize {
+    #[cfg(airun_cuda)]
+    // SAFETY: pure arithmetic on the arguments.
+    unsafe {
+        airun_moe_q8_scratch_bytes(k as i32, top_k as i32, ff as i32) as usize
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (k, top_k, ff);
+        0
+    }
 }
 
 /// Scales each token's row by `sigmoid(logit[token])`.
@@ -762,7 +789,7 @@ pub struct Staged {
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gate_up_tab(ty: KernelType, gate_tab: *const c_void, up_tab: *const c_void, x: *const c_void,
     ids: *const c_void, h: *mut c_void, k: usize, ff: usize, n_tokens: usize, top_k: usize, row_bytes: usize,
-    staged: Option<(Staged, *const c_void, *const c_void)>, stream: &Stream) -> Result<()> {
+    staged: Option<(Staged, *const c_void, *const c_void)>, q8: *mut c_void, stream: &Stream) -> Result<()> {
     let (sidx, stride, gs, us, only) = staged.map_or((std::ptr::null(), 0, std::ptr::null(), std::ptr::null(), 0),
         |(s, g, u)| (s.sidx, s.stride, g, u, s.only));
     if k % 32 != 0 {
@@ -773,17 +800,17 @@ pub fn moe_gate_up_tab(ty: KernelType, gate_tab: *const c_void, up_tab: *const c
     unsafe {
         ffi::check(airun_moe_gate_up_tab(ty.0, std::ptr::null(), std::ptr::null(), x, ids, h, k as i32, ff as i32,
             n_tokens as i32, top_k as i32, row_bytes as u64, stride as u64, gate_tab, up_tab, sidx, gs, us, only,
-            stream.raw()))
+            q8, stream.raw()))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(ty, gate_tab, up_tab, x, ids, h, k, ff, n_tokens, top_k, row_bytes, sidx, stride, gs, us, only, stream)
+    needs_cuda!(ty, gate_tab, up_tab, x, ids, h, k, ff, n_tokens, top_k, row_bytes, sidx, stride, gs, us, only, q8, stream)
 }
 
 /// [`moe_down`] through an address table, as [`moe_gate_up_tab`].
 #[allow(clippy::too_many_arguments)]
 pub fn moe_down_tab(ty: KernelType, down_tab: *const c_void, h: *const c_void, ids: *const c_void,
     weights: *const c_void, y: *mut c_void, ff: usize, n_embd: usize, n_tokens: usize, top_k: usize,
-    row_bytes: usize, staged: Option<(Staged, *const c_void)>, stream: &Stream) -> Result<()> {
+    row_bytes: usize, staged: Option<(Staged, *const c_void)>, q8: *mut c_void, stream: &Stream) -> Result<()> {
     let (sidx, stride, ds, only) =
         staged.map_or((std::ptr::null(), 0, std::ptr::null(), 0), |(s, d)| (s.sidx, s.stride, d, s.only));
     if ff % 32 != 0 {
@@ -793,10 +820,10 @@ pub fn moe_down_tab(ty: KernelType, down_tab: *const c_void, h: *const c_void, i
     // SAFETY: as moe_down; every table entry addresses one whole expert.
     unsafe {
         ffi::check(airun_moe_down_tab(ty.0, std::ptr::null(), h, ids, weights, y, ff as i32, n_embd as i32,
-            n_tokens as i32, top_k as i32, row_bytes as u64, stride as u64, down_tab, sidx, ds, only, stream.raw()))
+            n_tokens as i32, top_k as i32, row_bytes as u64, stride as u64, down_tab, sidx, ds, only, q8, stream.raw()))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(ty, down_tab, h, ids, weights, y, ff, n_embd, n_tokens, top_k, row_bytes, sidx, stride, ds, only, stream)
+    needs_cuda!(ty, down_tab, h, ids, weights, y, ff, n_embd, n_tokens, top_k, row_bytes, sidx, stride, ds, only, q8, stream)
 }
 
 /// Assigns each routed expert that is not `resident` (u8 per expert) a
@@ -815,13 +842,32 @@ pub fn moe_stage_plan(ids: *const c_void, n_ids: usize, resident: *const c_void,
 
 /// Copies the planned experts (`list`, at most `cap`) from where `tab` says
 /// they are into `stage`, `stride` bytes each.
-pub fn moe_stage_copy(tab: *const c_void, list: *const c_void, n_list: *const c_void, stage: *mut c_void,
-    stride: usize, cap: usize, stream: &Stream) -> Result<()> {
+/// [`moe_stage_plan`] after a prefetch put the n_pre[0] experts of `pre_list`
+/// at staging slots 0..: they keep their slots, the other host-side experts are
+/// listed from slot `first[0]` = n_pre[0] on. `stats` (nullable, 3 u32) adds
+/// prefetched experts used, missed by the prediction, and unused.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_stage_plan_pre(ids: *const c_void, n_ids: usize, resident: *const c_void, n_experts: usize,
+    pre_list: *const c_void, n_pre: *const c_void, sidx: *mut c_void, list: *mut c_void, n_list: *mut c_void,
+    first: *mut c_void, stats: *mut c_void, stream: &Stream) -> Result<()> {
     #[cfg(airun_cuda)]
-    // SAFETY: stage holds cap * stride bytes; every listed table entry one expert.
-    unsafe { ffi::check(airun_moe_stage_copy(tab, list, n_list, stage, stride as u64, cap as i32, stream.raw())) }
+    // SAFETY: ids holds n_ids ids below n_experts; sidx and list n_ids entries;
+    // pre_list n_pre[0] distinct experts.
+    unsafe { ffi::check(airun_moe_stage_plan_pre(ids, n_ids as i32, resident, n_experts as i32, pre_list, n_pre,
+        sidx, list, n_list, first, stats, stream.raw())) }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(tab, list, n_list, stage, stride, cap, stream)
+    needs_cuda!(ids, n_ids, resident, n_experts, pre_list, n_pre, sidx, list, n_list, first, stats, stream)
+}
+
+pub fn moe_stage_copy(tab: *const c_void, list: *const c_void, n_list: *const c_void, first: *const c_void,
+    stage: *mut c_void, stride: usize, cap: usize, stream: &Stream) -> Result<()> {
+    #[cfg(airun_cuda)]
+    // SAFETY: stage holds first[0] + cap experts of stride bytes; every listed
+    // table entry one expert.
+    unsafe { ffi::check(airun_moe_stage_copy(tab, list, n_list, first, stage, stride as u64, cap as i32,
+        stream.raw())) }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(tab, list, n_list, first, stage, stride, cap, stream)
 }
 
 /// Sorts the `n` routed pairs by expert: `offsets` (n_experts + 1) delimits

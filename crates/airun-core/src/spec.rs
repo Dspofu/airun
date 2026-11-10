@@ -404,6 +404,7 @@ impl Runtime {
             return Err(CoreError::Other("verify_rows needs rows of one length within the batch".into()));
         }
         let n = n_rows * t;
+        self.kv_loan_guard(self.n_past + t)?;
         let mut seen = std::collections::HashSet::new();
         let (mut ids, mut positions, mut rope, mut past) = (Vec::with_capacity(n), Vec::with_capacity(n),
             vec![0i32; 3 * n], Vec::with_capacity(n_rows));
@@ -513,6 +514,7 @@ impl Runtime {
             return Err(CoreError::Other("accept_rows needs 1..=t tokens for every verified row".into()));
         }
         self.commit_rows(&rows, t, accept)?;
+        self.rebalance_experts()?;
         let mut bases = Vec::with_capacity(rows.len());
         for ((slot, toks), &(m, _)) in rows.iter().zip(accept) {
             let slot = *slot;
@@ -1011,6 +1013,7 @@ impl Runtime {
     /// nothing, and every row's greedy pick. The hidden rows stay in xb of the
     /// output device until the next pass.
     fn verify(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
+        self.kv_loan_guard(self.n_past + tokens.len())?;
         let n = tokens.len();
         let full = n == self.draft + 1 && !graphs_disabled();
         if full && self.states.len() > 1 && !shard_graphs_disabled() {
@@ -1300,6 +1303,9 @@ impl Runtime {
                 let t0 = std::time::Instant::now();
                 let picks = self.verify(&input)?;
                 timing[0] += t0.elapsed().as_secs_f64();
+                // Verifies route experts too: without this, MoE experts in
+                // RAM stay where the prompt left them for the whole reply.
+                self.rebalance_experts()?;
                 let mut a = 0;
                 let mut sampled = None;
                 if sampling {

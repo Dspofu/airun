@@ -117,15 +117,104 @@ pub struct MappedExperts {
     /// Its host copy, staged through pinned memory.
     mirror: RefCell<airun_cuda::PinnedBuffer<u64>>,
     /// Where each expert is: `Ok(slot)` in VRAM, `Err(index)` in `host`.
+    /// Slots from `base` on are loans (see [`Loan`]).
     pub place: RefCell<Vec<std::result::Result<usize, usize>>>,
+    /// Slots in the tensor's own VRAM.
+    base: usize,
+    /// VRAM lent by the KV cache's still unused rows; slot `base + i` is
+    /// `loans[i]`.
+    loans: RefCell<Vec<Loan>>,
+    /// For an expert in a loan, the host copy it keeps (`usize::MAX` for the
+    /// others): a loan holds a copy, so taking it back moves nothing.
+    home: RefCell<Vec<usize>>,
+}
+
+/// One expert's worth of VRAM in the KV cache's unused rows, usable while
+/// the sequence stays below row `p0` (see kv_loan.rs).
+#[derive(Clone, Copy, Debug)]
+pub struct Loan {
+    pub addr: u64,
+    pub p0: usize,
 }
 
 impl MappedExperts {
     fn addr(&self, data: &DeviceBuffer<u8>, stride: usize, p: std::result::Result<usize, usize>) -> u64 {
         match p {
+            Ok(slot) if slot >= self.base => self.loans.borrow()[slot - self.base].addr,
             Ok(slot) => data.as_ptr() as u64 + (slot * stride) as u64,
             Err(i) => self.host_dev + (i * stride) as u64,
         }
+    }
+
+    fn host_ptr(&self, j: usize, stride: usize) -> *const std::ffi::c_void {
+        (self.host.as_raw() as *const u8).wrapping_add(j * stride) as *const std::ffi::c_void
+    }
+
+    /// Replaces the loans; any expert in the old ones goes back to its host
+    /// copy. The caller publishes the table.
+    pub fn set_loans(&self, loans: Vec<Loan>) {
+        self.release_below(usize::MAX);
+        *self.loans.borrow_mut() = loans;
+    }
+
+    pub fn loans(&self) -> Vec<Loan> {
+        self.loans.borrow().clone()
+    }
+
+    /// Sends every expert in a loan starting below row `limit` back to its
+    /// host copy. Returns whether any moved; the caller then publishes.
+    pub fn release_below(&self, limit: usize) -> bool {
+        let loans = self.loans.borrow();
+        let mut place = self.place.borrow_mut();
+        let mut home = self.home.borrow_mut();
+        let mut moved = false;
+        for e in 0..place.len() {
+            if let Ok(s) = place[e] {
+                if s >= self.base && loans[s - self.base].p0 < limit {
+                    place[e] = Err(home[e]);
+                    home[e] = usize::MAX;
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+
+    /// Loans usable below row `limit` that hold no expert.
+    pub fn free_loans(&self, limit: usize) -> Vec<usize> {
+        let loans = self.loans.borrow();
+        let mut used = vec![false; loans.len()];
+        for p in self.place.borrow().iter() {
+            if let Ok(s) = *p {
+                if s >= self.base {
+                    used[s - self.base] = true;
+                }
+            }
+        }
+        (0..loans.len()).filter(|&i| !used[i] && loans[i].p0 >= limit).collect()
+    }
+
+    /// The lowest row of a loan that holds an expert (`usize::MAX` if none).
+    pub fn loan_floor(&self) -> usize {
+        let loans = self.loans.borrow();
+        self.place.borrow().iter().filter_map(|p| match *p {
+            Ok(s) if s >= self.base => Some(loans[s - self.base].p0),
+            _ => None,
+        }).min().unwrap_or(usize::MAX)
+    }
+
+    /// Copies expert `hot` (in host memory) into the free loan `li`; its host
+    /// copy stays. The caller publishes the table.
+    pub fn fill(&self, stride: usize, hot: usize, li: usize, stream: &Stream) -> Result<()> {
+        let mut place = self.place.borrow_mut();
+        let Err(j) = place[hot] else {
+            return Err(CoreError::Other("expert loaned while already in VRAM; this is a bug".into()));
+        };
+        let addr = self.loans.borrow()[li].addr;
+        airun_cuda::copy_h2d(addr as *mut std::ffi::c_void, self.host_ptr(j, stride), stride, stream)?;
+        place[hot] = Ok(self.base + li);
+        self.home.borrow_mut()[hot] = j;
+        Ok(())
     }
 
     /// Exchanges expert `hot` (in host memory) with `cold` (in VRAM), through
@@ -138,6 +227,18 @@ impl MappedExperts {
         let (Err(j), Ok(slot)) = (place[hot], place[cold]) else {
             return Err(CoreError::Other("expert swap between two experts on the same side; this is a bug".into()));
         };
+        if slot >= self.base {
+            // A loan holds a copy: `cold` goes back to its own, `hot` keeps
+            // its host one.
+            let addr = self.loans.borrow()[slot - self.base].addr;
+            airun_cuda::copy_h2d(addr as *mut std::ffi::c_void, self.host_ptr(j, stride), stride, stream)?;
+            let mut home = self.home.borrow_mut();
+            place[cold] = Err(home[cold]);
+            home[cold] = usize::MAX;
+            place[hot] = Ok(slot);
+            home[hot] = j;
+            return Ok(());
+        }
         let slot_ptr = data.offset_ptr(slot * stride);
         let host_ptr = (self.host.as_raw() as *mut u8).wrapping_add(j * stride);
         airun_cuda::copy_d2d(staging.as_mut_ptr(), slot_ptr, stride, stream)?;
@@ -1122,6 +1223,9 @@ fn load_cached(
             resident: DeviceBuffer::new(device, n_experts)?,
             resident_mirror: RefCell::new(airun_cuda::PinnedBuffer::new(n_experts)?),
             place: RefCell::new(place),
+            base: slots,
+            loans: RefCell::new(Vec::new()),
+            home: RefCell::new(vec![usize::MAX; n_experts]),
         };
         m.publish(&data, expert_stride, stream)?;
         // The pinned mirror is reused by the next publish; let this one land.

@@ -440,6 +440,11 @@ pub fn run(args: RunArgs) -> Result<()> {
                 "expert cache: {:.1}% hits ({hits} hits, {misses} misses)",
                 100.0 * hits as f64 / (hits + misses) as f64
             );
+            if let Some((used, missed, unused)) = runtime.expert_prefetch_stats().filter(|s| s.0 + s.1 > 0) {
+                eprintln!("expert prefetch: {:.1}% of the experts read from RAM were copied ahead ({used} ahead, \
+                           {missed} on demand, {unused} copied but not routed)",
+                    100.0 * used as f64 / (used + missed) as f64);
+            }
             let (wait, read) = runtime.expert_stream_timing();
             eprintln!("expert streaming: {wait:.0} ms waiting on the GPU for routing, {read:.0} ms reading misses");
         }

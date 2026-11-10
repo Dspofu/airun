@@ -1393,3 +1393,88 @@ Dividido, o planner põe 32/32 camadas e cada GPU fica em ~9 GiB.
   - **Exatidão:** texto guloso idêntico a `AIRUN_NO_LAYERED=1` com 4420 tokens: 1.7B com disco; 27B com disco com e sem MTP; 27B com disco em duas GPUs.
   - **Só com camadas no disco:** com camadas só na RAM fixada perdia (27B, 4420 tokens: 3,7 → 3,8 s numa GPU, 3,2 → 3,9 s em duas, que deixam de se sobrepor), então `layered_take` exige `model.disk`. Fora também: hyper-connections, PLE, imagens e o prefill em lote do `serve --parallel`.
 - **Achado à parte:** no Qwen3-1.7B Q8_K_XL, as camadas na RAM multiplicadas na CPU deram 2,5 tok/s e copiadas para a GPU (`AIRUN_RAM_ON_GPU=1`) 16,7 tok/s. O fallback `dequantize` + f32 de `cpu.rs` (tipos fora do NVFP4) é lento, e com PCIe rápido copiar ganha. A escolha CPU × cópia não olha o tipo nem a banda do link.
+
+## Camadas na RAM em K-quants e MoE com experts na RAM (2026-11-10, RTX 3060 12 GB sozinha)
+
+**Matmuls na CPU para Q4_K, Q5_K, Q6_K e Q8_0** (`cpu.rs`, `avx2::q4k_row4`/`q5k_row4`/`q6k_row4`/`q8_0_row4`):
+- Antes só o NVFP4 tinha kernel; os outros tipos iam para `dequantize` + f32, a ~1,5 GB/s. Qwen3.6-27B Q4_K_M (84% Q4_K/Q6_K) com 7,5 GB na RAM gerava a 0,2 tok/s.
+- Os pesos são decodificados em registradores e multiplicados como int8 (`maddubs`), como no NVFP4. O mínimo dos K-quants entra como `dmin * mn * soma do bloco de ativação` (`quantize_sums`).
+- `tests/cpu_bench.rs`: 1 token a 49–52 GB/s (Q4_K/Q5_K/Q6_K), Q8_0 a 27 GB/s.
+- Matmul com menos de 1 MiB de pesos roda na thread que chamou (`run_sized`): acordar o pool custava 205 µs para 138 KB.
+- **Não** aumente a espera ativa das threads (`AIRUN_CPU_SPIN_US`): a 5 ms a geração caiu de 3,0 para 0,9 tok/s, porque 23 threads girando tiram CPU da thread que dirige a GPU.
+- `AIRUN_CPU_STATS=1`: a cada 1000 matmuls, o tempo dentro delas e a banda.
+- **Resultado** (27B Q4_K_M, 3060, `--draft 0`): geração 0,2 → 4,6–4,8 tok/s; copiando para a GPU (`AIRUN_RAM_ON_GPU=1`), 2,8. Texto guloso idêntico nos dois caminhos.
+- Medir em sequência inflou rodadas: uma execução logo depois de outra que soltou muita memória fixada saiu a ~3 tok/s. Repita a medição.
+
+**Experts do MoE na decodificação com o caminho inteiro** (`moe.cu`, `moe_gate_up_q8_kernel`, `moe_down_q8_kernel`):
+- Os kernels de expert decodificavam cada peso para float: no 35B-A3B liam ~566 MB por token a ~18% da banda.
+- Com o buffer `q8` (`MoeScratch::q8`, `hybrid::moe_q8_scratch_bytes`), até 4 tokens quantizam a entrada (e o `h`) para int8 por 32 e usam `q8dot` (`dp4a`), como as matrizes densas. `AIRUN_MOE_F32=1` volta aos kernels float.
+- Selftest: "moe expert ffn, int8 decode kernels" (1,1% do pico com dados aleatórios). Texto guloso do 35B idêntico ao do caminho float.
+
+**Cópia dos experts que faltam com poucos blocos** (`moe_stage_copy_kernel`, `AIRUN_STAGE_BLOCKS`, padrão 4):
+- A cópia RAM → VRAM roda numa fila paralela aos experts residentes. Com 32 blocos por expert (até 256 ao mesmo tempo, cada um preso esperando o PCIe), ela ocupava a GPU e atrasava os kernels da outra fila.
+- Agora são 4 blocos por expert, com 8 leituras de 16 bytes em voo por thread.
+
+**Resultado no 35B-A3B Q4_K_M** (`-c 246000 --kv-type q8_0 --temp 0.7`, 7,16 GiB de pesos na VRAM, ~78% dos experts na VRAM):
+
+| Etapa | tok/s |
+|---|---|
+| antes | 42–44 |
+| experts em int8 | 48 |
+| cópia: 32 → 4 blocos por expert | 58,7–60,6 |
+
+- Varredura dos blocos: 32 → 51,6; 8 → 55; 4 → 58,7–60,6; 3 → 60,0–60,4; 1 → 55,7–57,4.
+- MTP continua perdendo com experts na RAM: `--draft 1` 56,4–56,8; `--draft 2` 48,3–49,3 (aceitação 45–65% a temp 0,7).
+- Chaves por divisão da atenção (`GQA_KEYS_PER_SPLIT`) 64 / 32 / 16: 60,3–60,7 / 61,3–62,2 / 57,8–64,0, dentro do ruído; ficou 64.
+
+**Onde vai o tempo agora** (nsys com `--cuda-graph-trace=node`, ms por token):
+- cópia dos experts 4,9, na fila paralela;
+- matvecs densos f32 5,8, perto da banda (Q6_K a ~338 GB/s);
+- experts em int8 3,2;
+- atenção 1,07 (107 µs por camada com ~230 tokens: 2 cabeças de KV dão poucos blocos);
+- `matvec_tallk` 0,8.
+
+Com o contexto cheio, só ler o KV a cada token já custa ~7,5 ms na 3060. Então 90 tok/s só é alcançável com a conversa curta.
+
+## KV emprestado aos experts, atenção com contexto curto e MTP com experts na RAM (2026-11-10, tarde)
+
+Mesmo cenário (35B-A3B Q4_K_M, RTX 3060 12 GB, `-c 246000 --kv-type q8_0`). Resultado, rodadas alternadas na mesma sessão, 300 tokens:
+
+| | temp 0,7 | guloso |
+|---|---|---|
+| antes (`AIRUN_NO_KV_LOAN=1 AIRUN_NO_SPLIT_WAVES=1`) | 59,9–62,2 | 59,8–62,0 |
+| agora | 73,0–73,6 | 73,7–74,7 |
+| agora + `--draft 1` | 64,8–67,3 | 68,2–69,4 |
+
+**KV emprestado aos experts** (`kv_loan.rs`, `model::Loan`, `MappedExperts::{fill, release_below}`):
+- O KV de 246k reserva ~2,7 GB que uma conversa curta não toca. As linhas ainda não alcançadas guardam cópias de experts da RAM (1013 experts, 2,43 GiB no 35B): acerto do cache 82% → 89%, 56 → 66 tok/s sozinho.
+- Layout do KV é `[cabeça][posição][linha]`; cada pedaço emprestado fica numa posição `p0` de uma cabeça e vale enquanto a sequência escreve abaixo dela. O host mantém a cópia original do expert, então devolver é só apontar a tabela de volta (nada atravessa o PCIe).
+- `kv_loan_guard(upto)` roda antes de qualquer escrita no KV: `step_inner`, `step_layered`, `chain_launch`, `decode_rows`, `load_state`, `spec::verify`, `verify_rows` e, de rede de segurança, `queue_forward_with`. Ao chegar a `margin` (= lote + 1024) linhas do empréstimo mais baixo, devolve tudo abaixo de `upto + 2 * margin`.
+- O rebalanceamento preenche empréstimos livres acima de `max(n_past, history.len()) + 2 * margin` com os experts mais quentes (uma cópia, contra três de uma troca). `reset()` libera as linhas de novo.
+- Fora com `--parallel` > 1 (cada slot teria de ter os seus), KV na RAM, índice de atenção esparsa, ou `AIRUN_NO_KV_LOAN=1`.
+- **Exatidão:** texto guloso idêntico com e sem empréstimo, inclusive com a devolução no meio da geração (4964 tokens de prompt, 2200 gerados, `-c 12288`), **desde que** `AIRUN_MOE_OVERLAP=0`. Com as duas passadas (residentes, depois copiados), um expert que muda de lado muda a ordem da soma em float e o texto pode divergir numa quase-empate. Isso não é corrupção: compare sempre com `AIRUN_MOE_OVERLAP=0`.
+
+**MTP: as verificações não rebalanceavam os experts** (`spec.rs`): `rebalance_experts` só rodava em `step()`; com `--draft` a escolha de experts na VRAM congelava no prompt. Agora roda após cada `verify` e `accept_rows`. `--draft 1`: 56 → 60–67 tok/s.
+
+**Atenção de decode com contexto curto** (`attention_decode_gqa_kernel`, `gqa_decode_tail<D, KV, GS>`):
+- Com ~300 tokens eram 5 divisões × 2 cabeças de KV = 10 warps na GPU inteira, ~90 µs por camada (~1 ms por token, 0,8% da banda). Nsight Compute: ~18k instruções por warp a ~9,5 ciclos cada, metade da espera em falta de instrução (o código desenrolado é percorrido uma vez só por bloco).
+- O laço das cabeças desenrolava `GQA_MAX` = 8 com `if (h >= G) continue` em tempo de execução: o corpo agora é instanciado com 1/2/4/8 cabeças fixas (genérico para outros G e para a verificação com vários warps, cuja numérica não pode depender do caminho).
+- `attention_active_splits` escolhe de 16 a 64 chaves por divisão, o menor que ainda cabe numa onda (`wave`). Atenção e merge chamam a mesma função, então concordam. Sem efeito no contexto longo (as divisões chegam ao teto de 256). `AIRUN_NO_SPLIT_WAVES=1` volta ao fixo: 69–72 contra 74–75 tok/s.
+- Muda a ordem da soma: texto guloso do Qwen3-4B diverge do fixo numa quase-empate (caractere 501 de 1627); os dois coerentes.
+- **Testado e descartado:** espalhar as 8 cabeças de query de um grupo por vários blocos. Com o corpo especializado ficou 72,4–73,3 contra 73,6–74,1: o tempo do bloco é a passada fria pelo código e a decodificação byte a byte do q8_0 (74% de setores excedentes), não as cabeças.
+
+**Prefetch dos experts antes do FFN** (`Prefetch`, `moe_prefetch`, `moe_stage_plan_pre_kernel`), **opcional** com `AIRUN_EXPERT_PREFETCH=1`:
+- No início da camada, o roteador dela aplicado ao residual que entra (normalizado com o peso do FFN) prevê os experts. Os previstos que estão na RAM começam a ser copiados enquanto a atenção roda, nas primeiras posições da área de cópia; no FFN só se copia o que a previsão errou (`first` em `moe_stage_copy`).
+- Acerta 72% das cópias e corta a espera pelo PCIe de 2,1 para 0,8 ms por token (nsys), mas perde: 67–69 contra 70 tok/s. A previsão custa ~20 µs por camada, e as cópias ao lado da atenção deixam os outros kernels ~2 ms mais lentos por token. Prevendo só 4 experts (31% de acerto, quase sem desperdício), perde igual.
+
+**Onde vai o tempo agora** (nsys, sem prefetch, ~14 ms por token fora do profiler):
+- cálculo ~11,7 ms: matvecs densos 5,4 (a saída de 248k × 2048 em Q6_K sozinha ~1,2), experts 2,8, `matvec_tallk` 0,9, atenção ~0,5;
+- GPU esperando a cópia de experts ~2,1 ms;
+- o profiler inflava a folga entre tokens: `cudaGraphLaunch` 1,2 ms por token com rastreamento. Sem ele a folga real é ~0,6 ms. Sortear na CPU com temp 0,7 custa só ~0,25 ms a mais que o guloso.
+
+**MTP ainda perde com experts na RAM:** verificar 2 tokens custa 22 ms contra 14–15 de 1 (cada token escolhe os próprios 8 experts, então quase dobram as cópias e o cálculo dos experts), e a cabeça mais o commit, 2,7 ms. Com 58–66% de aceitação fica abaixo do decode simples. `AIRUN_DRAFT_VOCAB=16384/32768` corta a cabeça para 1,3 ms, mas a aceitação cai para 34–57%: sem ganho.
+
+**Próximas alavancas:**
+- a espera pelo PCIe (~2,1 ms): só esconde se a cópia sair do caminho sem disputar a GPU. Um prefetch só ganha se a previsão custar quase nada (por exemplo o roteador da camada seguinte junto do da atual, num matvec só) e as cópias não atrasarem a atenção;
+- desquantizar a linha q8_0 do KV na atenção com leituras largas, em vez de byte a byte;
+- matvecs densos já estão perto da banda; a saída de 248k linhas é ~8% do token.

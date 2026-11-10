@@ -1,5 +1,6 @@
 // Transformer element-wise ops, RoPE, KV-cache maintenance and attention.
 
+#include <type_traits>
 #include "dequant.cuh"
 
 // ---------------------------------------------------------------------------
@@ -622,6 +623,14 @@ __device__ __forceinline__ int attention_active_splits(const int32_t* positions,
     if (keys_per_split <= 0) return splits;
     const int pos = positions[0];
     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
+    // A short span in splits of keys_per_split leaves the GPU nearly idle, and
+    // each split's warp stages (and for q8_0/q4_0 decodes) every row itself:
+    // down to a quarter of that per split while the splits still fit a wave.
+    if (wave > 0) {
+        int kps = max(1, keys_per_split / 4);
+        while (kps < keys_per_split && (pos + 1 - lo + kps - 1) / kps > wave) kps *= 2;
+        keys_per_split = kps;
+    }
     int a = min(splits, max(1, (pos + 1 - lo + keys_per_split - 1) / keys_per_split));
     if (wave > 0 && a > wave) a -= a % wave;
     return a;
@@ -762,6 +771,153 @@ __device__ __forceinline__ void gqa_stage(half* tile, const uint8_t* base, size_
     }
 }
 
+// The decode kernel's work once its block has its keys and query heads: GS of
+// them (0: any count up to GQA_MAX, `Gs` at run time). With the count fixed
+// the head loops compile to exactly that many heads; with a run-time bound
+// every warp issued all GQA_MAX heads' instructions predicated off -- ~19k
+// per warp at one head, and the unrolled code missed the instruction cache.
+template <int D, int KV, int GS>
+__device__ __forceinline__ void gqa_decode_tail(
+    float* __restrict__ partial, float* qs, half* tile, float* ps,
+    const uint8_t* __restrict__ k_cache, const uint8_t* __restrict__ v_cache, const int32_t* __restrict__ idx,
+    const int max_seq, const int kvh, const int G, const int Gs_rt, const int h0, const int split,
+    const int begin, const int end, const int my_pos, const int W, const int w, const int lane) {
+    constexpr int GL = GS > 0 ? GS : GQA_MAX;
+    const int Gs = GS > 0 ? GS : Gs_rt;
+    using S = GqaShape<D>;
+    constexpr int LD = S::LD;
+    constexpr int DP = D / 64;
+    const size_t row_bytes = kv_row_bytes<KV>(D);
+    const uint8_t* kbase = k_cache + (size_t)kvh * max_seq * row_bytes;
+    const uint8_t* vbase = v_cache + (size_t)kvh * max_seq * row_bytes;
+
+    float m[GL], l[GL], acc[GL][DP][2];
+#pragma unroll
+    for (int h = 0; h < GL; ++h) {
+        m[h] = -INFINITY;
+        l[h] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DP; ++i) acc[h][i][0] = acc[h][i][1] = 0.0f;
+    }
+
+    for (int t0 = begin; t0 < end; t0 += GQA_TILE) {
+        const int n = min(GQA_TILE, end - t0);
+        // Every warp stages its share of the tile's rows, so a verify's
+        // loads overlap rather than queue behind one warp.
+        const int per = (n + W - 1) / W, r0 = w * per, cnt = min(per, n - r0);
+        if (cnt > 0) gqa_stage<D, KV>(tile + (size_t)r0 * LD, kbase, row_bytes, t0 + r0, cnt, lane, idx);
+        __syncthreads();
+
+        // Lane `lane` scores key t0 + lane against every query head.
+        float s[GL];
+#pragma unroll
+        for (int h = 0; h < GL; ++h) s[h] = 0.0f;
+        const half* kr = tile + lane * LD;
+#pragma unroll 4
+        for (int c = 0; c < D / 8; ++c) {
+            const uint4 raw = *(const uint4*)&kr[8 * c];
+            // Unpacked with bit operations: taking the address of `raw` to view
+            // it as half2 put it in local memory.
+            const uint32_t w4[4] = {raw.x, raw.y, raw.z, raw.w};
+            float kf[8];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                kf[2 * e] = __half2float(__ushort_as_half((unsigned short)(w4[e] & 0xFFFFu)));
+                kf[2 * e + 1] = __half2float(__ushort_as_half((unsigned short)(w4[e] >> 16)));
+            }
+#pragma unroll
+            for (int h = 0; h < GL; ++h) {
+                if (h >= Gs) continue;
+                const float4 q0 = *(const float4*)&qs[h * D + 8 * c];
+                const float4 q1 = *(const float4*)&qs[h * D + 8 * c + 4];
+                s[h] = fmaf(q0.x, kf[0], fmaf(q0.y, kf[1], fmaf(q0.z, kf[2], fmaf(q0.w, kf[3], s[h]))));
+                s[h] = fmaf(q1.x, kf[4], fmaf(q1.y, kf[5], fmaf(q1.z, kf[6], fmaf(q1.w, kf[7], s[h]))));
+            }
+        }
+        const bool valid = lane < n && t0 + lane <= my_pos;
+#pragma unroll
+        for (int h = 0; h < GL; ++h) {
+            if (h >= Gs) continue;
+            const float sv = valid ? s[h] : -INFINITY;
+            float mt = sv;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+            const float m_new = fmaxf(m[h], mt);
+            // m[h] = -inf only before any key: corr = 0. Both -inf (a verify
+            // query with no key in this tile yet): nothing to rescale.
+            const float corr = m_new == -INFINITY ? 1.0f : __expf(m[h] - m_new);
+            const float p = valid ? __expf(sv - m_new) : 0.0f;
+            float sum = p;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            l[h] = l[h] * corr + sum;
+            m[h] = m_new;
+#pragma unroll
+            for (int i = 0; i < DP; ++i) { acc[h][i][0] *= corr; acc[h][i][1] *= corr; }
+            ps[h * GQA_TILE + lane] = p;
+        }
+        __syncwarp();      // ps is written
+        __syncthreads();   // every warp is done reading K
+
+        // An f16 V row is read straight from the cache: lane l takes halves
+        // 2l + 64i, so each i is one coalesced 128-byte load across the warp,
+        // with nothing to stage. Staging it through shared memory as K is
+        // made the warp wait out each tile's load before using any of it.
+        if constexpr (KV == KV_F16) {
+#pragma unroll 4
+            for (int j = 0; j < n; ++j) {
+                const half* vr = (const half*)(vbase + (size_t)(idx ? idx[t0 + j] : t0 + j) * row_bytes);
+                float2 v[DP];
+#pragma unroll
+                for (int i = 0; i < DP; ++i) v[i] = __half22float2(__ldg((const half2*)&vr[2 * lane + 64 * i]));
+#pragma unroll
+                for (int i = 0; i < DP; ++i) {
+#pragma unroll
+                    for (int h = 0; h < GL; ++h) {
+                        if (h >= Gs) continue;
+                        const float pj = ps[h * GQA_TILE + j];
+                        acc[h][i][0] = fmaf(pj, v[i].x, acc[h][i][0]);
+                        acc[h][i][1] = fmaf(pj, v[i].y, acc[h][i][1]);
+                    }
+                }
+            }
+        } else {
+            if (cnt > 0) gqa_stage<D, KV>(tile + (size_t)r0 * LD, vbase, row_bytes, t0 + r0, cnt, lane, idx);
+            __syncthreads();
+            for (int j = 0; j < n; ++j) {
+                const half* vr = tile + j * LD;
+#pragma unroll
+                for (int i = 0; i < DP; ++i) {
+                    const float2 v = __half22float2(*(const half2*)&vr[2 * lane + 64 * i]);
+#pragma unroll
+                    for (int h = 0; h < GL; ++h) {
+                        if (h >= Gs) continue;
+                        const float pj = ps[h * GQA_TILE + j];
+                        acc[h][i][0] = fmaf(pj, v.x, acc[h][i][0]);
+                        acc[h][i][1] = fmaf(pj, v.y, acc[h][i][1]);
+                    }
+                }
+            }
+        }
+        __syncthreads();   // the next tile's K overwrites these rows
+    }
+
+    // A compile-time trip count: indexing m/l/acc with a runtime bound put all
+    // three on the stack (224 bytes of local memory) and made every inner loop
+    // go through it -- 20k cycles per tile instead of a few thousand.
+#pragma unroll
+    for (int h = 0; h < GL; ++h) {
+        if (h >= Gs) continue;
+        float* out = partial + ((size_t)(kvh * G + h0 + h) * gridDim.y + split) * (D + 2);
+        if (lane == 0) { out[0] = m[h]; out[1] = l[h]; }
+#pragma unroll
+        for (int i = 0; i < DP; ++i) {
+            out[2 + 2 * lane + 64 * i] = acc[h][i][0];
+            out[2 + 2 * lane + 64 * i + 1] = acc[h][i][1];
+        }
+    }
+}
+
 template <int D, int KV>
 // minBlocks = 1 lifts ptxas's register target: left to itself it stopped the
 // f16 D=128 build at 128 registers and spilled 64 bytes to local memory.
@@ -822,6 +978,12 @@ __global__ __launch_bounds__(32 * GQA_MULTI_MAX, 1) void attention_decode_gqa_ke
     float* ps = (float*)(gqa_smem + (size_t)W * G * D * 4 + S::T_BYTES) + (size_t)w * G * GQA_TILE; // [G][TILE]
 
     const int kvh = blockIdx.x;
+    // Spreading a KV head's query heads over several blocks at short contexts
+    // (each block its share, all reading the same rows) measured slower:
+    // 72.4-73.3 against 73.6-74.1 tok/s on the 35B-A3B. A block's time there
+    // is its cold pass through the unrolled code and the q8_0 row decode, not
+    // the heads. So h0 = 0 and every block takes all G.
+    const int Gs = G, h0 = 0;
     const int split = blockIdx.y;
     const int my_pos = positions[w];
     int begin, end;
@@ -841,139 +1003,24 @@ __global__ __launch_bounds__(32 * GQA_MULTI_MAX, 1) void attention_decode_gqa_ke
         end = lo + (int)((int64_t)span * (split + 1) / splits);
     }
 
-    for (int i = lane; i < G * D; i += 32) qs[i] = q[(size_t)(kvh * G) * D + i] * scale;
+    for (int i = lane; i < Gs * D; i += 32) qs[i] = q[(size_t)(kvh * G + h0) * D + i] * scale;
     __syncwarp();
 
-    const size_t row_bytes = kv_row_bytes<KV>(D);
-    const uint8_t* kbase = k_cache + (size_t)kvh * max_seq * row_bytes;
-    const uint8_t* vbase = v_cache + (size_t)kvh * max_seq * row_bytes;
-
-    float m[GQA_MAX], l[GQA_MAX], acc[GQA_MAX][DP][2];
-#pragma unroll
-    for (int h = 0; h < GQA_MAX; ++h) {
-        m[h] = -INFINITY;
-        l[h] = 0.0f;
-#pragma unroll
-        for (int i = 0; i < DP; ++i) acc[h][i][0] = acc[h][i][1] = 0.0f;
-    }
-
-    for (int t0 = begin; t0 < end; t0 += GQA_TILE) {
-        const int n = min(GQA_TILE, end - t0);
-        // Every warp stages its share of the tile's rows, so a verify's
-        // loads overlap rather than queue behind one warp.
-        const int per = (n + W - 1) / W, r0 = w * per, cnt = min(per, n - r0);
-        if (cnt > 0) gqa_stage<D, KV>(tile + (size_t)r0 * LD, kbase, row_bytes, t0 + r0, cnt, lane, idx);
-        __syncthreads();
-
-        // Lane `lane` scores key t0 + lane against every query head.
-        float s[GQA_MAX];
-#pragma unroll
-        for (int h = 0; h < GQA_MAX; ++h) s[h] = 0.0f;
-        const half* kr = tile + lane * LD;
-#pragma unroll 4
-        for (int c = 0; c < D / 8; ++c) {
-            const uint4 raw = *(const uint4*)&kr[8 * c];
-            // Unpacked with bit operations: taking the address of `raw` to view
-            // it as half2 put it in local memory.
-            const uint32_t w4[4] = {raw.x, raw.y, raw.z, raw.w};
-            float kf[8];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                kf[2 * e] = __half2float(__ushort_as_half((unsigned short)(w4[e] & 0xFFFFu)));
-                kf[2 * e + 1] = __half2float(__ushort_as_half((unsigned short)(w4[e] >> 16)));
-            }
-#pragma unroll
-            for (int h = 0; h < GQA_MAX; ++h) {
-                if (h >= G) continue;
-                const float4 q0 = *(const float4*)&qs[h * D + 8 * c];
-                const float4 q1 = *(const float4*)&qs[h * D + 8 * c + 4];
-                s[h] = fmaf(q0.x, kf[0], fmaf(q0.y, kf[1], fmaf(q0.z, kf[2], fmaf(q0.w, kf[3], s[h]))));
-                s[h] = fmaf(q1.x, kf[4], fmaf(q1.y, kf[5], fmaf(q1.z, kf[6], fmaf(q1.w, kf[7], s[h]))));
-            }
-        }
-        const bool valid = lane < n && t0 + lane <= my_pos;
-#pragma unroll
-        for (int h = 0; h < GQA_MAX; ++h) {
-            if (h >= G) continue;
-            const float sv = valid ? s[h] : -INFINITY;
-            float mt = sv;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
-            const float m_new = fmaxf(m[h], mt);
-            // m[h] = -inf only before any key: corr = 0. Both -inf (a verify
-            // query with no key in this tile yet): nothing to rescale.
-            const float corr = m_new == -INFINITY ? 1.0f : __expf(m[h] - m_new);
-            const float p = valid ? __expf(sv - m_new) : 0.0f;
-            float sum = p;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-            l[h] = l[h] * corr + sum;
-            m[h] = m_new;
-#pragma unroll
-            for (int i = 0; i < DP; ++i) { acc[h][i][0] *= corr; acc[h][i][1] *= corr; }
-            ps[h * GQA_TILE + lane] = p;
-        }
-        __syncwarp();      // ps is written
-        __syncthreads();   // every warp is done reading K
-
-        // An f16 V row is read straight from the cache: lane l takes halves
-        // 2l + 64i, so each i is one coalesced 128-byte load across the warp,
-        // with nothing to stage. Staging it through shared memory as K is
-        // made the warp wait out each tile's load before using any of it.
-        if constexpr (KV == KV_F16) {
-#pragma unroll 4
-            for (int j = 0; j < n; ++j) {
-                const half* vr = (const half*)(vbase + (size_t)(idx ? idx[t0 + j] : t0 + j) * row_bytes);
-                float2 v[DP];
-#pragma unroll
-                for (int i = 0; i < DP; ++i) v[i] = __half22float2(__ldg((const half2*)&vr[2 * lane + 64 * i]));
-#pragma unroll
-                for (int i = 0; i < DP; ++i) {
-#pragma unroll
-                    for (int h = 0; h < GQA_MAX; ++h) {
-                        if (h >= G) continue;
-                        const float pj = ps[h * GQA_TILE + j];
-                        acc[h][i][0] = fmaf(pj, v[i].x, acc[h][i][0]);
-                        acc[h][i][1] = fmaf(pj, v[i].y, acc[h][i][1]);
-                    }
-                }
-            }
-        } else {
-            if (cnt > 0) gqa_stage<D, KV>(tile + (size_t)r0 * LD, vbase, row_bytes, t0 + r0, cnt, lane, idx);
-            __syncthreads();
-            for (int j = 0; j < n; ++j) {
-                const half* vr = tile + j * LD;
-#pragma unroll
-                for (int i = 0; i < DP; ++i) {
-                    const float2 v = __half22float2(*(const half2*)&vr[2 * lane + 64 * i]);
-#pragma unroll
-                    for (int h = 0; h < GQA_MAX; ++h) {
-                        if (h >= G) continue;
-                        const float pj = ps[h * GQA_TILE + j];
-                        acc[h][i][0] = fmaf(pj, v.x, acc[h][i][0]);
-                        acc[h][i][1] = fmaf(pj, v.y, acc[h][i][1]);
-                    }
-                }
-            }
-        }
-        __syncthreads();   // the next tile's K overwrites these rows
-    }
-
-    // A compile-time trip count: indexing m/l/acc with a runtime bound put all
-    // three on the stack (224 bytes of local memory) and made every inner loop
-    // go through it -- 20k cycles per tile instead of a few thousand.
-#pragma unroll
-    for (int h = 0; h < GQA_MAX; ++h) {
-        if (h >= G) continue;
-        float* out = partial + ((size_t)(kvh * G + h) * gridDim.y + split) * (D + 2);
-        if (lane == 0) { out[0] = m[h]; out[1] = l[h]; }
-#pragma unroll
-        for (int i = 0; i < DP; ++i) {
-            out[2 + 2 * lane + 64 * i] = acc[h][i][0];
-            out[2 + 2 * lane + 64 * i + 1] = acc[h][i][1];
-        }
+    const auto run = [&](auto gs) {
+        gqa_decode_tail<D, KV, decltype(gs)::value>(partial, qs, tile, ps, k_cache, v_cache, idx, max_seq, kvh, G,
+            Gs, h0, split, begin, end, my_pos, W, w, lane);
+    };
+    // A verify keeps the generic loop: its numbers must not depend on the
+    // path (see W above).
+    switch (W == 1 ? Gs : 0) {
+        case 1: run(std::integral_constant<int, 1>{}); break;
+        case 2: run(std::integral_constant<int, 2>{}); break;
+        case 4: run(std::integral_constant<int, 4>{}); break;
+        case 8: run(std::integral_constant<int, 8>{}); break;
+        default: run(std::integral_constant<int, 0>{}); break;
     }
 }
+
 // AIRUN_NO_SPLIT_WAVES=1 keeps every split a position has keys for, however
 // the last wave falls (see attention_active_splits).
 static bool split_waves_disabled() {

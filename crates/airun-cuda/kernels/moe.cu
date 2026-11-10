@@ -9,6 +9,7 @@
 // that the kernel reads across PCIe (see airun-core's MappedExperts).
 
 #include "dequant.cuh"
+#include "vecdotq.cuh"
 
 #define MOE_ROWS_PER_BLOCK 4
 
@@ -326,27 +327,249 @@ __global__ void moe_stage_plan_kernel(
     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) sidx[i] = at[ids[i]];
 }
 
+// moe_stage_plan_kernel after a prefetch: the experts `pre_list` already put
+// at staging slots 0..n_pre[0] keep them, and only the other host-side ones
+// are listed, from slot n_pre[0] on (`first[0]`, where the copy starts).
+// `stats` (nullable) adds up prefetched experts used, experts the prediction
+// missed, and prefetched ones not routed.
+__global__ void moe_stage_plan_pre_kernel(
+    const int32_t* __restrict__ ids, const int n_ids, const uint8_t* __restrict__ resident, const int n_experts,
+    const int32_t* __restrict__ pre_list, const int32_t* __restrict__ n_pre,
+    int32_t* __restrict__ sidx, int32_t* __restrict__ list, int32_t* __restrict__ n_list,
+    int32_t* __restrict__ first, unsigned int* __restrict__ stats) {
+    extern __shared__ int32_t at[];   // n_experts
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) at[e] = -1;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+        const int e = ids[i];
+        if (!resident[e]) at[e] = -2;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int np = n_pre[0];
+        int used = 0;
+        for (int j = 0; j < np; ++j) {
+            const int e = pre_list[j];
+            if (at[e] == -2) { at[e] = j; ++used; }
+        }
+        int m = 0;
+        for (int e = 0; e < n_experts; ++e) {
+            if (at[e] == -2) { at[e] = np + m; list[m] = e; ++m; }
+        }
+        n_list[0] = m;
+        first[0] = np;
+        if (stats) {
+            atomicAdd(stats + 0, (unsigned)used);
+            atomicAdd(stats + 1, (unsigned)m);
+            atomicAdd(stats + 2, (unsigned)(np - used));
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) sidx[i] = at[ids[i]];
+}
+
 // Copies the staged experts out of host memory: 16-byte loads, many blocks in
 // flight, which is what PCIe needs to run at its bandwidth -- the expert
 // kernels' own narrow, dependent reads ran five times slower across it.
+// Listed expert j lands at slot j + first[0] (`first` nullable: 0).
 __global__ void moe_stage_copy_kernel(
     const unsigned long long* __restrict__ tab, const int32_t* __restrict__ list, const int32_t* __restrict__ n_list,
-    uint8_t* __restrict__ stage, const size_t stride) {
+    const int32_t* __restrict__ first, uint8_t* __restrict__ stage, const size_t stride) {
     const int j = blockIdx.y;
     if (j >= n_list[0]) return;
     const uint4* src = (const uint4*)tab[list[j]];
-    uint4* dst = (uint4*)(stage + (size_t)j * stride);
+    uint4* dst = (uint4*)(stage + (size_t)(j + (first ? first[0] : 0)) * stride);
     const size_t n16 = stride / 16;
     // Four independent loads per thread before any store: a link with
     // microseconds of latency needs many requests in flight, and a
     // load-then-store loop keeps only one per thread.
     const size_t step = (size_t)gridDim.x * blockDim.x;
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    for (; i + 3 * step < n16; i += 4 * step) {
-        const uint4 a = src[i], b = src[i + step], c = src[i + 2 * step], d = src[i + 3 * step];
-        dst[i] = a; dst[i + step] = b; dst[i + 2 * step] = c; dst[i + 3 * step] = d;
+    for (; i + 7 * step < n16; i += 8 * step) {
+        uint4 v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = src[i + u * step];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) dst[i + u * step] = v[u];
     }
     for (; i < n16; i += step) dst[i] = src[i];
+}
+
+
+// ---------------------------------------------------------------------------
+// Decode: the dense decode's integer path
+// ---------------------------------------------------------------------------
+//
+// A decode step routes one token (a few with a speculative verify) to top_k
+// experts. The kernels above decode every weight to a float and pay an FMA per
+// element; for one token that is ALU- and latency-bound: on an RTX 3060 the
+// 35B-A3B's expert kernels read their ~566 MB a token at ~18% of the memory
+// bandwidth. Here the input is quantized to int8 per 32 (block_q8a, as the
+// dense decode does) and each group is one __dp4a dot (vecdotq.cuh) -- the
+// same trade llama.cpp's mmvq makes for its MoE. Not bit-identical to the
+// float kernels: the activations round to 8 bits per 32-value group.
+
+#define MOE_Q8_MAX_TOKENS 4   // decode and a speculative verify of up to 3 drafts
+#define MOE_Q8_ROWS 2         // output rows per warp in gate_up
+
+// Bytes of block_q8a scratch the launchers below need for `n_tokens` tokens.
+static size_t moe_q8_scratch_bytes(int n_tokens, int k, int top_k, int ff) {
+    const size_t elems = (size_t)n_tokens * (size_t)max(k, top_k * ff);
+    return elems / 32 * sizeof(block_q8a);
+}
+
+template <int TYPE>
+__global__ __launch_bounds__(32 * MOE_ROWS_PER_BLOCK) void moe_gate_up_q8_kernel(
+    const uint8_t* __restrict__ gate_w,
+    const uint8_t* __restrict__ up_w,
+    const block_q8a* __restrict__ xq,     // [n_tokens][K / 32]
+    const int32_t* __restrict__ ids,
+    float* __restrict__ h,
+    const int K,
+    const int ff,
+    const int top_k,
+    const size_t row_bytes,
+    const size_t expert_stride,
+    const unsigned long long* __restrict__ gate_tab,
+    const unsigned long long* __restrict__ up_tab,
+    const int32_t* __restrict__ sidx,
+    const uint8_t* __restrict__ gate_stage,
+    const uint8_t* __restrict__ up_stage,
+    const int only) {                     // as moe_gate_up_kernel
+
+    const int slot  = blockIdx.y;
+    const int token = blockIdx.z;
+    const int expert = ids[(size_t)token * top_k + slot];
+    const int st = sidx ? sidx[(size_t)token * top_k + slot] : -1;
+    if (only != 0 && (only == 2) != (st >= 0)) return;   // the whole block is one slot
+
+    const int row0 = (blockIdx.x * MOE_ROWS_PER_BLOCK + threadIdx.y) * MOE_Q8_ROWS;
+    if (row0 >= ff) return;
+    const uint8_t* g_base = gate_tab ? (const uint8_t*)gate_tab[expert] : gate_w + (size_t)expert * expert_stride;
+    const uint8_t* u_base = up_tab ? (const uint8_t*)up_tab[expert] : up_w + (size_t)expert * expert_stride;
+    if (st >= 0) {
+        g_base = gate_stage + (size_t)st * expert_stride;
+        u_base = up_stage + (size_t)st * expert_stride;
+    }
+    const int groups = K / 32;
+    const block_q8a* a = xq + (size_t)token * groups;
+
+    float acc_g[MOE_Q8_ROWS], acc_u[MOE_Q8_ROWS];
+#pragma unroll
+    for (int r = 0; r < MOE_Q8_ROWS; ++r) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
+    for (int g = threadIdx.x; g < groups; g += 32) {
+#pragma unroll
+        for (int r = 0; r < MOE_Q8_ROWS; ++r) {
+            const size_t off = (size_t)min(row0 + r, ff - 1) * row_bytes;
+            acc_g[r] += q8dot<TYPE>::dot(g_base + off, g, a);
+            acc_u[r] += q8dot<TYPE>::dot(u_base + off, g, a);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MOE_Q8_ROWS; ++r) {
+        const float gs = warp_reduce_sum(acc_g[r]);
+        const float us = warp_reduce_sum(acc_u[r]);
+        if (threadIdx.x == 0 && row0 + r < ff) {
+            const float silu = gs / (1.0f + __expf(-gs));
+            h[((size_t)token * top_k + slot) * ff + row0 + r] = silu * us;
+        }
+    }
+}
+
+// y[token][row] += sum_k weight[token][k] * (down_e[row] . h[token][k]), with
+// h quantized per (token, slot) row: hq[(token * top_k + slot) * ff / 32 + g].
+template <int TYPE>
+__global__ __launch_bounds__(32 * MOE_ROWS_PER_BLOCK) void moe_down_q8_kernel(
+    const uint8_t* __restrict__ down_w,
+    const block_q8a* __restrict__ hq,
+    const int32_t* __restrict__ ids,
+    const float* __restrict__ weights,
+    float* __restrict__ y,
+    const int ff,
+    const int n_embd,
+    const int top_k,
+    const size_t row_bytes,
+    const size_t expert_stride,
+    const unsigned long long* __restrict__ down_tab,
+    const int32_t* __restrict__ sidx,
+    const uint8_t* __restrict__ down_stage,
+    const int only) {
+
+    const int row = blockIdx.x * MOE_ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= n_embd) return;
+    const int token = blockIdx.y;
+    const int lane = threadIdx.x;
+
+    // As moe_down_kernel: lane s < top_k resolves slot s's row, the lanes
+    // split the (slot, group) pairs.
+    const uint8_t* my_row = nullptr;
+    float my_w = 0.0f;
+    if (lane < top_k) {
+        const int expert = ids[(size_t)token * top_k + lane];
+        my_w = weights[(size_t)token * top_k + lane];
+        const uint8_t* d_base = down_tab ? (const uint8_t*)down_tab[expert] : down_w + (size_t)expert * expert_stride;
+        const int st = sidx ? sidx[(size_t)token * top_k + lane] : -1;
+        if (st >= 0) d_base = down_stage + (size_t)st * expert_stride;
+        my_row = d_base + (size_t)row * row_bytes;
+        if (only != 0 && (only == 2) != (st >= 0)) my_row = nullptr;
+    }
+    const int groups = ff / 32;
+    const int pairs = top_k * groups;
+    float total = 0.0f;
+    for (int p0 = 0; p0 < pairs; p0 += 32) {
+        const int p = p0 + lane;
+        const int slot = min(p, pairs - 1) / groups;
+        const int grp = min(p, pairs - 1) - slot * groups;
+        const unsigned long long rp = __shfl_sync(0xffffffffu, (unsigned long long)my_row, slot);
+        const float w = __shfl_sync(0xffffffffu, my_w, slot);
+        if (p >= pairs || rp == 0) continue;
+        const block_q8a* a = hq + ((size_t)token * top_k + slot) * groups;
+        total = fmaf(w, q8dot<TYPE>::dot((const uint8_t*)rp, grp, a), total);
+    }
+    total = warp_reduce_sum(total);
+    if (lane == 0) y[(size_t)token * n_embd + row] += total;
+}
+
+// Quantizes n_groups 32-value groups of `x` into block_q8a, as the dense
+// decode's quantize_q8a_kernel (matmul.cu) does: amax/127 scale, round to
+// nearest even, the code sum folded into ds.y.
+__global__ void moe_quantize_q8a_kernel(const float* __restrict__ x, block_q8a* __restrict__ out, const int n_groups) {
+    const int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (g >= n_groups) return;
+    const float v = x[(size_t)g * 32 + lane];
+    float amax = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    const int qi = __float2int_rn(v * id);
+    int sum = qi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    out[g].qs[lane] = (int8_t)qi;
+    if (lane == 0) out[g].ds = __floats2half2_rn(d, d * (float)sum);
+}
+
+static void moe_quantize_q8a(const float* x, block_q8a* out, int64_t n_groups, cudaStream_t stream) {
+    const int per_block = 8;   // groups (warps) per block
+    moe_quantize_q8a_kernel<<<(unsigned)((n_groups + per_block - 1) / per_block), 32 * per_block, 0, stream>>>(
+        x, out, (int)n_groups);
+}
+
+// Whether the integer decode kernels serve this call.
+static bool moe_q8_ok(int32_t type_id, const void* q8, int32_t n_tokens) {
+    if (!q8 || n_tokens > MOE_Q8_MAX_TOKENS) return false;
+    static const bool off = getenv("AIRUN_MOE_F32") != nullptr;
+    if (off) return false;
+    switch (type_id) {
+#define Q8CASE(TYPE) case TYPE:
+        AIRUN_FOR_EACH_Q8_TYPE(Q8CASE)
+#undef Q8CASE
+        return true;
+        default:
+            return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,12 +1090,30 @@ airun_status airun_moe_gate_up_tab(
     int32_t k, int32_t ff, int32_t n_tokens, int32_t top_k,
     uint64_t row_bytes, uint64_t expert_stride, const void* gate_tab, const void* up_tab,
     const void* sidx, const void* gate_stage, const void* up_stage,
-    int32_t only, cudaStream_t stream) {
+    int32_t only, void* q8, cudaStream_t stream) {
 
     if (n_tokens <= 0) return AIRUN_OK;
     if (k % 32 != 0) return AIRUN_ERR_BAD_ARG;
 
     const dim3 block(32, MOE_ROWS_PER_BLOCK);
+    if (moe_q8_ok(type_id, q8, n_tokens)) {
+        moe_quantize_q8a((const float*)x, (block_q8a*)q8, (int64_t)n_tokens * k / 32, stream);
+        const dim3 qgrid((ff + MOE_Q8_ROWS * MOE_ROWS_PER_BLOCK - 1) / (MOE_Q8_ROWS * MOE_ROWS_PER_BLOCK), top_k,
+                         n_tokens);
+#define LAUNCH(TYPE)                                                          \
+    moe_gate_up_q8_kernel<TYPE><<<qgrid, block, 0, stream>>>(                 \
+        (const uint8_t*)gate_w, (const uint8_t*)up_w, (const block_q8a*)q8,   \
+        (const int32_t*)ids, (float*)h, k, ff, top_k,                         \
+        (size_t)row_bytes, (size_t)expert_stride,                             \
+        (const unsigned long long*)gate_tab, (const unsigned long long*)up_tab,  \
+        (const int32_t*)sidx, (const uint8_t*)gate_stage, (const uint8_t*)up_stage, only);
+        switch (type_id) {
+            AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)
+            default: return AIRUN_ERR_BAD_ARG;
+        }
+#undef LAUNCH
+        AIRUN_CHECK_LAUNCH();
+    }
     const dim3 grid((ff + 2 * MOE_ROWS_PER_BLOCK - 1) / (2 * MOE_ROWS_PER_BLOCK), top_k, n_tokens);
 
 #define LAUNCH(TYPE)                                                          \
@@ -897,13 +1138,28 @@ airun_status airun_moe_down_tab(
     int32_t ff, int32_t n_embd, int32_t n_tokens, int32_t top_k,
     uint64_t row_bytes, uint64_t expert_stride, const void* down_tab,
     const void* sidx, const void* down_stage,
-    int32_t only, cudaStream_t stream) {
+    int32_t only, void* q8, cudaStream_t stream) {
 
     if (n_tokens <= 0) return AIRUN_OK;
     if (ff % 32 != 0) return AIRUN_ERR_BAD_ARG;
 
     const dim3 block(32, MOE_ROWS_PER_BLOCK);
     const dim3 grid((n_embd + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK, n_tokens);
+    if (moe_q8_ok(type_id, q8, n_tokens)) {
+        moe_quantize_q8a((const float*)h, (block_q8a*)q8, (int64_t)n_tokens * top_k * ff / 32, stream);
+#define LAUNCH(TYPE)                                                          \
+    moe_down_q8_kernel<TYPE><<<grid, block, 0, stream>>>(                     \
+        (const uint8_t*)down_w, (const block_q8a*)q8, (const int32_t*)ids,    \
+        (const float*)weights, (float*)y, ff, n_embd, top_k,                  \
+        (size_t)row_bytes, (size_t)expert_stride, (const unsigned long long*)down_tab, \
+        (const int32_t*)sidx, (const uint8_t*)down_stage, only);
+        switch (type_id) {
+            AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)
+            default: return AIRUN_ERR_BAD_ARG;
+        }
+#undef LAUNCH
+        AIRUN_CHECK_LAUNCH();
+    }
 
 #define LAUNCH(TYPE)                                                          \
     moe_down_kernel<TYPE><<<grid, block, 0, stream>>>(                        \
@@ -925,9 +1181,9 @@ airun_status airun_moe_gate_up(
     const void* gate_w, const void* up_w, const void* x, const void* ids, void* h,
     int32_t k, int32_t ff, int32_t n_tokens, int32_t top_k,
     uint64_t row_bytes, uint64_t expert_stride,
-    cudaStream_t stream) {
+    void* q8, cudaStream_t stream) {
     return airun_moe_gate_up_tab(type_id, gate_w, up_w, x, ids, h, k, ff, n_tokens, top_k, row_bytes,
-                                 expert_stride, nullptr, nullptr, nullptr, nullptr, nullptr, 0, stream);
+                                 expert_stride, nullptr, nullptr, nullptr, nullptr, nullptr, 0, q8, stream);
 }
 
 airun_status airun_moe_down(
@@ -935,9 +1191,15 @@ airun_status airun_moe_down(
     const void* down_w, const void* h, const void* ids, const void* weights, void* y,
     int32_t ff, int32_t n_embd, int32_t n_tokens, int32_t top_k,
     uint64_t row_bytes, uint64_t expert_stride,
-    cudaStream_t stream) {
+    void* q8, cudaStream_t stream) {
     return airun_moe_down_tab(type_id, down_w, h, ids, weights, y, ff, n_embd, n_tokens, top_k, row_bytes,
-                              expert_stride, nullptr, nullptr, nullptr, 0, stream);
+                              expert_stride, nullptr, nullptr, nullptr, 0, q8, stream);
+}
+
+// Bytes of scratch the q8 argument of the expert launchers needs; 0 when the
+// integer kernels never run (more tokens than a decode).
+uint64_t airun_moe_q8_scratch_bytes(int32_t k, int32_t top_k, int32_t ff) {
+    return moe_q8_scratch_bytes(MOE_Q8_MAX_TOKENS, k, top_k, ff);
 }
 
 airun_status airun_moe_stage_plan(const void* ids, int32_t n_ids, const void* resident, int32_t n_experts,
@@ -949,15 +1211,39 @@ airun_status airun_moe_stage_plan(const void* ids, int32_t n_ids, const void* re
     AIRUN_CHECK_LAUNCH();
 }
 
-// Up to `cap` experts of `stride` bytes (a multiple of 16).
-airun_status airun_moe_stage_copy(const void* tab, const void* list, const void* n_list, void* stage,
-                                  uint64_t stride, int32_t cap, cudaStream_t stream) {
+airun_status airun_moe_stage_plan_pre(const void* ids, int32_t n_ids, const void* resident, int32_t n_experts,
+                                      const void* pre_list, const void* n_pre, void* sidx, void* list, void* n_list,
+                                      void* first, void* stats, cudaStream_t stream) {
+    if (n_ids <= 0) return AIRUN_OK;
+    moe_stage_plan_pre_kernel<<<1, 256, n_experts * sizeof(int32_t), stream>>>(
+        (const int32_t*)ids, n_ids, (const uint8_t*)resident, n_experts, (const int32_t*)pre_list,
+        (const int32_t*)n_pre, (int32_t*)sidx, (int32_t*)list, (int32_t*)n_list, (int32_t*)first,
+        (unsigned int*)stats);
+    AIRUN_CHECK_LAUNCH();
+}
+
+// Up to `cap` experts of `stride` bytes (a multiple of 16), from slot first[0]
+// on (`first` nullable: 0).
+airun_status airun_moe_stage_copy(const void* tab, const void* list, const void* n_list, const void* first,
+                                  void* stage, uint64_t stride, int32_t cap, cudaStream_t stream) {
     if (cap <= 0) return AIRUN_OK;
     if (stride % 16 != 0) return AIRUN_ERR_BAD_ARG;
-    const dim3 grid(32, cap);
+    // Blocks per expert: AIRUN_STAGE_BLOCKS, else 4. The copy runs beside the
+    // resident experts' kernels, and each of its blocks holds SM slots for the
+    // whole PCIe round trip: at 32 blocks an expert (256 at once) it filled
+    // the GPU and stalled them. Four, with eight 16-byte loads in flight per
+    // thread, still keep ~130 KB of reads outstanding, past what PCIe 4.0 x16
+    // needs. 35B-A3B Q4_K_M on an RTX 3060, 22% of experts from RAM:
+    // 32 blocks 51.6 tok/s, 8 55, 4 58.7-60.6, 3 60.0-60.4, 1 55.7-57.4.
+    static const int per = [] {
+        const char* v = getenv("AIRUN_STAGE_BLOCKS");
+        const int n = v ? atoi(v) : 0;
+        return n > 0 ? n : 4;
+    }();
+    const dim3 grid(per, cap);
     moe_stage_copy_kernel<<<grid, 256, 0, stream>>>(
-        (const unsigned long long*)tab, (const int32_t*)list, (const int32_t*)n_list, (uint8_t*)stage,
-        (size_t)stride);
+        (const unsigned long long*)tab, (const int32_t*)list, (const int32_t*)n_list, (const int32_t*)first,
+        (uint8_t*)stage, (size_t)stride);
     AIRUN_CHECK_LAUNCH();
 }
 
