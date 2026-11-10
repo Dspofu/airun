@@ -45,9 +45,57 @@ pub struct GpuTensor {
 
 /// A tensor kept in pinned RAM, and where its staged copy lands in VRAM.
 pub struct RamWeights {
-    pub host: airun_cuda::PinnedBuffer<u8>,
+    pub host: HostBytes,
     /// Device address inside the layer's GPU's staging buffer.
     pub staged: u64,
+}
+
+/// Where the bytes of a [`RamWeights`] are.
+pub enum HostBytes {
+    /// Copied into page-locked RAM at load.
+    Pinned(airun_cuda::PinnedBuffer<u8>),
+    /// Left in the model file (`--disk-offload`): a slice of its mapping,
+    /// paged in from the disk as it is read (see disk.rs). Unlike the pinned
+    /// copy, NVFP4 scales are not sanitized here; the CPU decoder reads 0x7F
+    /// as zero already, and a copy into VRAM is sanitized on the GPU.
+    File { file: Arc<GgufFile>, info: TensorInfo },
+}
+
+impl HostBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Pinned(b) => b.as_slice(),
+            Self::File { file, info } => file.tensor_bytes(info).expect("the tensor was read at load"),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn on_disk(&self) -> bool {
+        matches!(self, Self::File { .. })
+    }
+}
+
+/// One copy that stages a RAM layer's matrix into VRAM before the layer runs
+/// on the GPU (a prompt chunk; see cpu::set_pass).
+#[derive(Clone, Copy, Debug)]
+pub struct RamCopy {
+    /// Host address: pinned RAM, or the model file's mapping.
+    pub host: usize,
+    /// Device address inside the staging buffer.
+    pub dev: u64,
+    pub bytes: usize,
+    /// NVFP4 blocks to sanitize after the copy (see load_cached): a matrix
+    /// read from the file still has its 0x7F scales. 0 otherwise.
+    pub nvfp4_blocks: usize,
+    /// The host side is file pages, not pinned memory.
+    pub on_disk: bool,
 }
 
 /// An expert stack too big for VRAM, every expert addressable by the kernels:
@@ -382,9 +430,9 @@ pub struct LayerWeights {
     /// The mixes before the token mixer and before the feed-forward.
     pub hc: Option<(HcMix, HcMix)>,
     pub ple: Option<PleWeights>,
-    /// For a layer whose weights stay in RAM, the copies that stage them into
-    /// VRAM before it runs: (pinned host address, device address, bytes).
-    pub ram_copies: Vec<(usize, u64, usize)>,
+    /// For a layer whose weights stay in RAM (or on disk), the copies that
+    /// stage them into VRAM before it runs on the GPU.
+    pub ram_copies: Vec<RamCopy>,
 }
 
 /// The multi-token-prediction head stored after the main layers
@@ -427,6 +475,8 @@ pub struct Model {
     /// The VRAM that layers kept in RAM are staged through, one per GPU that
     /// runs any (sized by the planner for the largest such layer).
     pub ram_staging: Vec<DeviceBuffer<u8>>,
+    /// Fetches the layers read from the file ahead of use (--disk-offload).
+    pub disk: Option<crate::disk::Prefetcher>,
 }
 
 impl Model {
@@ -551,6 +601,9 @@ impl Model {
             && !std::env::var("AIRUN_RAM_ON_GPU").is_ok_and(|v| v.trim() != "0") {
             crate::cpu::set_in_use();
         }
+        if placement.shards.iter().any(|s| !s.disk_layers.is_empty()) {
+            crate::disk::set_in_use();
+        }
         let mut ram_staging: Vec<DeviceBuffer<u8>> = Vec::new();
         for dev in placement.devices() {
             let bytes = placement.staging_bytes(dev);
@@ -569,6 +622,7 @@ impl Model {
             let order = profile.filter(|p| p.knows(l)).map(|p| p.order(l));
             // A layer kept in RAM: its matrices are pinned host copies, staged
             // one after another into its GPU's staging buffer.
+            let on_disk = placement.layer_on_disk(l);
             let staging = placement.layer_in_ram(l).then(|| {
                 ram_staging.iter().find(|b| b.device() == dev).map(|b| (b.as_ptr() as u64, b.len()))
             }).flatten();
@@ -577,7 +631,11 @@ impl Model {
             let packed = |n: &str| -> Result<GpuTensor> {
                 match staging {
                     Some((base, cap)) => {
-                        let t = load_ram(gguf, n, dev, &config, base + cursor.get() as u64)?;
+                        let t = if on_disk {
+                            load_disk(gguf, n, dev, &config, base + cursor.get() as u64)?
+                        } else {
+                            load_ram(gguf, n, dev, &config, base + cursor.get() as u64)?
+                        };
                         let len = t.ram.as_ref().map_or(0, |r| r.host.len());
                         if cursor.get() + len > cap {
                             return Err(CoreError::Other(format!(
@@ -585,7 +643,15 @@ impl Model {
                                 airun_cuda::human_bytes(cap as u64))));
                         }
                         if let Some(r) = &t.ram {
-                            copies.borrow_mut().push((r.host.as_raw() as usize, r.staged, len));
+                            let sanitize = r.host.on_disk() && t.ty == airun_gguf::GgmlType::NVFP4
+                                && airun_cuda::ops::fp4_supported();
+                            copies.borrow_mut().push(RamCopy {
+                                host: r.host.as_slice().as_ptr() as usize,
+                                dev: r.staged,
+                                bytes: len,
+                                nvfp4_blocks: if sanitize { len / 36 } else { 0 },
+                                on_disk: r.host.on_disk(),
+                            });
                         }
                         cursor.set(cursor.get() + len.div_ceil(256) * 256);
                         Ok(t)
@@ -708,6 +774,13 @@ impl Model {
             s.synchronize()?;
         }
 
+        // The layers read from the file, in run order, with their ranges.
+        let disk_layers: Vec<(usize, Vec<(usize, usize)>)> = layers.iter().enumerate()
+            .filter(|(l, _)| placement.layer_on_disk(*l))
+            .map(|(l, w)| (l, w.ram_copies.iter().filter(|c| c.on_disk).map(|c| (c.host, c.bytes)).collect()))
+            .collect();
+        let disk = (!disk_layers.is_empty()).then(|| crate::disk::Prefetcher::new(gguf, disk_layers));
+
         Ok(Self {
             config,
             placement,
@@ -722,6 +795,7 @@ impl Model {
             total_bytes,
             expert_profile: None,
             ram_staging,
+            disk,
         })
     }
 
@@ -1102,7 +1176,8 @@ fn load_ram(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Config, stag
     let bytes = gguf.tensor_bytes(info)?;
     let mut host = airun_cuda::PinnedBuffer::<u8>::new(bytes.len()).map_err(|e| CoreError::Other(format!(
         "cannot pin {} of RAM for {name} ({e}); free RAM, lower --ctx-size so fewer layers stay in RAM, \
-         or use --alloc gpu", airun_cuda::human_bytes(bytes.len() as u64))))?;
+         pass --disk-offload to read what the RAM cannot hold from the SSD, or use --alloc gpu",
+        airun_cuda::human_bytes(bytes.len() as u64))))?;
     host.as_mut_slice().copy_from_slice(bytes);
     // As load_cached does on the GPU: ggml reads a 0x7F NVFP4 run scale as
     // zero, the FP4 tensor cores as NaN. Each 36-byte block starts with its
@@ -1117,14 +1192,40 @@ fn load_ram(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Config, stag
         }
     }
     let mut t = describe_packed(gguf, name, device, config)?;
-    t.ram = Some(RamWeights { host, staged });
+    t.ram = Some(RamWeights { host: HostBytes::Pinned(host), staged });
     Ok(t)
 }
 
+/// A matrix left in the model file (`--disk-offload`): nothing is read now;
+/// the CPU kernels read the mapping, and a pass on the GPU stages it to
+/// `staged` (see [`HostBytes::File`]).
+fn load_disk(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Config, staged: u64) -> Result<GpuTensor> {
+    let info = tensor_info(gguf, name, &config.arch_name)?;
+    if !airun_cuda::ops::KernelType(info.ty.id() as i32).is_supported() {
+        return Err(CoreError::UnsupportedTensorType { name: name.to_string(), ty: info.ty.to_string() });
+    }
+    // Bounds-checks the slice now, so HostBytes::as_slice cannot fail later.
+    gguf.tensor_bytes(info)?;
+    let info = info.clone();
+    let mut t = describe_packed(gguf, name, device, config)?;
+    t.ram = Some(RamWeights { host: HostBytes::File { file: Arc::clone(gguf), info }, staged });
+    Ok(t)
+}
+
+/// Set by the loader when --disk-offload finds no RAM for mapped experts.
+static STREAM_EXPERTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Experts that do not fit in VRAM are read from the file from now on.
+pub fn stream_experts() {
+    STREAM_EXPERTS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether experts that do not fit in VRAM live in mapped host memory (the
-/// default) or are read from the GGUF on each miss (AIRUN_EXPERTS=stream).
+/// default) or are read from the GGUF on each miss (AIRUN_EXPERTS=stream, or
+/// --disk-offload with too little RAM).
 pub fn experts_mapped() -> bool {
-    std::env::var("AIRUN_EXPERTS").map_or(true, |v| v.trim() != "stream")
+    !STREAM_EXPERTS.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var("AIRUN_EXPERTS").map_or(true, |v| v.trim() != "stream")
 }
 
 /// Uploads a tensor widened to f32. Used for norms and delta-net coefficients.
@@ -1203,7 +1304,7 @@ fn validate_shapes(cfg: &Config, layers: &[LayerWeights], embd: &GpuTensor) -> R
         });
     }
 
-    let mut check = |name: String, found: (usize, usize), expected: (usize, usize)| -> Result<()> {
+    let check = |name: String, found: (usize, usize), expected: (usize, usize)| -> Result<()> {
         if found != expected {
             return Err(CoreError::ShapeMismatch {
                 name,

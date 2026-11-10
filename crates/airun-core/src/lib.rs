@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod cpu;
+pub mod disk;
 pub mod error;
 mod expert_cache;
 mod gather_pool;

@@ -396,10 +396,12 @@ fn mixed_graphs_disabled() -> bool {
 }
 
 /// Whether AIRUN_NO_GRAPH=1 turned off decode graph capture, or some
-/// layer's matmuls run on the CPU, which a graph cannot hold.
+/// layer's matmuls run on the CPU or read the model file, which a graph
+/// cannot hold.
 fn graphs_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var("AIRUN_NO_GRAPH").is_ok_and(|v| v.trim() != "0")) || crate::cpu::in_use()
+        || crate::disk::in_use()
 }
 
 /// Whether `n` queries over one cache (a speculative verify) take the split
@@ -1707,9 +1709,18 @@ impl Runtime {
             // VRAM, in stream order, so they land after the previous such
             // layer is done with it. In a captured decode graph these are copy
             // nodes from the same pinned addresses.
-            for &(host, dev, bytes) in self.model.layers[layer].ram_copies.iter().filter(|_| !crate::cpu::pass_on_cpu()) {
-                airun_cuda::copy_h2d(dev as *mut std::ffi::c_void, host as *const std::ffi::c_void, bytes,
+            // A layer on disk (--disk-offload) is read from file pages: the
+            // prefetcher brings in the next ones meanwhile, and its NVFP4
+            // scales are sanitized once in VRAM.
+            if let Some(d) = &self.model.disk {
+                d.before(layer);
+            }
+            for c in self.model.layers[layer].ram_copies.iter().filter(|_| !crate::cpu::pass_on_cpu()) {
+                airun_cuda::copy_h2d(c.dev as *mut std::ffi::c_void, c.host as *const std::ffi::c_void, c.bytes,
                     &self.states[si].stream)?;
+                if c.nvfp4_blocks > 0 {
+                    ops::nvfp4_sanitize(c.dev as *mut std::ffi::c_void, c.nvfp4_blocks, &self.states[si].stream)?;
+                }
             }
             self.run_layer(si, local, layer, n, &cfg)?;
         }
@@ -2436,7 +2447,7 @@ impl Runtime {
         let need = total + if with_head { pending_bytes } else { 0 };
         // The previous snapshot's buffer, if it is big enough. Its last
         // restore was queued on the streams that queue the copies below.
-        let mut bytes = match self.turn_snap.take() {
+        let bytes = match self.turn_snap.take() {
             Some(s) if s.bytes.len() >= need => s.bytes,
             _ => airun_cuda::PinnedBuffer::new(total + pending_bytes)?,
         };

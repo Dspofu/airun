@@ -28,6 +28,8 @@ airun selftest    conferir os kernels da GPU contra a referência em Rust
 | `--hide-gpu <lista>` | nenhuma | GPUs que o airun **nunca** toca, nem para abrir contexto: número do CUDA (como `airun gpu` mostra sem nada oculto), UUID ou parte do nome, ex.: `--hide-gpu 5060`. Vale para qualquer comando. As outras passam a ser numeradas a partir de 0, e `--gpus`/`--main-gpu`/`--tensor-split` usam a numeração nova. Para ocultar sempre, defina `AIRUN_HIDE_GPUS` no ambiente. |
 | `--main-gpu <N>` | a mais rápida | A GPU que é enchida primeiro. Escolha a que está no slot PCIe mais rápido. |
 | `--alloc <modo>` | `auto` | Onde os pesos e o cache podem ficar. `auto`: nas GPUs necessárias e, só se faltar, na RAM (primeiro o cache, depois os pesos). `gpu`: só na VRAM (se não couber, reduz o contexto ou dá erro). `memory`: em todas as GPUs e depois na RAM. |
+| `--disk-offload` | desligado | Quando a VRAM e a RAM acabam, as camadas que sobram (ou, no MoE, os experts) são lidas **direto do arquivo .gguf no disco** enquanto rodam, em vez de a carga falhar. Veja [Offload para o disco](#offload-para-o-disco). |
+| `--ram-reserve <MiB>` | 1/10 da RAM (2–8 GiB) | RAM deixada livre para o sistema e outros programas ao decidir o que os pesos podem fixar. Com `--disk-offload`, o que passa disso vai para o disco. |
 | `--tensor-split <frações>` | — | Divide as camadas à mão, ex.: `0.7,0.3`. Desliga a divisão automática. |
 | `--single-gpu <N>` | — | Põe o modelo inteiro numa GPU. |
 | `--vram-reserve <MiB>` | `384` | VRAM deixada livre em cada GPU (o Windows não entrega os últimos megabytes). |
@@ -146,6 +148,33 @@ O airun tenta nesta ordem e avisa o que mudou:
 3. **Reserva de VRAM em 128 MiB:** último recurso.
 
 `--no-fallback` desliga essas reduções.
+
+### Offload para o disco
+
+Com `--disk-offload`, a ordem fica: **VRAM → RAM → disco**. As camadas que o
+planner manda para a RAM (veja acima) e que não cabem na RAM livre, depois de
+`--ram-reserve`, não são copiadas: ficam no próprio .gguf, mapeado em memória,
+e o sistema operacional as lê do SSD quando a CPU as multiplica, e as
+descarta quando outra coisa precisa da memória. Nada é fixado para elas, então
+não ocupam RAM nem o limite de commit do Windows.
+
+- Enquanto uma camada roda, 4 threads trazem as **2 seguintes** do disco
+  (`AIRUN_DISK_AHEAD`, `AIRUN_DISK_THREADS`), com leituras grandes
+  (`PrefetchVirtualMemory` no Windows, `madvise` no Linux).
+- **MoE:** se os experts que não cabem na VRAM não cabem na RAM, passam a ser
+  lidos do arquivo quando roteados (o mesmo caminho de `AIRUN_EXPERTS=stream`).
+- `--stats` mostra quais camadas ficaram no disco.
+- **MTP:** com camadas no disco e sem `--draft`, a cabeça rascunha 6 tokens por passo em vez de 4. Cada passada lê o disco uma vez, então mais tokens por passada é mais rápido (27B no NVMe: ~0,92 → ~1,05 tok/s).
+- **Prompt longo:** cada bloco de `-b` tokens relê as camadas do disco. Um prompt de 4096 tokens com `-b 512` lê o disco 8 vezes.
+
+**É lento.** Cada token relê essas camadas inteiras do disco: a velocidade é a
+do SSD dividida pelos bytes no disco (um NVMe de ~5 GB/s com 5 GB no disco dá
+~1 token/s, no melhor caso). Num HD fica inutilizável. Serve para rodar um
+modelo que de outro jeito não carregaria; para velocidade, prefira uma
+quantização menor ou menos contexto.
+
+Sem a opção, quando a RAM não comporta o plano, o airun avisa e sugere
+`--disk-offload`.
 
 ---
 
@@ -610,6 +639,8 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_NO_SPLIT_VERIFY=1` | A atenção do verify do MTP (vários tokens sobre um cache) volta ao kernel de prefill, que lê o contexto inteiro por bloco: 27B a 25 mil tokens, 52,8 → 34,2 tok/s. |
 | `AIRUN_RAM_ON_GPU=1` | Camadas que ficam na RAM são sempre copiadas para a VRAM antes de rodar, em vez de multiplicadas na CPU na geração. |
 | `AIRUN_CPU_THREADS=<n>` | Threads dos matmuls na CPU (padrão: uma por núcleo lógico). Na memória DDR5 do 13700, 8 já saturam a banda. |
+| `AIRUN_DISK_AHEAD=<n>` | Com `--disk-offload`, quantas camadas do disco são lidas adiantadas enquanto a atual roda (padrão 2). Cada uma ocupa sua parte do cache de arquivos. |
+| `AIRUN_DISK_THREADS=<n>` | Threads que leem essas camadas adiantadas (padrão 4). |
 | `AIRUN_CPU_MAX_TOKENS=<n>` | Passadas de até n tokens multiplicam as camadas da RAM na CPU; maiores copiam para a GPU (padrão 64). |
 | `AIRUN_NO_ROWS_SPEC=1` | Com `serve --parallel`, os passos em lote seguem sem rascunhos do MTP (só o pedido sozinho rascunha). |
 | `AIRUN_ROWS_DRAFT=<k2,k3,...>` | Rascunhos por pedido num passo em lote de 2, 3... pedidos (padrão `2,1,1`; 0 = sem rascunho). |

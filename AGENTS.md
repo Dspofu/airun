@@ -1356,3 +1356,38 @@ Dividido, o planner põe 32/32 camadas e cada GPU fica em ~9 GiB.
   arquivo é Q5_K (874 MB), não BF16 — o comentário antigo em `plan.rs`
   estava errado. Uma Q8_0 (1,35 GB) leria mais bytes, não menos.
 
+
+## Offload para o disco: `--disk-offload` (2026-11-09)
+
+**O que faz:** a ordem passa a ser VRAM → RAM → disco. As camadas que o planner já mandaria para a RAM (`Shard::ram_layers`) e que não cabem na RAM livre ficam no próprio GGUF, sem cópia.
+
+- **Decisão** (`loader.rs`, `place_on_disk`, depois do `plan()`): orçamento = RAM disponível agora (`disk::available_ram`: `GlobalMemoryStatusEx` / `MemAvailable`) menos `--ram-reserve` (padrão 1/10 da RAM, 2–8 GiB), menos o KV na RAM, a embedding no host e os experts mapeados. `plan::spill_to_disk` mantém fixadas as primeiras camadas da RAM que cabem e põe o resto em `Shard::disk_layers` (subconjunto de `ram_layers`, bytes também em `ram_bytes`). Sem a flag, só uma `note:` sugerindo `--disk-offload`.
+- **Carga** (`model.rs`, `load_disk`): `RamWeights::host` virou `HostBytes::{Pinned, File}`. `File` guarda o `Arc<GgufFile>` e o `TensorInfo`, e `as_slice()` é a fatia do mmap. Nada é lido na carga (27B: 4,3 s contra 23 s fixando 6,2 GiB).
+- **CPU (geração):** `cpu::matvec` lê a fatia do mmap; o SO pagina do SSD. Não precisa de sanitize: `ue4m3_to_f32(0x7F)` já é 0.
+- **GPU (blocos de prompt > `AIRUN_CPU_MAX_TOKENS`, ou `AIRUN_RAM_ON_GPU=1`):** `RamCopy` (substitui a tupla de `ram_copies`) copia da memória paginável e roda `nvfp4_sanitize` no staging quando `nvfp4_blocks > 0`. Cópia de memória paginável não entra em grafo: `disk::in_use()` desliga os grafos.
+- **Prefetch** (`disk.rs`, `Prefetcher`): `queue_shard` chama `before(layer)`; 4 threads (`AIRUN_DISK_THREADS`) fazem `PrefetchVirtualMemory`/`madvise(WILLNEED)` e tocam uma página a cada 4 KiB das 2 próximas camadas do disco (`AIRUN_DISK_AHEAD`), em pedaços de 8 MiB, voltando ao início para o próximo token. As threads seguram um `Arc` do arquivo, então o mmap vive enquanto elas rodam.
+- **MoE:** se os experts que iriam para RAM mapeada (`MappedExperts`) passam do orçamento, `model::stream_experts()` força o caminho de `AIRUN_EXPERTS=stream` (misses lidos do arquivo). É tudo ou nada; não há metade mapeada, metade do arquivo.
+
+**Validado** (5070 Ti, `--alloc memory --vram-reserve` para empurrar camadas, `--ram-reserve 1000000` para pôr todas no disco), texto guloso idêntico ao de RAM fixada:
+- Qwen3-1.7B Q8_K_XL, 26 camadas no disco: prompt de 12 e de 358 tokens, com e sem `AIRUN_RAM_ON_GPU=1`.
+- 27B NVFP4 (MTP ligado), 31 camadas / 6,19 GiB no disco: prompt de 14 e de 360 tokens. Geração 9,6–9,7 tok/s contra 10,0 na RAM.
+- Teste do planner: `what_the_ram_cannot_hold_goes_to_disk`.
+
+**Não medido:** cache de arquivos frio. Nos testes acima o arquivo estava no cache do Windows (RAM sobrando), então o número é o de RAM, não o de SSD. Com a RAM de fato cheia, o teto é a banda do SSD dividida pelos bytes no disco, por token. O caminho de experts do MoE com a flag também não foi rodado (não há MoE pequeno nesta máquina); usa o streaming que já existia.
+
+**Análise de velocidade (2026-11-09, NVMe SK hynix HFS256GEJ9X110N no D:, leitura a frio; `tests/disk_bench.rs`):**
+
+| Método | GB/s |
+|---|---|
+| page faults, 1 thread | 0,93 |
+| page faults, 8 threads | 1,58 |
+| dica + toque, 4 threads, 8 MiB (o `Prefetcher`) | 1,61 |
+| dica + toque, 8 threads | 1,61 |
+| dica + toque, 16 threads, 4 MiB | 1,23 |
+| ReadFile com cache, 8 threads | 1,20 |
+| ReadFile sem cache (`FILE_FLAG_NO_BUFFERING`), 8 / 16 threads | 1,32 / 1,38 |
+
+- **Leitura:** o `Prefetcher` já está no teto do disco. Ler sem cache num anel fixado não ganha banda; só deixaria o uso de memória fixo.
+- **Decode:** com o disco frio, o tempo por passada é bytes no disco ÷ banda (27B: 6,65 GB → ~4,1 s). O que acelera é mais tokens por passada. Tokens por passada do MTP (27B, 160 tokens de código): draft 2 → 2,8; 4 → 3,8; 6 → 4,3; 8 → 4,3. Por isso `DISK_DEFAULT_DRAFT = 6` (loader.rs): com camadas no disco e sem `--draft`, projeta 1,05 contra 0,92 tok/s. Os buffers do MTP são dimensionados para 6 antes do plano; se nada vai para o disco, o runtime usa 4 dentro deles. Com o arquivo no cache do SO (RAM sobrando, como nos testes daqui), o draft menor ganha (9,9 / 9,1 / 8,0 tok/s com 2 / 4 / 6); mas camadas no disco só existem quando a RAM acabou.
+- **Prefill (não feito, é o maior ganho que sobra):** cada bloco de `-b` tokens relê todas as camadas do disco; um prompt de 4096 com `-b 512` lê o disco 8 vezes (~33 s no 27B). Rodar camada por camada, todos os blocos de uma vez (guardar o resíduo de cada bloco, KV e estado da delta-net seguem a ordem causal dentro da camada), leria uma vez só. Toca `generate`, `generate_spec`, o prefill do `serve`, imagens e snapshots, a cabeça MTP por bloco e o handoff entre GPUs.
+- **Achado à parte:** no Qwen3-1.7B Q8_K_XL, as camadas na RAM multiplicadas na CPU deram 2,5 tok/s e copiadas para a GPU (`AIRUN_RAM_ON_GPU=1`) 16,7 tok/s. O fallback `dequantize` + f32 de `cpu.rs` (tipos fora do NVFP4) é lento, e com PCIe rápido copiar ganha. A escolha CPU × cópia não olha o tipo nem a banda do link.

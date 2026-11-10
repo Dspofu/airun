@@ -132,6 +132,11 @@ pub struct Shard {
     pub kv_ram_layers: Vec<usize>,
     pub kv_ram_bytes: u64,
     pub kv_stage_bytes: u64,
+    /// The part of `ram_layers` read from the model file instead of pinned
+    /// RAM (`--disk-offload`, see disk.rs): what the RAM could not hold.
+    /// Their bytes are in `ram_bytes` too.
+    pub disk_layers: Vec<usize>,
+    pub disk_bytes: u64,
 }
 
 impl Shard {
@@ -188,6 +193,11 @@ impl Placement {
         self.shards.iter().any(|s| s.ram_layers.contains(&l))
     }
 
+    /// Whether layer `l`'s weights are read from the model file on disk.
+    pub fn layer_on_disk(&self, l: usize) -> bool {
+        self.shards.iter().any(|s| s.disk_layers.contains(&l))
+    }
+
     /// Whether layer `l`'s KV cells stay in RAM.
     pub fn kv_in_ram(&self, l: usize) -> bool {
         self.shards.iter().any(|s| s.kv_ram_layers.contains(&l))
@@ -237,15 +247,26 @@ impl Placement {
                 airun_cuda::human_bytes(s.total_bytes()),
                 airun_cuda::human_bytes(s.budget_bytes),
             );
-            if !s.ram_layers.is_empty() {
+            let pinned: Vec<usize> = s.ram_layers.iter().copied().filter(|l| !s.disk_layers.contains(l)).collect();
+            if !pinned.is_empty() {
                 let _ = writeln!(
                     out,
                     "      layers {}..{} ({}) in RAM: {} pinned, copied through {} of VRAM before they run",
-                    s.ram_layers[0],
-                    s.ram_layers[s.ram_layers.len() - 1],
-                    s.ram_layers.len(),
-                    airun_cuda::human_bytes(s.ram_bytes),
+                    pinned[0],
+                    pinned[pinned.len() - 1],
+                    pinned.len(),
+                    airun_cuda::human_bytes(s.ram_bytes - s.disk_bytes),
                     airun_cuda::human_bytes(s.staging_bytes),
+                );
+            }
+            if !s.disk_layers.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "      layers {}..{} ({}) on disk: {} read from the model file as they run (--disk-offload)",
+                    s.disk_layers[0],
+                    s.disk_layers[s.disk_layers.len() - 1],
+                    s.disk_layers.len(),
+                    airun_cuda::human_bytes(s.disk_bytes),
                 );
             }
             if !s.kv_ram_layers.is_empty() {
@@ -781,6 +802,8 @@ fn try_place(
             kv_stage_bytes: if layers.iter().any(|l| kv_ram.contains(l)) { stage } else { 0 },
             kv_ram_bytes: layers.iter().filter(|l| kv_ram.contains(l)).count() as u64 * moved,
             kv_ram_layers: layers.iter().copied().filter(|l| kv_ram.contains(l)).collect(),
+            disk_layers: Vec::new(),
+            disk_bytes: 0,
         });
     }
 
@@ -1003,6 +1026,34 @@ fn spill_to_ram(
     let mut out: Vec<(i32, usize)> = ordered.iter().zip(&counts).map(|(d, &c)| (d.ordinal, c)).collect();
     out.retain(|&(_, c)| c > 0);
     Some((out, ram))
+}
+
+/// Moves the layers kept in RAM that do not fit `ram_budget` bytes of pinned
+/// memory to the disk (`--disk-offload`): the first ones, in run order, stay
+/// pinned, the rest are read from the file. Returns the bytes moved.
+pub fn spill_to_disk(placement: &mut Placement, sizes: &WeightSizes, ram_budget: u64) -> u64 {
+    let mut pinned = 0u64;
+    let mut moved = 0u64;
+    for s in &mut placement.shards {
+        s.disk_layers.clear();
+        s.disk_bytes = 0;
+        for &l in &s.ram_layers {
+            let b = sizes.per_layer[l];
+            if pinned + b <= ram_budget {
+                pinned += b;
+            } else {
+                s.disk_layers.push(l);
+                s.disk_bytes += b;
+                moved += b;
+            }
+        }
+    }
+    moved
+}
+
+/// Bytes of weights the plan keeps in RAM, across all shards.
+pub fn ram_weight_bytes(placement: &Placement) -> u64 {
+    placement.shards.iter().map(|s| s.ram_bytes).sum()
 }
 
 /// Splits `n_layers` into contiguous runs proportional to `weights`.
@@ -1261,6 +1312,28 @@ mod tests {
         let gpu_only = PlacementRequest { ctx: 40960, alloc: AllocMode::Gpu, ..Default::default() };
         let p = plan(&cfg, &sz, &devs, &gpu_only).unwrap();
         assert!(p.ctx < 40960 && p.shards[0].kv_ram_layers.is_empty(), "--alloc gpu shrinks the context instead");
+    }
+
+    /// --disk-offload: of the layers in RAM, the first that fit the RAM budget
+    /// stay pinned and the rest are read from the file.
+    #[test]
+    fn what_the_ram_cannot_hold_goes_to_disk() {
+        let cfg = config(40);
+        let sz = sizes(40, 500);
+        let devs = vec![device(0, 15, 70, 256)];
+        let mut p = plan(&cfg, &sz, &devs, &PlacementRequest { ctx: 8192, ..Default::default() }).unwrap();
+        let ram: Vec<usize> = p.shards[0].ram_layers.clone();
+        assert!(ram.len() > 3);
+        let budget = 3 * sz.per_layer[ram[0]] + 1;
+        let moved = spill_to_disk(&mut p, &sz, budget);
+        let s = &p.shards[0];
+        assert_eq!(s.disk_layers, ram[3..].to_vec(), "the first three stay pinned");
+        assert_eq!(moved, s.disk_bytes);
+        assert_eq!(s.disk_bytes, ram[3..].iter().map(|&l| sz.per_layer[l]).sum::<u64>());
+        assert!(p.layer_on_disk(39) && p.layer_in_ram(39) && !p.layer_on_disk(ram[0]));
+        // Enough RAM: nothing moves.
+        assert_eq!(spill_to_disk(&mut p, &sz, u64::MAX), 0);
+        assert!(p.shards[0].disk_layers.is_empty());
     }
 
     /// A model bigger than the GPU keeps its context and puts the layers that

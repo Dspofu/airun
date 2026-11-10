@@ -23,6 +23,20 @@ pub struct AllocArgs {
     /// in RAM (give it the fastest PCIe slot). Default: the fastest GPU.
     #[arg(long)]
     pub main_gpu: Option<i32>,
+
+    /// When neither VRAM nor RAM is left, read the remaining layers (or MoE
+    /// experts) straight from the model file on disk as they run, instead of
+    /// failing to load. Keep the .gguf on an SSD/NVMe: every token reads
+    /// those layers again, so it is far slower than RAM, and on a hard disk
+    /// unusable.
+    #[arg(long)]
+    pub disk_offload: bool,
+
+    /// MiB of RAM left free for the system and other programs when deciding
+    /// what weights may pin; the rest goes to disk with --disk-offload.
+    /// Default: a tenth of the installed RAM, between 2 and 8 GiB.
+    #[arg(long, value_name = "MiB")]
+    pub ram_reserve: Option<u64>,
 }
 
 #[derive(Args, Clone)]
@@ -269,6 +283,8 @@ impl RunArgs {
             slots: 1,
             alloc: self.alloc.alloc,
             main_gpu: self.alloc.main_gpu,
+            disk_offload: self.alloc.disk_offload,
+            ram_reserve: self.alloc.ram_reserve.map(|m| m << 20),
         }
     }
 

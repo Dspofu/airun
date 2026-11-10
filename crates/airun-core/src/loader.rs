@@ -52,6 +52,12 @@ pub struct LoadOptions {
     pub alloc: AllocMode,
     /// The GPU filled first; None picks the fastest.
     pub main_gpu: Option<i32>,
+    /// What the RAM cannot hold is read from the model file on disk
+    /// (`--disk-offload`, see disk.rs) instead of failing to pin.
+    pub disk_offload: bool,
+    /// RAM left free when deciding what may be pinned (`--ram-reserve`);
+    /// None: disk::default_ram_reserve.
+    pub ram_reserve: Option<u64>,
 }
 
 impl Default for LoadOptions {
@@ -72,6 +78,8 @@ impl Default for LoadOptions {
             slots: 1,
             alloc: AllocMode::Auto,
             main_gpu: None,
+            disk_offload: false,
+            ram_reserve: None,
         }
     }
 }
@@ -87,6 +95,15 @@ pub const DEFAULT_DRAFT: usize = 4;
 /// Q5_K_M on 2x RTX 5060 Ti (2026-11-06): no MTP 109.6, draft 2 137.6, draft 3
 /// 128.2 tok/s on prose; 108.8 / 132.1 / 127.4 on code.
 pub const MOE_DEFAULT_DRAFT: usize = 2;
+
+/// The same on dense models with layers read from disk (--disk-offload).
+/// Each verify pass reads those layers from the SSD once, so tokens per pass
+/// is the speed; the drafts' compute is noise next to the read. Qwen3.8-27B
+/// NVFP4, 160 tokens of code (2026-11-09): tokens per pass 2.8 / 3.8 / 4.3 /
+/// 4.3 at draft 2 / 4 / 6 / 8. With 6.6 GB on an NVMe at 1.6 GB/s that is
+/// 0.92 tok/s at draft 4 and 1.05 at 6. (With the file in the OS cache,
+/// which is RAM speed, draft 2 wins: 9.9 against 9.1 and 8.0 tok/s.)
+pub const DISK_DEFAULT_DRAFT: usize = 6;
 
 /// What the loader did, for reporting.
 pub struct LoadReport {
@@ -133,9 +150,14 @@ pub fn load(
     let config_slots = opts.slots.max(1);
     let mut mtp_src = if draft_wanted { mtp_source(path, &gguf, &config, opts.mtp_file.as_deref())? } else { None };
     let moe_default = opts.draft.is_none() && config.moe.is_some();
+    // With --disk-offload the head's buffers are sized for
+    // DISK_DEFAULT_DRAFT; if no layer ends up on disk the runtime drafts
+    // DEFAULT_DRAFT within them (see set_draft below).
+    let disk_draft = opts.draft.is_none() && opts.disk_offload && config.moe.is_none();
     let mut draft = match opts.draft {
         Some(d) => d,
         None if config.moe.is_some() => MOE_DEFAULT_DRAFT,
+        None if disk_draft => DISK_DEFAULT_DRAFT,
         None => DEFAULT_DRAFT,
     };
     // On a MoE the head pays only with every expert in VRAM: the verify's
@@ -236,6 +258,42 @@ pub fn load(
         }
     }
 
+    // The RAM that may be pinned: what is free now, less the reserve.
+    let ram_budget = crate::disk::available_ram().map(|a| a.saturating_sub(
+        opts.ram_reserve.unwrap_or_else(crate::disk::default_ram_reserve)));
+    if opts.disk_offload && opts.alloc == AllocMode::Gpu {
+        eprintln!("note: --disk-offload does nothing with --alloc gpu, which keeps every weight in VRAM; \
+                   use --alloc auto or memory");
+    }
+    // Experts mapped in pinned RAM that the RAM cannot hold: with
+    // --disk-offload they are read from the file on each miss instead.
+    let mut mapped_expert_bytes = 0u64;
+    if let (Some(slots), Some(moe)) = (&expert_slots, config.moe.as_ref()) {
+        if crate::model::experts_mapped() {
+            for l in 0..config.n_run_layers() {
+                for kind in ["gate", "up", "down"] {
+                    if let Some(t) = gguf.tensor(&format!("blk.{l}.ffn_{kind}_exps.weight")) {
+                        mapped_expert_bytes += t.nbytes / moe.n_experts as u64 * (moe.n_experts - slots[l]) as u64;
+                    }
+                }
+            }
+            if let Some(budget) = ram_budget.filter(|&b| mapped_expert_bytes > b) {
+                if opts.disk_offload {
+                    crate::model::stream_experts();
+                    eprintln!("note: the experts that do not fit in VRAM need {} of RAM, {} is free past the \
+                               reserve: they are read from the model file as they are routed (--disk-offload)",
+                        airun_cuda::human_bytes(mapped_expert_bytes), airun_cuda::human_bytes(budget));
+                    mapped_expert_bytes = 0;
+                } else {
+                    eprintln!("note: the experts that do not fit in VRAM need {} of pinned RAM, and only {} is \
+                               free past the reserve; if loading fails or the system starts paging, pass \
+                               --disk-offload to read them from the SSD",
+                        airun_cuda::human_bytes(mapped_expert_bytes), airun_cuda::human_bytes(budget));
+                }
+            }
+        }
+    }
+
     // Which experts take the VRAM slots: the most routed ones of earlier runs.
     let mut profile = match (&expert_slots, config.moe.as_ref()) {
         (Some(_), Some(moe)) if crate::model::experts_mapped() =>
@@ -307,6 +365,7 @@ pub fn load(
         if opts.kv_type != airun_cuda::ops::KvType::F16 {
             placement.notes.push(format!("KV cache {}", opts.kv_type.name()));
         }
+        place_on_disk(&mut placement, &sizes, &gguf, &config, ram_budget, mapped_expert_bytes, opts.disk_offload);
 
         if placement.ctx != ctx {
             fallbacks.push(format!(
@@ -356,9 +415,16 @@ pub fn load(
         let tokenizer = Tokenizer::from_gguf(&gguf)?;
 
         let weight_bytes = model.total_bytes;
-        let placement_out = model.placement.clone();
+        let mut placement_out = model.placement.clone();
+        let on_disk = placement_out.shards.iter().any(|s| !s.disk_layers.is_empty());
+        let run_draft = if disk_draft && !on_disk { DEFAULT_DRAFT.min(draft) } else { draft };
+        if disk_draft && on_disk && load_mtp {
+            placement_out.notes.push(format!(
+                "MTP drafts {draft} tokens per step (not {DEFAULT_DRAFT}): each verify reads the layers on disk \
+                 once, so more tokens per pass is faster; --draft sets it"));
+        }
         let mut runtime = Runtime::new(model, tokenizer, streams, batch)?;
-        runtime.set_draft(draft);
+        runtime.set_draft(run_draft);
         runtime.set_slots(config_slots)?;
         // Every buffer a request needs, now: one that fails here takes the
         // next rung, where on the first request it was an error to the user.
@@ -387,6 +453,46 @@ pub fn load(
                 fallbacks,
             },
         ));
+    }
+}
+
+/// Of the weights the plan keeps in RAM, moves what `ram_budget` (free RAM
+/// past the reserve) cannot pin, after the other pinned buffers, to the disk
+/// when `disk_offload` is on; without it, only warns.
+fn place_on_disk(placement: &mut Placement, sizes: &WeightSizes, gguf: &GgufFile, config: &Config,
+                 ram_budget: Option<u64>, mapped_expert_bytes: u64, disk_offload: bool) {
+    let weights = crate::plan::ram_weight_bytes(placement);
+    let Some(free) = ram_budget else {
+        if disk_offload && weights > 0 {
+            placement.notes.push("--disk-offload: free RAM could not be read on this system, so every \
+                layer in RAM stays pinned".into());
+        }
+        return;
+    };
+    if weights == 0 {
+        return;
+    }
+    let kv: u64 = placement.shards.iter().map(|s| s.kv_ram_bytes).sum();
+    let embed = if crate::model::embeds_on_host(config) {
+        gguf.tensor("token_embd.weight").map_or(0, |t| t.nbytes)
+    } else {
+        0
+    };
+    let budget = free.saturating_sub(kv + embed + mapped_expert_bytes);
+    if weights <= budget {
+        return;
+    }
+    if disk_offload {
+        let moved = crate::plan::spill_to_disk(placement, sizes, budget);
+        placement.notes.push(format!(
+            "--disk-offload: {} of RAM is free past the reserve for {} of layers, so {} is read from the \
+             model file as it runs; keep the model on an SSD/NVMe, a hard disk makes this very slow",
+            airun_cuda::human_bytes(budget), airun_cuda::human_bytes(weights), airun_cuda::human_bytes(moved)));
+    } else {
+        placement.notes.push(format!(
+            "layers kept in RAM need {} pinned but only {} is free past the reserve; if loading fails or the \
+             system starts paging, pass --disk-offload to read the rest from the SSD, or lower --ram-reserve",
+            airun_cuda::human_bytes(weights), airun_cuda::human_bytes(budget)));
     }
 }
 
@@ -729,7 +835,9 @@ fn upload_labels(placement: &Placement, n_run: usize) -> Vec<String> {
             (Some(a), Some(b)) => format!("{a}..{b}"),
             _ => String::new(),
         };
-        if s.ram_layers.contains(&l) {
+        if s.disk_layers.contains(&l) {
+            format!("-> disk via GPU {}, layers {}", s.device, range(&s.disk_layers))
+        } else if s.ram_layers.contains(&l) {
             format!("-> RAM via GPU {}, layers {}", s.device, range(&s.ram_layers))
         } else {
             let vram: Vec<usize> = s.layers.iter().copied().filter(|x| !s.ram_layers.contains(x)).collect();
