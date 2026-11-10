@@ -5,7 +5,7 @@
 //! placeholder offsets, then rewritten once the real offsets are known.
 
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};

@@ -543,9 +543,8 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
         if odd_k && elems != 32 {
             continue;
         }
-        let K: usize = if odd_k { 544 } else { 512 };
-        let N_TOKENS = n_tokens;
-        let blocks_per_row = K / elems;
+        let k: usize = if odd_k { 544 } else { 512 };
+        let blocks_per_row = k / elems;
         let row_bytes = blocks_per_row * layout.bytes as usize;
 
         let mut rng = Rng::new(0xD8_4000 + ty.id() as u64);
@@ -553,16 +552,16 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
         for _ in 0..N_ROWS {
             packed.extend_from_slice(&random_blocks(&mut rng, ty, blocks_per_row));
         }
-        let x = rng.floats(N_TOKENS * K);
+        let x = rng.floats(n_tokens * k);
         let xq = quantize_q8a_mirror(&x);
 
-        let mut row = vec![0f32; K];
-        let mut cpu = vec![0f32; N_TOKENS * N_ROWS];
-        let mut magnitude = vec![0f64; N_TOKENS * N_ROWS];
+        let mut row = vec![0f32; k];
+        let mut cpu = vec![0f32; n_tokens * N_ROWS];
+        let mut magnitude = vec![0f64; n_tokens * N_ROWS];
         for r in 0..N_ROWS {
-            dequant::dequantize(ty, &packed[r * row_bytes..(r + 1) * row_bytes], K, &mut row)?;
-            for t in 0..N_TOKENS {
-                let at = &xq[t * K..(t + 1) * K];
+            dequant::dequantize(ty, &packed[r * row_bytes..(r + 1) * row_bytes], k, &mut row)?;
+            for t in 0..n_tokens {
+                let at = &xq[t * k..(t + 1) * k];
                 let mut acc = 0f64;
                 let mut mag = 0f64;
                 for (w, v) in row.iter().zip(at) {
@@ -577,17 +576,17 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
 
         let d_w = DeviceBuffer::<u8>::from_slice(device, &packed, stream)?;
         let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
-        let d_xq = DeviceBuffer::<u8>::new(device, N_TOKENS * K / 32 * 36)?;
-        let d_y = DeviceBuffer::<f32>::new(device, N_TOKENS * N_ROWS)?;
-        ops::quantize_act(d_x.as_ptr(), d_xq.as_mut_ptr(), N_TOKENS * K, stream)?;
+        let d_xq = DeviceBuffer::<u8>::new(device, n_tokens * k / 32 * 36)?;
+        let d_y = DeviceBuffer::<f32>::new(device, n_tokens * N_ROWS)?;
+        ops::quantize_act(d_x.as_ptr(), d_xq.as_mut_ptr(), n_tokens * k, stream)?;
         ops::matvec_q8(
             kty,
             d_w.as_ptr(),
             d_xq.as_ptr(),
             d_y.as_mut_ptr(),
-            K,
+            k,
             N_ROWS,
-            N_TOKENS,
+            n_tokens,
             row_bytes,
             stream,
         )?;
@@ -600,7 +599,7 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
         // half-epsilon of slack per term.
         const EPS_F32: f64 = 1.192_092_9e-7;
         const EPS_F16: f64 = 9.765_625e-4;
-        let bound_factor = EPS_F32 * (K as f64).sqrt() * 4.0 + EPS_F16 * 2.0;
+        let bound_factor = EPS_F32 * (k as f64).sqrt() * 4.0 + EPS_F16 * 2.0;
 
         let mut worst_ulps = 0f64;
         let mut worst_abs = 0f64;
@@ -615,7 +614,7 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
 
         let path = if n_tokens >= 32 && ops::mmq_supported() { "mmq" } else { "dp4a" };
         report.case(
-            &format!("matvec_q8 {ty}, {n_tokens} tokens, K {K} ({path})"),
+            &format!("matvec_q8 {ty}, {n_tokens} tokens, K {k} ({path})"),
             format!(
                 "max_abs {worst_abs:.3e}  error/bound {worst_ulps:.2}x  (activation quantized both sides)"
             ),
@@ -2650,36 +2649,35 @@ fn attention_case(
     label: &str,
     positions: &[i32],
 ) -> Result<()> {
-    let (N_HEADS, N_KV_HEADS, HEAD_DIM) = (n_heads, n_kv_heads, head_dim);
     const MAX_SEQ: usize = 96;
-    let N_TOKENS = positions.len();
+    let n_tokens = positions.len();
     // The flash kernel rounds Q and the probabilities to fp16.
-    let tolerance = if N_TOKENS >= 16 { 3e-3 } else { 1e-3 };
+    let tolerance = if n_tokens >= 16 { 3e-3 } else { 1e-3 };
 
     let mut rng = Rng::new(0xF6_6000);
-    let q = rng.floats(N_TOKENS * N_HEADS * HEAD_DIM);
+    let q = rng.floats(n_tokens * n_heads * head_dim);
     let positions = positions.to_vec();
     let n_kv = *positions.iter().max().unwrap() as usize + 1;
 
     // The cache is f16 on device, so the reference must round-trip through f16
     // too or the comparison would measure storage precision, not the kernel.
-    let k_raw = rng.floats(N_KV_HEADS * MAX_SEQ * HEAD_DIM);
-    let v_raw = rng.floats(N_KV_HEADS * MAX_SEQ * HEAD_DIM);
+    let k_raw = rng.floats(n_kv_heads * MAX_SEQ * head_dim);
+    let v_raw = rng.floats(n_kv_heads * MAX_SEQ * head_dim);
     let k_half: Vec<half::f16> = k_raw.iter().map(|&v| half::f16::from_f32(v)).collect();
     let v_half: Vec<half::f16> = v_raw.iter().map(|&v| half::f16::from_f32(v)).collect();
     let k: Vec<f32> = k_half.iter().map(|v| v.to_f32()).collect();
     let v: Vec<f32> = v_half.iter().map(|v| v.to_f32()).collect();
 
-    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    let mut cpu = vec![0f32; N_TOKENS * N_HEADS * HEAD_DIM];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut cpu = vec![0f32; n_tokens * n_heads * head_dim];
     for (t, &pos) in positions.iter().enumerate() {
-        for h in 0..N_HEADS {
-            let kv_head = h / (N_HEADS / N_KV_HEADS);
-            let qv = &q[(t * N_HEADS + h) * HEAD_DIM..][..HEAD_DIM];
+        for h in 0..n_heads {
+            let kv_head = h / (n_heads / n_kv_heads);
+            let qv = &q[(t * n_heads + h) * head_dim..][..head_dim];
 
             let mut scores = Vec::with_capacity(pos as usize + 1);
             for j in 0..=pos as usize {
-                let kj = &k[(kv_head * MAX_SEQ + j) * HEAD_DIM..][..HEAD_DIM];
+                let kj = &k[(kv_head * MAX_SEQ + j) * head_dim..][..head_dim];
                 let dot: f32 = qv.iter().zip(kj).map(|(a, b)| a * b).sum();
                 scores.push(dot * scale);
             }
@@ -2687,11 +2685,11 @@ fn attention_case(
             let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
             let sum: f32 = exps.iter().sum();
 
-            let out = &mut cpu[(t * N_HEADS + h) * HEAD_DIM..][..HEAD_DIM];
+            let out = &mut cpu[(t * n_heads + h) * head_dim..][..head_dim];
             for (j, e) in exps.iter().enumerate() {
-                let vj = &v[(kv_head * MAX_SEQ + j) * HEAD_DIM..][..HEAD_DIM];
+                let vj = &v[(kv_head * MAX_SEQ + j) * head_dim..][..head_dim];
                 let w = e / sum;
-                for d in 0..HEAD_DIM {
+                for d in 0..head_dim {
                     out[d] += w * vj[d];
                 }
             }
@@ -2702,7 +2700,7 @@ fn attention_case(
     let d_k = DeviceBuffer::<half::f16>::from_slice(device, &k_half, stream)?;
     let d_v = DeviceBuffer::<half::f16>::from_slice(device, &v_half, stream)?;
     let d_p = DeviceBuffer::<i32>::from_slice(device, &positions, stream)?;
-    let d_o = DeviceBuffer::<f32>::new(device, N_TOKENS * N_HEADS * HEAD_DIM)?;
+    let d_o = DeviceBuffer::<f32>::new(device, n_tokens * n_heads * head_dim)?;
 
     ops::attention(
         d_o.as_mut_ptr(),
@@ -2710,10 +2708,10 @@ fn attention_case(
         d_k.as_ptr(),
         d_v.as_ptr(),
         d_p.as_ptr(),
-        N_TOKENS,
-        N_HEADS,
-        N_KV_HEADS,
-        HEAD_DIM,
+        n_tokens,
+        n_heads,
+        n_kv_heads,
+        head_dim,
         MAX_SEQ,
         scale,
         0,
@@ -2731,17 +2729,17 @@ fn attention_case(
     );
 
     // A window of 1 must reduce to attending only to the query's own position.
-    let d_o2 = DeviceBuffer::<f32>::new(device, N_TOKENS * N_HEADS * HEAD_DIM)?;
+    let d_o2 = DeviceBuffer::<f32>::new(device, n_tokens * n_heads * head_dim)?;
     ops::attention(
         d_o2.as_mut_ptr(),
         d_q.as_ptr(),
         d_k.as_ptr(),
         d_v.as_ptr(),
         d_p.as_ptr(),
-        N_TOKENS,
-        N_HEADS,
-        N_KV_HEADS,
-        HEAD_DIM,
+        n_tokens,
+        n_heads,
+        n_kv_heads,
+        head_dim,
         MAX_SEQ,
         scale,
         1,
@@ -2749,12 +2747,12 @@ fn attention_case(
         stream,
     )?;
     let windowed = d_o2.to_vec(stream)?;
-    let mut expect = vec![0f32; N_TOKENS * N_HEADS * HEAD_DIM];
+    let mut expect = vec![0f32; n_tokens * n_heads * head_dim];
     for (t, &pos) in positions.iter().enumerate() {
-        for h in 0..N_HEADS {
-            let kv_head = h / (N_HEADS / N_KV_HEADS);
-            let vj = &v[(kv_head * MAX_SEQ + pos as usize) * HEAD_DIM..][..HEAD_DIM];
-            expect[(t * N_HEADS + h) * HEAD_DIM..][..HEAD_DIM].copy_from_slice(vj);
+        for h in 0..n_heads {
+            let kv_head = h / (n_heads / n_kv_heads);
+            let vj = &v[(kv_head * MAX_SEQ + pos as usize) * head_dim..][..head_dim];
+            expect[(t * n_heads + h) * head_dim..][..head_dim].copy_from_slice(vj);
         }
     }
     let (wabs, wrel) = compare(&expect, &windowed);
@@ -2764,19 +2762,19 @@ fn attention_case(
         wabs <= 1e-4,
     );
 
-    let partial = DeviceBuffer::<f32>::new(device, N_HEADS * 128 * (HEAD_DIM + 2))?;
+    let partial = DeviceBuffer::<f32>::new(device, n_heads * 128 * (head_dim + 2))?;
     for splits in [4, 16, 128] {
-        for t in 0..N_TOKENS.min(3) {
+        for t in 0..n_tokens.min(3) {
             for window in [0, 1] {
                 ops::attention_split(d_o.as_mut_ptr(), &partial,
-                    d_q.offset_ptr(t * N_HEADS * HEAD_DIM), d_k.as_ptr(), d_v.as_ptr(),
-                    d_p.offset_ptr(t), N_HEADS, N_KV_HEADS, HEAD_DIM, MAX_SEQ,
+                    d_q.offset_ptr(t * n_heads * head_dim), d_k.as_ptr(), d_v.as_ptr(),
+                    d_p.offset_ptr(t), n_heads, n_kv_heads, head_dim, MAX_SEQ,
                     scale, window, splits, ops::KvType::F16, stream)?;
-                let mut actual = vec![0.0f32; N_HEADS * HEAD_DIM];
+                let mut actual = vec![0.0f32; n_heads * head_dim];
                 d_o.copy_to_host(&mut actual, stream)?;
                 stream.synchronize()?;
                 let reference = if window == 0 { &cpu } else { &expect };
-                let reference = &reference[t * N_HEADS * HEAD_DIM..(t + 1) * N_HEADS * HEAD_DIM];
+                let reference = &reference[t * n_heads * head_dim..(t + 1) * n_heads * head_dim];
                 let (error, _) = compare(reference, &actual);
                 report.case(&format!("split attention {label}, splits={splits}, token={t}, window={window}"),
                     format!("max_abs {error:.3e}"), error <= 1e-3 && actual.iter().all(|x| x.is_finite()));

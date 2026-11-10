@@ -192,6 +192,8 @@ unsafe extern "C" {
 }
 
 /// Every entry point degrades to the same error without compiled kernels.
+/// Only expanded in builds without them.
+#[cfg_attr(airun_cuda, allow(unused_macros))]
 macro_rules! needs_cuda {
     ($($unused:expr),* $(,)?) => {{
         $( let _ = $unused; )*

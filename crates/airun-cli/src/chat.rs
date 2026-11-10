@@ -15,7 +15,6 @@ use serde_json::{Map, Value, json};
 
 pub struct ChatTemplate {
     env: minijinja::Environment<'static>,
-    pub source: String,
     pub bos: String,
     pub eos: String,
 }
@@ -40,9 +39,9 @@ impl ChatTemplate {
             fmt.replace("%Y", &y.to_string()).replace("%m", &format!("{m:02}")).replace("%d", &format!("{d:02}"))
                 .replace("%B", MONTHS[(m - 1) as usize]).replace("%b", &MONTHS[(m - 1) as usize][..3])
         });
-        env.add_template_owned("chat", source.clone())
+        env.add_template_owned("chat", source)
             .map_err(|e| anyhow!("the model's chat template does not parse: {e}"))?;
-        Ok(Self { env, source, bos, eos })
+        Ok(Self { env, bos, eos })
     }
 
     /// The prompt for `messages` (OpenAI shape) and `tools`, with the

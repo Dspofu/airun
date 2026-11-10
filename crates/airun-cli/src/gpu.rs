@@ -1,6 +1,6 @@
 //! `airun gpu` -- report the CUDA devices airun can see and what it can do with them.
 
-use airun_cuda::device::{self, Generation};
+use airun_cuda::device;
 use anyhow::Result;
 use clap::Args;
 
@@ -229,5 +229,3 @@ pub fn usable_devices() -> Result<Vec<airun_cuda::Device>> {
 /// Silences the dead-code lint until the loader starts calling this.
 const _: fn() -> Result<Vec<airun_cuda::Device>> = usable_devices;
 
-/// Restates the supported floor for error messages elsewhere.
-pub const MIN_GENERATION: Generation = Generation::Turing;

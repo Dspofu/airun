@@ -1236,7 +1236,7 @@ impl Runtime {
         let mut generated = 0usize;
         let mut last_token = t;
         let (mut drafted, mut accepted) = (0usize, 0usize);
-        let mut stop = StopReason::MaxTokens;
+        let stop;
         let mut timing = [0f64; 3];
         let mut steps = 0usize;
 

@@ -85,6 +85,13 @@ fn main() {
         if cfg!(windows) {
             // MSVC's C++ exception model (gcc and clang need no flag).
             cmd.args(["-Xcompiler", "/EHsc"]);
+            // The same C runtime Rust links: the DLL one (/MD) unless the
+            // build asks for crt-static. nvcc's default, the static one,
+            // made the linker warn LNK4098 (LIBCMT conflicts) and put two
+            // C runtimes in the binary.
+            let crt_static = std::env::var("CARGO_CFG_TARGET_FEATURE")
+                .is_ok_and(|f| f.split(',').any(|x| x == "crt-static"));
+            cmd.args(["-Xcompiler", if crt_static { "/MT" } else { "/MD" }]);
         } else {
             // Static libraries linked into a Rust binary, which is position
             // independent by default on Linux.
