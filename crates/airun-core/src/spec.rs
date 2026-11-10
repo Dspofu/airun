@@ -1190,6 +1190,25 @@ impl Runtime {
         let snap_at = self.snapshot_point(prompt, cached);
         self.prefill_report(prompt_done, prompt.len(), cached, start);
         while prompt_done < prompt.len() {
+            // As in generate_with: whole batches before the last, layer by
+            // layer, each batch's rows through the head as it comes out.
+            let span = self.layered_take(prompt, prompt_done, snap_at);
+            if span > 0 {
+                let tokens = prompt[prompt_done..prompt_done + span].to_vec();
+                self.step_layered(&tokens, &mut |rt, chunk, pos0| {
+                    rt.stage_h(true, chunk.len() - 1)?;
+                    rt.save_pending(chunk.len() - 1)?;
+                    let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+                    let pos: Vec<i32> = (0..chunk.len()).map(|i| (pos0 + i) as i32).collect();
+                    rt.mtp_queue(&ids, &pos)
+                })?;
+                prompt_done += span;
+                self.prefill_report(prompt_done, prompt.len(), cached, start);
+                if snap_at == Some(prompt_done) {
+                    self.take_snapshot(true)?;
+                }
+                continue;
+            }
             let mut take = (prompt.len() - prompt_done).min(self.max_batch);
             if let Some(p) = snap_at.filter(|&p| p > prompt_done) {
                 take = take.min(p - prompt_done);

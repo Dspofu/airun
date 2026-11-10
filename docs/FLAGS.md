@@ -165,7 +165,7 @@ não ocupam RAM nem o limite de commit do Windows.
   lidos do arquivo quando roteados (o mesmo caminho de `AIRUN_EXPERTS=stream`).
 - `--stats` mostra quais camadas ficaram no disco.
 - **MTP:** com camadas no disco e sem `--draft`, a cabeça rascunha 6 tokens por passo em vez de 4. Cada passada lê o disco uma vez, então mais tokens por passada é mais rápido (27B no NVMe: ~0,92 → ~1,05 tok/s).
-- **Prompt longo:** cada bloco de `-b` tokens relê as camadas do disco. Um prompt de 4096 tokens com `-b 512` lê o disco 8 vezes.
+- **Prompt longo:** os blocos de `-b` tokens passam juntos por cada camada do disco, que é lida uma vez para todos (até 8192 tokens por vez), e não uma vez por bloco. Um prompt de 4096 tokens com `-b 512` lê o disco 2 vezes em vez de 8. O resultado é o mesmo.
 
 **É lento.** Cada token relê essas camadas inteiras do disco: a velocidade é a
 do SSD dividida pelos bytes no disco (um NVMe de ~5 GB/s com 5 GB no disco dá
@@ -641,6 +641,8 @@ e duas sessões separadas variam ~15%.
 | `AIRUN_CPU_THREADS=<n>` | Threads dos matmuls na CPU (padrão: uma por núcleo lógico). Na memória DDR5 do 13700, 8 já saturam a banda. |
 | `AIRUN_DISK_AHEAD=<n>` | Com `--disk-offload`, quantas camadas do disco são lidas adiantadas enquanto a atual roda (padrão 2). Cada uma ocupa sua parte do cache de arquivos. |
 | `AIRUN_DISK_THREADS=<n>` | Threads que leem essas camadas adiantadas (padrão 4). |
+| `AIRUN_NO_LAYERED=1` | Com camadas no disco, o prompt volta a passar bloco por bloco por todas as camadas (lendo o disco uma vez por bloco). |
+| `AIRUN_LAYERED_TOKENS=<n>` | Tokens do prompt que passam juntos por cada camada do disco (padrão 8192). Cada token custa 8 bytes × largura do modelo de memória temporária. |
 | `AIRUN_CPU_MAX_TOKENS=<n>` | Passadas de até n tokens multiplicam as camadas da RAM na CPU; maiores copiam para a GPU (padrão 64). |
 | `AIRUN_NO_ROWS_SPEC=1` | Com `serve --parallel`, os passos em lote seguem sem rascunhos do MTP (só o pedido sozinho rascunha). |
 | `AIRUN_ROWS_DRAFT=<k2,k3,...>` | Rascunhos por pedido num passo em lote de 2, 3... pedidos (padrão `2,1,1`; 0 = sem rascunho). |

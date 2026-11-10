@@ -1528,6 +1528,167 @@ impl Runtime {
         Ok(())
     }
 
+    /// Prompt tokens one layer-by-layer pass takes at most (see
+    /// [`Self::step_layered`]): AIRUN_LAYERED_TOKENS, default 8192. Its saved
+    /// rows cost 8 bytes per token and model width on each GPU (27B: 168 MiB
+    /// for 4096 tokens).
+    fn layered_span(&self) -> usize {
+        static SPAN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let span = *SPAN.get_or_init(|| std::env::var("AIRUN_LAYERED_TOKENS").ok()
+            .and_then(|v| v.trim().parse().ok()).unwrap_or(8192));
+        span.max(self.max_batch) / self.max_batch * self.max_batch
+    }
+
+    /// Of a prompt with `done` tokens in the caches, `len` in all and an
+    /// optional snapshot point, how many tokens from `done` go through
+    /// [`Self::step_layered`] before the loop resumes batch by batch: the
+    /// whole batches before the last one (whose logits the caller reads) or
+    /// before the snapshot point. 0 when that is fewer than two batches, or
+    /// no layer is read from disk.
+    pub(crate) fn layered_take(&self, prompt: &[u32], done: usize, snap_at: Option<usize>) -> usize {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("AIRUN_NO_LAYERED").is_ok_and(|v| v.trim() != "0")) {
+            return 0;
+        }
+        let cfg = &self.model.config;
+        // Only with layers on disk: with them in pinned RAM the copy is not
+        // the bottleneck, and the layer order loses the overlap of GPUs on a
+        // split (27B, 4420 tokens: 3.2 -> 3.9 s on two GPUs, 3.7 -> 3.8 on one).
+        if cfg.hc.is_some() || cfg.ple.is_some() || self.embeds_ready || self.model.disk.is_none() {
+            return 0;
+        }
+        let mb = self.max_batch;
+        let len = prompt.len();
+        let take = match snap_at.filter(|&p| p > done && p < len) {
+            Some(p) => p - done,
+            None if len > done => (len - done - 1) / mb * mb,
+            None => 0,
+        };
+        let take = if take > self.layered_span() { self.layered_span() } else { take };
+        if take <= mb || prompt[done..done + take].iter().any(|&t| is_image_token(t))
+            || self.n_past + take > self.ctx {
+            return 0;
+        }
+        take
+    }
+
+    /// The same as [`Self::step`] over `tokens` in batches of `max_batch`,
+    /// one after another, but run one layer at a time across the batches
+    /// wherever a layer's weights are staged from RAM or read from disk
+    /// (--alloc, --disk-offload): each such layer is copied or read once for
+    /// the whole span, not once per batch. Layers in VRAM still run as a
+    /// block per batch. Between runs each batch's residual and the fused norm
+    /// the last layer left (x and xb) wait in a buffer, and every layer sees
+    /// the inputs, caches, recurrent states and positions the batch-by-batch
+    /// order gives it, so the result is the same. `after` runs for each
+    /// batch, in order, right after its output norm and logits on the output
+    /// device, with the batch and its first position.
+    pub(crate) fn step_layered(&mut self, tokens: &[u32],
+                               after: &mut dyn FnMut(&mut Self, &[u32], usize) -> Result<()>) -> Result<()> {
+        let cfg = self.model.config.clone();
+        if let Some(sp) = self.spec.as_mut() {
+            sp.synced = false;
+        }
+        let start = self.n_past;
+        let mb = self.max_batch;
+        let chunks: Vec<(usize, usize)> = (0..tokens.len()).step_by(mb)
+            .map(|o| (o, (tokens.len() - o).min(mb))).collect();
+        let width = cfg.n_embd;
+        let row = width * std::mem::size_of::<f32>();
+        let n_shards = self.states.len();
+        // Each shard's saved (x, xb) rows, for the shards that need them.
+        let mut saved: Vec<Option<(DeviceBuffer<f32>, DeviceBuffer<f32>)>> = Vec::new();
+        let result = (|| -> Result<()> {
+            for si in 0..n_shards {
+                // Runs of layers: the VRAM ones together, each staged one alone.
+                let n_local = self.states[si].layers.len();
+                let staged = |rt: &Self, j: usize| !rt.model.layers[rt.states[si].layers[j]].ram_copies.is_empty();
+                let mut segs: Vec<std::ops::Range<usize>> = Vec::new();
+                let mut i = 0;
+                while i < n_local {
+                    let mut j = i + 1;
+                    if !staged(self, i) {
+                        while j < n_local && !staged(self, j) {
+                            j += 1;
+                        }
+                    }
+                    segs.push(i..j);
+                    i = j;
+                }
+                if segs.is_empty() {
+                    segs.push(0..0);
+                }
+                let last_shard = si + 1 == n_shards;
+                let dev = self.states[si].device;
+                device::set_device(dev)?;
+                saved.push(if segs.len() > 1 || !last_shard {
+                    let len = tokens.len() * width;
+                    let alloc = || DeviceBuffer::<f32>::new(dev, len).or_else(|_| DeviceBuffer::<f32>::in_ram(dev, len));
+                    Some((alloc()?, alloc()?))
+                } else {
+                    None
+                });
+                for (k, seg) in segs.iter().enumerate() {
+                    let last_seg = k + 1 == segs.len();
+                    for &(off, n) in &chunks {
+                        let pos0 = start + off;
+                        // The attention reads how many keys there are from it.
+                        self.n_past = pos0;
+                        let ids: Vec<i32> = tokens[off..off + n].iter().map(|&t| t as i32).collect();
+                        let pos: Vec<i32> = (0..n).map(|i| (pos0 + i) as i32).collect();
+                        if k == 0 && si == 0 {
+                            self.shard_input(0, &ids, &pos, true, true, true, &cfg)?;
+                        } else {
+                            device::set_device(dev)?;
+                            crate::cpu::set_pass(n);
+                            let st = &self.states[si];
+                            st.positions.copy_from_host_at(0, &pos, &st.stream)?;
+                            if k == 0 {
+                                // As the handoff: the previous shard's residual, whose norm
+                                // the first layer computes itself.
+                                let (px, _) = saved[si - 1].as_ref().expect("a shard with a successor saves");
+                                if px.is_in_ram() || px.device() == dev {
+                                    airun_cuda::copy_d2d(st.x.as_mut_ptr(), px.offset_ptr(off * width), n * row, &st.stream)?;
+                                } else {
+                                    airun_cuda::copy_peer(st.x.as_mut_ptr(), dev, px.offset_ptr(off * width), px.device(),
+                                        n * row, &st.stream)?;
+                                }
+                            } else {
+                                let (sx, sxb) = saved[si].as_ref().expect("allocated for several runs");
+                                airun_cuda::copy_d2d(st.x.as_mut_ptr(), sx.offset_ptr(off * width), n * row, &st.stream)?;
+                                airun_cuda::copy_d2d(st.xb.as_mut_ptr(), sxb.offset_ptr(off * width), n * row, &st.stream)?;
+                            }
+                        }
+                        self.shard_layers(si, seg.clone(), n, &cfg)?;
+                        if last_seg && last_shard {
+                            self.shard_output(n, &cfg)?;
+                            after(self, &tokens[off..off + n], pos0)?;
+                        } else {
+                            let st = &self.states[si];
+                            let (sx, sxb) = saved[si].as_ref().expect("allocated when not the end");
+                            airun_cuda::copy_d2d(sx.offset_ptr(off * width), st.x.as_ptr(), n * row, &st.stream)?;
+                            airun_cuda::copy_d2d(sxb.offset_ptr(off * width), st.xb.as_ptr(), n * row, &st.stream)?;
+                        }
+                    }
+                }
+                // The next shard reads the rows saved on this one's stream.
+                device::set_device(dev)?;
+                self.states[si].stream.synchronize()?;
+            }
+            Ok(())
+        })();
+        // The saved rows are freed below; nothing may still read them.
+        for st in &self.states {
+            device::set_device(st.device)?;
+            st.stream.synchronize()?;
+        }
+        drop(saved);
+        self.n_past = start + tokens.len();
+        result?;
+        self.history.extend_from_slice(tokens);
+        self.rebalance_experts()
+    }
+
     /// One decode step through a captured graph.
     ///
     /// The first step records the whole forward pass -- kernel launches and
@@ -1659,6 +1820,20 @@ impl Runtime {
         -> Result<()> {
         let cfg = self.model.config.clone();
         let n = token_ids.len();
+        self.shard_input(si, token_ids, positions, upload, fill_ple, record_ple_event, &cfg)?;
+        self.shard_layers(si, 0..self.states[si].layers.len(), n, &cfg)?;
+        if si + 1 < self.states.len() {
+            return Ok(());
+        }
+        self.shard_output(n, &cfg)
+    }
+
+    /// The start of [`Self::queue_shard`]: the embedding on the first shard,
+    /// the positions, the PLE rows.
+    #[allow(clippy::too_many_arguments)]
+    fn shard_input(&mut self, si: usize, token_ids: &[i32], positions: &[i32], upload: bool, fill_ple: bool,
+                   record_ple_event: bool, cfg: &Config) -> Result<()> {
+        let n = token_ids.len();
         device::set_device(self.states[si].device)?;
         crate::cpu::set_pass(n);
 
@@ -1703,7 +1878,12 @@ impl Runtime {
             self.ple_upload(si, n, record_ple_event)?;
         }
 
-        for local in 0..self.states[si].layers.len() {
+        Ok(())
+    }
+
+    /// Shard `si`'s layers at positions `locals` of its list, over `n` rows.
+    fn shard_layers(&mut self, si: usize, locals: std::ops::Range<usize>, n: usize, cfg: &Config) -> Result<()> {
+        for local in locals {
             let layer = self.states[si].layers[local];
             // A layer kept in RAM (--alloc): copy its weights into the staging
             // VRAM, in stream order, so they land after the previous such
@@ -1722,12 +1902,14 @@ impl Runtime {
                     ops::nvfp4_sanitize(c.dev as *mut std::ffi::c_void, c.nvfp4_blocks, &self.states[si].stream)?;
                 }
             }
-            self.run_layer(si, local, layer, n, &cfg)?;
+            self.run_layer(si, local, layer, n, cfg)?;
         }
-        if si + 1 < self.states.len() {
-            return Ok(());
-        }
+        Ok(())
+    }
 
+    /// The end of the last shard's part: the final norm and the logits of the
+    /// last of `n` rows.
+    fn shard_output(&mut self, n: usize, cfg: &Config) -> Result<()> {
         // --- final norm and projection, last token only ---
         let last = self.states.len() - 1;
         let st = &self.states[last];
@@ -3769,6 +3951,18 @@ impl Runtime {
         let snap_at = self.snapshot_point(prompt, cached);
         self.prefill_report(prompt_done, prompt.len(), prompt_cached, start);
         while prompt_done < prompt.len() {
+            // With layers on disk, whole batches before the last run layer by
+            // layer: each staged layer is read once for them, not per batch.
+            let span = self.layered_take(prompt, prompt_done, snap_at);
+            if span > 0 {
+                self.step_layered(&prompt[prompt_done..prompt_done + span], &mut |_, _, _| Ok(()))?;
+                prompt_done += span;
+                if snap_at == Some(prompt_done) {
+                    self.take_snapshot(false)?;
+                }
+                self.prefill_report(prompt_done, prompt.len(), prompt_cached, start);
+                continue;
+            }
             let mut take = (prompt.len() - prompt_done).min(self.max_batch);
             if let Some(p) = snap_at.filter(|&p| p > prompt_done) {
                 take = take.min(p - prompt_done);
