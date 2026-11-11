@@ -8,7 +8,7 @@
 :root {
   --bg: #0f1115; --side: #14171d; --surface: #1a1e26; --surface-2: #222733; --line: #2c3240;
   --text: #e7e9ee; --muted: #9aa2b1; --faint: #6b7385; --accent: #7c8cff; --accent-soft: rgba(124,140,255,.14);
-  --think: #b69cff; --think-soft: rgba(182,156,255,.10); --ok: #3ecf8e; --err: #ff6b6b;
+  --think: #b69cff; --think-soft: rgba(182,156,255,.10); --ok: #3ecf8e; --err: #ff6b6b; --warn: #f5a524;
   --user: #262c3a; --code: #12151b; --shadow: 0 8px 30px rgba(0,0,0,.35);
 }
 @media (prefers-color-scheme: light) {
@@ -209,6 +209,36 @@ details.think.live > summary { color: var(--think); }
 .panel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .preview .panel { width: min(1100px, 100%); height: 85vh; display: flex; flex-direction: column; }
 .preview iframe { flex: 1; border: 0; background: #fff; border-radius: 0 0 16px 16px; }
+/* hardware */
+.bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
+.bar.warm > i { background: var(--warn); } .bar.hot > i { background: var(--err); }
+.bar.mem > i { background: var(--ok); }
+.hw-mini { display: block; width: auto; margin: 0 8px 8px; padding: 8px 10px; border: 1px solid var(--line);
+           border-radius: 10px; background: var(--surface); text-align: left; font-size: 12px; color: var(--muted); }
+.hw-mini:hover { border-color: var(--accent); }
+.hw-mini .row { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 3px;
+                font-variant-numeric: tabular-nums; }
+.hw-mini .row b { color: var(--text); font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.hw-mini .gpu + .gpu { margin-top: 7px; }
+.hw-mini .bar { height: 4px; margin-top: 3px; }
+.hw-card { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 12px 0 0;
+           background: var(--surface); }
+.hw-card h5 { display: flex; align-items: baseline; gap: 8px; margin: 0 0 10px; font-size: 14px; }
+.hw-card h5 .sub { margin-left: auto; font-weight: 500; font-size: 12px; color: var(--faint); }
+.meter { display: grid; grid-template-columns: 92px 1fr auto; gap: 8px; align-items: center; margin: 7px 0;
+         font-size: 12.5px; }
+.meter .k { color: var(--faint); }
+.meter .v { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; min-width: 96px; }
+.hw-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 4px 14px; margin-top: 10px;
+            font-size: 12.5px; }
+.hw-facts span { color: var(--faint); } .hw-facts b { color: var(--text); font-weight: 600;
+            font-variant-numeric: tabular-nums; }
+.hw-plan { margin-top: 8px; font-size: 12px; color: var(--faint); }
+.spark { width: 100%; height: 34px; display: block; margin-top: 6px; }
+.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.spark polygon { fill: var(--accent-soft); stroke: none; }
+.hw-note { font-size: 12px; color: var(--faint); margin-top: 12px; }
 .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--surface-2);
          border: 1px solid var(--line); padding: 8px 14px; border-radius: 10px; font-size: 13.5px; z-index: 60;
          box-shadow: var(--shadow); }
@@ -233,9 +263,11 @@ details.think.live > summary { color: var(--think); }
   <button class="newchat" id="newChat" title="New chat (Ctrl+Shift+O)"><span data-icon="plus"></span>New chat</button>
   <div class="search"><span data-icon="search"></span><input id="search" placeholder="Search chats"></div>
   <div id="chats"></div>
+  <button class="hw-mini" id="hwMini" hidden title="Hardware: GPUs and RAM"></button>
   <div class="side-foot">
     <div class="status" id="status"></div>
     <div class="model" id="modelName">connecting…</div>
+    <button class="ibtn" id="hwBtn" title="Hardware: GPUs and RAM" data-icon="activity" hidden></button>
     <button class="ibtn" id="settingsBtn" title="Settings" data-icon="settings"></button>
   </div>
 </aside>
@@ -320,6 +352,13 @@ details.think.live > summary { color: var(--think); }
   </div>
 </div>
 
+<div class="overlay" id="hardware" hidden>
+  <div class="panel">
+    <div class="panel-head"><span>Hardware</span><button class="ibtn" id="closeHardware" title="Close" data-icon="x"></button></div>
+    <div class="panel-body" id="hwBody"></div>
+  </div>
+</div>
+
 <div class="overlay preview" id="preview" hidden>
   <div class="panel">
     <div class="panel-head"><span>Preview</span>
@@ -353,6 +392,7 @@ const ICONS = {
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
   external: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   spark: '<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>',
+  activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
 };
 const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ""}</svg>`;
 function paintIcons(root = document) {
@@ -695,6 +735,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (!$("preview").hidden) $("preview").hidden = true;
     else if (!$("settings").hidden) $("settings").hidden = true;
+    else if (!$("hardware").hidden) $("hardware").hidden = true;
     else if (controller) stop();
   }
   if (e.key.toLowerCase() === "o" && e.ctrlKey && e.shiftKey) { e.preventDefault(); startNew(); }
@@ -1167,6 +1208,127 @@ function modelInfo(p) {
   return sections.join("");
 }
 
+// --- hardware (GET /hardware) ---------------------------------------------------
+// Polled every 2.5 s for the sidebar summary, every second while the panel is
+// open, and every 10 s while the tab is in the background. A server without
+// the route (404) hides both.
+const hw = { last: null, hist: {}, timer: null };
+const HW_HISTORY = 60;
+const pct = (a, b) => (a != null && b) ? Math.min(100, Math.max(0, 100 * a / b)) : null;
+const gb = (b) => b == null ? "—" : (b / 2 ** 30).toLocaleString("en-US", { maximumFractionDigits: 1 });
+const rate = (b) => b == null ? "—" : b >= 1e9 ? (b / 1e9).toFixed(2) + " GB/s"
+  : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB/s" : Math.round(b / 1e3) + " KB/s";
+const gpuName = (n) => (n || "GPU").replace(/^NVIDIA (GeForce )?/, "");
+const val = (v, unit = "") => v == null ? "—" : v + unit;
+
+function bar(p, kind = "") {
+  if (p == null) return `<div class="bar ${kind}"></div>`;
+  const level = kind ? "" : (p >= 95 ? " hot" : p >= 80 ? " warm" : "");
+  return `<div class="bar ${kind}${level}"><i style="width:${p.toFixed(1)}%"></i></div>`;
+}
+function tempBar(t) {
+  if (t == null) return `<div class="bar"></div>`;
+  const p = Math.min(100, Math.max(0, (t - 25) / (90 - 25) * 100));
+  return `<div class="bar${t >= 83 ? " hot" : t >= 72 ? " warm" : ""}"><i style="width:${p.toFixed(1)}%"></i></div>`;
+}
+function spark(vals) {
+  if (vals.length < 2) return "";
+  const w = HW_HISTORY - 1, step = w / (vals.length - 1);
+  const pts = vals.map((v, i) => `${(i * step).toFixed(2)},${(100 - v).toFixed(1)}`).join(" ");
+  return `<svg class="spark" viewBox="0 0 ${w} 100" preserveAspectRatio="none" aria-label="GPU load, last ${vals.length} readings">` +
+    `<polygon points="0,100 ${pts} ${w},100"/><polyline points="${pts}"/></svg>`;
+}
+function meter(label, p, text, kind) {
+  return `<div class="meter"><span class="k">${esc(label)}</span>${bar(p, kind)}<span class="v">${esc(text)}</span></div>`;
+}
+
+function renderHwMini() {
+  const h = hw.last;
+  if (!h) return;
+  $("hwMini").innerHTML = h.gpus.map((g) => {
+    const used = pct(g.vram_used, g.vram_total);
+    return `<div class="gpu"><div class="row"><b>${esc(gpuName(g.name))}</b>` +
+      `<span>${g.util_gpu != null ? g.util_gpu + "%" : ""}${g.temp_c != null ? " · " + g.temp_c + "°C" : ""}</span></div>` +
+      `<div class="row"><span>VRAM</span><span>${gb(g.vram_used)} / ${gb(g.vram_total)} GiB</span></div>${bar(used, "mem")}</div>`;
+  }).join("");
+  $("hwMini").hidden = !h.gpus.length;
+}
+
+function renderHardware() {
+  const h = hw.last;
+  if (!h) { $("hwBody").innerHTML = `<div class="hw-note">Reading…</div>`; return; }
+  const plans = props.details?.gpus || [];
+  const cards = h.gpus.map((g) => {
+    const plan = plans.find((p) => p.device === g.device);
+    const power = g.power_w != null ? `${g.power_w.toFixed(0)}${g.power_limit_w ? " / " + g.power_limit_w.toFixed(0) : ""} W` : "—";
+    const clock = g.clock_sm_mhz != null ? `${g.clock_sm_mhz}${g.clock_sm_max_mhz ? " / " + g.clock_sm_max_mhz : ""} MHz` : "—";
+    const link = g.pcie_gen != null ? `Gen ${g.pcie_gen} ×${g.pcie_width ?? "?"}` : "—";
+    const planLine = plan ? `airun on this GPU: weights ${mib(plan.weight_bytes)} · KV ${mib(plan.kv_bytes)} · ` +
+      `scratch ${mib(plan.scratch_bytes)}${plan.layers ? " · layers " + span(plan.layers) : ""}` +
+      `${plan.output ? " · output head" : ""}${plan.embedding ? " · embedding" : ""}` : "not used by this model";
+    return `<div class="hw-card"><h5>GPU ${g.device} · ${esc(gpuName(g.name))}<span class="sub">${esc(g.pci_bus_id)}` +
+      `${g.pstate != null ? " · P" + g.pstate : ""}</span></h5>` +
+      meter("GPU load", g.util_gpu, val(g.util_gpu, "%")) +
+      meter("memory bus", g.util_mem, val(g.util_mem, "%")) +
+      meter("VRAM", pct(g.vram_used, g.vram_total), `${gb(g.vram_used)} / ${gb(g.vram_total)} GiB`, "mem") +
+      meter("power", pct(g.power_w, g.power_limit_w), power) +
+      `<div class="meter"><span class="k">temperature</span>${tempBar(g.temp_c)}<span class="v">${val(g.temp_c, " °C")}</span></div>` +
+      spark(hw.hist[g.device] || []) +
+      `<div class="hw-facts"><div><span>SM clock</span> <b>${clock}</b></div>` +
+      `<div><span>memory clock</span> <b>${val(g.clock_mem_mhz, " MHz")}</b></div>` +
+      `<div><span>fan</span> <b>${val(g.fan_pct, "%")}</b></div>` +
+      `<div><span>PCIe</span> <b>${link}</b></div>` +
+      `<div><span>PCIe to GPU</span> <b>${rate(g.pcie_rx)}</b></div>` +
+      `<div><span>PCIe from GPU</span> <b>${rate(g.pcie_tx)}</b></div></div>` +
+      `<div class="hw-plan">${esc(planLine)}</div></div>`;
+  }).join("");
+  const r = h.ram || {};
+  const used = r.total != null && r.available != null ? r.total - r.available : null;
+  const ram = `<div class="hw-card"><h5>RAM<span class="sub">${r.total != null ? gb(r.total) + " GiB installed" : ""}</span></h5>` +
+    meter("system", pct(used, r.total), `${gb(used)} / ${gb(r.total)} GiB`, "mem") +
+    meter("airun", pct(r.process_resident, r.total), `${gb(r.process_resident)} GiB`, "mem") +
+    meter("pinned", pct(r.pinned, r.total), `${gb(r.pinned)} GiB`, "mem") +
+    `<div class="hw-facts">${r.process_committed != null ? `<div><span>airun committed</span> <b>${gb(r.process_committed)} GiB</b></div>` : ""}` +
+    `<div><span>available</span> <b>${gb(r.available)} GiB</b></div></div>` +
+    `<div class="hw-plan">Pinned RAM holds the KV cache or weights kept in RAM; Windows caps how much a process may pin.</div></div>`;
+  const note = h.nvml ? `NVML${h.driver ? " · driver " + esc(h.driver) : ""} · ${h.processing ? "generating" : "idle"}`
+    : "NVML not found (it comes with the NVIDIA driver): only VRAM is shown.";
+  $("hwBody").innerHTML = cards + ram + `<div class="hw-note">${note}</div>`;
+}
+
+async function pollHardware() {
+  if (hw.busy) return;   // the reading in flight schedules the next one
+  hw.busy = true;
+  clearTimeout(hw.timer);
+  try {
+    const r = await fetch("./hardware", { headers: headers() });
+    if (r.status === 404) { $("hwMini").hidden = true; $("hwBtn").hidden = true; hw.busy = false; return; }
+    if (r.ok) {
+      hw.last = await r.json();
+      for (const g of hw.last.gpus) {
+        const h = hw.hist[g.device] ||= [];
+        h.push(g.util_gpu ?? 0);
+        if (h.length > HW_HISTORY) h.shift();
+      }
+      $("hwBtn").hidden = false;
+      renderHwMini();
+      if (!$("hardware").hidden) renderHardware();
+    }
+  } catch (_) {}
+  hw.busy = false;
+  hw.timer = setTimeout(pollHardware, !$("hardware").hidden ? 1000 : document.hidden ? 10000 : 2500);
+}
+function openHardware() {
+  $("hardware").hidden = false;
+  renderHardware();
+  pollHardware();
+}
+$("hwMini").addEventListener("click", openHardware);
+$("hwBtn").addEventListener("click", openHardware);
+$("closeHardware").addEventListener("click", () => { $("hardware").hidden = true; });
+$("hardware").addEventListener("click", (e) => { if (e.target === $("hardware")) $("hardware").hidden = true; });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pollHardware(); });
+
 // --- server ---------------------------------------------------------------------
 let propsRepainted = false;
 async function connect() {
@@ -1222,6 +1384,7 @@ renderChat();
 syncComposer();
 $("sideClose").hidden = window.innerWidth > 800;
 connect().then(resumePending);
+pollHardware();
 input.focus();
 </script>
 </body>

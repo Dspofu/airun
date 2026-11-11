@@ -2,10 +2,21 @@
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CudaError, Result};
 use crate::ffi;
 use crate::stream::Stream;
+
+/// Pinned RAM this process holds now ([`DeviceBuffer::in_ram`] and
+/// [`PinnedBuffer`]). The driver caps it well below the installed RAM on
+/// Windows, so it is worth showing next to the RAM figures.
+static PINNED: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of pinned RAM allocated through this crate and not yet freed.
+pub fn pinned_bytes() -> u64 {
+    PINNED.load(Ordering::Relaxed)
+}
 
 /// A typed allocation in one GPU's memory.
 ///
@@ -96,6 +107,7 @@ impl<T: Copy> DeviceBuffer<T> {
             unsafe { ffi::airun_host_free(host) };
             return Err(CudaError::from_status(status));
         }
+        PINNED.fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(Self { ptr, len, device, host, _marker: PhantomData })
     }
 
@@ -289,6 +301,7 @@ impl<T> Drop for DeviceBuffer<T> {
                 ffi::airun_free(self.device, self.ptr);
             } else {
                 ffi::airun_host_free(self.host);
+                PINNED.fetch_sub((self.len * std::mem::size_of::<T>()) as u64, Ordering::Relaxed);
             }
         }
     }
@@ -335,6 +348,7 @@ impl<T: Copy + Default> PinnedBuffer<T> {
                 ),
             });
         }
+        PINNED.fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(Self {
             ptr,
             len,
@@ -386,5 +400,6 @@ impl<T> Drop for PinnedBuffer<T> {
         unsafe {
             ffi::airun_host_free(self.ptr);
         }
+        PINNED.fetch_sub((self.len * std::mem::size_of::<T>()) as u64, Ordering::Relaxed);
     }
 }

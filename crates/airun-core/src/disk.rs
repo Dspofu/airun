@@ -88,6 +88,50 @@ fn memory_status() -> Option<(u64, u64)> {
     Some((field("MemTotal:")?, field("MemAvailable:")?))
 }
 
+/// This process's memory: (resident in RAM, committed). Committed counts
+/// what the process allocated whether or not it is in RAM now (Windows:
+/// private bytes; Linux: none, so None).
+pub fn process_memory() -> Option<(u64, Option<u64>)> {
+    process_memory_impl()
+}
+
+#[cfg(windows)]
+fn process_memory_impl() -> Option<(u64, Option<u64>)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        quota_peak_paged_pool: usize,
+        quota_paged_pool: usize,
+        quota_peak_non_paged_pool: usize,
+        quota_non_paged_pool: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32GetProcessMemoryInfo(process: *mut std::ffi::c_void, counters: *mut Counters, cb: u32) -> i32;
+    }
+    let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+    // SAFETY: `c` is a PROCESS_MEMORY_COUNTERS_EX with its size in `cb`; the
+    // pseudo-handle of the current process needs no closing.
+    (unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0)
+        .then_some((c.working_set as u64, Some(c.private_usage as u64)))
+}
+
+#[cfg(not(windows))]
+fn process_memory_impl() -> Option<(u64, Option<u64>)> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = text.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line["VmRSS:".len()..].trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some((kb * 1024, None))
+}
+
 /// RAM kept free for the system and other programs when deciding what the
 /// weights may pin, unless `--ram-reserve` says otherwise: a tenth of the
 /// installed RAM, between 2 and 8 GiB.

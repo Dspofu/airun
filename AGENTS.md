@@ -565,6 +565,17 @@ built for it work unchanged:
 - **Health and metadata:** `/health`, `/v1/health`, `/props`, `/models`,
   `/v1/models`, `/slots` and `/metrics` (501, like llama-server without
   `--metrics`).
+- **Hardware (airun's own):** `/hardware` (behind the API key, like
+  `/slots`). Per GPU, from NVML (`airun-cuda/src/nvml.rs`, opened at run
+  time from the driver, so not a dependency): load, memory-bus load, VRAM
+  (`nvmlDeviceGetMemoryInfo_v2`, which matches nvidia-smi), temperature,
+  power and limit, clocks, fan, P-state, PCIe link and traffic. Without NVML
+  only VRAM, from `cudaMemGetInfo`. RAM: system, this process
+  (`disk::process_memory`) and pinned (`airun_cuda::pinned_bytes`, counted
+  in `buffer.rs`). A reading costs ~250 ms on two GPUs (NVML samples PCIe for
+  ~20 ms per counter), so it is cached for 0.7 s and shared between clients.
+  The web UI polls it every 2.5 s for the sidebar block, every second while
+  its Hardware panel is open, every 10 s in a background tab.
 - **Generation:** `/completion` and `/completions` (native), `/infill`,
   `/v1/completions`, `/chat/completions` and `/v1/chat/completions`,
   `/v1/responses` (and `/responses`, OpenAI Responses) and `/v1/messages`

@@ -267,6 +267,12 @@ struct AppState {
     default_breakers: Arc<Vec<bool>>,
     /// Fill-in-the-middle markers, if the vocabulary has them.
     fim: Option<Fim>,
+    /// Every visible GPU, for /hardware: (ordinal, name, PCI bus id).
+    hw_devices: Vec<(i32, String, String)>,
+    /// The last /hardware reading and when it was taken. A reading costs
+    /// ~50 ms per GPU (NVML samples PCIe traffic), so several open pages
+    /// share one.
+    hw_cache: std::sync::Mutex<Option<(std::time::Instant, Value)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -746,6 +752,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
         pooling,
         think_tags,
         active: Default::default(),
+        hw_devices: airun_cuda::devices().unwrap_or_default().into_iter()
+            .map(|d| (d.ordinal, d.name.clone(), d.pci_bus_id())).collect(),
+        hw_cache: std::sync::Mutex::new(None),
     });
 
     let app = Router::new()
@@ -758,6 +767,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         .route("/slots", get(slots_handler))
         .route("/slots/{id}", post(slot_action))
         .route("/metrics", get(metrics_handler))
+        .route("/hardware", get(hardware_handler))
         .route("/completion", post(native_completion))
         .route("/completions", post(native_completion))
         .route("/v1/completions", post(oai_completions))
@@ -805,7 +815,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("  web ui:         http://{addr}/");
         eprintln!("  authentication: {auth}");
         eprintln!("  endpoints: /v1/chat/completions /v1/responses /v1/messages /v1/completions /completion /infill /tokenize \
-                   /detokenize /apply-template /v1/models /props /slots /health /v1/stream/{{id}}");
+                   /detokenize /apply-template /v1/models /props /slots /health /hardware /v1/stream/{{id}}");
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -999,6 +1009,74 @@ async fn slots_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -
 }
 
 /// llama-server answers 501 unless started with `--metrics`; airun has none.
+/// Live hardware readings: each GPU's load, memory, temperature, power,
+/// clocks and PCIe traffic (from NVML, when the driver has it), and the RAM
+/// of the machine and of this process, pinned RAM included. airun's own plan
+/// per GPU is in /props (`details.gpus`).
+async fn hardware_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let st = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || hardware_reading(&st)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("could not read the hardware: {e}"),
+            "server_error"),
+    }
+}
+
+fn hardware_reading(state: &AppState) -> Value {
+    const FRESH: std::time::Duration = std::time::Duration::from_millis(700);
+    // Held across the reading, so concurrent requests wait for one reading
+    // instead of each sampling the GPUs.
+    let mut cache = state.hw_cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, v)) = cache.as_ref() {
+        if at.elapsed() < FRESH {
+            return v.clone();
+        }
+    }
+    let nvml = airun_cuda::nvml::available();
+    let gpus: Vec<Value> = state.hw_devices.iter().map(|(ordinal, name, pci)| {
+        let s = airun_cuda::nvml::gpu_stats(pci).unwrap_or_default();
+        // Without NVML, the VRAM figures still come from CUDA.
+        let (total, used) = match (s.mem_total, s.mem_used) {
+            (Some(t), Some(u)) => (Some(t), Some(u)),
+            _ => match airun_cuda::device::mem_info(*ordinal) {
+                Ok((free, total)) => (Some(total), Some(total.saturating_sub(free))),
+                Err(_) => (None, None),
+            },
+        };
+        json!({
+            "device": ordinal, "name": name, "pci_bus_id": pci,
+            "vram_total": total, "vram_used": used,
+            "util_gpu": s.util_gpu, "util_mem": s.util_mem,
+            "temp_c": s.temp_c, "power_w": s.power_w, "power_limit_w": s.power_limit_w,
+            "clock_sm_mhz": s.clock_sm_mhz, "clock_sm_max_mhz": s.clock_sm_max_mhz,
+            "clock_mem_mhz": s.clock_mem_mhz, "fan_pct": s.fan_pct,
+            "pcie_tx": s.pcie_tx, "pcie_rx": s.pcie_rx, "pcie_gen": s.pcie_gen, "pcie_width": s.pcie_width,
+            "pstate": s.pstate,
+        })
+    }).collect();
+    let process = airun_core::disk::process_memory();
+    let v = json!({
+        "time_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64),
+        "nvml": nvml,
+        "driver": airun_cuda::nvml::driver_version(),
+        "gpus": gpus,
+        "ram": {
+            "total": airun_core::disk::total_ram(),
+            "available": airun_core::disk::available_ram(),
+            "process_resident": process.map(|p| p.0),
+            "process_committed": process.and_then(|p| p.1),
+            "pinned": airun_cuda::pinned_bytes(),
+        },
+        "processing": state.processing.load(Ordering::Relaxed),
+    });
+    *cache = Some((std::time::Instant::now(), v.clone()));
+    v
+}
+
 async fn metrics_handler() -> Response {
     api_error(StatusCode::NOT_IMPLEMENTED,
         "This server does not support metrics endpoint. Start it with `--metrics`", "not_supported_error")

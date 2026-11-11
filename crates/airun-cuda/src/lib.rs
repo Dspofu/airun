@@ -14,12 +14,13 @@ pub mod error;
 pub mod ffi;
 pub mod hc;
 pub mod hybrid;
+pub mod nvml;
 pub mod ops;
 pub mod qsa;
 pub mod stream;
 pub mod vision;
 
-pub use buffer::{DeviceBuffer, PinnedBuffer};
+pub use buffer::{DeviceBuffer, PinnedBuffer, pinned_bytes};
 pub use ops::KernelType;
 pub use device::{Device, Generation, devices, device_count};
 pub use error::{CudaError, Result};

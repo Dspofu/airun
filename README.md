@@ -235,6 +235,7 @@ with llama-server's, field by field.
 | `/tokenize`, `/detokenize`, `/apply-template` | Utilities |
 | `/v1/stream/{id}` | Replay a generation that continued after the client dropped |
 | `/slots`, `/health`, `/props`, `/v1/models` | Server state |
+| `/hardware` | Live GPU load, VRAM, temperature, power, clocks and PCIe traffic (NVML), plus system, process and pinned RAM; the web UI shows it in the sidebar |
 
 - **Images:** with `--mmproj`, send the image as a data URL (OpenAI) or base64
   (Anthropic).
