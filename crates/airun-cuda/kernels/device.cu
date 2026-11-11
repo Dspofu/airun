@@ -140,6 +140,9 @@ airun_status airun_malloc(int32_t ordinal, uint64_t bytes, void** out) {
     void* ptr = nullptr;
     cudaError_t e = cudaMalloc(&ptr, (size_t)bytes);
     if (e != cudaSuccess) {
+        // The failure is returned here; leaving it as the runtime's last
+        // error would make the next kernel launch check report it too.
+        cudaGetLastError();
         *out = nullptr;
         return (airun_status)e;
     }
@@ -161,6 +164,11 @@ airun_status airun_host_alloc(uint64_t bytes, void** out) {
     void* ptr = nullptr;
     cudaError_t e = cudaHostAlloc(&ptr, (size_t)bytes, cudaHostAllocPortable | cudaHostAllocMapped);
     if (e != cudaSuccess) {
+        // As in airun_malloc: the caller gets the error, the next launch
+        // check must not. A turn snapshot that could not be pinned (pinned
+        // RAM used up by a KV cache in RAM) failed every chat request with
+        // cudaErrorMemoryAllocation from an unrelated kernel launch.
+        cudaGetLastError();
         *out = nullptr;
         return (airun_status)e;
     }

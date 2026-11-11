@@ -71,11 +71,53 @@ struct TurnSnapshot {
     /// [`Runtime::walk_state`] without the KV rows, in pinned memory: the
     /// copies are queued on each shard's stream, in order with the prefill,
     /// and nothing waits for them. Kept across turns, as its size is fixed.
-    bytes: airun_cuda::PinnedBuffer<u8>,
+    bytes: SnapBytes,
     /// Whether `bytes` ends with the MTP head's `pending` row at the same
     /// point (hidden of the last token): the prefill that took it ran the
     /// head too, so the head's cache rows before it are good.
     pending: bool,
+}
+
+/// Where a turn snapshot lives. Pinned RAM when the driver grants it; else
+/// ordinary RAM, which the copies reach synchronously (the CUDA runtime
+/// stages them) -- slower, but the chat goes on. Windows caps pinned memory:
+/// Qwen3.8-27B Q6_K at -c 248144 --parallel 4 had 15 GB of KV pinned on a
+/// 32 GB PC, and every chat request (the snapshot is taken at
+/// `<|im_start|>`) failed with cudaErrorMemoryAllocation.
+enum SnapBytes {
+    Pinned(airun_cuda::PinnedBuffer<u8>),
+    Pageable(Box<[u8]>),
+}
+
+impl SnapBytes {
+    fn new(bytes: usize) -> Self {
+        match airun_cuda::PinnedBuffer::new(bytes) {
+            Ok(b) => SnapBytes::Pinned(b),
+            Err(e) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| eprintln!(
+                    "note: could not pin {} of RAM for the chat-turn snapshot ({e}); keeping it in ordinary \
+                     RAM, which is slower to copy. Pinned RAM is scarce: a smaller -c or --parallel, or \
+                     --alloc gpu, pins less KV cache",
+                    airun_cuda::human_bytes(bytes as u64)));
+                SnapBytes::Pageable(vec![0u8; bytes].into_boxed_slice())
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            SnapBytes::Pinned(b) => b.len(),
+            SnapBytes::Pageable(b) => b.len(),
+        }
+    }
+
+    fn as_raw(&mut self) -> *mut std::ffi::c_void {
+        match self {
+            SnapBytes::Pinned(b) => b.as_raw(),
+            SnapBytes::Pageable(b) => b.as_mut_ptr().cast(),
+        }
+    }
 }
 
 /// AIRUN_NO_STATE_SNAPSHOT=1 turns the turn snapshot off.
@@ -2713,7 +2755,23 @@ impl Runtime {
 
     /// Saves the recurrent state the caches hold now (n_past tokens), and the
     /// MTP head's `pending` row when `with_head`.
+    ///
+    /// The snapshot only saves work, so failing to take one never fails the
+    /// generation: the next turn then reprocesses its prompt.
     pub(crate) fn take_snapshot(&mut self, with_head: bool) -> Result<()> {
+        if let Err(e) = self.try_take_snapshot(with_head) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| eprintln!(
+                "note: no chat-turn snapshot ({e}); each turn reprocesses the conversation. Pinned RAM is \
+                 scarce: a smaller -c or --parallel, or --alloc gpu, pins less KV cache"));
+            // SAFETY: only reads and resets the runtime's last-error slot.
+            unsafe { airun_cuda::ffi::airun_clear_error() };
+            self.turn_snap = None;
+        }
+        Ok(())
+    }
+
+    fn try_take_snapshot(&mut self, with_head: bool) -> Result<()> {
         let mut total = 0usize;
         self.walk_state(false, |buf, offset, len, _| { total += buf.raw(offset, len).1; Ok(()) })?;
         let pending_bytes = self.model.config.n_embd * std::mem::size_of::<f32>();
@@ -2721,23 +2779,33 @@ impl Runtime {
         let need = total + if with_head { pending_bytes } else { 0 };
         // The previous snapshot's buffer, if it is big enough. Its last
         // restore was queued on the streams that queue the copies below.
-        let bytes = match self.turn_snap.take() {
+        let mut bytes = match self.turn_snap.take() {
             Some(s) if s.bytes.len() >= need => s.bytes,
-            _ => airun_cuda::PinnedBuffer::new(total + pending_bytes)?,
+            _ => SnapBytes::new(total + pending_bytes),
         };
         let base = bytes.as_raw();
         let mut at = 0usize;
-        self.walk_state(false, |buf, offset, len, stream| {
+        let copied = self.walk_state(false, |buf, offset, len, stream| {
             let (src, n) = buf.raw(offset, len);
             airun_cuda::copy_d2h(base.wrapping_byte_add(at), src, n, stream)?;
             at += n;
             Ok(())
-        })?;
-        if with_head {
-            let st = self.states.last().expect("a runtime has at least one device");
-            device::set_device(st.device)?;
-            let sp = self.spec.as_ref().expect("checked above");
-            airun_cuda::copy_d2h(base.wrapping_byte_add(at), sp.pending.as_ptr(), pending_bytes, &st.stream)?;
+        }).and_then(|_| {
+            if with_head {
+                let st = self.states.last().expect("a runtime has at least one device");
+                device::set_device(st.device)?;
+                let sp = self.spec.as_ref().expect("checked above");
+                airun_cuda::copy_d2h(base.wrapping_byte_add(at), sp.pending.as_ptr(), pending_bytes, &st.stream)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = copied {
+            // Copies queued before the failure may still be writing `bytes`;
+            // let them land before it is freed.
+            for st in &self.states {
+                let _ = device::set_device(st.device).map(|_| st.stream.synchronize());
+            }
+            return Err(e);
         }
         self.turn_snap = Some(TurnSnapshot { tokens: self.history[..self.n_past].to_vec(), bytes, pending: with_head });
         Ok(())
@@ -2747,7 +2815,7 @@ impl Runtime {
     /// copies are queued on each shard's stream, ahead of the prefill that
     /// follows.
     fn restore_snapshot(&mut self, n: usize) -> Result<()> {
-        let snap = self.turn_snap.take().filter(|s| s.tokens.len() == n).ok_or_else(|| CoreError::Other(
+        let mut snap = self.turn_snap.take().filter(|s| s.tokens.len() == n).ok_or_else(|| CoreError::Other(
             "no turn snapshot at that point; this is a bug".into()))?;
         let base = snap.bytes.as_raw();
         let mut at = 0usize;

@@ -80,7 +80,8 @@ impl<T: Copy> DeviceBuffer<T> {
                 code: status as i32,
                 name: "AIRUN_HOST_ALLOC".into(),
                 message: format!(
-                    "could not pin {} of RAM for a KV cache; close other programs, lower -c or                      --parallel, or use --alloc gpu",
+                    "could not pin {} of RAM for a KV cache; close other programs, lower -c or --parallel, or use \
+                     --alloc gpu",
                     crate::human_bytes(bytes as u64)
                 ),
             });
@@ -322,7 +323,18 @@ impl<T: Copy + Default> PinnedBuffer<T> {
         let bytes = std::mem::size_of::<T>() * len;
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // SAFETY: `ptr` is a valid out-parameter.
-        ffi::check(unsafe { ffi::airun_host_alloc(bytes as u64, &mut ptr) })?;
+        let status = unsafe { ffi::airun_host_alloc(bytes as u64, &mut ptr) };
+        if status != ffi::AIRUN_OK {
+            return Err(CudaError::Runtime {
+                code: status as i32,
+                name: "AIRUN_HOST_ALLOC".into(),
+                message: format!(
+                    "could not pin {} of RAM (page-locked memory, which Windows caps); close other programs, \
+                     or pin less KV cache with a smaller -c or --parallel, or --alloc gpu",
+                    crate::human_bytes(bytes as u64)
+                ),
+            });
+        }
         Ok(Self {
             ptr,
             len,

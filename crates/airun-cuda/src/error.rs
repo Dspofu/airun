@@ -6,7 +6,9 @@ pub type Result<T> = std::result::Result<T, CudaError>;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CudaError {
-    #[error("CUDA error {code} ({name}): {message}{}", hint_suffix(*code))]
+    // A failed pinned-RAM allocation also returns code 2, but its message
+    // already says what to do, and the VRAM hint would mislead.
+    #[error("CUDA error {code} ({name}): {message}{}", if name == "AIRUN_HOST_ALLOC" { "" } else { hint_suffix(*code) })]
     Runtime {
         code: i32,
         name: String,
