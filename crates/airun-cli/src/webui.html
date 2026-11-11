@@ -209,6 +209,10 @@ details.think.live > summary { color: var(--think); }
 .panel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .preview .panel { width: min(1100px, 100%); height: 85vh; display: flex; flex-direction: column; }
 .preview iframe { flex: 1; border: 0; background: #fff; border-radius: 0 0 16px 16px; }
+.cut { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; padding: 8px 12px; border-radius: 10px;
+       font-size: 13px; color: var(--warn); background: rgba(245,165,36,.08); border: 1px solid rgba(245,165,36,.3); }
+.cut .icon { width: 14px; height: 14px; margin-top: 3px; }
+
 /* hardware */
 .bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
 .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
@@ -333,7 +337,9 @@ details.think.live > summary { color: var(--think); }
       <div class="field"><label for="rep">repeat penalty <b id="repV"></b></label>
         <input type="range" id="rep" min="1" max="1.5" step="0.01" value="1.1"></div>
       <div class="field"><label for="maxTok">maximum tokens in the answer</label>
-        <input type="number" id="maxTok" min="1" max="131072" value="4096"></div>
+        <input type="number" id="maxTok" min="1" max="131072" value="" placeholder="no limit">
+        <div class="note">Empty = until the answer ends or the context fills. Reasoning counts too: a limit
+          can cut a reply off while the model is still thinking.</div></div>
       <div class="field"><label for="seed">seed</label>
         <input type="text" id="seed" placeholder="random" inputmode="numeric"></div>
       <h4>Chat</h4>
@@ -450,6 +456,9 @@ function loadSettings() {
   try { s = JSON.parse(localStorage.getItem(SETTINGS) || "{}"); } catch (_) {}
   for (const id of CONTROLS) if (s[id] !== undefined) $(id).value = s[id];
   if (!$("effort").value) $("effort").value = "default"; // a value this version no longer has
+  // 4096 was the default before "no limit": a thinking model spent it all
+  // reasoning and the answer never came. Saved as-is, it was never chosen.
+  if (s.maxTokV2 === undefined && String(s.maxTok) === "4096") $("maxTok").value = "";
   if (s.lastOn) lastOn = s.lastOn;
   // Settings saved before the levels had "off": a separate on/off switch.
   if (s.thinking === false && s.effortV2 === undefined) {
@@ -459,7 +468,7 @@ function loadSettings() {
 }
 function saveSettings() {
   if (thinkingOn()) lastOn = $("effort").value;
-  const s = { lastOn, effortV2: true };
+  const s = { lastOn, effortV2: true, maxTokV2: true };
   for (const id of CONTROLS) s[id] = $(id).value;
   try { localStorage.setItem(SETTINGS, JSON.stringify(s)); } catch (_) {}
 }
@@ -689,6 +698,14 @@ function renderAssistant(el, raw, stats, live) {
       `<summary>${icon("brain")}${label}</summary><div class="think-body">${esc(think)}</div></details>`;
   }
   html += `<div class="answer${live && !thinkingNow ? " cursor" : ""}">${markdown(answer)}</div>`;
+  const cut = el.dataset.index !== undefined ? chat()?.turns[+el.dataset.index]?.cut : null;
+  if (cut && !live) {
+    const why = cut.limit
+      ? `the limit of ${num(cut.limit)} tokens per answer (Settings → maximum tokens; empty = no limit)`
+      : "the context is full: start a new chat or raise -c";
+    html += `<div class="cut">${icon("stop")}<span>Cut off${thinkingNow ? " while still thinking" : ""}: ` +
+      `${esc(why)}. Regenerate to try again.</span></div>`;
+  }
   body.innerHTML = html;
   if (live && thinkingNow) {
     const tb = body.querySelector(".think-body");
@@ -772,7 +789,8 @@ function requestBody(c) {
   }
   const body = {
     model: props.model || "airun", messages, stream: true,
-    max_tokens: +$("maxTok").value || 4096, temperature: +$("temp").value, top_p: +$("top_p").value,
+    // Always sent: without it the server's --default-max-tokens (512) applies.
+    max_tokens: +$("maxTok").value || props.ctx || 131072, temperature: +$("temp").value, top_p: +$("top_p").value,
     top_k: +$("top_k").value, min_p: +$("min_p").value, repeat_penalty: +$("rep").value,
   };
   if (props.thinking) {
@@ -801,9 +819,10 @@ function headers(extra) {
   return h;
 }
 
-// Reads an SSE stream of chat chunks, calling `each(reasoning, content)` per delta and
-// `final(chunk)` for the closing chunk (usage/timings).
-async function readSse(res, each, final) {
+// Reads an SSE stream of chat chunks, calling `each(reasoning, content)` per delta,
+// `final(chunk)` for the closing chunk (usage/timings) and `ended(reason)` with the
+// finish reason ("stop", "length", "tool_calls").
+async function readSse(res, each, final, ended) {
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = "";
   for (;;) {
@@ -819,6 +838,8 @@ async function readSse(res, each, final) {
       let j;
       try { j = JSON.parse(payload); } catch (_) { continue; }
       if (j.error) throw new Error(j.error.message || "server error");
+      const reason = j.choices?.[0]?.finish_reason;
+      if (reason && ended) ended(reason);
       const d = j.choices?.[0]?.delta || {};
       if (d.reasoning_content || d.content) each(d.reasoning_content || "", d.content || "");
       else if (final && (j.usage || j.timings)) final(j);
@@ -898,6 +919,9 @@ async function generate(c, resume) {
       turn.stats = { ...turn.stats, usage: j.usage || null, timings: j.timings || null };
       paint();
       save();
+    }, (reason) => {
+      // "length": the token limit or a full context ended it, not the model.
+      if (reason === "length") turn.cut = { limit: +$("maxTok").value || 0 };
     });
   } catch (e) {
     if (e.name === "AbortError") {
