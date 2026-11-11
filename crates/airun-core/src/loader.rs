@@ -199,6 +199,19 @@ pub fn load(
     }
     let head_bytes = mtp_src.as_ref().map_or(0, |src| crate::model::mtp_head_bytes(src, &config)
         + crate::model::spec_scratch_bytes(&config, opts.batch, draft));
+    // Each linear-attention layer keeps the verify's stash on its own GPU.
+    // Counted before auto_ctx so its probes are the plan that gets made:
+    // without it (Qwen3.8-27B, --draft 3 --parallel 4) the probe had the head
+    // on the 5070 Ti at 143616 tokens, the real plan did not fit that layout
+    // and put it on the 5060 Ti, 57.7 instead of 68.8 tok/s.
+    if load_mtp {
+        let stash = crate::model::spec_stash_bytes(&config, draft);
+        for l in 0..config.n_run_layers().min(sizes.per_layer.len()) {
+            if config.layer_kind(l) == crate::config::LayerKind::LinearAttention {
+                sizes.per_layer[l] += stash;
+            }
+        }
+    }
     let auto;
     let opts = if opts.ctx_auto {
         let ctx = auto_ctx(&config, &sizes, &devices, opts, load_mtp.then_some(head_bytes));
@@ -208,15 +221,8 @@ pub fn load(
         opts
     };
     if load_mtp {
-        // The head and its own KV cache sit with the output projection; each
-        // linear-attention layer keeps the verify's stash on its own GPU.
+        // The head and its own KV cache sit with the output projection.
         sizes.output += head_bytes + config.kv_bytes_per_layer(opts.ctx);
-        let stash = crate::model::spec_stash_bytes(&config, draft);
-        for l in 0..config.n_run_layers().min(sizes.per_layer.len()) {
-            if config.layer_kind(l) == crate::config::LayerKind::LinearAttention {
-                sizes.per_layer[l] += stash;
-            }
-        }
     }
     let mut split = opts.split.clone();
     let mut device_order: Vec<i32> = Vec::new();
