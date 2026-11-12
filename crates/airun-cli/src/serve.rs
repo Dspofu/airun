@@ -89,15 +89,13 @@ pub struct ServeArgs {
     pub batch_size: usize,
 
     /// Speculative decoding with the model's own MTP head: tokens drafted per
-    /// step (0 turns it off). Engages on a request only when it decodes
-    /// greedily: temperature 0 and no repeat/presence/frequency penalties
-    /// (this command's default --repeat-penalty is 1.1, which disables it;
-    /// start with --repeat-penalty 1.0 to use it). The drafts are verified by
-    /// the model, but in a small batch: on a near-tie the text can differ
-    /// from one-at-a-time decoding. Files without a usable MTP head ignore
-    /// it (a note is printed at load).
-    #[arg(long, default_value_t = 0)]
-    pub draft: usize,
+    /// step. Off unless given; the load says when the model has a head and
+    /// how many drafts suit it. The drafts are verified by the model, and
+    /// sampling keeps its distribution, but the verify runs in a small
+    /// batch: on a near-tie the text can differ from one-at-a-time decoding.
+    /// Files without a usable MTP head ignore it.
+    #[arg(long)]
+    pub draft: Option<usize>,
 
     /// The MTP head in a file of its own (mtp-*.gguf). Default: the model's
     /// own head, or an mtp-*.gguf of the same model in the model's folder.
@@ -474,7 +472,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     run_args.single_gpu = args.single_gpu;
     run_args.alloc = args.alloc.clone();
     run_args.vram_reserve = args.vram_reserve;
-    run_args.draft = Some(args.draft);
+    run_args.draft = args.draft;
     run_args.mtp = args.mtp.clone();
     run_args.mmproj = args.mmproj.clone();
     run_args.image_max_tokens = args.image_max_tokens;
@@ -585,7 +583,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         })),
         "mtp": {
             "head": runtime.model.mtp.is_some(),
-            "draft": if runtime.model.mtp.is_some() { args.draft } else { 0 },
+            "draft": if runtime.model.mtp.is_some() { runtime.draft() } else { 0 },
         },
         "gpus": placement.shards.iter().map(|s| {
             let vram: Vec<usize> = s.layers.iter().copied().filter(|l| !s.ram_layers.contains(l)).collect();

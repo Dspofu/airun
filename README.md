@@ -142,8 +142,11 @@ r = client.chat.completions.create(model="airun", messages=[{"role": "user", "co
 print(r.choices[0].message.content)
 ```
 
-Without `-c`, the context is the largest that fits the GPUs with every weight
-in VRAM.
+Without `-c`, airun picks the context: the largest that fits, or, between GPUs
+of different speeds, the largest that costs at most 10% of the decode speed
+(`--prefer speed|balanced|context` changes that). MTP is off unless you pass
+`--draft`; the load tells you when the model has a head and how many drafts
+suit it.
 
 ---
 
@@ -165,6 +168,51 @@ Best of 3 alternated rounds
 | 2048-token prompt | **3690** | 3652 | +1% |
 | generation | **49.0** | 47.9 | +2% |
 | generation with MTP | **113.7** | 104.6 | +9% |
+
+### Speed by context depth (RTX 5070 Ti + RTX 5060 Ti)
+
+Qwen3.8-27B NVFP4, `serve --kv-type q4_0 -c 131072`, prompts of real source
+code, 200 tokens generated, one run per point
+([`benchmarks/2026-11-12`](benchmarks/2026-11-12/RESULTS.md)). The x axis is
+the prompt size in thousands of tokens.
+
+```mermaid
+xychart-beta
+    title "Generation: tok/s by prompt size (upper line --draft 4, lower line no MTP)"
+    x-axis "prompt, thousands of tokens" ["0.8", "3.5", "7", "14", "28", "61", "112"]
+    y-axis "tok/s" 0 --> 80
+    line [74.0, 76.1, 68.6, 68.5, 59.1, 40.4, 26.8]
+    line [41.7, 40.7, 39.4, 35.9, 31.4, 24.6, 18.4]
+```
+
+```mermaid
+xychart-beta
+    title "Prompt processing: tok/s by prompt size"
+    x-axis "prompt, thousands of tokens" ["0.8", "3.5", "7", "14", "28", "61", "112"]
+    y-axis "tok/s" 0 --> 4000
+    line [1944, 3665, 3684, 3341, 2738, 1859, 1260]
+```
+
+```mermaid
+xychart-beta
+    title "Seconds to read the whole prompt"
+    x-axis "prompt, thousands of tokens" ["0.8", "3.5", "7", "14", "28", "61", "112"]
+    y-axis "seconds" 0 --> 90
+    line [0.4, 0.9, 1.9, 4.2, 10.2, 33.1, 88.7]
+```
+
+| Prompt tokens | 764 | 3,467 | 6,851 | 14,006 | 27,885 | 61,491 | 111,761 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prompt tok/s | 1944 | 3665 | 3684 | 3341 | 2738 | 1859 | 1260 |
+| generation, `--draft 4` | 74.0 | 76.1 | 68.6 | 68.5 | 59.1 | 40.4 | 26.8 |
+| generation, no MTP | 41.7 | 40.7 | 39.4 | 35.9 | 31.4 | 24.6 | 18.4 |
+
+- **Generation holds within 10% of its best up to ~14k tokens,** has lost a
+  quarter by 28k and two thirds by 112k: every new token reads the whole
+  cache.
+- **MTP's gain shrinks with depth,** from 1.8-1.9x to 1.5x at 112k.
+- **Prompt processing peaks between 3k and 7k tokens** and falls to a third
+  by 112k. A chat does not pay it again: the next turn reuses the cache.
 
 ### Long context, real code (RTX 5060 Ti + RTX 3060)
 

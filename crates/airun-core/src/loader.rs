@@ -58,6 +58,64 @@ pub struct LoadOptions {
     /// RAM left free when deciding what may be pinned (`--ram-reserve`);
     /// None: disk::default_ram_reserve.
     pub ram_reserve: Option<u64>,
+    /// What the automatic context favours between GPUs of different speeds.
+    pub prefer: Prefer,
+}
+
+/// What the automatic context gives up when the GPUs differ in speed
+/// (`--prefer`). Every gigabyte of KV cache on the fast card is a gigabyte
+/// of weights the slow one reads instead, on every token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prefer {
+    /// The largest context that costs at most SPEED_SLOWDOWN of the fastest
+    /// layout's decode time.
+    Speed,
+    /// The largest context that costs at most BALANCED_SLOWDOWN of that.
+    #[default]
+    Balanced,
+    /// The largest context the GPUs hold.
+    Context,
+}
+
+/// Decode time [`Prefer::Balanced`] gives up for context.
+pub const BALANCED_SLOWDOWN: f64 = 0.10;
+
+/// What crossing from one GPU to the next costs a decode step, as a share of
+/// the step, whatever the number of layers on each side, and what a layer
+/// costs more on a card whose memory bus is half as wide, as a share of the
+/// layer's. Measured (2026-11-12) on Qwen3.8-27B NVFP4, 5070 Ti (256-bit) +
+/// 5060 Ti (128-bit), `serve --draft 4`, one request, by layers on the slow
+/// card: 0 -> 120.3 tok/s, 5 -> 110, 18 -> 104, 35 -> 94.8. That is 6.5% for
+/// the split and 0.42% a layer (with --parallel 4, 3 -> 115.5 and 25 -> 98.2:
+/// 0.7% a layer), where the bus widths alone (twice as slow) would say 1.56%:
+/// a step is not all weights, and the verify's matmul is not held by the
+/// memory on either card. Waiting on the first GPU from the host instead of
+/// by event did not change the split's cost.
+const SPLIT_SHARE: f64 = 0.065;
+const SLOW_SHARE: f64 = 0.35;
+
+/// The same for [`Prefer::Speed`]: not zero, or a model that just fits the
+/// fast card would be left with the 4096-token floor.
+pub const SPEED_SLOWDOWN: f64 = 0.03;
+
+impl Prefer {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "speed" => Ok(Self::Speed),
+            "balanced" | "auto" => Ok(Self::Balanced),
+            "context" | "ctx" => Ok(Self::Context),
+            _ => Err(format!("unknown --prefer '{s}': use speed, balanced or context")),
+        }
+    }
+
+    /// The decode slowdown the automatic context may cost; None: any.
+    fn slowdown(self) -> Option<f64> {
+        match self {
+            Self::Speed => Some(SPEED_SLOWDOWN),
+            Self::Balanced => Some(BALANCED_SLOWDOWN),
+            Self::Context => None,
+        }
+    }
 }
 
 impl Default for LoadOptions {
@@ -80,6 +138,7 @@ impl Default for LoadOptions {
             main_gpu: None,
             disk_offload: false,
             ram_reserve: None,
+            prefer: Prefer::default(),
         }
     }
 }
@@ -180,6 +239,16 @@ pub fn load(
     // --expert-cache streams the misses from the file, which the head's wider
     // verify only multiplies.
     if moe_default && opts.expert_cache.is_some() {
+        draft = 0;
+    }
+    // The head runs only when asked for: it changes what a run costs in VRAM
+    // and, on a near-tie, its text. Without --draft the load says the model
+    // has one and which number of drafts measured fastest for its kind.
+    if opts.draft.is_none() {
+        if draft > 0 && mtp_src.is_some() {
+            eprintln!("note: this model has an MTP head (speculative decoding, about twice as fast on dense \
+                       models) and it is off; --draft {draft} turns it on");
+        }
         draft = 0;
     }
     mtp_src = mtp_src.filter(|_| draft > 0);
@@ -593,9 +662,10 @@ fn mtp_mismatch(config: &Config, side: &GgufFile) -> Option<String> {
 /// The context to use when none was asked for: the largest the GPUs hold
 /// with every weight still in VRAM, up to what the model was trained for.
 ///
-/// The GPUs are the ones the model takes at the default context (`opts.ctx`):
-/// a model that fits one card stays on it, since spreading it over a second
-/// for context would slow every token. When the weights do not fit the
+/// The GPUs are the ones the model takes at the default context (`opts.ctx`)
+/// and any as fast. A slower one is used for context only as far as
+/// `--prefer` allows (see [`Prefer`]): spreading the model onto it slows
+/// every token. When the weights do not fit the
 /// GPUs even then (a MoE whose experts go to RAM), the default stays: each
 /// gigabyte of KV cache would push weights out of VRAM.
 fn auto_ctx(config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &LoadOptions,
@@ -627,8 +697,11 @@ fn auto_ctx(config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &Loa
     // speed (two RTX 5060 Ti: the 27B goes from 4k to the context both hold).
     let slowest = devices.iter().filter(|d| at_base.devices().contains(&d.ordinal))
         .map(|d| d.perf_score()).fold(f64::INFINITY, f64::min);
+    // A slower GPU joins too: the model spreads onto it as the context
+    // grows, as far as the pace limit below (--prefer) lets it.
     let used: Vec<Device> = devices.iter()
-        .filter(|d| at_base.devices().contains(&d.ordinal) || d.perf_score() >= 0.9 * slowest)
+        .filter(|d| at_base.devices().contains(&d.ordinal) || d.perf_score() >= 0.9 * slowest
+            || matches!(opts.split, SplitMode::Auto))
         .cloned().collect();
     let split = match used.as_slice() {
         [one] => SplitMode::Single(one.ordinal),
@@ -661,6 +734,7 @@ fn auto_ctx(config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &Loa
     let best = used.iter().map(|d| d.perf_score()).fold(0.0, f64::max);
     let fastest = used.iter().find(|d| d.perf_score() >= best).map(|d| d.ordinal);
     let unequal = used.iter().any(|d| d.perf_score() < 0.9 * best);
+    let mut head_note = None;
     let head_fast_at = |ctx: usize| plan(config, &sizes_at(ctx), &used, &req_at(ctx, split.clone()))
         .is_ok_and(|p| p.ctx == ctx && p.batch >= at_base.batch && Some(p.output_device()) == fastest);
     if unequal && opts.main_gpu.is_none() && matches!(opts.split, SplitMode::Auto) && !head_fast_at(lo) {
@@ -674,12 +748,58 @@ fn auto_ctx(config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &Loa
                 }
                 if head_fast_at(mid) { a = mid } else { b = mid }
             }
-            eprintln!("note: context {a} instead of {lo}, so the output head stays on the fastest GPU (decoding is faster; -c {lo} takes the larger context)");
+            head_note = Some(format!("note: context {a} instead of {lo}, so the output head stays on the fastest \
+                GPU (decoding is faster; -c {lo} takes the larger context)"));
             lo = a;
         }
     }
+    // Between unequal cards the context is paid for in speed: the fast card's
+    // VRAM holds either cache or weights, and the weights it cannot hold are
+    // read at the slow card's pace on every token. The predicted time of a
+    // step, in units of the weights read: a card's weights count
+    // 1 + SLOW_SHARE for each time its memory bus is narrower than the
+    // fastest card's (the embedding is only gathered from), plus SPLIT_SHARE
+    // of the whole for each hop between cards. Keep the largest context
+    // within `--prefer`'s share of the fastest layout's.
+    let bus = |ordinal: i32| used.iter().find(|d| d.ordinal == ordinal)
+        .map_or(64.0, |d| d.mem_bus_width_bits.max(64) as f64);
+    let widest = used.iter().map(|d| d.mem_bus_width_bits.max(64) as f64).fold(64.0, f64::max);
+    let cost_at = |ctx: usize| -> Option<f64> {
+        let p = plan(config, &sizes_at(ctx), &used, &req_at(ctx, split.clone())).ok()?;
+        let read = |s: &crate::plan::Shard| {
+            s.weight_bytes.saturating_sub(if s.hosts_embedding { sizes.embedding } else { 0 }) as f64
+        };
+        let handoffs = p.shards.len().saturating_sub(1) as f64;
+        (p.ctx == ctx && p.batch >= at_base.batch).then(|| {
+            p.shards.iter().map(|s| read(s) * (1.0 + SLOW_SHARE * (widest / bus(s.device) - 1.0))).sum::<f64>()
+                + handoffs * SPLIT_SHARE * p.shards.iter().map(read).sum::<f64>()
+        })
+    };
+    let mut note = "the most the GPUs hold with every weight in VRAM".to_string();
+    if let (true, Some(share), Some(fastest), Some(at_lo)) = (unequal, opts.prefer.slowdown(), cost_at(base), cost_at(lo)) {
+        let limit = fastest * (1.0 + share) * 1.0001;
+        if at_lo > limit {
+            let (mut a, mut b) = (base, lo);
+            while b - a > 256 {
+                let mid = (a + (b - a) / 2) / 256 * 256;
+                if mid <= a {
+                    break;
+                }
+                if cost_at(mid).is_some_and(|c| c <= limit) { a = mid } else { b = mid }
+            }
+            let slower = (at_lo / cost_at(a).unwrap_or(fastest) - 1.0) * 100.0;
+            let kept = format!("within {:.0}% of its fastest", share * 100.0);
+            note = format!("the most that keeps decoding {kept} (the {lo} the GPUs hold would put more layers \
+                on the slower one, about {slower:.0}% slower per token; --prefer context takes it)");
+            head_note = None;
+            lo = a;
+        }
+    }
+    if let Some(n) = head_note {
+        eprintln!("{n}");
+    }
     if lo > base {
-        eprintln!("context: {lo} tokens, the most the GPUs hold with every weight in VRAM (-c sets it)");
+        eprintln!("context: {lo} tokens, {note} (-c sets it)");
     }
     lo
 }

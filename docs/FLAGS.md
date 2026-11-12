@@ -33,6 +33,7 @@ airun selftest    check the GPU kernels against the Rust reference
 | `--tensor-split <fractions>` | — | Splits the layers by hand, e.g. `0.7,0.3`. Turns off the automatic split. |
 | `--single-gpu <N>` | — | Puts the whole model on one GPU. |
 | `--vram-reserve <MiB>` | `384` | VRAM left free on each GPU (Windows does not hand out the last megabytes). |
+| `--prefer <what>` | `balanced` | What the automatic context favours when the GPUs differ in speed: `speed`, `balanced` or `context`. See [Automatic context](#automatic-context). |
 | `--no-fallback` | off | Errors instead of lowering batch or context to fit. Useful in automated tests. |
 | `--expert-cache <N>` | all | MoE only: how many experts per layer stay in VRAM; the others are read from the file when the model asks for them. |
 | `--draft <N>` | see [MTP](#mtp-faster-generation) | How many tokens the MTP head drafts per step. `0` turns it off. |
@@ -42,11 +43,24 @@ airun selftest    check the GPU kernels against the Rust reference
 
 ### Automatic context
 
-Without `-c`, `run` and `serve` use **the largest context that fits the GPUs
-with every weight in VRAM**, at least 4096 and at most the model's training
-context. A model that fits one GPU stays on one GPU: airun does not spread the
-model over two cards just to gain context. If not even the weights fit (a MoE
-with experts in RAM), it stays at 4096. `bench` and `perplexity` use 4096.
+Without `-c`, `run` and `serve` pick the context themselves, with every weight
+in VRAM, at least 4096 and at most the model's training context. If not even
+the weights fit (a MoE with experts in RAM), it stays at 4096. `bench` and
+`perplexity` use 4096.
+
+- **Equal GPUs, or one GPU:** the largest context that fits.
+- **GPUs of different speeds:** context costs speed. The cache takes room on
+  the fast card, the layers it pushes out go to the slow one, and that card
+  reads them slower on every token. `--prefer` says how much to give up:
+
+  | `--prefer` | Context chosen | 27B NVFP4, 5070 Ti + 5060 Ti |
+  |---|---|---|
+  | `speed` | the largest within 3% of the fastest layout | 4.8k tokens, 120 tok/s |
+  | `balanced` (default) | the largest within 10% | ~80k tokens, ~110 tok/s |
+  | `context` | the largest that fits | 728k tokens, ~91 tok/s |
+
+  The load prints which context it took and what the largest one would have
+  cost. An explicit `-c` always wins.
 
 ### MTP (faster generation)
 
@@ -54,11 +68,14 @@ Qwen3.5/3.8 ship an extra layer, the "MTP head", that guesses the next tokens.
 airun uses that head to draft a few tokens, and the main model checks all of
 them at once. The ones it approves come for free.
 
-- **Default:** `run` uses 4 drafts on dense models and 2 on MoEs that fit the
+- **Suggested:** 4 drafts on dense models and 2 on MoEs that fit the
   GPUs whole (35B-A3B on 2× 5060 Ti: 109.6 → 137.6 tok/s). On a MoE with
   experts in RAM it is off, because checking several tokens pulls many more
   experts over PCIe (35B-A3B on one RTX 3060: 73–75 tok/s without, 65–69 with
-  `--draft 1`); `--draft 2` turns it on anyway. `serve` uses 0.
+  `--draft 1`); `--draft 2` turns it on anyway.
+- **Off unless you pass `--draft`** (`run` and `serve`). When the model has a
+  head, the load prints a note with the number of drafts that suits it (the
+  ones above). On the 27B, `--draft 4` takes `serve` from 48 to 108 tok/s.
 - **Gain:** on the 27B, 26 → 68 tok/s greedy (`--temp 0`) and 25.7 → 47.2
   tok/s with `--temp 0.7`.
 - **Works with any sampling except mirostat.** With temperature, each draft is

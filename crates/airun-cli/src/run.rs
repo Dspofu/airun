@@ -37,6 +37,14 @@ pub struct AllocArgs {
     /// Default: a tenth of the installed RAM, between 2 and 8 GiB.
     #[arg(long, value_name = "MiB")]
     pub ram_reserve: Option<u64>,
+
+    /// What the automatic context (no -c) favours when the GPUs differ in
+    /// speed: speed (at most 3% slower per token than the fastest layout),
+    /// balanced (at most 10% slower) or context (the largest the GPUs hold).
+    /// Context on the fast GPU pushes layers onto the slow one, which reads
+    /// them slower on every token.
+    #[arg(long, default_value = "balanced", value_parser = airun_core::Prefer::parse)]
+    pub prefer: airun_core::Prefer,
 }
 
 #[derive(Args, Clone)]
@@ -285,6 +293,7 @@ impl RunArgs {
             main_gpu: self.alloc.main_gpu,
             disk_offload: self.alloc.disk_offload,
             ram_reserve: self.alloc.ram_reserve.map(|m| m << 20),
+            prefer: self.alloc.prefer,
         }
     }
 

@@ -1787,3 +1787,73 @@ acceptance it stays below plain decoding.
   by byte;
 - dense matvecs are already close to bandwidth; the 248k-row output is ~8% of
   the token.
+
+## Automatic dose: `--prefer`, MTP on in `serve`, and a verify kernel that lost (2026-11-12, 5070 Ti + 5060 Ti)
+
+Goal of the session: Qwen3.8-27B NVFP4 as fast as it goes with no flags. The
+"300 tok/s on a 3090" numbers going around come from 3-bit weights (TQ3, 11.9
+GB against this file's 14.6) plus a separate block drafter (DFlash2, ~5.7
+accepted tokens per pass on reasoning prompts); with the model's own MTP head
+the best published 3090 figures are 112-117 tok/s. Neither a 3-bit format nor
+a drafter exists here yet: those are the two levers left for a big jump.
+
+**What changed.**
+- **MTP only with `--draft`, in `run` and `serve` alike** (the user's rule:
+  the engine may point the head out, not turn it on). Without the flag the
+  loader prints a `note:` with the number of drafts it would have used
+  (`DEFAULT_DRAFT`, `MOE_DEFAULT_DRAFT`, `DISK_DEFAULT_DRAFT`) and loads no
+  head. `run` used to draft by default; `serve` never did (48 against 108
+  tok/s on the 27B with `--draft 4`).
+- **`--prefer speed|balanced|context`** (`loader.rs`, `auto_ctx`): between
+  GPUs of different speeds the automatic context is bounded by a predicted
+  decode cost, `SPLIT_SHARE` (6.5% of a step for each hop between cards) plus
+  `SLOW_SHARE` (35% of a layer's share for each time the card's bus is
+  narrower). The constants are measured, not derived: the comment on them has
+  the table. Bus width alone (2x) predicted 1.56% a layer; measured 0.42-0.7%.
+  A slower GPU now joins the automatic context's GPUs (it used to stay out
+  when the model fit one card, which left `serve` at 18k tokens).
+- Same prompt, `serve`, one request, thinking off, 300 tokens: old flags
+  (`--draft 3 --parallel 4 -c 248144`) 89 tok/s; `--draft 4` alone 108-111
+  at 80k; with `--prefer speed` 120 at 4.8k; with `--prefer context` 91 at
+  728k; with `--parallel 4` 98 alone, 100 summed with 4 requests.
+
+**By context depth** (`benchmarks/2026-11-12`, `-c 131072`, real code, one
+run per point; prompt tokens -> prefill / decode with `--draft 4` / decode
+without MTP, tok/s): 764 -> 1944 / 74.0 / 41.7; 3.5k -> 3665 / 76.1 / 40.7;
+6.9k -> 3684 / 68.6 / 39.4; 14k -> 3341 / 68.5 / 35.9; 28k -> 2738 / 59.1 /
+31.4; 61k -> 1859 / 40.4 / 24.6; 112k -> 1260 / 26.8 / 18.4. On code the
+drafts are accepted 52-64% of the time, against 82% on the predictable prompt
+of the table above: compare speeds on the same prompt only.
+
+**Where a speculative step goes** (5070 Ti alone, `--draft 4`, 33 ms):
+verify 26.3 ms (the NVFP4 matmuls 25.2 for 5 rows, against ~20.5 for one),
+advance 6.7 ms, of which 4.3 ms are the four reads of the 874 MB output head
+for the drafts' argmax. `AIRUN_DRAFT_VOCAB=32768` cuts those (89 -> 102
+tok/s on English) but loses acceptance on Portuguese and code: the next step
+worth taking is a learned shortlist (rows of the tokens seen, plus a
+frequency profile), which keeps the gain without the language dependence.
+Longer drafts do not pay: acceptance falls to 48% at 6 and the verify jumps
+to 48 ms at 9 rows (the multi-token kernel takes 8).
+
+**A tensor-core verify kernel that lost.** `matvec_nvfp4_mma8_kernel`: int8
+`m16n8k16` MMAs straight from global memory (a lane loads the 16 bits that
+hold its four codes, the neighbour's half arrives by shuffle, k permuted the
+same way in A and B), 64 rows per warp. In `matvec_bench` on the 5070 Ti it
+won (5 tokens 66 -> 55 us, 8 tokens 82 -> 58), and in the model it lost
+badly: verify 26.5 -> 37.6 ms. Two lessons:
+- **`matvec_bench` does not measure memory on the 5070 Ti.** Its 50 MB matrix
+  fits the card's L2 (1870 GB/s "of weights" for one token), so it times
+  arithmetic only. The model's 13.6 GB come from DRAM, where 16 warps
+  striding the K of 64 rows read far worse than two rows per block in order.
+  Decide kernels with `run`/`bench` on the model, or make the bench matrix
+  larger than L2.
+- What the first version paid for was `ue4m3_to_f32` (19 of 66 us: its
+  branches and int-to-float) and shared memory (a 32 KiB reduction buffer per
+  block comes out of L1). Both are fixable and neither was the problem.
+
+**Also measured.** The fixed cost of a split (verify +1.8 ms, advance +1.1)
+does not come from waiting: synchronizing the first GPU from the host before
+the handoff changed nothing. With MTP off and one conversation, the 27B fits
+the 5060 Ti alone and `auto` picks it over the 5070 Ti, which has a little
+less free VRAM (decode 23 tok/s): a model that fits only the slower card
+should still be weighed against splitting.
