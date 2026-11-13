@@ -104,6 +104,12 @@ The script finds your GPUs, builds only for them and, at the end, runs the
 | `-NoGpu` | `--no-gpu` | No CUDA |
 | `-Debug` | `--debug` | Debug build |
 | `-SkipCheck` | `--skip-check` | Does not run the selftest at the end |
+| `-Yes` | `--yes` | Installs whatever is missing without asking |
+
+If Rust, the C++ compiler or the CUDA Toolkit is missing (or too old), the
+script says what to install and offers to install it: rustup and winget on
+Windows, rustup and the distro's package manager (apt, dnf, pacman) on Linux.
+The NVIDIA driver is only pointed at, since it needs a reboot.
 
 **GPUs of different generations in the same PC** (e.g. RTX 3060 + RTX 5060 Ti)
 work: the script builds for both, and each card runs its own code.

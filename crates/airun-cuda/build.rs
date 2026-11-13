@@ -316,6 +316,8 @@ fn cuda_candidates() -> Vec<PathBuf> {
             push(v);
         }
     }
+    // Arch Linux's cuda package.
+    push(PathBuf::from("/opt/cuda"));
     found
 }
 
