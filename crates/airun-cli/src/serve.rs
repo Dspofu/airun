@@ -340,14 +340,58 @@ fn strip_reasoning(text: &str) -> (&str, Option<&str>) {
 }
 
 /// One line per request, so a slow first token can be attributed.
+///
+/// Written by a thread of its own, never by the request: it runs between the
+/// last token and the final chunk, and a write to stderr can block for as long
+/// as the console wants. On Windows, text selected in the console window (a
+/// stray click with QuickEdit on) blocks every write until the selection ends:
+/// each reply then stopped after its last token, with no finish_reason, usage
+/// or [DONE], the GPUs idle, until the client or a proxy gave up minutes later.
 fn log_request(s: &airun_core::GenerationStats) {
-    eprintln!(
+    static LOG: std::sync::OnceLock<std::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
+    let tx = LOG.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new().name("airun-log".into())
+            .spawn(move || rx.into_iter().for_each(|line| eprintln!("{line}")))
+            .expect("the log thread starts");
+        tx
+    });
+    let _ = tx.send(format!(
         "  prompt {} tok ({} cached, {} new)  prefill {:.0} ms ({:.1} tok/s)  \
          decode {} tok in {:.0} ms ({:.1} tok/s)",
         s.prompt_tokens, s.cached_tokens, s.processed_tokens(), s.prefill_ms, s.prefill_tps(),
         s.generated_tokens, s.decode_ms, s.decode_tps(),
-    );
+    ));
 }
+
+/// Turns off QuickEdit in the console that runs the server, so a click in the
+/// window no longer selects text and freezes every write to it (see
+/// `log_request`). Selecting still works with the window menu's Edit > Mark.
+#[cfg(windows)]
+fn disable_quick_edit() {
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
+    }
+    // SAFETY: plain console-mode calls on this process's own stdin handle;
+    // without a console (service, redirected input) GetConsoleMode fails and
+    // nothing changes.
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        if !handle.is_null() && GetConsoleMode(handle, &mut mode) != 0 {
+            SetConsoleMode(handle, (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn disable_quick_edit() {}
 
 /// `logit_bias` in either shape: OpenAI's object keyed by token id, or
 /// llama.cpp's `[[id, bias], ...]` (a bias of `false` bans the token).
@@ -461,6 +505,7 @@ fn completion_id(prefix: &str) -> String {
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
+    disable_quick_edit();
     let mut run_args = RunArgs::bench_defaults(args.model.clone());
     run_args.ctx_size = args.ctx_size;
     run_args.expert_cache = args.expert_cache;
