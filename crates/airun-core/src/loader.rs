@@ -164,6 +164,31 @@ pub const MOE_DEFAULT_DRAFT: usize = 2;
 /// which is RAM speed, draft 2 wins: 9.9 against 9.1 and 8.0 tok/s.)
 pub const DISK_DEFAULT_DRAFT: usize = 6;
 
+/// The highest `--draft` that measured close to the best, per kind of model.
+/// Past it each verify pass wakes more experts (MoE) or computes more rows
+/// than the extra accepted tokens pay for, and speed falls off quickly: a
+/// 35B-A3B on an RTX 5060 Ti ran above 80 tok/s at draft 3 and about 15 at
+/// draft 4 (2026-11-12). Layers read from disk are the exception (see
+/// DISK_DEFAULT_DRAFT).
+pub const MOE_MAX_GOOD_DRAFT: usize = 3;
+pub const DENSE_MAX_GOOD_DRAFT: usize = 5;
+pub const DISK_MAX_GOOD_DRAFT: usize = 8;
+
+/// A warning when the user asked for more drafts than tested well on this
+/// kind of model; None for the defaults or a reasonable value.
+pub fn draft_too_high(asked: Option<usize>, draft: usize, moe: bool, on_disk: bool) -> Option<String> {
+    asked?;
+    let (limit, best, kind) = match (moe, on_disk) {
+        (true, _) => (MOE_MAX_GOOD_DRAFT, MOE_DEFAULT_DRAFT, "MoE models"),
+        (false, true) => (DISK_MAX_GOOD_DRAFT, DISK_DEFAULT_DRAFT, "models with layers on disk"),
+        (false, false) => (DENSE_MAX_GOOD_DRAFT, DEFAULT_DRAFT, "dense models"),
+    };
+    (draft > limit).then(|| format!(
+        "--draft {draft} is above what measured well on {kind} (best {best}, up to {limit}); higher values \
+         can slow decoding several times over instead of speeding it up. Try --draft {best}, and compare \
+         tok/s with --stats"))
+}
+
 /// What the loader did, for reporting.
 pub struct LoadReport {
     pub config: Config,
@@ -497,6 +522,11 @@ pub fn load(
             placement_out.notes.push(format!(
                 "MTP drafts {draft} tokens per step (not {DEFAULT_DRAFT}): each verify reads the layers on disk \
                  once, so more tokens per pass is faster; --draft sets it"));
+        }
+        if load_mtp {
+            if let Some(note) = draft_too_high(opts.draft, run_draft, config.moe.is_some(), on_disk) {
+                placement_out.notes.push(note);
+            }
         }
         let mut runtime = Runtime::new(model, tokenizer, streams, batch)?;
         runtime.set_draft(run_draft);
@@ -1056,6 +1086,20 @@ pub fn apply_chat_template(system: Option<&str>, user: &str, prefill: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_warning_only_past_the_tested_range() {
+        // Defaults never warn, whatever their value.
+        assert!(draft_too_high(None, 6, false, true).is_none());
+        // MoE: 3 is fine, 4 is the cliff seen on a 35B-A3B.
+        assert!(draft_too_high(Some(3), 3, true, false).is_none());
+        let w = draft_too_high(Some(4), 4, true, false).unwrap();
+        assert!(w.starts_with("--draft 4") && w.contains("--draft 2"), "{w}");
+        // Dense: 5 fine, 6 warns; on disk 8 is still fine.
+        assert!(draft_too_high(Some(5), 5, false, false).is_none());
+        assert!(draft_too_high(Some(6), 6, false, false).is_some());
+        assert!(draft_too_high(Some(8), 8, false, true).is_none());
+    }
 
     #[test]
     fn fallback_ladder_shrinks_batch_then_context_then_reserve() {

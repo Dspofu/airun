@@ -355,6 +355,12 @@ pub fn run(args: RunArgs) -> Result<()> {
     }
     if args.stats {
         eprint!("{}", report.placement.report());
+    } else {
+        // The one note worth showing without --stats: a --draft that can cost
+        // several times the speed.
+        for note in report.placement.notes.iter().filter(|n| n.starts_with("--draft ")) {
+            eprintln!("warning: {note}");
+        }
     }
 
     let mut image_ids = Vec::new();
@@ -442,6 +448,12 @@ pub fn run(args: RunArgs) -> Result<()> {
         if stats.drafted > 0 {
             eprintln!("speculation: {} of {} drafted tokens accepted ({:.0}%)", stats.accepted, stats.drafted,
                 100.0 * stats.accepted as f64 / stats.drafted as f64);
+            // Most drafts thrown away: each pass computed rows for nothing.
+            let draft = runtime.draft();
+            if draft > 2 && stats.drafted >= 32 && stats.accepted * 2 < stats.drafted {
+                eprintln!("hint: under half of the drafts were accepted; a lower --draft (e.g. {}) is likely \
+                           faster here", (draft - 1).max(2));
+            }
         }
         let (hits, misses) = runtime.expert_cache_stats();
         if hits + misses > 0 {
