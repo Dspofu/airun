@@ -473,6 +473,11 @@ pub fn run(args: RunArgs) -> Result<()> {
             }
             let (wait, read) = runtime.expert_stream_timing();
             eprintln!("expert streaming: {wait:.0} ms waiting on the GPU for routing, {read:.0} ms reading misses");
+            let (pinned, from_ram, from_file) = runtime.expert_ram_stats();
+            if pinned > 0 {
+                eprintln!("expert RAM tier: {} pinned; of the experts missing from VRAM, {from_ram} came from RAM \
+                           and {from_file} from the file", airun_cuda::human_bytes(pinned as u64));
+            }
         }
     }
     Ok(())

@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod disk;
 pub mod error;
 mod expert_cache;
+mod expert_ram;
 mod gather_pool;
 pub mod expert_profile;
 pub mod grammar;

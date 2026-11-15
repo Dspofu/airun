@@ -1,4 +1,4 @@
-﻿// Quantized matrix-vector / matrix-matrix products.
+// Quantized matrix-vector / matrix-matrix products.
 //
 // Decode (one token) is memory bound: the weights are read once and every byte
 // fetched is used exactly once, so the win comes from reading the packed form
@@ -737,6 +737,148 @@ __global__ __launch_bounds__(WIDE_THREADS) void matvec_q8_wide_multi_kernel(
     }
 }
 
+// Q6_K decode and speculative verify (1..NT tokens) on the integer path.
+//
+// The per-group kernels above read a Q6_K group as ~21 loads for 26 bytes: its
+// low nibbles, its share of the high bits (which four groups share, so every
+// group re-read them), two scale bytes and d, all off word alignment. The 27B
+// Q6_K decoded at ~70% of what its bytes allow. Here a thread takes half a
+// superblock -- four groups whose ql (64 bytes), qh (32) and scales (8) are
+// each one contiguous run -- of R rows: 30 aligned word loads per 105 bytes,
+// every byte read once, and the four activation blocks as nine 16-byte loads
+// spent on all R rows. Codes and per-group products are vdot_q6_K's; the sums
+// are taken in another order, so it is held to the selftest bound.
+//
+// Needs K % 256 == 0 (always, for Q6_K), xq 16-byte aligned, and a matrix that
+// starts and ends on a 4-byte boundary so the aligned words stay inside it;
+// dispatch checks.
+#define Q6K_WIDE_THREADS 64
+template <int R, int NT>
+__global__ __launch_bounds__(Q6K_WIDE_THREADS) void matvec_q6k_wide_kernel(
+    const uint8_t* __restrict__ w,
+    const block_q8a* __restrict__ xq,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens,
+    const size_t row_bytes) {
+
+    const int row0 = blockIdx.x * R;
+    const int halves = K / 128;
+    const int groups = K / 32;
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[r][t] = 0.0f;
+
+    for (int hb = threadIdx.x; hb < halves; hb += Q6K_WIDE_THREADS) {
+        // Every row's words are requested before any is used (see q8_0_load).
+        uint32_t rl[R][17], rh[R][9], rt[R][3], sh[R];
+        float d[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* b = w + (size_t)min(row0 + r, n_rows - 1) * row_bytes + (size_t)(hb >> 1) * 210;
+            const uintptr_t a = (uintptr_t)b + (hb & 1) * 64;          // this half's ql
+            const uintptr_t ah = (uintptr_t)b + 128 + (hb & 1) * 32;   // its qh
+            const uintptr_t at = (uintptr_t)b + 192 + (hb & 1) * 8;    // its scales
+            // All three are a multiple of 4 from the block's start: one phase.
+            sh[r] = 8u * (uint32_t)(a & 3);
+            const uint32_t* pl = (const uint32_t*)(a & ~(uintptr_t)3);
+            const uint32_t* ph = (const uint32_t*)(ah & ~(uintptr_t)3);
+            const uint32_t* pt = (const uint32_t*)(at & ~(uintptr_t)3);
+#pragma unroll
+            for (int i = 0; i < 17; ++i) rl[r][i] = pl[i];
+#pragma unroll
+            for (int i = 0; i < 9; ++i) rh[r][i] = ph[i];
+#pragma unroll
+            for (int i = 0; i < 3; ++i) rt[r][i] = pt[i];
+            d[r] = __half2float(__ushort_as_half(*(const uint16_t*)(b + 208)));
+        }
+
+        // Codes of the four groups and their two int8 scales each.
+        uint32_t q[R][4][8];
+        int sc[R][4][2];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint32_t s_lo = __funnelshift_r(rt[r][0], rt[r][1], sh[r]);
+            const uint32_t s_hi = __funnelshift_r(rt[r][1], rt[r][2], sh[r]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t s = j < 2 ? s_lo : s_hi;
+                sc[r][j][0] = (int)(int8_t)(s >> (16 * (j & 1)));
+                sc[r][j][1] = (int)(int8_t)(s >> (16 * (j & 1) + 8));
+                const int loshift = j >= 2 ? 4 : 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int li = (j & 1) * 8 + i;
+                    const uint32_t wl = __funnelshift_r(rl[r][li], rl[r][li + 1], sh[r]);
+                    const uint32_t wh = __funnelshift_r(rh[r][i], rh[r][i + 1], sh[r]);
+                    const uint32_t lo = (wl >> loshift) & 0x0F0F0F0Fu;
+                    const uint32_t hi = ((wh >> (2 * j)) & 0x03030303u) << 4;
+                    q[r][j][i] = __vsub4(lo | hi, 0x20202020u);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= n_tokens) continue;
+            // Four 36-byte activation blocks: 144 bytes, 16-byte aligned.
+            const uint4* xp = (const uint4*)(xq + (size_t)t * groups + (size_t)hb * 4);
+            int xw[36];
+#pragma unroll
+            for (int i = 0; i < 9; ++i) {
+                const uint4 v = xp[i];
+                xw[4 * i + 0] = (int)v.x;
+                xw[4 * i + 1] = (int)v.y;
+                xw[4 * i + 2] = (int)v.z;
+                xw[4 * i + 3] = (int)v.w;
+            }
+            float part[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) part[r] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float dx = __half2float(__ushort_as_half((unsigned short)(xw[j * 9 + 8] & 0xFFFF)));
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    int d0 = 0, d1 = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) d0 = __dp4a((int)q[r][j][i], xw[j * 9 + i], d0);
+#pragma unroll
+                    for (int i = 4; i < 8; ++i) d1 = __dp4a((int)q[r][j][i], xw[j * 9 + i], d1);
+                    // |scale * dot| <= 128 * 16 * 32 * 127 each: the sum of the
+                    // two stays below 2^24, so one exact int-to-float.
+                    part[r] = fmaf(dx, (float)(sc[r][j][0] * d0 + sc[r][j][1] * d1), part[r]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r][t] = fmaf(d[r], part[r], acc[r][t]);
+        }
+    }
+
+    __shared__ float red[R][NT][Q6K_WIDE_THREADS / 32];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float s = warp_reduce_sum(acc[r][t]);
+            if (lane == 0) red[r][t][warp] = s;
+        }
+    __syncthreads();
+    if (threadIdx.x < R * NT) {
+        const int r = threadIdx.x / NT, t = threadIdx.x % NT;
+        if (row0 + r < n_rows && t < n_tokens) {
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < Q6K_WIDE_THREADS / 32; ++i) s += red[r][t][i];
+            y[(size_t)t * n_rows + row0 + r] = s;
+        }
+    }
+}
+
 // A few tokens (speculative verify, 2..8): each weight group is loaded and
 // decoded to its integer codes once -- mmq_decode, the same codes and scales
 // the tensor-core kernel uses -- and spent against every token's activation.
@@ -1041,6 +1183,18 @@ static bool q8_wide_disabled() {
     return cached == 1;
 }
 
+// Whether matvec_q6k_wide_kernel can read this matrix (see its comment).
+// AIRUN_NO_Q6K_WIDE=1 keeps Q6_K on the per-group kernels.
+static bool q6k_wide_ok(const void* w, const void* xq, int k, int n_rows, uint64_t row_bytes) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_Q6K_WIDE");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 0 && k % 256 == 0 && (uintptr_t)w % 4 == 0 && (uintptr_t)xq % 16 == 0 &&
+           ((uint64_t)n_rows * row_bytes) % 4 == 0;
+}
+
 // AIRUN_NO_Q8_MULTI=1 sends 2..8-token batches back to the tiled kernel.
 static bool q8_multi_disabled() {
     static int cached = -1;
@@ -1051,9 +1205,33 @@ static bool q8_multi_disabled() {
     return cached == 1;
 }
 
-// Smallest batch the integer tensor-core kernel takes; below it the dp4a tiles
-// win because an MMQ tile of 64 tokens would be mostly padding.
-#define MMQ_MIN_TOKENS 32
+// Smallest batch the integer tensor-core kernel takes. Up to 8 tokens the
+// multi-token dp4a kernels read each weight once at memory bandwidth and win;
+// from 9 the dp4a tile re-reads the matrix per 16 tokens and decodes each
+// group per token, and a mostly empty 64-token MMQ tile still beats it. On the
+// 27B's 17408 x 5120 FFN (matvec_bench, RTX 5070 Ti / 5060 Ti), 31 tokens:
+// Q4_K 404 -> 111 us / 838 -> 232, Q6_K 906 -> 160 / 1836 -> 346, NVFP4
+// 701 -> 146 / 1467 -> 338; 9 tokens ties or wins everywhere but NVFP4 on the
+// 5070 Ti (129 -> 141). It was 32 until 2026-11-15. AIRUN_MMQ_MIN sets it
+// (=32 also puts the selftest's 12- and 16-token cases back on the dp4a tile).
+static int mmq_min_tokens() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_MMQ_MIN");
+        cached = v && atoi(v) > 0 ? atoi(v) : 9;
+    }
+    return cached;
+}
+#define MMQ_MIN_TOKENS mmq_min_tokens()
+// Batches from here always took MMQ; smaller ones only outside a graph capture
+// (see airun_matvec_q8).
+#define MMQ_ALWAYS_TOKENS 32
+
+static bool stream_is_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+           capture != cudaStreamCaptureStatusNone;
+}
 
 // 1 when the current device runs matvec_mmq_kernel: m16n8k32 integer MMA is
 // sm_80+. AIRUN_NO_MMQ=1 turns it off to measure it against the fp16 path.
@@ -1080,8 +1258,6 @@ static bool mmq_async_disabled() {
     return cached == 1;
 }
 
-// The cp.async kernel needs whole, aligned chunks; anything else (Q6_K's
-// 210-byte blocks, a K that is not a multiple of 128) takes the synchronous one.
 // Split-K: how many K slices to cut the grid into, from how well the plain grid
 // fills the GPU. `per_sm` blocks fit an SM at once, so the grid runs in waves of
 // SMs * per_sm; a 16-block grid on 28 SMs leaves 12 idle, and 40 blocks run as
@@ -1220,15 +1396,26 @@ static bool mmq_streamk_plan(const void* kernel, size_t smem, int tiles, int tok
     return true;
 }
 
-// The cp.async kernel needs whole, aligned chunks; anything else (Q6_K's
-// 210-byte blocks, a K that is not a multiple of 128) takes the synchronous one.
+// Whether the cp.async kernel can read this matrix: whole chunks, and 16-byte
+// copies that stay inside it. Types whose rows are 16-byte multiples copy from
+// row-relative offsets; the ROW_SKEW ones (Q6_K) align each row's copies
+// themselves, which only needs the matrix to start and end on a boundary.
+template <int TYPE>
+static bool mmq_async_fits(const void* w, const void* xq, int k, int n_rows, uint64_t row_bytes) {
+    using A = mmq_async<TYPE>;
+    const bool rows = A::ROW_SKEW ? ((uint64_t)n_rows * row_bytes) % 16 == 0 : row_bytes % 16 == 0;
+    return rows && (uintptr_t)w % 16 == 0 && (uintptr_t)xq % 16 == 0 &&
+           (k / 32) % A::GROUP_MULTIPLE == 0;
+}
+
+// The cp.async kernel needs whole, aligned chunks; anything else (a K that is
+// not a multiple of 128 or 256) takes the synchronous one.
 template <int TYPE, int TC>
 static void launch_mmq_tc(const void* w, const void* xq, void* y, int k, int n_rows,
                           int n_tokens, uint64_t row_bytes, cudaStream_t stream) {
     bool async = false;
     if constexpr (mmq_async<TYPE>::OK) {
-        async = row_bytes % 16 == 0 && (uintptr_t)w % 16 == 0 && (uintptr_t)xq % 16 == 0 &&
-                (k / 32) % mmq_async<TYPE>::GROUP_MULTIPLE == 0 && !mmq_async_disabled();
+        async = mmq_async_fits<TYPE>(w, xq, k, n_rows, row_bytes) && !mmq_async_disabled();
     }
     const int tok_tiles = (n_tokens + TC - 1) / TC;
     const int tiles = tok_tiles * ((n_rows + MMQ_TR - 1) / MMQ_TR);
@@ -1289,8 +1476,12 @@ static int mmq_forced_tc() {
 template <int TYPE>
 static void launch_mmq(const void* w, const void* xq, void* y, int k, int n_rows,
                        int n_tokens, uint64_t row_bytes, cudaStream_t stream) {
-    // 99 KiB is the per-block opt-in on sm_86/89/120. Q5_K's 176-byte
-    // superblocks make the 128-token asynchronous tile 106 KiB: it stays at 64.
+    // 99 KiB is the per-block opt-in on sm_86/89/120. Two buffers of Q5_K's
+    // 176-byte superblocks made the 128-token asynchronous tile 106 KiB, and
+    // Q6_K's 224-byte copies 118: those two keep one weight buffer and copy a
+    // superblock once for its two chunks (mmq_async's BLOCK2), 84 and 90 KiB.
+    // A 96-token tile was measured too (Q5_K, 2048 tokens: 51.6 T MAC/s at 64,
+    // 59.4 at 96) and loses to 128 wherever 128 fits.
     constexpr bool wide_fits = !mmq_async<TYPE>::OK || mmq_async_smem<TYPE, 128>() <= 99 * 1024;
     const int forced = mmq_forced_tc();
     // Measured on Qwen3-4B (best of 3): at 128 tokens the wide tile wins 13%
@@ -1332,14 +1523,14 @@ static void launch_mmq_glu_tc(const void* wg, const void* wu, const void* xq, vo
 }
 
 template <int TYPE>
-static bool mmq_glu_ok(const void* wg, const void* wu, const void* xq, int k, uint64_t row_bytes,
-                       int n_tokens) {
+static bool mmq_glu_ok(const void* wg, const void* wu, const void* xq, int k, int n_rows,
+                       uint64_t row_bytes, int n_tokens) {
     if constexpr (!mmq_async<TYPE>::OK) {
         return false;
     } else {
         return n_tokens >= MMQ_MIN_TOKENS && airun_mmq_supported() && !mmq_async_disabled() &&
-               row_bytes % 16 == 0 && (uintptr_t)wg % 16 == 0 && (uintptr_t)wu % 16 == 0 &&
-               (uintptr_t)xq % 16 == 0 && (k / 32) % mmq_async<TYPE>::GROUP_MULTIPLE == 0;
+               mmq_async_fits<TYPE>(wg, xq, k, n_rows, row_bytes) &&
+               mmq_async_fits<TYPE>(wu, xq, k, n_rows, row_bytes);
     }
 }
 
@@ -1354,11 +1545,11 @@ static bool mmq_glu_disabled() {
 }
 
 extern "C" int32_t airun_mmq_glu_supported(int32_t type_id, const void* wg, const void* wu,
-                                           const void* xq, int32_t k, uint64_t row_bytes,
-                                           int32_t n_tokens) {
+                                           const void* xq, int32_t k, int32_t n_rows,
+                                           uint64_t row_bytes, int32_t n_tokens) {
     if (mmq_glu_disabled() || k % 32 != 0) return 0;
     switch (type_id) {
-#define GLU_CASE(TYPE) case TYPE: return mmq_glu_ok<TYPE>(wg, wu, xq, k, row_bytes, n_tokens) ? 1 : 0;
+#define GLU_CASE(TYPE) case TYPE: return mmq_glu_ok<TYPE>(wg, wu, xq, k, n_rows, row_bytes, n_tokens) ? 1 : 0;
         AIRUN_FOR_EACH_Q8_TYPE(GLU_CASE)
 #undef GLU_CASE
         default: return 0;
@@ -1368,7 +1559,7 @@ extern "C" int32_t airun_mmq_glu_supported(int32_t type_id, const void* wg, cons
 extern "C" airun_status airun_matvec_q8_glu(
     int32_t type_id, const void* wg, const void* wu, const void* xq, void* y,
     int32_t k, int32_t n_rows, int32_t n_tokens, uint64_t row_bytes, cudaStream_t stream) {
-    if (!airun_mmq_glu_supported(type_id, wg, wu, xq, k, row_bytes, n_tokens)) return AIRUN_ERR_BAD_TYPE;
+    if (!airun_mmq_glu_supported(type_id, wg, wu, xq, k, n_rows, row_bytes, n_tokens)) return AIRUN_ERR_BAD_TYPE;
     const int forced = mmq_forced_tc();
     const bool wide = forced ? forced == 128 : n_tokens >= 128;
     switch (type_id) {
@@ -1382,6 +1573,7 @@ extern "C" airun_status airun_matvec_q8_glu(
         GLU_LAUNCH(AIRUN_TYPE_Q8_0)
         GLU_LAUNCH(AIRUN_TYPE_Q4_K)
         GLU_LAUNCH(AIRUN_TYPE_Q5_K)
+        GLU_LAUNCH(AIRUN_TYPE_Q6_K)
         GLU_LAUNCH(AIRUN_TYPE_NVFP4)
 #undef GLU_LAUNCH
         default: return AIRUN_ERR_BAD_TYPE;
@@ -1654,7 +1846,12 @@ airun_status airun_matvec_q8(
 
     const dim3 block(32, ROWS_PER_BLOCK);
 
-    if (n_tokens >= MMQ_MIN_TOKENS && airun_mmq_supported()) {
+    // A graph being captured keeps the few-token kernels below 32 tokens (a
+    // batched verify of several conversations): a small MMQ grid wants split-K,
+    // whose partial buffer is reallocated as later launches grow it, and a
+    // graph would keep the old address.
+    if (airun_mmq_supported() &&
+        (n_tokens >= MMQ_ALWAYS_TOKENS || (n_tokens >= MMQ_MIN_TOKENS && !stream_is_capturing(stream)))) {
 #define LAUNCH(TYPE) launch_mmq<TYPE>(w, xq, y, k, n_rows, n_tokens, row_bytes, stream);
 
         switch (type_id) {
@@ -1666,6 +1863,16 @@ airun_status airun_matvec_q8(
         constexpr int R = 2;
         matvec_q8_wide_kernel<AIRUN_TYPE_NVFP4, R><<<(n_rows + R - 1) / R, WIDE_THREADS, 0, stream>>>(
             (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, (size_t)row_bytes);
+    } else if (n_tokens <= 8 && type_id == AIRUN_TYPE_Q6_K && q6k_wide_ok(w, xq, k, n_rows, row_bytes)) {
+        constexpr int R = 2;
+        const int blocks = (n_rows + R - 1) / R;
+#define Q6K_LAUNCH(NT) matvec_q6k_wide_kernel<R, NT><<<blocks, Q6K_WIDE_THREADS, 0, stream>>>( \
+            (const uint8_t*)w, (const block_q8a*)xq, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes)
+        if (n_tokens == 1) Q6K_LAUNCH(1);
+        else if (n_tokens == 2) Q6K_LAUNCH(2);
+        else if (n_tokens <= 4) Q6K_LAUNCH(4);
+        else Q6K_LAUNCH(8);
+#undef Q6K_LAUNCH
     } else if (n_tokens == 1 && !getenv("AIRUN_Q8_DECODE_MULTI")) {
         const int warps = (n_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
         const dim3 grid((warps + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, 1);

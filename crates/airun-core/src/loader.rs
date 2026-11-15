@@ -474,10 +474,39 @@ pub fn load(
             if let Some(budget) = ram_budget.filter(|&b| mapped_expert_bytes > b) {
                 if opts.disk_offload {
                     crate::model::stream_experts();
-                    eprintln!("note: the experts that do not fit in VRAM need {} of RAM, {} is free past the \
-                               reserve: they are read from the model file as they are routed (--disk-offload)",
-                        airun_cuda::human_bytes(mapped_expert_bytes), airun_cuda::human_bytes(budget));
-                    mapped_expert_bytes = 0;
+                    // A pinned RAM tier between the VRAM slots and the file
+                    // (expert_ram.rs) only when it can hold nearly all of what
+                    // is missing. Pinning takes that RAM from the system's file
+                    // cache, which otherwise serves the reads: Qwen4 Flash-Next
+                    // on 32 GB (25 GiB missing, 13.75 pinned, where Windows
+                    // stops) prefilled at 64-71 tok/s against 18-30, but loaded
+                    // in 106-122 s against 25 and generated at 5 tok/s against
+                    // 8-12, because half of a generation's misses are the tail
+                    // the tier left out. EXPERT_RAM_SPARE is left for what the
+                    // plan does not count on the host: the upload staging, the
+                    // turn snapshot, the tokenizer. AIRUN_EXPERT_RAM (MiB)
+                    // sets the tier's size whatever this says.
+                    const EXPERT_RAM_SPARE: u64 = 3 << 29;
+                    const EXPERT_RAM_COVER: f64 = 0.85;
+                    // Windows refused to pin past ~43% of the RAM here.
+                    let pinnable = crate::disk::total_ram().map_or(u64::MAX, |t| t / 5 * 2);
+                    let fits = budget.saturating_sub(EXPERT_RAM_SPARE).min(pinnable);
+                    let worth = fits as f64 >= EXPERT_RAM_COVER * mapped_expert_bytes as f64;
+                    crate::model::set_expert_ram(if worth { fits } else { 0 });
+                    let tier = crate::model::expert_ram();
+                    if tier > 0 {
+                        eprintln!("note: the experts that do not fit in VRAM need {} of RAM, {} is free past the \
+                                   reserve: up to {} of the most routed stay pinned in RAM and the rest are read \
+                                   from the model file as they are routed (--disk-offload)",
+                            airun_cuda::human_bytes(mapped_expert_bytes), airun_cuda::human_bytes(budget),
+                            airun_cuda::human_bytes(tier));
+                    } else {
+                        eprintln!("note: the experts that do not fit in VRAM need {} of RAM, {} is free past the \
+                                   reserve: they are read from the model file as they are routed (--disk-offload). \
+                                   More free RAM, or a smaller quantization, is what makes this model faster here",
+                            airun_cuda::human_bytes(mapped_expert_bytes), airun_cuda::human_bytes(budget));
+                    }
+                    mapped_expert_bytes = tier;
                 } else {
                     eprintln!("note: the experts that do not fit in VRAM need {} of pinned RAM, and only {} is \
                                free past the reserve; if loading fails or the system starts paging, pass \
@@ -490,7 +519,7 @@ pub fn load(
 
     // Which experts take the VRAM slots: the most routed ones of earlier runs.
     let mut profile = match (&expert_slots, config.moe.as_ref()) {
-        (Some(_), Some(moe)) if crate::model::experts_mapped() =>
+        (Some(_), Some(moe)) =>
             crate::expert_profile::ExpertProfile::open(gguf.path(), gguf.file_len(), config.n_run_layers(), moe.n_experts),
         _ => None,
     };
@@ -645,6 +674,17 @@ pub fn load(
                 }
             }
             Err(e) => return Err(e),
+        }
+        // Streamed experts: the ones earlier runs routed most, read now
+        // instead of one miss at a time under the first request. A failure
+        // here only leaves them to be read as they are routed.
+        let warm = std::time::Instant::now();
+        match runtime.warm_experts() {
+            Ok(0) => {}
+            Ok(bytes) => eprintln!("note: read {} of the most routed experts into VRAM and RAM in {:.1} s (the routing \
+                                    profile of earlier runs; AIRUN_NO_EXPERT_WARM=1 skips this)",
+                airun_cuda::human_bytes(bytes), warm.elapsed().as_secs_f64()),
+            Err(e) => eprintln!("note: the experts were not read ahead ({e}); they are read as they are routed"),
         }
 
         return Ok((

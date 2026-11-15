@@ -524,13 +524,17 @@ fn quantize_q8a_mirror(x: &[f32]) -> Vec<f32> {
 /// backward-error bound proves the GPU integer path computes the same product
 /// the mirrored quantization defines.
 fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
-    // 3 tokens take the dp4a tiles; 100 take the integer tensor-core kernel on
-    // sm_80+. Neither 96 rows nor 100 tokens fill its 128 x 64 tile, and 544
-    // is 17 groups where it stages 4 at a time, so every edge path runs.
+    // Up to 8 tokens take the dp4a kernels; from 9 the integer tensor-core
+    // kernel on sm_80+ (12 and 16 took the dp4a tile until the threshold moved
+    // from 32; AIRUN_MMQ_MIN=32 runs them there again). Neither 96 rows nor 100
+    // tokens fill its 128 x 64 tile, and 544 is 17 groups where it stages 4 at
+    // a time, so every edge path runs.
     const N_ROWS: usize = 96;
     // (tokens, odd K): 100 tokens with K = 512 take the cp.async MMQ kernel for
-    // Q8_0/Q4_K/Q5_K; K = 544 (Q8_0 only) is 17 groups, which it cannot chunk,
-    // so the synchronous one runs.
+    // Q8_0/Q4_K/Q5_K/Q6_K (Q6_K's 420-byte rows start 0, 4, 8 and 12 bytes past
+    // a 16-byte boundary, so every row phase of its copies runs); K = 544
+    // (Q8_0 only) is 17 groups, which it cannot chunk, so the synchronous one
+    // runs.
     // 300 tokens take the 128-token tile, with a partial last tile.
     for (n_tokens, odd_k) in [(1usize, false), (3, false), (8, false), (12, false), (16, false), (100, false), (100, true), (300, false)] {
     for &ty in TYPES {
@@ -612,7 +616,10 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
             }
         }
 
-        let path = if n_tokens >= 32 && ops::mmq_supported() { "mmq" } else { "dp4a" };
+        // The kernels' threshold (mmq_min_tokens in matmul.cu): 9, or AIRUN_MMQ_MIN.
+        let mmq_min = std::env::var("AIRUN_MMQ_MIN").ok().and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0).unwrap_or(9);
+        let path = if n_tokens >= mmq_min && ops::mmq_supported() { "mmq" } else { "dp4a" };
         report.case(
             &format!("matvec_q8 {ty}, {n_tokens} tokens, K {k} ({path})"),
             format!(
@@ -803,7 +810,7 @@ fn test_mmq_glu(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
             let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
             let d_xq = DeviceBuffer::<u8>::new(device, n_tokens * K / 32 * 36)?;
             ops::quantize_act(d_x.as_ptr(), d_xq.as_mut_ptr(), n_tokens * K, stream)?;
-            if !ops::mmq_glu_supported(kty, d_g.as_ptr(), d_u.as_ptr(), d_xq.as_ptr(), K, row_bytes, n_tokens) {
+            if !ops::mmq_glu_supported(kty, d_g.as_ptr(), d_u.as_ptr(), d_xq.as_ptr(), K, N_ROWS, row_bytes, n_tokens) {
                 continue;
             }
             let d_yg = DeviceBuffer::<f32>::new(device, n_tokens * N_ROWS)?;

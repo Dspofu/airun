@@ -187,7 +187,7 @@ unsafe extern "C" {
         weights: *const c_void, h: *mut c_void, ypair: *mut c_void, y: *mut c_void, k: i32, ff: i32,
         n_tokens: i32, top_k: i32, n_experts: i32, gate_row_bytes: u64, down_row_bytes: u64,
         gate_res: *const c_void, down_res: *const c_void, xh: *mut c_void, side: ffi::Stream, ev_fork: *mut c_void,
-        ev_join: *mut c_void, stream: ffi::Stream) -> Status;
+        ev_join: *mut c_void, phase: i32, stream: ffi::Stream) -> Status;
 
     fn airun_sigmoid_scale_rows(
         x: *mut c_void,
@@ -904,6 +904,27 @@ pub fn moe_grouped(gate: ExpertWeights, up: ExpertWeights, down: ExpertWeights, 
     perm: *const c_void, offsets: *const c_void, weights: *const c_void, h: *mut c_void, ypair: *mut c_void,
     y: *mut c_void, k: usize, ff: usize, n_tokens: usize, top_k: usize, n_experts: usize, xh: *mut c_void,
     side: Option<(&Stream, &crate::Event, &crate::Event)>, stream: &Stream) -> Result<()> {
+    moe_grouped_phase(gate, up, down, x, perm, offsets, weights, h, ypair, y, k, ff, n_tokens, top_k, n_experts, xh,
+        side, GROUPED_ALL, stream)
+}
+
+/// [`moe_grouped`]'s phases, for a caller that runs the experts in waves
+/// (each wave's `offsets` give pairs only to the experts its tables hold):
+/// prepare the activations once, run each wave's experts, combine once.
+pub const GROUPED_PREPARE: i32 = 1;
+pub const GROUPED_EXPERTS: i32 = 2;
+pub const GROUPED_COMBINE: i32 = 4;
+/// With a residency map: every expert that has pairs is in VRAM, so the
+/// pass for experts in host memory is not launched.
+pub const GROUPED_ALL_DIRECT: i32 = 8;
+pub const GROUPED_ALL: i32 = GROUPED_PREPARE | GROUPED_EXPERTS | GROUPED_COMBINE;
+
+/// [`moe_grouped`] restricted to the phases in `phase` (GROUPED_* flags).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_phase(gate: ExpertWeights, up: ExpertWeights, down: ExpertWeights, x: *const c_void,
+    perm: *const c_void, offsets: *const c_void, weights: *const c_void, h: *mut c_void, ypair: *mut c_void,
+    y: *mut c_void, k: usize, ff: usize, n_tokens: usize, top_k: usize, n_experts: usize, xh: *mut c_void,
+    side: Option<(&Stream, &crate::Event, &crate::Event)>, phase: i32, stream: &Stream) -> Result<()> {
     if gate.ty != up.ty || gate.row_bytes != up.row_bytes || gate.stride != up.stride {
         return Err(bad_arg("gate and up experts must share a type and layout".to_string()));
     }
@@ -916,10 +937,10 @@ pub fn moe_grouped(gate: ExpertWeights, up: ExpertWeights, down: ExpertWeights, 
             down.row_bytes as u64, gate.resident, down.resident, xh,
             side.map_or(std::ptr::null_mut(), |(s, _, _)| s.raw()),
             side.map_or(std::ptr::null_mut(), |(_, f, _)| f.raw()),
-            side.map_or(std::ptr::null_mut(), |(_, _, j)| j.raw()), stream.raw()))
+            side.map_or(std::ptr::null_mut(), |(_, _, j)| j.raw()), phase, stream.raw()))
     }
     #[cfg(not(airun_cuda))]
-    needs_cuda!(gate.ty, x, perm, offsets, weights, h, ypair, y, k, ff, n_tokens, top_k, n_experts, stream)
+    needs_cuda!(gate.ty, x, perm, offsets, weights, h, ypair, y, k, ff, n_tokens, top_k, n_experts, phase, stream)
 }
 
 /// `counts[ids[i]] += 1` for the `n` routed ids (u32 counts).

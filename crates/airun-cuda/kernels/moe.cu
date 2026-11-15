@@ -1267,9 +1267,15 @@ airun_status airun_moe_grouped(
     const void* x, const void* perm, const void* offsets, const void* weights, void* h, void* ypair, void* y,
     int32_t k, int32_t ff, int32_t n_tokens, int32_t top_k, int32_t n_experts,
     uint64_t gate_row_bytes, uint64_t down_row_bytes, const void* gate_res, const void* down_res,
-    void* xh, void* side, void* ev_fork, void* ev_join, cudaStream_t stream) {
+    void* xh, void* side, void* ev_fork, void* ev_join, int32_t phase, cudaStream_t stream) {
     if (n_tokens <= 0) return AIRUN_OK;
     if (k % 32 != 0 || ff % 32 != 0) return AIRUN_ERR_BAD_ARG;
+    // phase splits the work for a caller that runs the experts in several
+    // waves (streamed experts: each wave's offsets give pairs only to the
+    // experts its tables hold): 1 prepares the activations, 2 runs the
+    // experts, 4 combines the pairs into y; 8 says every expert with pairs
+    // is in VRAM, so the staged pass is skipped. 7 is the whole thing.
+    const bool do_prep = phase & 1, do_experts = phase & 2, do_combine = phase & 4, all_direct = phase & 8;
     // Below MMA_MIN_TOKENS the f32 kernels are cheap enough and keep a short
     // prompt's numbers those of the reference; fp16 can tip a near tie.
     if (n_tokens >= MMA_MIN_TOKENS && xh && moe_mma_usable(k, ff)) {
@@ -1289,10 +1295,10 @@ airun_status airun_moe_grouped(
             int n_gu = 0, n_dn = 0;
             if (!gate_tab) gu_pass[n_gu++] = {1, nullptr};
             else if (!gate_res) gu_pass[n_gu++] = {0, nullptr};
-            else { gu_pass[n_gu++] = {1, (const uint8_t*)gate_res}; gu_pass[n_gu++] = {0, (const uint8_t*)gate_res}; }
+            else { gu_pass[n_gu++] = {1, (const uint8_t*)gate_res}; if (!all_direct) gu_pass[n_gu++] = {0, (const uint8_t*)gate_res}; }
             if (!down_tab) dn_pass[n_dn++] = {1, nullptr};
             else if (!down_res) dn_pass[n_dn++] = {0, nullptr};
-            else { dn_pass[n_dn++] = {1, (const uint8_t*)down_res}; dn_pass[n_dn++] = {0, (const uint8_t*)down_res}; }
+            else { dn_pass[n_dn++] = {1, (const uint8_t*)down_res}; if (!all_direct) dn_pass[n_dn++] = {0, (const uint8_t*)down_res}; }
             const int n_embd = k;
             auto launch_gu = [&](int pi, cudaStream_t st) -> airun_status {
                 const int direct = gu_pass[pi].direct;
@@ -1321,7 +1327,7 @@ airun_status airun_moe_grouped(
                 return AIRUN_OK;
             };
             // The activations in fp16 once, read by every block as B fragments.
-            {
+            if (do_prep) {
                 const size_t nx = (size_t)n_tokens * k;
                 moe_half_kernel<<<(unsigned)((nx + 255) / 256), 256, 0, stream>>>((const float*)x, (half*)xh, nx);
             }
@@ -1329,7 +1335,8 @@ airun_status airun_moe_grouped(
             // the arithmetic: with a side stream the two passes run at once.
             // Each pass touches only its own experts' pairs, so they share h
             // and ypair without overlapping.
-            if (side && n_gu == 2 && n_dn == 2) {
+            if (!do_experts) {
+            } else if (side && n_gu == 2 && n_dn == 2) {
                 AIRUN_TRY(cudaEventRecord((cudaEvent_t)ev_fork, stream));
                 AIRUN_TRY(cudaStreamWaitEvent((cudaStream_t)side, (cudaEvent_t)ev_fork, 0));
                 for (int pi = 0; pi < 2; ++pi) {
@@ -1351,9 +1358,11 @@ airun_status airun_moe_grouped(
                     if (e != AIRUN_OK) return e;
                 }
             }
-            const size_t total = (size_t)n_tokens * n_embd;
-            moe_combine_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
-                (const float*)ypair, (const float*)weights, (float*)y, n_tokens, top_k, n_embd);
+            if (do_combine) {
+                const size_t total = (size_t)n_tokens * n_embd;
+                moe_combine_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
+                    (const float*)ypair, (const float*)weights, (float*)y, n_tokens, top_k, n_embd);
+            }
             AIRUN_CHECK_LAUNCH();
         }
     }
@@ -1361,7 +1370,7 @@ airun_status airun_moe_grouped(
     if (2 * MOE_ROWS_PER_BLOCK * gate_row_bytes > 48 * 1024 || MOE_ROWS_PER_BLOCK * down_row_bytes > 48 * 1024)
         return AIRUN_ERR_BAD_ARG;
     const dim3 block(32, MOE_ROWS_PER_BLOCK);
-    {
+    if (do_experts) {
         const dim3 grid((ff + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK, n_experts);
 #define LAUNCH(TYPE)                                                                                   \
         moe_grouped_gate_up_kernel<TYPE><<<grid, block, 2 * MOE_ROWS_PER_BLOCK * gate_row_bytes, stream>>>( \
@@ -1374,7 +1383,7 @@ airun_status airun_moe_grouped(
         }
 #undef LAUNCH
     }
-    {
+    if (do_experts) {
         const int n_embd = k;
         const dim3 grid((n_embd + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK, n_experts);
 #define LAUNCH(TYPE)                                                                                   \
@@ -1387,9 +1396,11 @@ airun_status airun_moe_grouped(
             default: return AIRUN_ERR_BAD_ARG;
         }
 #undef LAUNCH
-        const size_t total = (size_t)n_tokens * n_embd;
+    }
+    if (do_combine) {
+        const size_t total = (size_t)n_tokens * k;
         moe_combine_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
-            (const float*)ypair, (const float*)weights, (float*)y, n_tokens, top_k, n_embd);
+            (const float*)ypair, (const float*)weights, (float*)y, n_tokens, top_k, k);
     }
     AIRUN_CHECK_LAUNCH();
 }

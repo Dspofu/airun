@@ -155,6 +155,10 @@ version (`matvec_mmq_async_kernel`). Other types and older GPUs go to fp16
 tensor cores (`matvec_wmma_kernel`). Each path has its selftest cases with a
 backward error bound; `AIRUN_MATVEC_F32=1` forces the exact one everywhere,
 `AIRUN_NO_MMQ=1`, `AIRUN_NO_MMQ_ASYNC=1` and `AIRUN_NO_WMMA=1` turn each off.
+**Since 2026-11-15** the sizes above moved: MMQ takes batches from 9 tokens
+(`AIRUN_MMQ_MIN`), Q6_K has the `cp.async` kernel too, and Q6_K decodes on the
+integer path like NVFP4 — see "Q6_K kernels, MMQ from 9 tokens, streamed
+experts in waves" at the end of this file.
 
 **NVFP4** (Qwen3.8-27B NVFP4) takes the integer path at every size, decode
 included (`KernelType::prefers_q8_decode`): at 4.5 bits the f32 vector each
@@ -2018,3 +2022,174 @@ a layer on the CPU, decoding 6.9 -> 13.2 tok/s, the image in 865 ms against
 **Test notes.** This machine has no `curl`; `serve` was driven with Python's
 urllib. `pkill -f "airun serve"` kills the shell that runs it (its own
 command line matches); use `pkill -x airun`.
+
+## Q6_K kernels, MMQ from 9 tokens, streamed experts in waves (2026-11-15, 5070 Ti + 5060 Ti)
+
+Models: Qwen3.8-27B Q6_K with an MTP head (20.9 GiB, every matrix Q6_K, split
+21 layers on the 5060 Ti and 43 on the 5070 Ti) and Qwen4 Flash-Next (78 GB)
+on 32 GB of RAM, where the experts that do not fit VRAM need 24.7 GiB of RAM
+and only 16-19 were free, so they are streamed from the file
+(`--disk-offload`).
+
+**Where Q6_K stood.** It was the one common type with no kernel of its own:
+prefill on the synchronous MMQ kernel, decode on the per-group f32 kernel,
+which reads a group as ~21 misaligned loads for 26 bytes. The 27B Q6_K
+prefilled at 510 / 697 / 999 tok/s (128 / 512 / 2048 tokens) and decoded at
+22.8 tok/s, against ~2700 and 48.6 for the same model in NVFP4 on one card.
+
+**What changed.**
+- **Asynchronous MMQ for Q6_K** (`mmq_async<AIRUN_TYPE_Q6_K>`, `mmq.cuh`).
+  A 210-byte superblock is only 2-byte aligned and the usual rows are not
+  16-byte multiples (20 superblocks = 4200 bytes), so each row's copies are
+  aligned on their own (`ROW_SKEW`): 14 16-byte pieces from the boundary at or
+  below the block. The launch needs the matrix to start and end on a 16-byte
+  boundary (`mmq_async_fits`); `airun_mmq_glu_supported` takes `n_rows` for
+  that. The fused gate/up/SwiGLU launch covers Q6_K too.
+- **One weight buffer, one copy per superblock** (`BLOCK2`, Q5_K and Q6_K).
+  Two buffers of whole-superblock copies did not leave room for the 128-token
+  tile in 99 KiB (Q5_K had been stuck at 64 tokens for that). A superblock is
+  now copied once for its two chunks into a single buffer, and the next one
+  is requested after the second chunk's decode, while its MMAs run.
+  `matvec_bench` (`kquant`, 17408 x 5120, 512 tokens, T MAC/s): Q5_K 50.8 ->
+  68.8, Q6_K 37.8 (async, 64-token tile) -> 50.2. A 96-token tile was measured
+  and loses to 128 wherever 128 fits.
+- **`mmq_decode<Q6_K>::load`** reads nine aligned words each for ql and qh and
+  funnel-shifts them, instead of sixteen halfwords each.
+- **Q6_K decode and verify on the integer path**
+  (`matvec_q6k_wide_kernel<R, NT>`, `KernelType::prefers_q8_decode`): a thread
+  takes half a superblock of 2 rows -- 30 aligned word loads per 105 bytes,
+  every byte once -- for 1 to 8 tokens. Isolated: 808 GB/s for one token and
+  773 for five on the 5070 Ti, where the other types' five-token kernels do
+  620-680. `AIRUN_Q6K_F32_DECODE=1` keeps decode on the exact f32 kernel
+  (generation is then bit-identical to the CPU reference again);
+  `AIRUN_NO_Q6K_WIDE=1` keeps the per-group integer kernels.
+- **MMQ from 9 tokens** (`mmq_min_tokens`, was 32; `AIRUN_MMQ_MIN`). The dp4a
+  tile re-reads the matrix per 16 tokens and decodes each group per token; a
+  mostly empty 64-token MMQ tile beats it from 9 tokens on both cards
+  (31 tokens, 5070 Ti / 5060 Ti: Q4_K 404 -> 111 us / 838 -> 232, Q6_K
+  906 -> 160 / 1836 -> 346, NVFP4 701 -> 146 / 1467 -> 338). Below 32 tokens
+  a stream that is capturing a graph keeps the few-token kernels: a small MMQ
+  grid wants split-K, whose partial buffer may be reallocated later.
+  `AIRUN_MMQ_MIN=32 airun selftest` puts the 12- and 16-token cases back on
+  the dp4a tile, which the default run no longer reaches.
+- **Streamed experts, expert-major in waves** (`run_moe`, the `m.wave`
+  branch; `ExpertSlots::select_keeping`; `hybrid::moe_grouped_phase`). A batch
+  of 16+ tokens over streamed experts sorts its routed pairs by expert on the
+  host and runs the grouped kernels once per wave of as many experts as the
+  VRAM slots hold, through a table of slot addresses. Each missing expert is
+  read once per batch; token by token the slots turned over every ~14 tokens
+  and a 512-token batch read an expert ~2.6 times. The most routed experts go
+  in the last wave, and those already in VRAM are kept in place through the
+  earlier ones, so the slots end the batch holding what decode wants.
+  `AIRUN_NO_STREAM_GROUPED=1` goes back to token order. The hit rate of a
+  batch now counts experts per wave, not routings: it reads lower (60% against
+  87%) for half the reads.
+
+**Measured, 27B Q6_K** (`bench -c 8192`, tok/s; `run` for MTP):
+
+| | before | after |
+|---|---|---|
+| prefill 16 | 80.9 | 213 |
+| prefill 128 | 510 | 1068 |
+| prefill 512 | 697 | 1227 |
+| prefill 2048 | 999 | 1799 |
+| decode @16 | 22.8 | 26.5-27.5 |
+| `--draft 4`, code prompt (46% accepted) | 49.4 | 54.1 |
+
+A speculative step went from verify 48.6 + advance 9.8 ms to 43.3 + 9.3; one
+decode step is 38.6 ms, so five rows cost 12% more than one. The 13.5 GB on
+the 5070 Ti and 6.1 GB on the 5060 Ti bound a step at ~33 ms: decode is at
+85% of bandwidth, like NVFP4. In the prefill profile (nsys) the MMQ kernels
+are 81% of GPU time.
+
+**Measured, 27B NVFP4** (one 5070 Ti, alternated): unchanged at 128 / 512 /
+2048 tokens (2736 / 2747 / 2670) and in decode (48.6); 24 tokens 147 -> 437
+tok/s.
+
+**Measured, Qwen4 Flash-Next** (`run --disk-offload`, prefill tok/s):
+
+| prompt | token order | waves | waves, larger `-b` |
+|---|---|---|---|
+| 732 tokens | 25.6 | 29.2 | 31.8 (`-b 1024`) |
+| 1824 tokens | ~26-36 (bench) | 52.3 | 67.6 (`-b 2048`) |
+
+Decode is unchanged (10-16 tok/s after a prompt, 27 on a short one). Of a
+35 s run, 24 s were expert reads and 2 s GPU: the misses fell from 119k to 64k
+tensors but the time only from 23.7 to 21.2 s, because the reads that went
+away came from the Windows file cache and the ones left are cold SSD reads
+(~2 GB/s). A batch that touches every expert costs one pass over the ~35 GB
+that are not in VRAM, ~17 s, whatever its size: with streamed experts a
+larger `-b` is what speeds a long prompt up. The real fix on this machine is
+a RAM tier (below).
+
+**Exactness.** Selftest 297/297 on both cards, and with `AIRUN_MMQ_MIN=32`.
+Perplexity, 27B Q6_K: built-in passage token by token 1.3569 -> 1.3564;
+AGENTS.md 4096 tokens `--chunk 512 --batched` 2.3552 -> 2.3564. 27B NVFP4
+batched: 1.8795 both. Qwen4, README 1024 tokens batched: 1.6189 token order,
+1.6273 in waves (the grouped tensor-core kernels are fp16, as on the mapped
+path); 80 greedy tokens identical.
+
+**Not done, in order of what they would give.**
+- **Experts in three tiers**: built the same night, see the next section. It
+  is off on this machine by its own rule.
+- **Automatic `-b` for streamed experts.** It costs VRAM scratch (and so
+  expert slots); not measured against decode.
+- **Q6_K's split products.** Its int8 scale changes every 16 values, so a
+  group is two k16 MMAs where Q4_K's is one k32: 50 against 69 T MAC/s.
+
+## A RAM tier for streamed experts, on only where it covers the gap (2026-11-15, later)
+
+`expert_ram.rs` (`ExpertRam`): pinned RAM between the VRAM slots and the file,
+for experts streamed with `--disk-offload`. `upload_experts` asks it for each
+VRAM miss: an expert it holds uploads straight from its block; one it does not
+is read from the file into a block (or into the old staging buffer when the
+tier refuses one). `Runtime::warm_experts`, called by the loader, fills the
+VRAM slots and the tier from the routing profile before the first request;
+the streamed path now records that profile too (`run_moe`), which only the
+mapped path did.
+
+- **Chunks pinned on demand** (256 MiB), so a refused allocation caps the tier
+  instead of failing the load. Windows stopped pinning at 13.75 GiB of 32.
+- **Kept by routing count, not recency.** A prompt batch walks every expert of
+  a layer in the same order; with fewer blocks than experts, least recently
+  used evicts exactly what the next batch asks for first (512-token batches:
+  37 tok/s, the same as with no tier; 89 by count). A block is reused only by
+  an expert of the same size (the quantization mix varies by layer) that has
+  been routed more than its holder.
+- **Warm-up scores** are the profile share times the expert count (1 for an
+  average expert). At ten times that, 60% of a generation's misses were
+  refused a block and read from the file.
+
+**Measured, Qwen4 Flash-Next on 32 GB** (25 GiB of experts missing from VRAM),
+alternated in one window, two rounds, 732-token prompt + 108 tokens:
+
+| | load | prefill | decode |
+|---|---|---|---|
+| no tier | 24-25 s | 18.5 / 30.4 | 7.7 / 12.4 |
+| tier + warm-up | 106-122 s | 64.5 / 71.4 | 4.8 / 5.5 |
+| tier, no warm-up | 25-29 s | 18.5 / 18.9 | 8.7 / 6.1 |
+
+The tier triples prefill and loses everywhere else: pinning 13.75 GiB takes
+that RAM from the system's file cache, which was serving the reads, and half
+of a generation's VRAM misses are the tail the tier left out (23k of 54k came
+from the file). So **the loader turns the tier on only when what can be
+pinned covers 85% of the missing experts** (`EXPERT_RAM_COVER`, with the
+pinnable RAM taken as 40% of the installed), and warms up only with the tier
+on. Here that is off: the model runs as in the section above, and the note at
+load says more free RAM or a smaller quantization is what would help.
+`AIRUN_EXPERT_RAM=<MiB>` forces a size (0: off); `AIRUN_NO_EXPERT_WARM=1`
+skips the warm-up. **The rule's "on" side is not measured**: no machine here
+has the RAM for it.
+
+**Tried and discarded.**
+- **Ordinary (unpinned) memory for the rest of the budget**: 5.6 GiB more put
+  the machine in the page file; warm-up 23 -> 92-115 s, generation 13 -> 7
+  tok/s.
+- **VRAM slots evicted by routing count instead of recency**
+  (`ExpertSlots`): the hit rate did not move (82.2% against 82.8%).
+
+**Measuring this model.** The numbers depend on what Windows has of the file
+in its cache: the same build did 29 tok/s of prefill and 15 of decode with a
+warm cache and 18-20 and 8-9 after the cache was emptied. Compare only runs
+alternated in one window; the "before" columns of the section above were
+taken with a warm cache.

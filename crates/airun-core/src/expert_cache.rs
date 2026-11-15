@@ -17,10 +17,24 @@ impl ExpertSlots {
     }
 
     pub fn select(&mut self, ids: &[i32], n_experts: usize) -> Result<(Vec<i32>, Vec<(usize, usize)>)> {
-        if ids.iter().any(|&id| id < 0 || id as usize >= n_experts) {
+        self.select_keeping(ids, &[], n_experts)
+    }
+
+    /// Whether `id` sits in a slot now.
+    pub fn holds(&self, id: i32) -> bool {
+        self.experts.contains(&Some(id))
+    }
+
+    /// [`Self::select`] that also leaves the experts in `keep` where they
+    /// are: a batch that runs its experts in several waves keeps the ones its
+    /// last wave needs out of the earlier waves' evictions. `keep` is neither
+    /// given slots nor counted.
+    pub fn select_keeping(&mut self, ids: &[i32], keep: &[i32], n_experts: usize)
+        -> Result<(Vec<i32>, Vec<(usize, usize)>)> {
+        if ids.iter().chain(keep).any(|&id| id < 0 || id as usize >= n_experts) {
             return Err(CoreError::Other("router produced an invalid expert id; run airun selftest".into()));
         }
-        let mut unique = ids.to_vec();
+        let mut unique: Vec<i32> = ids.iter().chain(keep).copied().collect();
         unique.sort_unstable();
         unique.dedup();
         if unique.len() > self.experts.len() {
@@ -66,6 +80,22 @@ mod tests {
         assert_eq!(slots, [1, 0, 2]);
         assert_eq!(uploads, [(1, 3)]);
         assert!(c.select(&[2, 3, 0], 8).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn kept_experts_survive_a_wave_that_fills_the_other_slots() {
+        let mut c = ExpertSlots::new(4);
+        c.select(&[0, 1, 2, 3], 16).unwrap();
+        // 0 and 3 are kept: the wave may only take the slots of 1 and 2.
+        let (slots, uploads) = c.select_keeping(&[8, 9], &[0, 3], 16).unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(uploads.len(), 2);
+        assert!(c.holds(0) && c.holds(3) && c.holds(8) && c.holds(9));
+        assert!(!c.holds(1) && !c.holds(2));
+        // Kept experts are not counted: 4 misses at first, 2 now, no hits.
+        assert_eq!((c.hits, c.misses), (0, 6));
+        // A wave and its kept experts must fit together.
+        assert!(c.select_keeping(&[10, 11, 12], &[0, 3], 16).is_err());
     }
 
     #[test]

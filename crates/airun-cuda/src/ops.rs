@@ -60,7 +60,7 @@ unsafe extern "C" {
     fn airun_matvec_glu(type_id: i32, wg: *const c_void, wu: *const c_void, x: *const c_void,
         y: *mut c_void, k: i32, n_rows: i32, row_bytes: u64, stream: ffi::Stream) -> Status;
     fn airun_mmq_glu_supported(type_id: i32, wg: *const c_void, wu: *const c_void,
-        xq: *const c_void, k: i32, row_bytes: u64, n_tokens: i32) -> i32;
+        xq: *const c_void, k: i32, n_rows: i32, row_bytes: u64, n_tokens: i32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn airun_matvec_q8_glu(type_id: i32, wg: *const c_void, wu: *const c_void,
         xq: *const c_void, y: *mut c_void, k: i32, n_rows: i32, n_tokens: i32,
@@ -242,8 +242,17 @@ impl KernelType {
     /// re-reads is ~3.5x the bytes of the weights it is spent against, and the
     /// quantized vector is a quarter of that; at Q8_0's 8.5 bits the weights
     /// dominate and f32 measured faster (148 vs 133 tok/s, 1.7B).
+    ///
+    /// Q6_K takes it too: its exact kernel reads a group as some twenty
+    /// misaligned loads for 26 bytes and ran the 27B at ~70% of bandwidth,
+    /// where the integer path has a kernel that reads half a superblock per
+    /// thread (`matvec_q6k_wide_kernel`). AIRUN_Q6K_F32_DECODE=1 keeps Q6_K
+    /// decode on the exact kernel.
     pub fn prefers_q8_decode(self) -> bool {
+        static Q6K_F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         self.0 == 40   // NVFP4
+            || (self.0 == 14   // Q6_K
+                && !*Q6K_F32.get_or_init(|| std::env::var("AIRUN_Q6K_F32_DECODE").is_ok_and(|v| v.trim() != "0")))
     }
 }
 
@@ -375,18 +384,19 @@ pub fn matvec_glu(ty: KernelType, wg: *const c_void, wu: *const c_void, x: *cons
 }
 /// Whether [`matvec_q8_glu`] can run gate and up with these pointers and sizes:
 /// integer tensor cores on this GPU, a type the asynchronous MMQ kernel reads,
-/// aligned buffers and enough tokens.
+/// aligned buffers and enough tokens. `n_rows` is each matrix's row count.
 #[allow(clippy::too_many_arguments)]
 pub fn mmq_glu_supported(ty: KernelType, wg: *const c_void, wu: *const c_void, xq: *const c_void,
-    k: usize, row_bytes: usize, n_tokens: usize) -> bool {
+    k: usize, n_rows: usize, row_bytes: usize, n_tokens: usize) -> bool {
     #[cfg(airun_cuda)]
     // SAFETY: inspects the arguments and the device's capability; touches no memory.
     unsafe {
-        airun_mmq_glu_supported(ty.0, wg, wu, xq, k as i32, row_bytes as u64, n_tokens as i32) != 0
+        airun_mmq_glu_supported(ty.0, wg, wu, xq, k as i32, n_rows as i32, row_bytes as u64,
+            n_tokens as i32) != 0
     }
     #[cfg(not(airun_cuda))]
     {
-        let _ = (ty, wg, wu, xq, k, row_bytes, n_tokens);
+        let _ = (ty, wg, wu, xq, k, n_rows, row_bytes, n_tokens);
         false
     }
 }

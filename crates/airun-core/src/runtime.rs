@@ -1,4 +1,4 @@
-﻿//! The forward pass and the generation loop.
+//! The forward pass and the generation loop.
 //!
 //! Handles both plain dense decoders and Qwen3-Next style hybrids, where most
 //! layers are gated delta-net linear attention and only every Nth is softmax
@@ -287,6 +287,9 @@ struct MoeScratch {
     cache_group: usize,
     /// Present only when experts are streamed.
     reader: Option<ExpertReader>,
+    /// Streamed experts kept in pinned RAM, between the VRAM slots and the
+    /// file (see expert_ram.rs); None without a RAM budget for it.
+    ram: Option<std::cell::RefCell<ExpertRam>>,
     /// Milliseconds spent waiting for routing results and reading misses.
     timing: std::cell::Cell<(f64, f64)>,
     /// With mapped experts: per local MoE layer, how often each expert was
@@ -306,6 +309,10 @@ struct MoeScratch {
     /// offsets, the sorted pairs, and per-pair down projections.
     /// (counts, offsets, perm, ypair, fp16 activations) of the expert-major batch path.
     grouped: Option<(DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<f32>, DeviceBuffer<u16>)>,
+    /// Streamed experts, expert-major batches (see Runtime::moe_waves): the
+    /// slot address of each expert of the wave for gate, up and down, and a
+    /// residency map that is all ones.
+    wave: Option<([DeviceBuffer<u64>; 3], DeviceBuffer<u8>)>,
     /// With mapped experts: the prediction of a layer's experts made as the
     /// layer starts (see Runtime::moe_prefetch).
     pre: Option<Prefetch>,
@@ -555,7 +562,7 @@ fn dense_ffn(st: &DeviceState, gate: &GpuTensor, up: &GpuTensor, down: &GpuTenso
         && !fp4_prefill(gate, n, &st.q8act)
         && ops::matvec_supports_q8(gate.kernel_type())
         && ops::mmq_glu_supported(gate.kernel_type(), gate.ptr(),
-            up.ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
+            up.ptr(), st.q8act.buf.as_ptr(), gate.k, gate.rows, gate.row_bytes, n);
     if n == 1 && no_scale && same_shape(&[gate, up]) && !q8_decode(gate) {
         // Decode: gate, up and SwiGLU in one launch, bit-identical.
         ops::matvec_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
@@ -973,6 +980,15 @@ impl Runtime {
                     .transpose()
                     .map_err(|e| CoreError::Other(format!(
                         "cannot reopen the model to stream experts ({e}); check the file is still readable")))?,
+                    ram: {
+                        let streamed = |ls: &mut dyn Iterator<Item = &crate::model::LayerWeights>| ls.filter(|l| matches!(&l.ffn,
+                            FfnWeights::Moe { gate_exps, .. } if gate_exps.host_experts.is_some())).count() as u64;
+                        let (mine, all) = (streamed(&mut shard.layers.iter().map(|&l| &model.layers[l])),
+                            streamed(&mut model.layers.iter()));
+                        // Each GPU's share of the tier follows its streamed layers.
+                        let budget = if all == 0 { 0 } else { crate::model::expert_ram() / all * mine };
+                        (budget > 0).then(|| std::cell::RefCell::new(ExpertRam::new(budget as usize)))
+                    },
                     timing: std::cell::Cell::new((0.0, 0.0)),
                     counts: if mapped_layers > 0 {
                         Some(DeviceBuffer::zeroed(dev, mapped_layers * moe.n_experts, &stream)?)
@@ -1012,6 +1028,14 @@ impl Runtime {
                               DeviceBuffer::new(dev, b * moe.n_experts_used)?,
                               DeviceBuffer::new(dev, b * moe.n_experts_used * cfg.n_embd)?,
                               DeviceBuffer::new(dev, b * cfg.n_embd)?))
+                    } else {
+                        None
+                    },
+                    wave: if b >= GROUPED_MIN && model.layers.iter().any(|l| matches!(&l.ffn,
+                        FfnWeights::Moe { gate_exps, .. } if gate_exps.host_experts.is_some())) {
+                        let ones = DeviceBuffer::<u8>::from_slice(dev, &vec![1u8; moe.n_experts], &stream)?;
+                        Some(([DeviceBuffer::new(dev, moe.n_experts)?, DeviceBuffer::new(dev, moe.n_experts)?,
+                               DeviceBuffer::new(dev, moe.n_experts)?], ones))
                     } else {
                         None
                     },
@@ -1228,6 +1252,15 @@ impl Runtime {
     /// Tensor-cache hits/misses, including prefill and warm-up.
     /// Milliseconds spent (waiting on the GPU for routing, reading expert
     /// misses) since load; the first includes all GPU work queued before it.
+    /// The streamed experts' RAM tier: bytes pinned, VRAM misses it served
+    /// and misses read from the file.
+    pub fn expert_ram_stats(&self) -> (usize, u64, u64) {
+        self.states.iter().filter_map(|s| s.moe.as_ref()?.ram.as_ref()).fold((0, 0, 0), |(b, h, r), t| {
+            let t = t.borrow();
+            (b + t.held(), h + t.hits, r + t.reads + t.refused)
+        })
+    }
+
     pub fn expert_stream_timing(&self) -> (f64, f64) {
         self.states.iter().filter_map(|s| s.moe.as_ref())
             .fold((0.0, 0.0), |(w, r), m| { let (a, b) = m.timing.get(); (w + a, r + b) })
@@ -1715,6 +1748,104 @@ impl Runtime {
                 eprintln!("warning: cannot save the expert routing profile to {} ({e}); the next load                     will place experts without it -- check the directory is writable, or set                     AIRUN_EXPERT_PROFILE to another path", p.path().display());
             }
         }
+    }
+
+    /// Streamed experts: puts each layer's most routed experts of earlier
+    /// runs (the routing profile) in its VRAM slots, and the next most routed
+    /// in the RAM tier, before the first request. Without it every expert's
+    /// first use is a read from the file: Qwen4 Flash-Next generated its
+    /// first 300 tokens at 11.5 tok/s for that, 27 once warm. Returns the
+    /// bytes read; 0 without streamed experts or a profile.
+    /// AIRUN_NO_EXPERT_WARM=1 skips it.
+    pub fn warm_experts(&mut self) -> Result<u64> {
+        // A warmed expert's score in the tier is its share of the layer's
+        // routings times the expert count: 1 for an average expert. The
+        // tier then counts each later miss as 1, so an expert the profile
+        // did not expect takes the block of a below-average one the first
+        // time it is routed. At 10 per average expert, 60% of a
+        // generation's misses were refused a block and read from the file.
+        let share_scale = self.model.config.moe.as_ref().map_or(1.0, |m| m.n_experts as f32);
+        /// Tier reads issued together.
+        const READS: usize = 384;
+        if std::env::var("AIRUN_NO_EXPERT_WARM").is_ok_and(|v| v.trim() != "0") {
+            return Ok(0);
+        }
+        let Some(profile) = &self.model.expert_profile else { return Ok(0) };
+        let profile = profile.borrow();
+        let mut bytes = 0u64;
+        for st in &self.states {
+            let Some(m) = &st.moe else { continue };
+            let (Some(upload), Some(reader)) = (&m.upload, &m.reader) else { continue };
+            // Only with the RAM tier: reading ahead without it took the load
+            // from 25 to over 100 s for experts the file cache then lost.
+            if m.ram.is_none() { continue; }
+            let mut staging = upload.borrow_mut();
+            // (share of the layer's routings, layer, expert) of what VRAM does not take
+            let mut rest: Vec<(f32, usize, usize)> = Vec::new();
+            for &l in &st.layers {
+                let FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } = &self.model.layers[l].ffn else { continue };
+                if gate_exps.host_experts.is_none() { continue; }
+                let Some(shares) = profile.shares(l) else { continue };
+                let order = profile.order(l);
+                let cap = gate_exps.cache_capacity().min(order.len());
+                let top: Vec<i32> = order[..cap].iter().map(|&e| e as i32).collect();
+                let tensors = [gate_exps, up_exps, down_exps];
+                let fail = |e: CoreError| { tensors.iter().for_each(|w| w.invalidate_experts()); e };
+                let mut picks = Vec::with_capacity(3);
+                for w in tensors {
+                    picks.push(w.select_experts(&top).map_err(fail)?);
+                }
+                upload_experts(&tensors, &picks, staging.as_mut_slice(), reader, None, &|_| 0.0, &st.stream)
+                    .map_err(fail)?;
+                // The staging buffer is the next layer's too.
+                st.stream.synchronize()?;
+                bytes += tensors.iter().zip(&picks).map(|(w, p)| (p.1.len() * w.expert_stride) as u64).sum::<u64>();
+                rest.extend(order[cap..].iter().filter(|&&e| shares[e] > 0.0).map(|&e| (shares[e], l, e)));
+            }
+            let Some(ram) = &m.ram else { continue };
+            let mut ram = ram.borrow_mut();
+            ram.begin();
+            rest.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let mut reads = Vec::new();
+            let mut keys = Vec::new();
+            let mut flush = |reads: &mut Vec<(usize, u64, &mut [u8])>, keys: &mut Vec<(usize, u32)>, ram: &mut ExpertRam|
+                -> Result<()> {
+                let n: u64 = reads.iter().map(|r| r.2.len() as u64).sum();
+                if let Err(e) = reader.read_all(std::mem::take(reads)) {
+                    keys.drain(..).for_each(|k| ram.forget(k));
+                    return Err(CoreError::Other(format!(
+                        "reading experts from the model file failed ({e}); check the drive and that the file is unchanged")));
+                }
+                keys.clear();
+                bytes += n;
+                Ok(())
+            };
+            'fill: for (share, l, e) in rest {
+                let FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } = &self.model.layers[l].ffn else { continue };
+                for w in [gate_exps, up_exps, down_exps] {
+                    let Some(offset) = w.expert_file_offset(e) else { continue };
+                    let key = (w.data.as_ptr() as usize, e as u32);
+                    match ram.block(key, w.expert_stride, share * share_scale) {
+                        Some(b) if !b.filled => {
+                            keys.push(key);
+                            // SAFETY: a tier block of expert_stride bytes, handed
+                            // out once in this pass.
+                            reads.push((offset.0, offset.1, unsafe { std::slice::from_raw_parts_mut(b.ptr, w.expert_stride) }));
+                        }
+                        Some(_) => {}
+                        // The tier is full; the rest are routed less.
+                        None => break 'fill,
+                    }
+                }
+                if reads.len() >= READS {
+                    flush(&mut reads, &mut keys, &mut ram)?;
+                }
+            }
+            flush(&mut reads, &mut keys, &mut ram)?;
+            // The counters are for what requests do.
+            (ram.hits, ram.reads, ram.refused) = (0, 0, 0);
+        }
+        Ok(bytes)
     }
 
     /// Queues `tokens` into the caches without reading anything back: a
@@ -4210,9 +4341,124 @@ impl Runtime {
             m.ids.copy_to_host(&mut ids, stream)?;
             stream.synchronize()?;
             let wait_ms = waited.elapsed().as_secs_f64() * 1000.0;
+            // What this run routes is what the next load puts in VRAM and RAM
+            // first (warm_experts).
+            if let Some(p) = &self.model.expert_profile {
+                let mut routed = vec![0u32; moe.n_experts];
+                for &e in &ids {
+                    if let Some(c) = routed.get_mut(e as usize) { *c += 1; }
+                }
+                p.borrow_mut().add(layer, &routed);
+            }
             let mut staging = upload.borrow_mut();
-            let mut host_ids = m.cached_host_ids.borrow_mut();
             let tensors = [gate_exps, up_exps, down_exps];
+            // A batch goes expert-major here too, in waves of as many experts
+            // as the VRAM slots hold: each missing expert is read once for all
+            // its tokens. Token by token (below), the slots turned over every
+            // dozen tokens and a 512-token batch read the same expert ~2.6
+            // times; on Qwen4 Flash-Next (78 GB on 32 GB of RAM) those reads
+            // were 70% of a prompt.
+            if let (Some((tabs, ones)), Some((_, offsets, perm, ypair, xh)), true) = (&m.wave, &m.grouped,
+                n >= GROUPED_MIN && gate_exps.host_experts.is_some() && stream_grouped()) {
+                let (k, ne, cap) = (moe.n_experts_used, moe.n_experts, gate_exps.cache_capacity());
+                if ids.iter().any(|&e| e < 0 || e as usize >= ne) {
+                    return Err(CoreError::Other("router produced an invalid expert id; run airun selftest".into()));
+                }
+                // The routed pairs (token * k + slot) by expert.
+                let mut start = vec![0usize; ne + 1];
+                for &e in &ids { start[e as usize + 1] += 1; }
+                for e in 0..ne { start[e + 1] += start[e]; }
+                let mut fill = start.clone();
+                let mut pairs = vec![0i32; ids.len()];
+                for (p, &e) in ids.iter().enumerate() {
+                    pairs[fill[e as usize]] = p as i32;
+                    fill[e as usize] += 1;
+                }
+                let count = |e: i32| start[e as usize + 1] - start[e as usize];
+                let mut used: Vec<i32> = (0..ne as i32).filter(|&e| count(e) > 0).collect();
+                // (experts of the wave, experts it must leave in their slots)
+                let mut waves: Vec<(Vec<i32>, Vec<i32>)> = Vec::new();
+                if used.len() <= cap {
+                    waves.push((used, Vec::new()));
+                } else {
+                    // The most routed experts go last, so they are what the
+                    // slots hold for the next pass; those of them already in
+                    // VRAM stay put through the earlier waves (a quarter of
+                    // the slots is always left to turn over).
+                    used.sort_by_key(|&e| std::cmp::Reverse(count(e)));
+                    let last = used[..cap].to_vec();
+                    let mut keep: Vec<i32> = last.iter().copied().filter(|&e| gate_exps.expert_cached(e)).collect();
+                    keep.truncate(cap - (cap / 4).max(1));
+                    let mut rest = used[cap..].to_vec();
+                    rest.sort_by_key(|&e| !gate_exps.expert_cached(e));
+                    for chunk in rest.chunks(cap - keep.len()) {
+                        waves.push((chunk.to_vec(), keep.clone()));
+                    }
+                    waves.push((last, Vec::new()));
+                }
+                let ew = |t: &GpuTensor, tab: &DeviceBuffer<u64>| hybrid::ExpertWeights {
+                    ty: t.kernel_type(),
+                    tab: tab.as_ptr(),
+                    base: std::ptr::null(),
+                    stride: t.expert_stride,
+                    row_bytes: t.row_bytes,
+                    resident: ones.as_ptr(),
+                };
+                let grouped = |phase: i32| hybrid::moe_grouped_phase(ew(gate_exps, &tabs[0]), ew(up_exps, &tabs[1]),
+                    ew(down_exps, &tabs[2]), st.xb.as_ptr(), perm.as_ptr(), offsets.as_ptr(), m.weights.as_ptr(),
+                    m.h.as_mut_ptr(), ypair.as_mut_ptr(), st.xb2.as_mut_ptr(), cfg.n_embd, moe.expert_ff, n, k, ne,
+                    xh.as_mut_ptr(), None, phase, stream);
+                grouped(hybrid::GROUPED_PREPARE)?;
+                let reader = m.reader.as_ref().ok_or_else(|| CoreError::Other(
+                    "streamed experts without a reader; reload the model".into()))?;
+                // Host copies of what each wave uploads; the stream is
+                // synchronized before they (and the pinned staging) change.
+                let mut host_tabs = [vec![0u64; ne], vec![0u64; ne], vec![0u64; ne]];
+                let mut host_off = vec![0i32; ne + 1];
+                let mut host_perm: Vec<i32> = Vec::with_capacity(ids.len());
+                let mut in_wave = vec![false; ne];
+                let mut read_ms = 0.0;
+                let fail = |e: CoreError| { tensors.iter().for_each(|w| w.invalidate_experts()); e };
+                for (wi, (experts, keep)) in waves.iter().enumerate() {
+                    if wi > 0 { stream.synchronize()?; }
+                    let mut picks = Vec::with_capacity(3);
+                    for w in tensors {
+                        picks.push(w.select_wave(experts, keep).map_err(fail)?);
+                    }
+                    if picks[0].0 != picks[1].0 || picks[0].0 != picks[2].0 {
+                        return Err(fail(CoreError::Other(
+                            "expert caches disagree; reload the model and run airun selftest".into())));
+                    }
+                    let read = std::time::Instant::now();
+                    upload_experts(&tensors, &picks, staging.as_mut_slice(), reader, m.ram.as_ref(),
+                        &|e| count(e as i32) as f32, stream).map_err(fail)?;
+                    read_ms += read.elapsed().as_secs_f64() * 1000.0;
+                    in_wave.fill(false);
+                    for (ti, t) in tensors.iter().enumerate() {
+                        host_tabs[ti].fill(0);
+                        for (&e, &slot) in experts.iter().zip(&picks[ti].0) {
+                            host_tabs[ti][e as usize] = t.data.as_ptr() as u64 + (slot as usize * t.expert_stride) as u64;
+                        }
+                        tabs[ti].copy_from_host_at(0, &host_tabs[ti], stream)?;
+                    }
+                    for &e in experts { in_wave[e as usize] = true; }
+                    host_perm.clear();
+                    for e in 0..ne {
+                        if in_wave[e] { host_perm.extend_from_slice(&pairs[start[e]..start[e + 1]]); }
+                        host_off[e + 1] = host_perm.len() as i32;
+                    }
+                    offsets.copy_from_host_at(0, &host_off, stream)?;
+                    perm.copy_from_host_at(0, &host_perm, stream)?;
+                    grouped(hybrid::GROUPED_EXPERTS | hybrid::GROUPED_ALL_DIRECT)?;
+                }
+                grouped(hybrid::GROUPED_COMBINE)?;
+                // The host tables above are dropped on return.
+                stream.synchronize()?;
+                let (w, r) = m.timing.get();
+                m.timing.set((w + wait_ms, r + read_ms));
+                return Ok(());
+            }
+            let mut host_ids = m.cached_host_ids.borrow_mut();
             for t in (0..n).step_by(m.cache_group) {
                 // The next token may evict a slot, and pinned staging cannot be
                 // rewritten while the DMA engine is still reading it.
@@ -4233,7 +4479,7 @@ impl Runtime {
                 let reader = m.reader.as_ref().ok_or_else(|| CoreError::Other(
                     "streamed experts without a reader; reload the model".into()))?;
                 let read = std::time::Instant::now();
-                let uploaded = upload_experts(&tensors, &picks, staging.as_mut_slice(), reader, stream);
+                let uploaded = upload_experts(&tensors, &picks, staging.as_mut_slice(), reader, m.ram.as_ref(), &|_| 1.0, stream);
                 let (w, r) = m.timing.get();
                 m.timing.set((w + if t == 0 { wait_ms } else { 0.0 }, r + read.elapsed().as_secs_f64() * 1000.0));
                 if let Err(e) = uploaded {
@@ -4746,6 +4992,13 @@ fn moe_overlap() -> bool {
     *ON.get_or_init(|| std::env::var("AIRUN_MOE_OVERLAP").as_deref() != Ok("0"))
 }
 
+/// Whether a batch over streamed experts runs expert by expert, in waves (see
+/// run_moe). AIRUN_NO_STREAM_GROUPED=1 keeps it token by token.
+fn stream_grouped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("AIRUN_NO_STREAM_GROUPED").is_ok_and(|v| v.trim() != "0"))
+}
+
 /// Forward passes between expert rebalances, and the decay of the routing
 /// scores at each one.
 const REBALANCE_EVERY: usize = 8;
@@ -4762,6 +5015,7 @@ const STAGE_CAP: usize = 64;
 /// bandwidth with several requests in flight.
 const EXPERT_READERS: usize = 8;
 
+use crate::expert_ram::ExpertRam;
 use crate::expert_reader::ExpertReader;
 
 /// Reads every expert miss of one MoE step from the GGUF into pinned staging,
@@ -4776,43 +5030,76 @@ fn upload_experts(
     picks: &[(Vec<i32>, Vec<(usize, usize)>)],
     staging: &mut [u8],
     reader: &ExpertReader,
+    ram: Option<&std::cell::RefCell<ExpertRam>>,
+    routed: &dyn Fn(usize) -> f32,
     stream: &Stream,
 ) -> Result<()> {
-    // (tensor, slot, (shard, file offset), staging range)
-    let mut jobs = Vec::new();
+    // `routed(expert)` is how many of this pass's tokens go to the expert,
+    // which is what the RAM tier ranks by.
+    // An expert the RAM tier holds uploads straight from it; one it does not
+    // is read into the block the tier gives it, or into the staging buffer
+    // when the tier has none to give. The caller synchronized the stream
+    // since the last call, so no earlier upload still reads these blocks.
+    let mut ram = ram.map(|r| r.borrow_mut());
+    if let Some(r) = ram.as_mut() {
+        r.begin();
+    }
+    let stage = staging.as_mut_ptr();
     let mut used = 0usize;
+    // (tensor, slot, where its bytes are)
+    let mut jobs: Vec<(&GpuTensor, usize, *mut u8)> = Vec::new();
+    let mut reads = Vec::new();
+    let mut fresh = Vec::new();
     for (w, (_, uploads)) in tensors.iter().zip(picks) {
         for &(slot, expert) in uploads {
             let offset = w.expert_file_offset(expert).ok_or_else(|| CoreError::Other(
                 "an expert miss on a tensor that is not streamed; reload the model".into()))?;
-            let end = used + w.expert_stride;
-            if end > staging.len() {
-                return Err(CoreError::Other(
-                    "expert uploads exceed the staging buffer; lower --batch-size".into()));
+            let key = (w.data.as_ptr() as usize, expert as u32);
+            let (ptr, filled) = match ram.as_mut().and_then(|r| r.block(key, w.expert_stride, routed(expert))) {
+                Some(b) => {
+                    if !b.filled { fresh.push(key); }
+                    (b.ptr, b.filled)
+                }
+                None => {
+                    if let Some(r) = ram.as_mut() { r.refused += 1; }
+                    if used + w.expert_stride > staging.len() {
+                        return Err(CoreError::Other(
+                            "expert uploads exceed the staging buffer; lower --batch-size".into()));
+                    }
+                    // SAFETY: used + stride <= staging.len(), checked above.
+                    let p = unsafe { stage.add(used) };
+                    used += w.expert_stride;
+                    (p, false)
+                }
+            };
+            if !filled {
+                // SAFETY: a block of expert_stride bytes that this call alone
+                // holds: a tier block (handed out once per pass) or its own
+                // range of the staging buffer.
+                reads.push((offset.0, offset.1, unsafe { std::slice::from_raw_parts_mut(ptr, w.expert_stride) }));
             }
-            jobs.push((*w, slot, offset, used..end));
-            used = end;
+            jobs.push((*w, slot, ptr));
         }
     }
     if jobs.is_empty() {
         return Ok(());
     }
-
-    let mut rest = &mut staging[..used];
-    let mut reads = Vec::with_capacity(jobs.len());
-    for (w, _, offset, _) in &jobs {
-        let (head, tail) = rest.split_at_mut(w.expert_stride);
-        reads.push((offset.0, offset.1, head));
-        rest = tail;
+    if let Err(e) = reader.read_all(reads) {
+        // The tier's new blocks hold nothing usable.
+        if let Some(r) = ram.as_mut() {
+            fresh.iter().for_each(|&k| r.forget(k));
+        }
+        return Err(CoreError::Other(format!(
+            "reading experts from the model file failed ({e}); check the drive and that the file is unchanged")));
     }
-    reader.read_all(reads).map_err(|e| CoreError::Other(format!(
-        "reading experts from the model file failed ({e}); check the drive and that the file is unchanged")))?;
-    for (w, slot, _, range) in jobs {
-        w.data.copy_from_host_at(slot * w.expert_stride, &staging[range], stream)?;
+    for (w, slot, ptr) in jobs {
+        // SAFETY: as above; the bytes stay in place until the caller's next
+        // stream synchronization, which comes before the next call.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, w.expert_stride) };
+        w.data.copy_from_host_at(slot * w.expert_stride, bytes, stream)?;
     }
     Ok(())
 }
-
 /// AIRUN_NO_GPU_ARGMAX=1 copies the logits to the host for greedy decoding too.
 fn gpu_argmax_disabled() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

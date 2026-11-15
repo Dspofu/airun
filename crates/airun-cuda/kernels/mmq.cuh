@@ -120,16 +120,24 @@ template <> struct mmq_decode<AIRUN_TYPE_Q5_K> {
 // products per group instead of one k32.
 template <> struct mmq_decode<AIRUN_TYPE_Q6_K> {
     static constexpr bool SPLIT = true, HAS_MIN = false;
-    struct Raw { uint16_t l[16], h[16], sc, d; };   // 210-byte blocks: 2-byte alignment
+    // 210-byte blocks are only 2-byte aligned. ql and qh sit at multiples of 4
+    // from the block's start, so both are off a word boundary by the same 0 or
+    // 2 bytes: nine aligned words each and a funnel shift, as for Q8_0, instead
+    // of sixteen halfwords each. The ninth word is always inside the block
+    // (the furthest, qh of the second half, ends in the scales).
+    struct Raw { uint32_t l[9], h[9], sh; uint16_t sc, d; };
     __device__ static __forceinline__ void load(const uint8_t* wr, int g, Raw& r) {
         const int sub = g % 8;
         const block_q6_K* b = (const block_q6_K*)(wr + (size_t)(g / 8) * sizeof(block_q6_K));
         const int half_ = sub / 4;
         const int quarter = sub % 4;
-        const uint16_t* ql = (const uint16_t*)(b->ql + half_ * 64 + (quarter & 1) * 32);
-        const uint16_t* qh = (const uint16_t*)(b->qh + half_ * 32);
+        const uintptr_t ql = (uintptr_t)(b->ql + half_ * 64 + (quarter & 1) * 32);
+        const uintptr_t qh = (uintptr_t)(b->qh + half_ * 32);
+        const uint32_t* pl = (const uint32_t*)(ql & ~(uintptr_t)3);
+        const uint32_t* ph = (const uint32_t*)(qh & ~(uintptr_t)3);
 #pragma unroll
-        for (int i = 0; i < 16; ++i) { r.l[i] = ql[i]; r.h[i] = qh[i]; }
+        for (int i = 0; i < 9; ++i) { r.l[i] = pl[i]; r.h[i] = ph[i]; }
+        r.sh = 8u * (uint32_t)(ql & 3);   // 0 or 16
         r.sc = *(const uint16_t*)(b->scales + half_ * 8 + quarter * 2);
         r.d = *(const uint16_t*)&b->d;
     }
@@ -140,8 +148,8 @@ template <> struct mmq_decode<AIRUN_TYPE_Q6_K> {
         const int loshift = (quarter >= 2) ? 4 : 0;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const uint32_t wl = (uint32_t)r.l[2 * i] | ((uint32_t)r.l[2 * i + 1] << 16);
-            const uint32_t wh = (uint32_t)r.h[2 * i] | ((uint32_t)r.h[2 * i + 1] << 16);
+            const uint32_t wl = __funnelshift_r(r.l[i], r.l[i + 1], r.sh);
+            const uint32_t wh = __funnelshift_r(r.h[i], r.h[i + 1], r.sh);
             const uint32_t lo = (wl >> loshift) & 0x0F0F0F0Fu;
             const uint32_t hi = ((wh >> shift) & 0x03030303u) << 4;
             q[i] = __vsub4(lo | hi, 0x20202020u);
@@ -505,32 +513,53 @@ __global__ __launch_bounds__(256, 2) void matvec_mmq_kernel(
 //
 // Only for layouts whose chunks are aligned for cp.async and whole.
 template <int TYPE> struct mmq_async {
-    static constexpr bool OK = false;
+    static constexpr bool OK = false, ROW_SKEW = false, BLOCK2 = false;
     static constexpr int BYTES = 0, STRIDE = 0, COPY = 16, GROUP_MULTIPLE = 1;   // unused
 };
+// ROW_SKEW: where a chunk falls against a 16-byte boundary depends on the row
+// too (rows are not 16-byte multiples), so the kernel aligns each row's copy
+// on its own; `offset` is then the chunk's unaligned offset in the row and
+// `skew` is unused.
+// BLOCK2: a copy is one whole superblock (8 groups, two chunks) into a single
+// weight buffer, where the others copy per chunk into two alternating ones.
 // Q8_0 chunks start 8-byte aligned (136 bytes each). Copying from the 16-byte
 // boundary at or below the start takes 144 bytes in nine 16-byte pieces instead
 // of seventeen 8-byte ones; `skew` says where the chunk begins in the copy.
 // Needs a group count divisible by 8, so the last copy ends inside the row.
 template <> struct mmq_async<AIRUN_TYPE_Q8_0> {
-    static constexpr bool OK = true;
+    static constexpr bool OK = true, ROW_SKEW = false, BLOCK2 = false;
     static constexpr int BYTES = 144, STRIDE = 144, COPY = 16, GROUP_MULTIPLE = 8;
     __device__ static __forceinline__ int base_group(int g0) { return g0; }
     __device__ static __forceinline__ size_t offset(int g0) { return ((size_t)g0 * 34) & ~(size_t)15; }
     __device__ static __forceinline__ int skew(int g0) { return (g0 * 34) & 15; }
 };
 template <> struct mmq_async<AIRUN_TYPE_Q4_K> {
-    static constexpr bool OK = true;
+    static constexpr bool OK = true, ROW_SKEW = false, BLOCK2 = false;
     static constexpr int BYTES = 144, STRIDE = 144, COPY = 16, GROUP_MULTIPLE = MMQ_KG;
     __device__ static __forceinline__ int base_group(int g0) { return (g0 / 8) * 8; }
     __device__ static __forceinline__ size_t offset(int g0) { return (size_t)(g0 / 8) * 144; }
     __device__ static __forceinline__ int skew(int) { return 0; }
 };
 template <> struct mmq_async<AIRUN_TYPE_Q5_K> {
-    static constexpr bool OK = true;
+    static constexpr bool OK = true, ROW_SKEW = false, BLOCK2 = true;
     static constexpr int BYTES = 176, STRIDE = 176, COPY = 16, GROUP_MULTIPLE = MMQ_KG;
     __device__ static __forceinline__ int base_group(int g0) { return (g0 / 8) * 8; }
     __device__ static __forceinline__ size_t offset(int g0) { return (size_t)(g0 / 8) * 176; }
+    __device__ static __forceinline__ int skew(int) { return 0; }
+};
+// Q6_K: a 210-byte superblock is only 2-byte aligned and the usual rows are
+// not 16-byte multiples (20 superblocks are 4200 bytes), so a block starts 0
+// to 14 bytes past a 16-byte boundary, differently in each row. Fourteen
+// 16-byte pieces from the boundary at or below the block cover it wherever it
+// falls. A chunk is half a superblock whose ql, qh and scales are three
+// separate runs, so the copy is of the whole one, made once for both chunks
+// (BLOCK2). On the synchronous kernel a 27B Q6_K prefilled at a third of the
+// same model's Q4_K rate.
+template <> struct mmq_async<AIRUN_TYPE_Q6_K> {
+    static constexpr bool OK = true, ROW_SKEW = true, BLOCK2 = true;
+    static constexpr int BYTES = 224, STRIDE = 224, COPY = 16, GROUP_MULTIPLE = 8;
+    __device__ static __forceinline__ int base_group(int g0) { return (g0 / 8) * 8; }
+    __device__ static __forceinline__ size_t offset(int g0) { return (size_t)(g0 / 8) * 210; }
     __device__ static __forceinline__ int skew(int) { return 0; }
 };
 
@@ -539,7 +568,7 @@ template <> struct mmq_async<AIRUN_TYPE_Q5_K> {
 // cover it, as for Q8_0. Rows of a multiple of 8 groups are 16-byte multiples,
 // so the copies of a row's last chunk (always the 8-aligned kind) end inside it.
 template <> struct mmq_async<AIRUN_TYPE_NVFP4> {
-    static constexpr bool OK = true;
+    static constexpr bool OK = true, ROW_SKEW = false, BLOCK2 = false;
     static constexpr int BYTES = 80, STRIDE = 80, COPY = 16, GROUP_MULTIPLE = 8;
     __device__ static __forceinline__ int base_group(int g0) { return g0; }
     __device__ static __forceinline__ size_t offset(int g0) { return ((size_t)g0 / 2 * 36) & ~(size_t)15; }
@@ -549,7 +578,8 @@ template <> struct mmq_async<AIRUN_TYPE_NVFP4> {
 template <int TYPE, int TC>
 constexpr size_t mmq_async_smem() {
     return (size_t)MMQ_TR * MMQ_LDW + sizeof(MmqScales<TC>)
-         + 2 * (size_t)MMQ_TR * mmq_async<TYPE>::STRIDE + 2 * (size_t)TC * MMQ_XLD;
+         + (mmq_async<TYPE>::BLOCK2 ? 1 : 2) * (size_t)MMQ_TR * mmq_async<TYPE>::STRIDE
+         + 2 * (size_t)TC * MMQ_XLD;
 }
 
 template <int BYTES>
@@ -612,8 +642,9 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
     extern __shared__ __align__(16) unsigned char mmq_smem[];
     int8_t* ws = (int8_t*)mmq_smem;
     MmqScales<TC>& S = *(MmqScales<TC>*)(mmq_smem + MMQ_TR * MMQ_LDW);
-    unsigned char* wraw = mmq_smem + MMQ_TR * MMQ_LDW + sizeof(MmqScales<TC>);   // [2][TR][STRIDE]
-    unsigned char* xraw = wraw + 2 * MMQ_TR * A::STRIDE;                          // [2][TC][XLD]
+    constexpr int WSTAGES = A::BLOCK2 ? 1 : 2;
+    unsigned char* wraw = mmq_smem + MMQ_TR * MMQ_LDW + sizeof(MmqScales<TC>);   // [WSTAGES][TR][STRIDE]
+    unsigned char* xraw = wraw + WSTAGES * MMQ_TR * A::STRIDE;                    // [2][TC][XLD]
 
     constexpr int ROWS = GLU ? MMQ_TR / 2 : MMQ_TR;   // output rows per tile
     constexpr int E = MMQ_MT * (TC / 32) * 4;          // accumulators per thread
@@ -645,6 +676,9 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
         constexpr int XT = (TC * XP + 255) / 256;                // activation copies per thread
         const uint8_t* wsrc_t[WT];
         int wdst_t[WT];
+        // ROW_SKEW: the row's own distance past a 16-byte boundary; wsrc_t
+        // then starts at that boundary.
+        int wlow_t[WT];
 #pragma unroll
         for (int i = 0; i < WT; ++i) {
             const int task = tid + i * 256;
@@ -652,7 +686,9 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
             const int rr = GLU ? (r & 63) : r;
             const bool ok = task < MMQ_TR * WP && rr < rows_valid;
             const uint8_t* mat = (GLU && r >= 64) ? w2 : w;
-            wsrc_t[i] = ok ? mat + (size_t)(row0 + rr) * row_bytes + k * A::COPY : nullptr;
+            const uint8_t* row = mat + (size_t)(row0 + rr) * row_bytes;
+            wlow_t[i] = A::ROW_SKEW ? (int)((uintptr_t)row & 15) : 0;
+            wsrc_t[i] = ok ? row - wlow_t[i] + k * A::COPY : nullptr;
             wdst_t[i] = r * A::STRIDE + k * A::COPY;
         }
         const unsigned char* xsrc_t[XT];
@@ -665,22 +701,33 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
             xsrc_t[i] = ok ? (const unsigned char*)(xq + (size_t)(tok0 + t) * n_groups) + k * 16 : nullptr;
             xdst_t[i] = t * MMQ_XLD + k * 16;
         }
-        auto issue = [&](int g0, int stage) {
+        auto commit = [&]() {
+#if __CUDA_ARCH__ >= 800
+            asm volatile("cp.async.commit_group;\n" ::);
+#endif
+        };
+        auto issue_w = [&](int g0, int stage) {
             unsigned char* wdst = wraw + stage * (MMQ_TR * A::STRIDE);
             const size_t woff = A::offset(g0);
 #pragma unroll
             for (int i = 0; i < WT; ++i) {
-                if (wsrc_t[i]) cp_async<A::COPY>(wdst + wdst_t[i], wsrc_t[i] + woff);
+                if constexpr (A::ROW_SKEW) {
+                    if (wsrc_t[i]) {
+                        cp_async<A::COPY>(wdst + wdst_t[i],
+                                          wsrc_t[i] + ((woff + (size_t)wlow_t[i]) & ~(size_t)15));
+                    }
+                } else {
+                    if (wsrc_t[i]) cp_async<A::COPY>(wdst + wdst_t[i], wsrc_t[i] + woff);
+                }
             }
+        };
+        auto issue_x = [&](int g0, int stage) {
             unsigned char* xdst = xraw + stage * (TC * MMQ_XLD);
             const size_t xoff = (size_t)g0 * sizeof(block_q8a);
 #pragma unroll
             for (int i = 0; i < XT; ++i) {
                 if (xsrc_t[i]) cp_async<16>(xdst + xdst_t[i], xsrc_t[i] + xoff);
             }
-#if __CUDA_ARCH__ >= 800
-            asm volatile("cp.async.commit_group;\n" ::);
-#endif
         };
 
         // The previous tile's last chunk and epilogue read these buffers.
@@ -693,7 +740,9 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
         }
 #pragma unroll
         for (int e = 0; e < E; ++e) a[e] = 0.0f;
-        issue(g_begin, 0);
+        issue_w(g_begin, 0);
+        issue_x(g_begin, 0);
+        commit();
         int stage = 0;
         for (int g0 = g_begin; g0 < g_end; g0 += MMQ_KG, stage ^= 1) {
 #if __CUDA_ARCH__ >= 800
@@ -704,14 +753,44 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
             // barrier of its own at the end of the chunk (there were three per
             // chunk; ncu put ~10% of the samples on the waits after them).
             __syncthreads();
-            if (g0 + MMQ_KG < g_end) issue(g0 + MMQ_KG, stage ^ 1);
-            const unsigned char* wsrc = wraw + (size_t)stage * MMQ_TR * A::STRIDE;
+            const bool more = g0 + MMQ_KG < g_end;
+            // BLOCK2: one copy of a superblock serves both of its chunks, and
+            // there is a single weight buffer -- the copies of two would not
+            // leave room for a 128-token tile. The next superblock is asked
+            // for below, once this one's second chunk is decoded.
+            if (more) {
+                if constexpr (!A::BLOCK2) issue_w(g0 + MMQ_KG, stage ^ 1);
+                issue_x(g0 + MMQ_KG, stage ^ 1);
+                commit();
+            }
+            const unsigned char* wsrc = wraw + (A::BLOCK2 ? 0 : (size_t)stage * MMQ_TR * A::STRIDE);
             const int skew = A::skew(g0);
-            auto src = [&](int r) { return wsrc + r * A::STRIDE + skew; };
+            // ROW_SKEW: the block sits in its row's copy as far past the
+            // start as it sat past the 16-byte boundary (low 4 bits of its
+            // address, which 32-bit arithmetic keeps).
+            const uint32_t woff32 = (uint32_t)A::offset(g0);
+            auto src = [&](int r) {
+                if constexpr (A::ROW_SKEW) {
+                    const uint8_t* mat = (GLU && r >= 64) ? w2 : w;
+                    const uint32_t rr = (uint32_t)(row0 + (GLU ? (r & 63) : r));
+                    const uint32_t at = (uint32_t)(uintptr_t)mat + rr * (uint32_t)row_bytes + woff32;
+                    return wsrc + r * A::STRIDE + (int)(at & 15u);
+                } else {
+                    return wsrc + r * A::STRIDE + skew;
+                }
+            };
             const int8_t (*xs)[MMQ_XLD] = (const int8_t (*)[MMQ_XLD])(xraw + (size_t)stage * TC * MMQ_XLD);
             mmq_decode_tile<D, TC>(ws, S, src, g0, A::base_group(g0), rows_valid, MMQ_KG, tid, GLU);
             mmq_stage_xds<TC>(xs, S, tid);
             __syncthreads();
+            if constexpr (A::BLOCK2) {
+                // Every thread is done reading the weight buffer: the next
+                // superblock streams in while this chunk's MMAs run.
+                if (more && ((g0 / MMQ_KG) & 1)) {
+                    issue_w(g0 + MMQ_KG, 0);
+                    commit();
+                }
+            }
             mmq_chunk<TC, D::SPLIT, D::HAS_MIN>(ws, S, xs, acc, wr, wc, lane);
         }
     };
@@ -721,7 +800,11 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
         if constexpr (GLU) {
             // Warps 2k (gate rows) and 2k+1 (up rows) hold the same (row, token)
             // elements lane for lane. The up warp hands its accumulators over
-            // through the now idle copy buffers.
+            // through the now idle copy buffers (the weight ones and, where
+            // a BLOCK2 type has only one of those, on into the activations',
+            // which follow them).
+            static_assert(4 * 32 * E * sizeof(float) <= WSTAGES * MMQ_TR * A::STRIDE + 2 * TC * MMQ_XLD,
+                          "the gate/up exchange does not fit the copy buffers");
             float* ex = (float*)wraw + (size_t)(warp / 2) * 32 * E;
             __syncthreads();
             if (warp & 1) {

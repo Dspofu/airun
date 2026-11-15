@@ -288,6 +288,18 @@ impl GpuTensor {
         host.slots.borrow_mut().select(ids, self.n_experts)
     }
 
+    /// [`Self::select_experts`] for one wave of a batch run expert by expert:
+    /// `keep` stays in its slots (see ExpertSlots::select_keeping).
+    pub fn select_wave(&self, ids: &[i32], keep: &[i32]) -> Result<(Vec<i32>, Vec<(usize, usize)>)> {
+        let Some(host) = &self.host_experts else { return Ok((ids.to_vec(), Vec::new())); };
+        host.slots.borrow_mut().select_keeping(ids, keep, self.n_experts)
+    }
+
+    /// Whether a streamed expert is in a VRAM slot now.
+    pub fn expert_cached(&self, id: i32) -> bool {
+        self.host_experts.as_ref().is_some_and(|h| h.slots.borrow().holds(id))
+    }
+
     pub fn invalidate_experts(&self) {
         if let Some(host) = &self.host_experts { host.slots.borrow_mut().invalidate(); }
     }
@@ -1637,6 +1649,24 @@ static STREAM_EXPERTS: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// Experts that do not fit in VRAM are read from the file from now on.
 pub fn stream_experts() {
     STREAM_EXPERTS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bytes of RAM the streamed experts may keep pinned (see expert_ram.rs).
+static EXPERT_RAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set by the loader along with [`stream_experts`]: what is left of the RAM
+/// budget for a tier between the VRAM slots and the file.
+pub fn set_expert_ram(bytes: u64) {
+    EXPERT_RAM.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The RAM tier's budget in bytes. AIRUN_EXPERT_RAM (MiB) overrides the
+/// loader's figure; 0 turns the tier off.
+pub fn expert_ram() -> u64 {
+    match std::env::var("AIRUN_EXPERT_RAM").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(mib) => mib << 20,
+        None => EXPERT_RAM.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// Whether experts that do not fit in VRAM live in mapped host memory (the
