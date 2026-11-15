@@ -30,6 +30,9 @@ pub struct DeviceBuffer<T> {
     /// The pinned host allocation behind `ptr` when the buffer lives in RAM
     /// (see [`DeviceBuffer::in_ram`]); null for VRAM.
     host: *mut c_void,
+    /// A range of another buffer's allocation ([`DeviceBuffer::view`]):
+    /// nothing to free.
+    borrowed: bool,
     _marker: PhantomData<T>,
 }
 
@@ -73,6 +76,7 @@ impl<T: Copy> DeviceBuffer<T> {
             len,
             device,
             host: std::ptr::null_mut(),
+            borrowed: false,
             _marker: PhantomData,
         })
     }
@@ -108,7 +112,7 @@ impl<T: Copy> DeviceBuffer<T> {
             return Err(CudaError::from_status(status));
         }
         PINNED.fetch_add(bytes as u64, Ordering::Relaxed);
-        Ok(Self { ptr, len, device, host, _marker: PhantomData })
+        Ok(Self { ptr, len, device, host, borrowed: false, _marker: PhantomData })
     }
 
     /// Whether the buffer lives in RAM (see [`DeviceBuffer::in_ram`]).
@@ -124,6 +128,24 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 
     /// Allocates and fills from a host slice.
+    /// `len` elements at `offset` of `arena`, as a buffer that frees nothing.
+    /// cudaMalloc rounds every large allocation up to 2 MiB (measured: 0.4
+    /// MiB lost per 45.7 MB matrix, 1 MiB per 3 MB one), so a model's
+    /// hundreds of tensors carved out of a few allocations leave that VRAM
+    /// to weights.
+    ///
+    /// # Safety
+    /// `arena` must outlive the view and every kernel that reads through it.
+    pub unsafe fn view(arena: &DeviceBuffer<u8>, offset: usize, len: usize) -> Result<Self> {
+        let bytes = len * std::mem::size_of::<T>();
+        if offset > arena.len || bytes > arena.len - offset || !arena.host.is_null() {
+            return Err(CudaError::Runtime { code: -1, name: "AIRUN_VIEW_TOO_LARGE".into(),
+                message: "a tensor view exceeds its arena; this is a bug".into() });
+        }
+        Ok(Self { ptr: arena.offset_ptr(offset), len, device: arena.device, host: std::ptr::null_mut(),
+            borrowed: true, _marker: PhantomData })
+    }
+
     pub fn from_slice(device: i32, data: &[T], stream: &Stream) -> Result<Self> {
         let mut buf = Self::new(device, data.len())?;
         buf.copy_from_host(data, stream)?;
@@ -289,7 +311,7 @@ impl<T: Copy> DeviceBuffer<T> {
 
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
-        if self.ptr.is_null() {
+        if self.ptr.is_null() || self.borrowed {
             return;
         }
         // SAFETY: the pointer came from airun_malloc on this device (or the

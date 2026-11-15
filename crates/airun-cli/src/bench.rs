@@ -51,9 +51,12 @@ pub struct BenchArgs {
     #[arg(long)]
     pub forward_only: bool,
 
-    /// Tokens per forward pass during prefill.
-    #[arg(short = 'b', long, default_value_t = 512)]
-    pub batch_size: usize,
+    /// Tokens processed per forward pass during prompt ingestion. Default:
+    /// 512, or 256/128 when the weights do not fit the GPUs and the smaller
+    /// prefill scratch keeps enough layers off the CPU to decode clearly
+    /// faster (a note says so).
+    #[arg(short = 'b', long)]
+    pub batch_size: Option<usize>,
 
     /// CUDA ordinals to use.
     #[arg(long, value_delimiter = ',')]
@@ -119,7 +122,7 @@ impl Measurement {
 }
 
 pub fn run(args: BenchArgs) -> Result<()> {
-    anyhow::ensure!(args.runs > 0 && args.batch_size > 0 && args.ctx_size > 0 && args.decode > 0,
+    anyhow::ensure!(args.runs > 0 && args.batch_size != Some(0) && args.ctx_size > 0 && args.decode > 0,
         "runs, batch-size, ctx-size and decode must be positive; pass values greater than zero");
     let mut run_args = RunArgs::bench_defaults(args.model.clone());
     run_args.ctx_size = Some(args.ctx_size);
@@ -138,7 +141,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     bar.finish();
     // The planner may have lowered the prompt batch to keep the model on one
     // GPU; chunking by the one asked for would then overrun the runtime.
-    let batch = runtime.max_batch().min(args.batch_size);
+    let batch = runtime.max_batch().min(args.batch_size.unwrap_or(usize::MAX));
 
     if !args.json {
         println!("{}", report.config.summary());

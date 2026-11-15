@@ -204,7 +204,17 @@ pub fn set_pass(n_tokens: usize) {
 }
 
 pub fn pass_on_cpu() -> bool {
-    PASS.load(Ordering::Relaxed)
+    PASS.load(Ordering::Relaxed) && !RESIDENT.load(Ordering::Relaxed)
+}
+
+/// Whether the layer running now is a RAM layer whose weights are already in
+/// its GPU's staging VRAM (the last one a prompt chunk copied there): it then
+/// runs on the GPU even in a CPU pass. The staging buffer would otherwise sit
+/// idle while decoding.
+static RESIDENT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_layer_resident(resident: bool) {
+    RESIDENT.store(resident, Ordering::Relaxed);
 }
 
 // --- activations ---------------------------------------------------------------
@@ -237,6 +247,12 @@ fn quantize_sums(x: &[f32], q: &mut Vec<i8>, d: &mut Vec<f32>, mut sums: Option<
             s[b] = sum;
         }
     }
+}
+
+/// How far ahead of the block in use the AVX2 kernels prefetch, in bytes.
+fn prefetch_distance() -> usize {
+    static D: OnceLock<usize> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("AIRUN_CPU_PREFETCH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
 }
 
 /// Whether the AVX2 integer kernels can run here.
@@ -346,7 +362,10 @@ pub fn matvec(ty: GgmlType, w: &[u8], row_bytes: usize, k: usize, rows: usize, x
             let mut d = Vec::new();
             let mut sums = Vec::new();
             quantize_sums(&x[..n * k], &mut q, &mut d, Some(&mut sums));
-            let (q, d, sums) = (&q, &d, &sums);
+            // Each activation block's scale times its int8 sum: what the
+            // K-quants' minimums multiply.
+            let dsum: Vec<f32> = d.iter().zip(&sums).map(|(&s, &v)| s * v as f32).collect();
+            let (q, d, dsum) = (&q, &d, &dsum);
             run_sized(chunks, rows * row_bytes, &|c| {
                 for r in c * CHUNK..((c + 1) * CHUNK).min(rows) {
                     let wr = &w[r * row_bytes..(r + 1) * row_bytes];
@@ -358,8 +377,8 @@ pub fn matvec(ty: GgmlType, w: &[u8], row_bytes: usize, k: usize, rows: usize, x
                         // the activations hold k elements per token.
                         let v = unsafe {
                             match ty {
-                                GgmlType::Q4_K => avx2::q4k_row4(wr, k, q, d, sums, t0, m),
-                                GgmlType::Q5_K => avx2::q5k_row4(wr, k, q, d, sums, t0, m),
+                                GgmlType::Q4_K => avx2::q4k_row4(wr, k, q, d, dsum, t0, m),
+                                GgmlType::Q5_K => avx2::q5k_row4(wr, k, q, d, dsum, t0, m),
                                 GgmlType::Q6_K => avx2::q6k_row4(wr, k, q, d, t0, m),
                                 _ => avx2::q8_0_row4(wr, k, q, d, t0, m),
                             }
@@ -479,18 +498,42 @@ fn nvfp4_row(w: &[u8], k: usize, q: &[i8], d: &[f32], n: usize, mut emit: impl F
 mod avx2 {
     use std::arch::x86_64::*;
 
+    /// Calls `$f::<M>` with M = `$m` (1..=4) as a constant: with a run-time
+    /// token count the per-token accumulators (`acc[i]`, `i < m`) lived on
+    /// the stack, each FMA waiting on the previous one's store, and four
+    /// tokens cost 1.7x one instead of reading the weights once for all.
+    macro_rules! by_m {
+        ($m:expr, $f:ident $(::<$($g:tt),*>)? ($($a:expr),*)) => {
+            match $m {
+                1 => $f::<$($($g,)*)? 1>($($a),*),
+                2 => $f::<$($($g,)*)? 2>($($a),*),
+                3 => $f::<$($($g,)*)? 3>($($a),*),
+                _ => $f::<$($($g,)*)? 4>($($a),*),
+            }
+        };
+    }
+
+
     /// Tokens t0..t0+m (m <= 4) of one NVFP4 row; see nvfp4_row.
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn nvfp4_row4(w: &[u8], k: usize, q: &[i8], d: &[f32], t0: usize, m: usize) -> [f32; 4] {
+        by_m!(m, nvfp4_rows(w, k, q, d, t0))
+    }
+
+    #[inline(always)]
+    unsafe fn nvfp4_rows<const M: usize>(w: &[u8], k: usize, q: &[i8], d: &[f32], t0: usize) -> [f32; 4] {
         let table = super::ue4m3_table();
         let lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
                                    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
         let low = _mm_set1_epi8(0x0F);
         let ones = _mm256_set1_epi16(1);
-        let mut acc = [_mm256_setzero_ps(); 4];
+        let mut acc = [_mm256_setzero_ps(); M];
         let blocks = k / 64;
         for b in 0..blocks {
             let blk = w.as_ptr().add(b * 36);
+            if b % 2 == 0 {
+                prefetch(blk, 72);
+            }
             let s = [table[*blk as usize], table[*blk.add(1) as usize], table[*blk.add(2) as usize],
                      table[*blk.add(3) as usize]];
             // Two halves of 32: runs (0,1) then (2,3), each one activation block.
@@ -505,7 +548,7 @@ mod avx2 {
                 let aw = _mm256_sign_epi8(wv, wv);
                 let scale = _mm256_setr_m128(_mm_set1_ps(s[2 * h]), _mm_set1_ps(s[2 * h + 1]));
                 let at = b * 64 + h * 32;
-                for i in 0..m {
+                for i in 0..M {
                     let t = t0 + i;
                     let x = _mm256_loadu_si256(q.as_ptr().add(t * k + at) as *const __m256i);
                     let xs = _mm256_sign_epi8(x, wv);
@@ -515,11 +558,31 @@ mod avx2 {
                 }
             }
         }
+        out4(&acc, &[0f32; M])
+    }
+
+    #[inline(always)]
+    unsafe fn out4<const M: usize>(acc: &[__m256; M], sub: &[f32; M]) -> [f32; 4] {
         let mut out = [0f32; 4];
-        for i in 0..m {
-            out[i] = hsum(acc[i]);
+        for i in 0..M {
+            out[i] = hsum(acc[i]) - sub[i];
         }
         out
+    }
+
+    /// Asks for the cache lines `PREFETCH` bytes past `p`, enough of them to
+    /// cover `bytes` (one block's worth). Each thread streams its own rows,
+    /// and the hardware prefetcher alone left the 1-token Q4_K matmul at 22.5
+    /// GB/s of a ~27 GB/s DDR4 ceiling (i5-10400F): 26.3 with this. The
+    /// address may run past the matrix; a prefetch never faults.
+    #[inline(always)]
+    unsafe fn prefetch(p: *const u8, bytes: usize) {
+        let at = p.wrapping_add(super::prefetch_distance());
+        let mut o = 0;
+        while o < bytes {
+            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(o) as *const i8);
+            o += 64;
+        }
     }
 
     #[inline(always)]
@@ -585,25 +648,45 @@ mod avx2 {
         (sc, mn)
     }
 
-    /// Q4_K/Q5_K tokens t0..t0+m (m <= 4) of one row: 256-element
-    /// super-blocks of d, dmin (f16), 12 bytes of 6-bit scales and minimums,
-    /// Q5_K's 32 bytes of fifth bits, and 128 bytes of nibbles (each 32
-    /// bytes: sub-block 2j in the low nibbles, 2j+1 in the high ones, their
-    /// fifth bits bit 2j and 2j+1 of qh). value = d*sc*q - dmin*mn, so the
-    /// minimum's term is dmin*mn times the activation block's sum.
+    /// Eight vectors of eight i32 sums to one vector whose lane j is the sum
+    /// of all of `p[j]`'s lanes.
     #[inline(always)]
-    unsafe fn k45_row4<const FIVE: bool>(w: &[u8], k: usize, q: &[i8], d: &[f32], sums: &[i32], t0: usize,
-                                         m: usize) -> [f32; 4] {
+    unsafe fn reduce8(p: &[__m256i; 8]) -> __m256i {
+        let a = _mm256_hadd_epi32(_mm256_hadd_epi32(p[0], p[1]), _mm256_hadd_epi32(p[2], p[3]));
+        let b = _mm256_hadd_epi32(_mm256_hadd_epi32(p[4], p[5]), _mm256_hadd_epi32(p[6], p[7]));
+        // a: [p0..p3 over lanes 0-3 | p0..p3 over lanes 4-7], b likewise.
+        _mm256_add_epi32(_mm256_permute2x128_si256(a, b, 0x20), _mm256_permute2x128_si256(a, b, 0x31))
+    }
+
+    /// Q4_K/Q5_K tokens t0..t0+M of one row: 256-element super-blocks of d,
+    /// dmin (f16), 12 bytes of 6-bit scales and minimums, Q5_K's 32 bytes of
+    /// fifth bits, and 128 bytes of nibbles (each 32 bytes: sub-block 2j in
+    /// the low nibbles, 2j+1 in the high ones, their fifth bits bit 2j and
+    /// 2j+1 of qh). value = d*sc*q - dmin*mn, so the minimum's term is
+    /// dmin*mn times the activation block's sum (`dsum` = its scale times
+    /// its int8 sum).
+    ///
+    /// Each token's eight sub-block dot products stay integers until the
+    /// super-block's end, then one convert and two FMAs against the eight
+    /// scales at once: converting and scaling every 32 values (scalar
+    /// scale products, broadcasts, a scalar minimum chain) made four tokens
+    /// compute-bound at 1.7x the time of one.
+    #[inline(always)]
+    unsafe fn k45_rows<const FIVE: bool, const M: usize>(w: &[u8], k: usize, q: &[i8], d: &[f32], dsum: &[f32],
+                                                          t0: usize) -> [f32; 4] {
         let mask = _mm256_set1_epi8(0x0F);
         let one = _mm256_set1_epi8(1);
         let (bytes, nib) = if FIVE { (176, 48) } else { (144, 16) };
-        let mut acc = [_mm256_setzero_ps(); 4];
-        let mut acc_min = [0f32; 4];
+        let mut acc = [_mm256_setzero_ps(); M];
         for sb in 0..k / 256 {
             let b = w.as_ptr().add(sb * bytes);
+            prefetch(b, bytes);
             let (dd, dmin) = (f16_at(b), f16_at(b.add(2)));
             let (sc, mn) = k4_scales(b.add(4));
+            let scv = _mm256_mul_ps(_mm256_set1_ps(dd), _mm256_loadu_ps(sc.as_ptr()));
+            let mnv = _mm256_mul_ps(_mm256_set1_ps(dmin), _mm256_loadu_ps(mn.as_ptr()));
             let qh = if FIVE { _mm256_loadu_si256(b.add(16) as *const __m256i) } else { _mm256_setzero_si256() };
+            let mut wv = [_mm256_setzero_si256(); 8];
             for j in 0..4 {
                 let raw = _mm256_loadu_si256(b.add(nib + j * 32) as *const __m256i);
                 let mut lo = _mm256_and_si256(raw, mask);
@@ -612,39 +695,34 @@ mod avx2 {
                     lo = _mm256_or_si256(lo, _mm256_slli_epi16(_mm256_and_si256(srl(qh, 2 * j), one), 4));
                     hi = _mm256_or_si256(hi, _mm256_slli_epi16(_mm256_and_si256(srl(qh, 2 * j + 1), one), 4));
                 }
-                let (s0, s1) = (dd * sc[2 * j], dd * sc[2 * j + 1]);
-                let (m0, m1) = (dmin * mn[2 * j], dmin * mn[2 * j + 1]);
-                let a = sb * 256 + j * 64;
-                for i in 0..m {
-                    let base = (t0 + i) * k + a;
-                    let blk = base / 32;
-                    let (d0, d1) = (*d.get_unchecked(blk), *d.get_unchecked(blk + 1));
-                    let p0 = _mm256_cvtepi32_ps(dot_u8(lo, xq(q, base)));
-                    let p1 = _mm256_cvtepi32_ps(dot_u8(hi, xq(q, base + 32)));
-                    acc[i] = _mm256_fmadd_ps(p0, _mm256_set1_ps(s0 * d0), acc[i]);
-                    acc[i] = _mm256_fmadd_ps(p1, _mm256_set1_ps(s1 * d1), acc[i]);
-                    acc_min[i] += m0 * d0 * *sums.get_unchecked(blk) as f32
-                        + m1 * d1 * *sums.get_unchecked(blk + 1) as f32;
+                wv[2 * j] = lo;
+                wv[2 * j + 1] = hi;
+            }
+            for i in 0..M {
+                let base = (t0 + i) * k + sb * 256;
+                let mut p = [_mm256_setzero_si256(); 8];
+                for s in 0..8 {
+                    p[s] = dot_u8(wv[s], xq(q, base + s * 32));
                 }
+                let blk = base / 32;
+                let scale = _mm256_mul_ps(scv, _mm256_loadu_ps(d.as_ptr().add(blk)));
+                acc[i] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(reduce8(&p)), scale, acc[i]);
+                acc[i] = _mm256_fnmadd_ps(mnv, _mm256_loadu_ps(dsum.as_ptr().add(blk)), acc[i]);
             }
         }
-        let mut out = [0f32; 4];
-        for i in 0..m {
-            out[i] = hsum(acc[i]) - acc_min[i];
-        }
-        out
+        out4(&acc, &[0f32; M])
     }
 
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn q4k_row4(w: &[u8], k: usize, q: &[i8], d: &[f32], sums: &[i32], t0: usize, m: usize)
+    pub(super) unsafe fn q4k_row4(w: &[u8], k: usize, q: &[i8], d: &[f32], dsum: &[f32], t0: usize, m: usize)
         -> [f32; 4] {
-        k45_row4::<false>(w, k, q, d, sums, t0, m)
+        by_m!(m, k45_rows::<false>(w, k, q, d, dsum, t0))
     }
 
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn q5k_row4(w: &[u8], k: usize, q: &[i8], d: &[f32], sums: &[i32], t0: usize, m: usize)
+    pub(super) unsafe fn q5k_row4(w: &[u8], k: usize, q: &[i8], d: &[f32], dsum: &[f32], t0: usize, m: usize)
         -> [f32; 4] {
-        k45_row4::<true>(w, k, q, d, sums, t0, m)
+        by_m!(m, k45_rows::<true>(w, k, q, d, dsum, t0))
     }
 
     /// Q6_K: 210-byte super-blocks of 128 bytes of low nibbles (ql), 64 of
@@ -652,18 +730,32 @@ mod avx2 {
     /// value = d*sc*(q-32). In each 128-value half, ql[0..32]'s low nibbles
     /// are values 0..32, ql[32..64]'s 32..64, their high nibbles 64..96 and
     /// 96..128, with qh's bit pairs 0, 2, 4 and 6.
+    ///
+    /// The int8 scales go into the integer sum (`madd` by the scale instead
+    /// of by 1: |q-32| * 127 * 2 * 127 fits i32 easily), so each 32 values
+    /// carry only the activation's scale, applied once per super-block as in
+    /// k45_rows.
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn q6k_row4(w: &[u8], k: usize, q: &[i8], d: &[f32], t0: usize, m: usize) -> [f32; 4] {
+        by_m!(m, q6k_rows(w, k, q, d, t0))
+    }
+
+    #[inline(always)]
+    unsafe fn q6k_rows<const M: usize>(w: &[u8], k: usize, q: &[i8], d: &[f32], t0: usize) -> [f32; 4] {
         let mask = _mm256_set1_epi8(0x0F);
         let three = _mm256_set1_epi8(3);
         let bias = _mm256_set1_epi8(32);
-        let mut acc = [_mm256_setzero_ps(); 4];
+        let mut acc = [_mm256_setzero_ps(); M];
         for sb in 0..k / 256 {
             let b = w.as_ptr().add(sb * 210);
-            let dd = f16_at(b.add(208));
+            prefetch(b, 210);
+            let dd = _mm256_set1_ps(f16_at(b.add(208)));
+            let sc = b.add(192) as *const i8;
+            // Group g of 32 values (g = half*4 + 0..4) uses scales 2g, 2g+1.
+            let mut wv = [_mm256_setzero_si256(); 8];
+            let mut sv = [_mm256_setzero_si256(); 8];
             for half in 0..2 {
                 let ql = b.add(half * 64);
-                let sc = b.add(192 + half * 8) as *const i8;
                 let la = _mm256_loadu_si256(ql as *const __m256i);
                 let lb = _mm256_loadu_si256(ql.add(32) as *const __m256i);
                 let qh = _mm256_loadu_si256(b.add(128 + half * 32) as *const __m256i);
@@ -674,45 +766,50 @@ mod avx2 {
                     _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lb, 4), mask), high2(qh, 6, three)),
                 ];
                 for (g, &v) in groups.iter().enumerate() {
-                    let wv = _mm256_sub_epi8(v, bias);
-                    let (s0, s1) = (dd * f32::from(*sc.add(2 * g)), dd * f32::from(*sc.add(2 * g + 1)));
-                    let a = sb * 256 + half * 128 + g * 32;
-                    for i in 0..m {
-                        let base = (t0 + i) * k + a;
-                        let dx = *d.get_unchecked(base / 32);
-                        let p = _mm256_cvtepi32_ps(dot_i8(wv, xq(q, base)));
-                        let scale = _mm256_setr_m128(_mm_set1_ps(s0 * dx), _mm_set1_ps(s1 * dx));
-                        acc[i] = _mm256_fmadd_ps(p, scale, acc[i]);
-                    }
+                    let at = half * 4 + g;
+                    wv[at] = _mm256_sub_epi8(v, bias);
+                    sv[at] = _mm256_setr_m128i(_mm_set1_epi16(i16::from(*sc.add(2 * at))),
+                                               _mm_set1_epi16(i16::from(*sc.add(2 * at + 1))));
                 }
             }
+            for i in 0..M {
+                let base = (t0 + i) * k + sb * 256;
+                let mut p = [_mm256_setzero_si256(); 8];
+                for g in 0..8 {
+                    let (wg, x) = (wv[g], xq(q, base + g * 32));
+                    p[g] = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(wg, wg), _mm256_sign_epi8(x, wg)),
+                                             sv[g]);
+                }
+                let scale = _mm256_mul_ps(dd, _mm256_loadu_ps(d.as_ptr().add(base / 32)));
+                acc[i] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(reduce8(&p)), scale, acc[i]);
+            }
         }
-        let mut out = [0f32; 4];
-        for i in 0..m {
-            out[i] = hsum(acc[i]);
-        }
-        out
+        out4(&acc, &[0f32; M])
     }
 
     /// Q8_0: 34-byte blocks of d (f16) and 32 int8 values.
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn q8_0_row4(w: &[u8], k: usize, q: &[i8], d: &[f32], t0: usize, m: usize) -> [f32; 4] {
-        let mut acc = [_mm256_setzero_ps(); 4];
+        by_m!(m, q8_0_rows(w, k, q, d, t0))
+    }
+
+    #[inline(always)]
+    unsafe fn q8_0_rows<const M: usize>(w: &[u8], k: usize, q: &[i8], d: &[f32], t0: usize) -> [f32; 4] {
+        let mut acc = [_mm256_setzero_ps(); M];
         for blk in 0..k / 32 {
             let b = w.as_ptr().add(blk * 34);
+            if blk % 2 == 0 {
+                prefetch(b, 68);
+            }
             let dw = f16_at(b);
             let wv = _mm256_loadu_si256(b.add(2) as *const __m256i);
-            for i in 0..m {
+            for i in 0..M {
                 let base = (t0 + i) * k + blk * 32;
                 let p = _mm256_cvtepi32_ps(dot_i8(wv, xq(q, base)));
                 acc[i] = _mm256_fmadd_ps(p, _mm256_set1_ps(dw * *d.get_unchecked(base / 32)), acc[i]);
             }
         }
-        let mut out = [0f32; 4];
-        for i in 0..m {
-            out[i] = hsum(acc[i]);
-        }
-        out
+        out4(&acc, &[0f32; M])
     }
 }
 

@@ -137,11 +137,19 @@ pub struct Shard {
     /// Their bytes are in `ram_bytes` too.
     pub disk_layers: Vec<usize>,
     pub disk_bytes: u64,
+    /// Instead of whole layers in RAM (see [`split_ffn`]): the last
+    /// `ffn_cpu_cols` intermediate columns of every layer's feed-forward
+    /// stay in pinned RAM (their bytes in `ram_bytes`), multiplied on the CPU
+    /// while the GPU does the rest, or copied through `ffn_stage_bytes` of
+    /// VRAM (two layers' worth) for a prompt chunk. 0: none.
+    pub ffn_cpu_cols: usize,
+    pub ffn_stage_bytes: u64,
 }
 
 impl Shard {
     pub fn total_bytes(&self) -> u64 {
         self.weight_bytes + self.kv_bytes + self.scratch_bytes + self.staging_bytes + self.kv_stage_bytes
+            + self.ffn_stage_bytes
     }
 
     pub fn headroom(&self) -> i64 {
@@ -203,6 +211,12 @@ impl Placement {
         self.shards.iter().any(|s| s.kv_ram_layers.contains(&l))
     }
 
+    /// The feed-forward columns per layer kept in RAM on `device` (see
+    /// [`split_ffn`]); None when its plan keeps whole layers or none.
+    pub fn ffn_cpu_cols(&self, device: i32) -> Option<usize> {
+        self.shards.iter().find(|s| s.device == device).map(|s| s.ffn_cpu_cols).filter(|&c| c > 0)
+    }
+
     /// VRAM staging for the layers in RAM on `device`.
     pub fn staging_bytes(&self, device: i32) -> u64 {
         self.shards.iter().filter(|s| s.device == device).map(|s| s.staging_bytes).sum()
@@ -259,6 +273,16 @@ impl Placement {
                     airun_cuda::human_bytes(s.staging_bytes),
                 );
             }
+            if s.ffn_cpu_cols > 0 {
+                let _ = writeln!(
+                    out,
+                    "      the last {} feed-forward columns of every layer in RAM: {} pinned, multiplied on the \
+                     CPU alongside the GPU (prompt chunks copy them through {} of VRAM)",
+                    s.ffn_cpu_cols,
+                    airun_cuda::human_bytes(s.ram_bytes),
+                    airun_cuda::human_bytes(s.ffn_stage_bytes),
+                );
+            }
             if !s.disk_layers.is_empty() {
                 let _ = writeln!(
                     out,
@@ -286,6 +310,63 @@ impl Placement {
         }
         out
     }
+}
+
+/// VRAM a split plan leaves for the prompt kernels' own scratch.
+const SPLIT_SLACK: u64 = 32 << 20;
+
+/// Turns a one-GPU plan with whole layers in RAM into one that keeps every
+/// layer's attention in VRAM and only the last columns of every layer's
+/// feed-forward in RAM, as few as balance the budget. The CPU multiplies its
+/// columns while the GPU does the rest of the same feed-forward, so their
+/// times overlap where whole layers in RAM left one side idle while the other
+/// worked; and two layers' columns are all the VRAM a prompt chunk stages.
+///
+/// `col_bytes[l]`: the bytes one intermediate column of layer l's
+/// feed-forward weighs (a row of gate and of up, a column of down). `ffn_len`
+/// must be a multiple of `align` (the down projection's block, at most 256).
+/// Returns false, leaving the plan alone, when that does not apply or would
+/// put more than half of the feed-forward in RAM.
+pub fn split_ffn(placement: &mut Placement, cfg: &Config, col_bytes: &[u64], batch: usize, align: usize) -> bool {
+    let [s] = placement.shards.as_mut_slice() else { return false };
+    if s.ram_layers.is_empty() || !s.disk_layers.is_empty() || !s.kv_ram_layers.is_empty()
+        || col_bytes.len() < s.layers.len() || align == 0 || cfg.ffn_len % align != 0 {
+        return false;
+    }
+    // Everything in VRAM, the per-layer staging gone, plus the CPU part's
+    // product (one row per prompt token) and room for the split-K scratch
+    // the prompt kernels allocate as they go: the parts' narrower matrices
+    // fill the GPU worse and split more (without it, at the last MiB, those
+    // kernels fell back to slower whole tiles).
+    let all = s.total_bytes() - s.staging_bytes + s.ram_bytes + (batch * cfg.n_embd * 4) as u64 + SPLIT_SLACK;
+    // Whole 256-column steps: a K-quant block of down, and kernel-friendly
+    // row counts for gate and up.
+    let step = align.max(256);
+    if cfg.ffn_len % step != 0 {
+        return false;
+    }
+    let mut cols = step;
+    while cols <= cfg.ffn_len / 2 {
+        let moved: u64 = s.layers.iter().map(|&l| cols as u64 * col_bytes[l]).sum();
+        let stage = 2 * (s.layers.iter().map(|&l| cols as u64 * col_bytes[l]).max().unwrap_or(0) + (3 << 16));
+        if all + stage <= s.budget_bytes + moved {
+            s.weight_bytes = s.weight_bytes + s.ram_bytes - moved;
+            s.scratch_bytes += (batch * cfg.n_embd * 4) as u64;
+            s.ram_bytes = moved;
+            s.ram_layers.clear();
+            s.staging_bytes = 0;
+            s.ffn_cpu_cols = cols;
+            s.ffn_stage_bytes = stage;
+            placement.notes.retain(|n| !n.starts_with("the GPUs hold "));
+            placement.notes.push(format!(
+                "the GPUs hold every layer but {cols} of the {} feed-forward columns of each, which stay in RAM \
+                 and run on the CPU alongside GPU {} (--alloc gpu keeps everything in VRAM)",
+                cfg.ffn_len, s.device));
+            return true;
+        }
+        cols += step;
+    }
+    false
 }
 
 /// Exact per-tensor byte counts, grouped the way the planner needs them.
@@ -804,6 +885,8 @@ fn try_place(
             kv_ram_layers: layers.iter().copied().filter(|l| kv_ram.contains(l)).collect(),
             disk_layers: Vec::new(),
             disk_bytes: 0,
+            ffn_cpu_cols: 0,
+            ffn_stage_bytes: 0,
         });
     }
 
@@ -1334,6 +1417,37 @@ mod tests {
         // Enough RAM: nothing moves.
         assert_eq!(spill_to_disk(&mut p, &sz, u64::MAX), 0);
         assert!(p.shards[0].disk_layers.is_empty());
+    }
+
+    /// Whole layers in RAM become the fewest feed-forward columns of every
+    /// layer that balance the budget, with two layers' columns of staging.
+    #[test]
+    fn ram_layers_become_feed_forward_columns() {
+        let cfg = config(40);
+        let sz = sizes(40, 400); // ~15.6 GiB on one 15 GiB card
+        let devs = vec![device(0, 15, 70, 256)];
+        let mut p = plan(&cfg, &sz, &devs, &PlacementRequest { ctx: 8192, ..Default::default() }).unwrap();
+        let whole = p.shards[0].clone();
+        assert!(!whole.ram_layers.is_empty());
+        // A column: 60% of a layer over its ffn_len.
+        let col = sz.per_layer[0] * 6 / 10 / cfg.ffn_len as u64;
+        let cols = vec![col; 40];
+        assert!(cfg.ffn_len % 256 == 0, "the test config's feed-forward splits by 256");
+        assert!(split_ffn(&mut p, &cfg, &cols, 512, 256));
+        let s = &p.shards[0];
+        assert!(s.ram_layers.is_empty() && s.staging_bytes == 0);
+        assert!(s.ffn_cpu_cols >= 256 && s.ffn_cpu_cols % 256 == 0 && s.ffn_cpu_cols <= cfg.ffn_len / 2);
+        assert_eq!(s.ram_bytes, 40 * s.ffn_cpu_cols as u64 * col);
+        assert!(s.ram_bytes < whole.ram_bytes, "less in RAM than whole layers: the layer staging is gone");
+        assert!(s.headroom() >= 0);
+        assert_eq!(s.weight_bytes + s.ram_bytes, whole.weight_bytes + whole.ram_bytes);
+        assert_eq!(p.ffn_cpu_cols(0), Some(s.ffn_cpu_cols));
+        // One column step fewer would not fit.
+        let step = 40 * 256 * col;
+        assert!((s.total_bytes() + step + SPLIT_SLACK) as i64 > s.budget_bytes as i64 + 2 * 256 * col as i64);
+        // Nothing in RAM: nothing to split.
+        let mut fits = plan(&cfg, &sizes(40, 100), &devs, &PlacementRequest::default()).unwrap();
+        assert!(!split_ffn(&mut fits, &cfg, &cols, 512, 256));
     }
 
     /// A model bigger than the GPU keeps its context and puts the layers that

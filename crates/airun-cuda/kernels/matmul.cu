@@ -1141,7 +1141,9 @@ static float* mmq_scratch(size_t floats) {
         if (buf[dev]) cudaFree(buf[dev]);
         buf[dev] = nullptr;
         cap[dev] = 0;
-        if (cudaMalloc(&buf[dev], floats * sizeof(float)) != cudaSuccess) return nullptr;
+        // A failed allocation falls back to one split; clear its error, or the
+        // next launch check reports it.
+        if (cudaMalloc(&buf[dev], floats * sizeof(float)) != cudaSuccess) { cudaGetLastError(); return nullptr; }
         cap[dev] = floats;
     }
     return buf[dev];
@@ -1194,14 +1196,15 @@ static bool mmq_streamk_plan(const void* kernel, size_t smem, int tiles, int tok
         if (slots[dev]) cudaFree(slots[dev]);
         slots[dev] = nullptr;
         slots_cap[dev] = 0;
-        if (cudaMalloc(&slots[dev], need * sizeof(float)) != cudaSuccess) return false;
+        // As mmq_scratch: whole tiles instead, without the allocation's error.
+        if (cudaMalloc(&slots[dev], need * sizeof(float)) != cudaSuccess) { cudaGetLastError(); return false; }
         slots_cap[dev] = need;
     }
     if (flags_cap[dev] < wave) {
         if (flags[dev]) cudaFree(flags[dev]);
         flags[dev] = nullptr;
         flags_cap[dev] = 0;
-        if (cudaMalloc(&flags[dev], wave * sizeof(unsigned)) != cudaSuccess) return false;
+        if (cudaMalloc(&flags[dev], wave * sizeof(unsigned)) != cudaSuccess) { cudaGetLastError(); return false; }
         // Synchronous, so no launch sees the buffer before it is zeroed.
         if (cudaMemset(flags[dev], 0, wave * sizeof(unsigned)) != cudaSuccess) return false;
         flags_cap[dev] = wave;

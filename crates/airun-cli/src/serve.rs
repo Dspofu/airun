@@ -84,9 +84,12 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_fallback: bool,
 
-    /// Tokens per forward pass during prompt ingestion.
-    #[arg(short = 'b', long, default_value_t = 512)]
-    pub batch_size: usize,
+    /// Tokens processed per forward pass during prompt ingestion. Default:
+    /// 512, or 256/128 when the weights do not fit the GPUs and the smaller
+    /// prefill scratch keeps enough layers off the CPU to decode clearly
+    /// faster (a note says so).
+    #[arg(short = 'b', long)]
+    pub batch_size: Option<usize>,
 
     /// Speculative decoding with the model's own MTP head: tokens drafted per
     /// step. Off unless given; the load says when the model has a head and
@@ -526,7 +529,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let mut load_opts = run_args.load_options();
     load_opts.slots = args.parallel.max(1);
     if let Some(mm) = &args.mmproj {
-        load_opts.reserve_bytes += crate::media::vision_reserve(mm, args.image_max_tokens)?;
+        load_opts.vision = Some(crate::media::vision_reserve(mm, args.image_max_tokens)?);
     }
     let mut bar = crate::progress::LoadBar::new(&args.model);
     let (runtime, report) = loader::load(&args.model, &load_opts, |stage, d, t| bar.update(stage, d, t))
@@ -536,9 +539,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
     eprint!("{}", report.placement.report());
     let vision = match &args.mmproj {
         Some(mm) => {
-            let v = crate::media::load_vision(mm, &runtime, args.image_max_tokens)?;
-            eprintln!("vision encoder: {} on GPU {} (up to {} tokens per image)", mm.display(), v.device,
-                args.image_max_tokens);
+            let v = crate::media::load_vision(mm, &runtime, args.image_max_tokens, report.vision_streamed)?;
+            eprintln!("vision encoder: {} on GPU {} (up to {} tokens per image{})", mm.display(), v.device,
+                args.image_max_tokens, if v.streamed() { ", blocks uploaded per image" } else { "" });
             Some(std::sync::Mutex::new(v))
         }
         None => None,

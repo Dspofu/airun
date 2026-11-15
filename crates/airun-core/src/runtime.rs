@@ -363,6 +363,20 @@ struct DeltaStash {
     beta: DeviceBuffer<f32>,
 }
 
+/// A device's side of split feed-forwards: the CPU part's product in VRAM,
+/// the event its input download records, and the copy stream that stages
+/// the columns for prompt chunks into two slots (layers alternate between
+/// them), with the events that order a slot's copy against its use, and the
+/// layer each slot holds.
+struct FfnCpuState {
+    out: DeviceBuffer<f32>,
+    input: airun_cuda::Event,
+    copy: Stream,
+    copied: [airun_cuda::Event; 2],
+    used: [airun_cuda::Event; 2],
+    slot: [std::cell::Cell<Option<usize>>; 2],
+}
+
 /// The activation-quantization scratch and its freshness flag.
 ///
 /// `valid` means: `buf` holds the quantization of the input the current group
@@ -388,6 +402,11 @@ struct QAct {
 struct DeviceState {
     device: i32,
     stream: Stream,
+    /// The RAM layer whose weights the staging VRAM holds now (see
+    /// shard_layers), in stream order.
+    staged: Option<usize>,
+    /// For split feed-forwards (plan::split_ffn).
+    ffn_cpu: Option<FfnCpuState>,
     /// Copies host-side experts into the staging area while `stream`
     /// computes the resident ones (see run_moe), forked and joined by events.
     side: Stream,
@@ -517,6 +536,70 @@ fn on_cpu(w: &GpuTensor) -> bool {
     w.ram.is_some() && crate::cpu::pass_on_cpu()
 }
 
+/// A dense feed-forward on the GPU, `out = W_down (silu(W_gate xb) * W_up xb)`
+/// over `n` rows, by the fastest path the shapes and types allow. A split
+/// feed-forward's GPU part passes its own column count in the tensors.
+fn dense_ffn(st: &DeviceState, gate: &GpuTensor, up: &GpuTensor, down: &GpuTensor, out: &DeviceBuffer<f32>,
+             n: usize, stream: &Stream) -> Result<()> {
+    let mut down_done = false;
+    // Prefill takes gate, up and SwiGLU as one integer tensor-core
+    // launch where it can (see matvec_mmq_async_kernel's GLU).
+    // The fused launches write silu(Wg·x)⊙(Wu·x) directly, so they
+    // cannot apply a per-tensor scale afterwards (silu is not
+    // scale-linear). Only fuse when neither projection carries a
+    // global scale; otherwise the separate path scales gate and
+    // up before the SwiGLU.
+    // Matrices on the CPU take the plain path (each through matvec).
+    let no_scale = gate.global_scale == 1.0 && up.global_scale == 1.0 && !on_cpu(gate);
+    let glu = n > 1 && no_scale && !matvec_f32_forced() && same_shape(&[gate, up])
+        && !fp4_prefill(gate, n, &st.q8act)
+        && ops::matvec_supports_q8(gate.kernel_type())
+        && ops::mmq_glu_supported(gate.kernel_type(), gate.ptr(),
+            up.ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
+    if n == 1 && no_scale && same_shape(&[gate, up]) && !q8_decode(gate) {
+        // Decode: gate, up and SwiGLU in one launch, bit-identical.
+        ops::matvec_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
+            st.xb.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, gate.row_bytes,
+            stream)?;
+    } else if glu {
+        ops::quantize_act(st.xb.as_ptr(), st.q8act.buf.as_mut_ptr(), n * gate.k, stream)?;
+        ops::matvec_q8_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
+            st.q8act.buf.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, n,
+            gate.row_bytes, stream)?;
+    } else if no_scale && same_shape(&[gate, up]) && fp4_prefill(gate, n, &st.q8act)
+        && fp4_prefill(down, n, &st.q8act) && !fp4_glu_disabled() {
+        // Gate, up and SwiGLU in one FP4 launch (silu(g) * u in
+        // its epilogue); the down projection quantizes that.
+        let buf = st.q8act.fp4.as_ref().expect("checked by fp4_prefill");
+        st.q8act.valid.set(false);
+        st.q8act.fp4_valid.set(false);
+        ops::quantize_act_nvfp4(st.xb.as_ptr(), buf.as_mut_ptr(), n, gate.k, stream)?;
+        ops::matmul_nvfp4_glu(gate.ptr(), up.ptr(), gate.row_bytes, buf.as_ptr(),
+            st.gate.as_mut_ptr(), gate.k, gate.rows, n, stream)?;
+        matvec(down, &st.gate, out, n, &st.q8act, stream)?;
+        down_done = true;
+    } else if fp4_prefill(gate, n, &st.q8act) && fp4_prefill(down, n, &st.q8act) {
+        // The SwiGLU goes into the down projection's quantization.
+        matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
+        matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
+        let buf = st.q8act.fp4.as_ref().expect("checked by fp4_prefill");
+        ops::quantize_glu_nvfp4(st.gate.as_ptr(), st.up.as_ptr(), buf.as_mut_ptr(), n, down.k,
+            stream)?;
+        st.q8act.valid.set(false);
+        st.q8act.fp4_valid.set(true);
+        matvec_reuse(down, &st.gate, out, n, &st.q8act, stream)?;
+        down_done = true;
+    } else {
+        matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
+        matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
+        ops::swiglu(st.gate.as_mut_ptr(), st.up.as_ptr(), n * gate.rows, stream)?;
+    }
+    if !down_done {
+        matvec(down, &st.gate, out, n, &st.q8act, stream)?;
+    }
+    Ok(())
+}
+
 /// A dense feed-forward whose three matrices are on the CPU, there in one
 /// go: `out = W_down (silu(W_gate x) * W_up x)`. One trip of the input down
 /// and the product up, where three matvecs moved the 17408-wide gate and up
@@ -560,6 +643,33 @@ fn cpu_ffn(gate: &GpuTensor, up: &GpuTensor, down: &GpuTensor, x: &DeviceBuffer<
         hy.as_mut_slice()[..ny].iter_mut().for_each(|v| *v *= down.global_scale);
     }
     out.copy_from_host_at(0, &hy.as_slice()[..ny], stream)?;
+    Ok(())
+}
+
+/// The CPU part of a split feed-forward (plan::split_ffn) over `n` rows of
+/// `xs` (already on the host), into `ys`: its gate and up rows, the SwiGLU,
+/// and its block of down's columns.
+fn cpu_ffn_part(c: &crate::model::FfnCpu, xs: &[f32], n: usize, q8: &QAct, ys: &mut [f32]) -> Result<()> {
+    fn host(w: &GpuTensor) -> &[u8] {
+        w.ram.as_ref().map(|r| r.host.as_slice()).expect("a split part is in RAM")
+    }
+    let (gate, up, down) = (&c.gate, &c.up, &c.down);
+    let nf = n * gate.rows;
+    let mut mid = q8.host_mid.borrow_mut();
+    let (g, u) = &mut *mid;
+    g.resize(nf, 0.0);
+    u.resize(nf, 0.0);
+    crate::cpu::matvec(gate.ty, host(gate), gate.row_bytes, gate.k, gate.rows, xs, n, g)?;
+    crate::cpu::matvec(up.ty, host(up), up.row_bytes, up.k, up.rows, xs, n, u)?;
+    let (sg, su) = (gate.global_scale, up.global_scale);
+    for (a, b) in g.iter_mut().zip(u.iter()) {
+        let gv = *a * sg;
+        *a = gv / (1.0 + (-gv).exp()) * (*b * su);
+    }
+    crate::cpu::matvec(down.ty, host(down), down.row_bytes, down.k, down.rows, g, n, ys)?;
+    if down.global_scale != 1.0 {
+        ys.iter_mut().for_each(|v| *v *= down.global_scale);
+    }
     Ok(())
 }
 
@@ -973,8 +1083,23 @@ impl Runtime {
                 _ => None,
             };
 
+            let split = shard.layers.iter().any(|&l| model.layers[l].ffn_cpu.is_some());
+            let ffn_cpu = if split {
+                Some(FfnCpuState {
+                    out: DeviceBuffer::new(dev, b * cfg.n_embd)?,
+                    input: airun_cuda::Event::new()?,
+                    copy: Stream::new(dev)?,
+                    copied: [airun_cuda::Event::new()?, airun_cuda::Event::new()?],
+                    used: [airun_cuda::Event::new()?, airun_cuda::Event::new()?],
+                    slot: [std::cell::Cell::new(None), std::cell::Cell::new(None)],
+                })
+            } else {
+                None
+            };
             states.push(DeviceState {
                 device: dev,
+                staged: None,
+                ffn_cpu,
                 stream,
                 side: Stream::new(dev)?,
                 fork: airun_cuda::Event::new()?,
@@ -1667,17 +1792,23 @@ impl Runtime {
     /// [`Self::step_layered`] before the loop resumes batch by batch: the
     /// whole batches before the last one (whose logits the caller reads) or
     /// before the snapshot point. 0 when that is fewer than two batches, or
-    /// no layer is read from disk.
+    /// no layer is read from disk or (on one GPU) staged from RAM.
     pub(crate) fn layered_take(&self, prompt: &[u32], done: usize, snap_at: Option<usize>) -> usize {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *OFF.get_or_init(|| std::env::var("AIRUN_NO_LAYERED").is_ok_and(|v| v.trim() != "0")) {
             return 0;
         }
         let cfg = &self.model.config;
-        // Only with layers on disk: with them in pinned RAM the copy is not
-        // the bottleneck, and the layer order loses the overlap of GPUs on a
-        // split (27B, 4420 tokens: 3.2 -> 3.9 s on two GPUs, 3.7 -> 3.8 on one).
-        if cfg.hc.is_some() || cfg.ple.is_some() || self.embeds_ready || self.model.disk.is_none() {
+        // With layers on disk, or in pinned RAM on one GPU: the staging VRAM
+        // keeps the last layer copied (shard_layers), so a layer runs for
+        // every batch of the span on one copy (27B Q4_K_M, 6 RAM layers on a
+        // 5060 Ti at PCIe 3.0 x8, 3793 tokens: 603 -> 770 tok/s). On a split
+        // the layer order loses the overlap of GPUs on batches (27B, 4420
+        // tokens, two GPUs, when each batch still copied: 3.2 -> 3.9 s), so
+        // with RAM layers there it stays off.
+        let ram = crate::cpu::in_use() && self.states.len() == 1
+            && self.model.layers.iter().any(|l| !l.ram_copies.is_empty());
+        if cfg.hc.is_some() || cfg.ple.is_some() || self.embeds_ready || (self.model.disk.is_none() && !ram) {
             return 0;
         }
         let mb = self.max_batch;
@@ -1747,7 +1878,18 @@ impl Runtime {
                 device::set_device(dev)?;
                 saved.push(if segs.len() > 1 || !last_shard {
                     let len = tokens.len() * width;
-                    let alloc = || DeviceBuffer::<f32>::new(dev, len).or_else(|_| DeviceBuffer::<f32>::in_ram(dev, len));
+                    // VRAM first; a full card (layers in RAM fill it on purpose) holds
+                    // them in pinned RAM. A failed cudaMalloc leaves its error for the
+                    // next launch check to report, so it is cleared here.
+                    // Kept clear of the last VRAM: later buffers of this pass (the
+                    // chunk's workspaces, a snapshot) still need some.
+                    let room = airun_cuda::device::mem_info(dev).map_or(0, |(free, _)| free);
+                    let fits = room >= (2 * len * std::mem::size_of::<f32>()) as u64 + (256 << 20);
+                    let alloc = || if !fits { DeviceBuffer::<f32>::in_ram(dev, len) } else { DeviceBuffer::<f32>::new(dev, len).or_else(|_| {
+                        // SAFETY: only reads and resets the runtime's last-error slot.
+                        unsafe { airun_cuda::ffi::airun_clear_error() };
+                        DeviceBuffer::<f32>::in_ram(dev, len)
+                    }) };
                     Some((alloc()?, alloc()?))
                 } else {
                     None
@@ -2024,14 +2166,29 @@ impl Runtime {
             if let Some(d) = &self.model.disk {
                 d.before(layer);
             }
-            for c in self.model.layers[layer].ram_copies.iter().filter(|_| !crate::cpu::pass_on_cpu()) {
-                airun_cuda::copy_h2d(c.dev as *mut std::ffi::c_void, c.host as *const std::ffi::c_void, c.bytes,
-                    &self.states[si].stream)?;
-                if c.nvfp4_blocks > 0 {
-                    ops::nvfp4_sanitize(c.dev as *mut std::ffi::c_void, c.nvfp4_blocks, &self.states[si].stream)?;
+            // With the RAM layers multiplied on the CPU (no graph holds these
+            // copies), the staging VRAM keeps the last layer copied into it:
+            // the next pass skips that copy, and a CPU pass runs that layer on
+            // the GPU instead (one layer fewer read from DDR per token).
+            let copies = &self.model.layers[layer].ram_copies;
+            let keep = !copies.is_empty() && crate::cpu::in_use();
+            let resident = keep && self.states[si].staged == Some(layer);
+            crate::cpu::set_layer_resident(resident);
+            if !copies.is_empty() && !resident && (!crate::cpu::pass_on_cpu() || (keep && self.states[si].staged.is_none())) {
+                // A CPU pass with nothing staged yet stages this layer, once.
+                crate::cpu::set_layer_resident(keep);
+                for c in copies {
+                    airun_cuda::copy_h2d(c.dev as *mut std::ffi::c_void, c.host as *const std::ffi::c_void, c.bytes,
+                        &self.states[si].stream)?;
+                    if c.nvfp4_blocks > 0 {
+                        ops::nvfp4_sanitize(c.dev as *mut std::ffi::c_void, c.nvfp4_blocks, &self.states[si].stream)?;
+                    }
                 }
+                self.states[si].staged = keep.then_some(layer);
             }
-            self.run_layer(si, local, layer, n, cfg)?;
+            let ran = self.run_layer(si, local, layer, n, cfg);
+            crate::cpu::set_layer_resident(false);
+            ran?;
         }
         Ok(())
     }
@@ -2846,6 +3003,73 @@ impl Runtime {
         self.turn_snap.as_ref().is_some_and(|s| s.pending)
     }
 
+    /// Layer `layer`'s split feed-forward (plan::split_ffn) into xb2: `gpu`,
+    /// its columns in VRAM, and `c`, the ones in RAM. A pass on the CPU
+    /// queues the GPU part behind the download of xb and multiplies `c` on
+    /// the CPU meanwhile; a prompt chunk stages `c` (on the copy stream,
+    /// started a layer ahead) and runs both parts on the GPU.
+    fn split_ffn(&self, st: &DeviceState, layer: usize, gpu: (&GpuTensor, &GpuTensor, &GpuTensor),
+                 c: &crate::model::FfnCpu, n: usize, cfg: &Config) -> Result<()> {
+        let fc = st.ffn_cpu.as_ref().ok_or_else(|| CoreError::Other(
+            "split feed-forward without its device state; this is a bug".into()))?;
+        let stream = &st.stream;
+        let (gate, up, down) = gpu;
+        let ny = n * cfg.n_embd;
+        if crate::cpu::pass_on_cpu() {
+            let nx = n * c.gate.k;
+            let grow = |slot: &std::cell::RefCell<Option<airun_cuda::PinnedBuffer<f32>>>, len: usize| -> Result<()> {
+                if slot.borrow().as_ref().is_none_or(|b| b.len() < len) {
+                    *slot.borrow_mut() = Some(airun_cuda::PinnedBuffer::new(len)?);
+                }
+                Ok(())
+            };
+            grow(&st.q8act.host_x, nx)?;
+            grow(&st.q8act.host_y, ny)?;
+            let mut hx = st.q8act.host_x.borrow_mut();
+            let hx = hx.as_mut().expect("grown above");
+            st.xb.copy_to_host_at(0, &mut hx.as_mut_slice()[..nx], stream)?;
+            fc.input.record(stream)?;
+            // host_x holds the FFN input now, not what an earlier matvec cached.
+            st.q8act.host_valid.set(false);
+            dense_ffn(st, gate, up, down, &st.xb2, n, stream)?;
+            // The download is done once the event is; the GPU part runs on.
+            // (The previous layer's upload out of host_y was queued before it.)
+            fc.input.synchronize()?;
+            let mut hy = st.q8act.host_y.borrow_mut();
+            let hy = hy.as_mut().expect("grown above");
+            cpu_ffn_part(c, &hx.as_slice()[..nx], n, &st.q8act, &mut hy.as_mut_slice()[..ny])?;
+            fc.out.copy_from_host_at(0, &hy.as_slice()[..ny], stream)?;
+        } else {
+            let model = &self.model;
+            let issue = |l: usize| -> Result<()> {
+                let Some(p) = model.layers[l].ffn_cpu.as_ref() else { return Ok(()) };
+                if fc.slot[p.slot].get() == Some(l) {
+                    return Ok(());
+                }
+                // After the last read of the slot by the layer two back.
+                fc.copy.wait_for(&fc.used[p.slot])?;
+                for cp in &p.copies {
+                    airun_cuda::copy_h2d(cp.dev as *mut std::ffi::c_void, cp.host as *const std::ffi::c_void,
+                        cp.bytes, &fc.copy)?;
+                }
+                fc.copied[p.slot].record(&fc.copy)?;
+                fc.slot[p.slot].set(Some(l));
+                Ok(())
+            };
+            issue(layer)?;
+            // The next layer's columns copy while this one computes.
+            if let Some(&next) = st.layers.iter().position(|&x| x == layer).and_then(|i| st.layers.get(i + 1)) {
+                issue(next)?;
+            }
+            dense_ffn(st, gate, up, down, &st.xb2, n, stream)?;
+            stream.wait_for(&fc.copied[c.slot])?;
+            dense_ffn(st, &c.gate, &c.up, &c.down, &fc.out, n, stream)?;
+            fc.used[c.slot].record(stream)?;
+        }
+        ops::add(st.xb2.as_mut_ptr(), fc.out.as_ptr(), ny, stream)?;
+        Ok(())
+    }
+
     fn run_layer(
         &mut self,
         si: usize,
@@ -2941,64 +3165,10 @@ impl Runtime {
                     && gate.k == up.k && gate.rows == up.rows && down.k == gate.rows => {
                     cpu_ffn(gate, up, down, &st.xb, &st.xb2, n, &st.q8act, stream)?;
                 }
-                FfnWeights::Dense { gate, up, down } => {
-                    let mut down_done = false;
-                    // Prefill takes gate, up and SwiGLU as one integer tensor-core
-                    // launch where it can (see matvec_mmq_async_kernel's GLU).
-                    // The fused launches write silu(Wg·x)⊙(Wu·x) directly, so they
-                    // cannot apply a per-tensor scale afterwards (silu is not
-                    // scale-linear). Only fuse when neither projection carries a
-                    // global scale; otherwise the separate path scales gate and
-                    // up before the SwiGLU.
-                    // Matrices on the CPU take the plain path (each through matvec).
-                    let no_scale = gate.global_scale == 1.0 && up.global_scale == 1.0 && !on_cpu(gate);
-                    let glu = n > 1 && no_scale && !matvec_f32_forced() && same_shape(&[gate, up])
-                        && !fp4_prefill(gate, n, &st.q8act)
-                        && ops::matvec_supports_q8(gate.kernel_type())
-                        && ops::mmq_glu_supported(gate.kernel_type(), gate.ptr(),
-                            up.ptr(), st.q8act.buf.as_ptr(), gate.k, gate.row_bytes, n);
-                    if n == 1 && no_scale && same_shape(&[gate, up]) && !q8_decode(gate) {
-                        // Decode: gate, up and SwiGLU in one launch, bit-identical.
-                        ops::matvec_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
-                            st.xb.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, gate.row_bytes,
-                            stream)?;
-                    } else if glu {
-                        ops::quantize_act(st.xb.as_ptr(), st.q8act.buf.as_mut_ptr(), n * gate.k, stream)?;
-                        ops::matvec_q8_glu(gate.kernel_type(), gate.ptr(), up.ptr(),
-                            st.q8act.buf.as_ptr(), st.gate.as_mut_ptr(), gate.k, gate.rows, n,
-                            gate.row_bytes, stream)?;
-                    } else if no_scale && same_shape(&[gate, up]) && fp4_prefill(gate, n, &st.q8act)
-                        && fp4_prefill(down, n, &st.q8act) && !fp4_glu_disabled() {
-                        // Gate, up and SwiGLU in one FP4 launch (silu(g) * u in
-                        // its epilogue); the down projection quantizes that.
-                        let buf = st.q8act.fp4.as_ref().expect("checked by fp4_prefill");
-                        st.q8act.valid.set(false);
-                        st.q8act.fp4_valid.set(false);
-                        ops::quantize_act_nvfp4(st.xb.as_ptr(), buf.as_mut_ptr(), n, gate.k, stream)?;
-                        ops::matmul_nvfp4_glu(gate.ptr(), up.ptr(), gate.row_bytes, buf.as_ptr(),
-                            st.gate.as_mut_ptr(), gate.k, gate.rows, n, stream)?;
-                        matvec(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
-                        down_done = true;
-                    } else if fp4_prefill(gate, n, &st.q8act) && fp4_prefill(down, n, &st.q8act) {
-                        // The SwiGLU goes into the down projection's quantization.
-                        matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
-                        matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
-                        let buf = st.q8act.fp4.as_ref().expect("checked by fp4_prefill");
-                        ops::quantize_glu_nvfp4(st.gate.as_ptr(), st.up.as_ptr(), buf.as_mut_ptr(), n, down.k,
-                            stream)?;
-                        st.q8act.valid.set(false);
-                        st.q8act.fp4_valid.set(true);
-                        matvec_reuse(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
-                        down_done = true;
-                    } else {
-                        matvec(gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
-                        matvec_reuse(up, &st.xb, &st.up, n, &st.q8act, stream)?;
-                        ops::swiglu(st.gate.as_mut_ptr(), st.up.as_ptr(), n * cfg.ffn_len, stream)?;
-                    }
-                    if !down_done {
-                        matvec(down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
-                    }
-                }
+                FfnWeights::Dense { gate, up, down } => match &w.ffn_cpu {
+                    None => dense_ffn(st, gate, up, down, &st.xb2, n, stream)?,
+                    Some(c) => self.split_ffn(st, layer, (gate, up, down), c, n, cfg)?,
+                },
                 FfnWeights::Moe {
                     router,
                     gate_exps,

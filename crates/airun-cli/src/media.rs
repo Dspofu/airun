@@ -57,18 +57,20 @@ pub fn read_image(path: &Path) -> Result<Rgb> {
 /// VRAM the encoder takes on the GPU it runs on: its weights plus the
 /// scratch of the largest image it accepts. Added to every GPU's reserve
 /// before the text model is placed, so the automatic context leaves room.
-pub fn vision_reserve(mmproj: &Path, max_tokens: usize) -> Result<u64> {
+pub fn vision_reserve(mmproj: &Path, max_tokens: usize) -> Result<(u64, u64)> {
     let g = airun_gguf::GgufFile::open(mmproj)
         .with_context(|| format!("could not open the mmproj file {}", mmproj.display()))?;
     let mut cfg = VisionConfig::from_gguf(mmproj, &g)?;
     cfg.max_tokens = max_tokens;
-    let weights: u64 = g.tensors().iter().map(|t| t.nbytes).sum::<u64>() * 21 / 20; // + the FFN padding
-    Ok(weights + VisionModel::scratch_bytes(&cfg, max_tokens))
+    let scratch = VisionModel::scratch_bytes(&cfg, max_tokens);
+    // + the FFN padding
+    let need = |streamed: bool| VisionModel::weights_vram(&g, streamed) * 21 / 20 + scratch;
+    Ok((need(false), need(true)))
 }
 
 /// Loads the encoder on the GPU with the most free memory after the text
 /// model, checking the text model can take its tokens.
-pub fn load_vision(mmproj: &Path, runtime: &Runtime, max_tokens: usize) -> Result<VisionModel> {
+pub fn load_vision(mmproj: &Path, runtime: &Runtime, max_tokens: usize, streamed: bool) -> Result<VisionModel> {
     if !runtime.takes_images() {
         bail!("{} cannot take images: its RoPE has no M-RoPE sections (rope.dimension_sections). Use --mmproj \
                only with a Qwen3.5/3.8 model whose mmproj it is", runtime.model.config.arch_name);
@@ -82,12 +84,13 @@ pub fn load_vision(mmproj: &Path, runtime: &Runtime, max_tokens: usize) -> Resul
         }
     }
     let (dev, free) = best.context("no GPU to run the vision encoder on")?;
-    let need = vision_reserve(mmproj, max_tokens)?;
+    let (resident, stream) = vision_reserve(mmproj, max_tokens)?;
+    let need = if streamed { stream } else { resident };
     if free < need {
         bail!("the vision encoder needs {} on a GPU and the most free is {} (GPU {dev}); lower --ctx-size or \
                --image-max-tokens", airun_cuda::human_bytes(need), airun_cuda::human_bytes(free));
     }
-    let mut v = VisionModel::load(mmproj, dev)
+    let mut v = VisionModel::load(mmproj, dev, streamed)
         .with_context(|| format!("failed to load the vision encoder {}", mmproj.display()))?;
     v.cfg.max_tokens = max_tokens;
     if v.cfg.proj_dim != runtime.model.config.n_embd {

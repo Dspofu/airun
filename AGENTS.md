@@ -1857,3 +1857,164 @@ the handoff changed nothing. With MTP off and one conversation, the 27B fits
 the 5060 Ti alone and `auto` picks it over the 5070 Ti, which has a little
 less free VRAM (decode 23 tok/s): a model that fits only the slower card
 should still be weighed against splitting.
+
+## RAM layers on a 16 GB card: CPU kernels at the DDR4 ceiling, Q8_0 head (2026-11-14, RTX 5060 Ti alone)
+
+Machine: one RTX 5060 Ti 16 GB (PCIe 3.0 x8), i5-10400F (6 cores / 12
+threads, AVX2, no AVX-512), 30 GB DDR4 (~27 GB/s measured with 6–12 threads).
+Model: Qwen3.8-27B Q4_K_M with a **BF16** `output.weight` (2.37 GiB) and an
+MTP head, 17.2 GiB: it does not fit, so ~2.8 GB of layers ran on the CPU per
+token.
+
+**What changed.**
+- **Token count as a constant in the AVX2 kernels** (`by_m!` in `cpu.rs`):
+  with `for i in 0..m` at run time the per-token accumulators lived on the
+  stack and every FMA waited on the previous one's store.
+- **Q4_K/Q5_K/Q6_K sum the eight 32-value sub-blocks in integer** and do one
+  `cvt` + FMA per super-block per token (`reduce8`, horizontal adds), instead
+  of converting and scaling each 32 values with scalar scale products and a
+  scalar minimum chain. The minimum term is now `fnmadd(dmin*mn, d*sum)` over
+  the 8 blocks (`dsum`, precomputed per matmul). Q6_K puts its int8 scales in
+  the `madd` (instead of 1). Same integer math, same per-32 activation
+  quantization; only the float sum order changed.
+- **Software prefetch** 1024 bytes ahead in every AVX2 kernel
+  (`AIRUN_CPU_PREFETCH` to tune; 0 turns it off). 512–4096 measured alike.
+- **The output head goes in as Q8_0 when the weights do not fit the GPUs**
+  (`model::head_q8_bytes`/`set_head_q8`/`load_head_q8`, decided in
+  `loader.rs` with the same "every weight in VRAM at the default context"
+  probe auto_ctx uses). Only for 16/32-bit untied heads; `--alloc gpu` never
+  does it; `AIRUN_NO_HEAD_Q8=1` keeps the head as stored. A `note:` says so.
+
+**`tests/cpu_bench.rs`** (17408×5120, 1 / 4 tokens, ms a matrix):
+
+| | before | after |
+|---|---|---|
+| Q4_K | 2.35 / 3.98 | 1.97 / 2.30 |
+| Q6_K | 3.38 / 4.35 | 2.71 / 3.04 |
+| Q8_0 | 4.28 / 4.58 | 3.48 / 4.17 |
+| NVFP4 | 2.35 / 3.14 | 1.91 / 2.82 |
+
+**Model** (`run`, 121–200 tokens, `--temp 0 --repeat-penalty 1 --reasoning off`):
+
+| | before | kernels | + Q8_0 head + prefetch |
+|---|---|---|---|
+| code prompt, no MTP | 5.5 | 6.4 | **10.0** |
+| code prompt, `--draft 3` (93% accepted) | 13.1 | 15.8 | **24.1** |
+| Portuguese prose, no MTP | 5.9 | — | **10.0** |
+| Portuguese prose, `--draft 3` (34%) | 6.7 | — | **13.1** |
+| short prompt prefill | 17 | 25 | 35 |
+
+`--draft 3` beat 2 (20.4) and 4 (21.5) on the code prompt. `-b 128` frees
+one more layer of scratch (24.1 → 24.4 at draft 3, but slower long prompts).
+12 CPU threads beat 6 and 8.
+
+**Exactness.** Perplexity, 8192 tokens of AGENTS.md, `--chunk 1024
+--batched`: 2.3408 with the Q8_0 head against 2.3406 with BF16. Greedy text
+of the new build (Q8_0 head) byte-identical to the old build (BF16 head), on
+the CPU path and with `AIRUN_RAM_ON_GPU=1` alike. Note that the CPU path and
+`AIRUN_RAM_ON_GPU=1` differ from each other at a near-tie (byte 888 of 977 of
+a hash-map explanation) — in the old build too: it is the int8 sum order,
+not these changes.
+
+## Feed-forward columns in RAM, layer arenas, automatic batch (2026-11-14, RTX 5060 Ti alone)
+
+Same machine and model as the section above (27B Q4_K_M, 17.2 GiB on a
+16 GB card).
+
+**Where the time went.** With whole layers in RAM a token cost
+`VRAM bytes / GPU bandwidth + RAM bytes / CPU bandwidth`: the GPU sat idle
+while the CPU multiplied the 5–6 RAM layers (~45 ms) and the CPU sat idle
+while the GPU ran the other 58 (~35 ms).
+
+**What changed.**
+- **Feed-forward columns in RAM** (`plan::split_ffn`, decided in
+  `loader::split_ffn_plan`): on one GPU with dense feed-forwards, every layer
+  stays in VRAM except the last N intermediate columns of each feed-forward
+  (rows of gate and up, a column block of down, repacked at load by
+  `model::load_ffn_split` into `LayerWeights::ffn_cpu`). N is the fewest
+  256-column steps that balance the budget, at most half. In a CPU pass
+  (`Runtime::split_ffn`) the layer queues the download of `xb`, records an
+  event, queues the GPU part behind it, waits on the event only, and
+  multiplies its columns on the CPU while the GPU part runs; the two products
+  are added. A prompt chunk stages the columns through two small VRAM slots
+  (layers alternate) on a copy stream, a layer ahead, ordered by events, and
+  runs both parts on the GPU. `AIRUN_NO_FFN_SPLIT=1` keeps whole layers; MoE,
+  hyper-connection, PLE, split-GPU and disk plans keep them too.
+- **One VRAM allocation per layer** (`model::LayerArena`,
+  `DeviceBuffer::view`): cudaMalloc rounds each large allocation up to 2 MiB
+  (`tests/alloc_round.rs`, ignored by default: 0.41 MiB lost per 45.7 MB
+  matrix, 1.0 per 3 MB, 0.33 per 700 kB). Peak VRAM for the same plan fell
+  284 MiB. The planner never counted that loss; it came out of the reserve.
+- **A failed scratch cudaMalloc no longer poisons the next launch**
+  (`mmq_scratch`, `mmq_streamk_plan`, and `step_layered`'s saved rows): they
+  fell back as designed but left the error for the next launch check, which
+  reported "out of memory".
+- **Staging keeps its layer** (whole-layer plans): the staging VRAM holds the
+  last RAM layer copied, so the next pass skips that copy and a CPU pass runs
+  that layer on the GPU (`DeviceState::staged`, `cpu::set_layer_resident`).
+- **Layer-by-layer prefill for RAM layers on one GPU** (`layered_take`):
+  with the above, each RAM layer is copied once per span (603 -> 770 tok/s at
+  3.8k tokens). Its saved rows go to pinned RAM when less than 256 MiB of VRAM
+  would be left.
+- **Automatic prompt batch** (`loader::auto_batch`, `LoadOptions::batch_auto`;
+  `-b` is now optional in `run`, `serve` and `bench`): 256 or 128 instead of
+  512 when the smaller scratch moves enough weight bytes off the CPU to
+  predict 5% faster decoding (a CPU byte costs 16 GPU bytes). A `note:` says
+  so; `-b` given is always respected.
+- `AIRUN_SHOW_PLAN=1` prints the memory plan from any command.
+
+**Measured** (`run`, `--temp 0 --repeat-penalty 1 --reasoning off`):
+
+| | section above | whole layers, staged kept, `-b` auto | columns in RAM |
+|---|---|---|---|
+| code prompt, no MTP | 10.0 | 12.4 | **18.7** |
+| code prompt, `--draft 3` (88% accepted) | 24.1 | 28.4 | **31.0** |
+| 3.8k-token prompt | 603 | 747 | **832** (881 with `-b 512`, then 16.8 decoding) |
+| 28-token prompt | 35 | 36 | 52 |
+
+`--draft 2` 29.5, `--draft 4` 29.9. `-b 128` moves no more columns than 256.
+The plan with columns: 1536 of 17408 per layer in RAM (872 MiB) without the
+MTP head, 2560 with it.
+
+**Exactness.** Perplexity, 4088 tokens of AGENTS.md (HEAD), `--chunk 1024
+--batched`: 2.3406 with columns in RAM, 2.3408 with whole layers and with
+`AIRUN_RAM_ON_GPU=1`. Built-in 159 tokens, token by token: 1.3548 against
+1.3549. Greedy text of a 3.8k-token prompt, 64 tokens: columns in RAM equal
+to `AIRUN_RAM_ON_GPU=1`; whole layers on the CPU differ from both at a
+near-tie (byte 139), as the section above already notes for that path.
+
+**Pitfalls.**
+- A text difference between the CPU path and the GPU path at a near-tie moves
+  with *which* weights are on the CPU (the batch size changes that): it looked
+  like a bug of the layer-by-layer prefill and was not.
+- VRAM the plan does not count: the CUDA context (~140 MiB here), the prompt
+  kernels' lazy scratch, the turn snapshot (VRAM when it fits). `split_ffn`
+  leaves `SPLIT_SLACK` (32 MiB) on top of `--vram-reserve`.
+
+## Tested across the models on disk; vision encoder uploaded per image (2026-11-14)
+
+Run after the section above, same machine:
+
+| | result |
+|---|---|
+| 27B NVFP4 (fits whole) | `bench` 1760 / 2280 prefill, 26.4 decode; `--draft 3` 73.0 tok/s (89%) |
+| 27B Q4_K_M, `serve` | 18.1 tok/s; `--parallel 2`: two requests 17.5 tok/s together, alone 14.2; `--draft 3` 23–24 (59% accepted, thinking on) |
+| 27B Q4_K_M, `--disk-offload --ram-reserve 31000` | whole layers on disk as before (no column split), 12.5 tok/s, text equal to the reference |
+| 35B-A3B MoE Q4_K_M | `run` 42.0 tok/s (83% expert hits), `bench` 598 / 811 prefill, 92.4 decode |
+| 27B Q4_K_M + F32 mmproj, one image | right answer; see below |
+
+**Vision encoder uploaded per image** (`vision::Layers::Streamed`,
+`LoadOptions::vision`, `LoadReport::vision_streamed`). The encoder's VRAM was
+reserved whole for the life of the process (2.16 GiB for a 1.72 GiB F32
+mmproj) though it only runs when an image arrives. When the text model's
+weights do not fit the GPUs with it beside them, the loader now reserves one
+block plus the scratch (620 MiB) and `VisionModel::encode` uploads each of the
+27 blocks from the file's mapping, runs it and frees it. `--alloc gpu` and
+`AIRUN_VISION_RESIDENT=1` keep it resident; a model that fits keeps it
+resident too. 27B Q4_K_M with that mmproj: 5888 -> 2560 feed-forward columns
+a layer on the CPU, decoding 6.9 -> 13.2 tok/s, the image in 865 ms against
+871 (file in the page cache), same description.
+
+**Test notes.** This machine has no `curl`; `serve` was driven with Python's
+urllib. `pkill -f "airun serve"` kills the shell that runs it (its own
+command line matches); use `pkill -x airun`.

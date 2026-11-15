@@ -72,6 +72,16 @@ struct Layer {
     down_b: DeviceBuffer<f32>,
 }
 
+/// Where the encoder's blocks (nearly all of its weights) are.
+enum Layers {
+    /// In VRAM, loaded once.
+    Resident(Vec<Layer>),
+    /// Left in the mmproj file and uploaded one at a time for each image
+    /// (see [`VisionModel::load`]): the file's mapping, and its path for
+    /// messages.
+    Streamed(GgufFile, std::path::PathBuf),
+}
+
 pub struct VisionModel {
     pub cfg: VisionConfig,
     pub device: i32,
@@ -80,7 +90,7 @@ pub struct VisionModel {
     patch_b: DeviceBuffer<f32>,
     /// [pos_side * pos_side][n_embd], row-major over the grid.
     pos_embd: Vec<f32>,
-    layers: Vec<Layer>,
+    layers: Layers,
     post_w: DeviceBuffer<f32>,
     post_b: DeviceBuffer<f32>,
     mm0: Weight,
@@ -216,80 +226,36 @@ pub fn resize_bilinear(src: &Rgb, tw: usize, th: usize) -> Rgb {
 }
 
 impl VisionModel {
-    /// Loads the encoder onto `device`.
-    pub fn load(path: &Path, device: i32) -> Result<Self> {
+    /// Loads the encoder onto `device`. With `streamed`, its blocks stay in
+    /// the file and each image uploads them one at a time, so the encoder
+    /// holds one block's VRAM, not all 27: for a text model whose weights do
+    /// not fit the GPUs, where every GiB it keeps free is a GiB of weights
+    /// off the CPU on every token.
+    pub fn load(path: &Path, device: i32, streamed: bool) -> Result<Self> {
         let g = GgufFile::open(path).map_err(|e| bad(path, format!("{e}; pass the model's mmproj-*.gguf")))?;
         let cfg = VisionConfig::from_gguf(path, &g)?;
         device::set_device(device)?;
         let stream = Stream::new(device)?;
         let mut bytes = 0u64;
+        let up = Uploader { g: &g, path, device, stream: &stream };
+        let (f32s, vec_dev, matrix) = (
+            |name: &str| up.f32s(name),
+            |v: &[f32], bytes: &mut u64| up.vec_dev(v, bytes),
+            |name: &str, rows_to: Option<usize>, k_to: Option<usize>, bytes: &mut u64| up.matrix(name, rows_to, k_to, bytes),
+        );
 
-        let f32s = |name: &str| -> Result<Vec<f32>> {
-            let t = g.tensor(name).ok_or_else(|| bad(path, format!("it has no {name}")))?;
-            let n = t.dims.iter().product::<u64>() as usize;
-            let mut out = vec![0f32; n];
-            airun_gguf::dequant::dequantize(t.ty, g.tensor_bytes(t)?, n, &mut out)?;
-            Ok(out)
-        };
-        let vec_dev = |v: &[f32], bytes: &mut u64| -> Result<DeviceBuffer<f32>> {
-            *bytes += v.len() as u64 * 4;
-            Ok(DeviceBuffer::from_slice(device, v, &stream)?)
-        };
-        let vec_pad = |name: &str, to: usize, bytes: &mut u64| -> Result<DeviceBuffer<f32>> {
-            let mut v = f32s(name)?;
-            v.resize(to, 0.0);
-            vec_dev(&v, bytes)
-        };
-        // A matrix as stored (BF16/F16/F32/quantized), its rows padded to
-        // `rows_to` and each row's k to `k_to` with zeros (BF16/F16/F32 only).
-        let matrix = |name: &str, rows_to: Option<usize>, k_to: Option<usize>, bytes: &mut u64| -> Result<Weight> {
-            let t = g.tensor(name).ok_or_else(|| bad(path, format!("it has no {name}")))?;
-            let (k, rows) = (t.dims[0] as usize, t.dims.get(1).copied().unwrap_or(1) as usize);
-            let raw = g.tensor_bytes(t)?;
-            let (rows_to, k_to) = (rows_to.unwrap_or(rows), k_to.unwrap_or(k));
-            let (data, row_bytes) = if rows_to == rows && k_to == k {
-                (raw.to_vec(), raw.len() / rows)
-            } else {
-                let el = match t.ty {
-                    GgmlType::BF16 | GgmlType::F16 => 2,
-                    GgmlType::F32 => 4,
-                    other => return Err(bad(path, format!("{name} is {other}; padding it needs a float type"))),
-                };
-                let (src_rb, dst_rb) = (k * el, k_to * el);
-                let mut out = vec![0u8; rows_to * dst_rb];
-                for r in 0..rows {
-                    out[r * dst_rb..r * dst_rb + src_rb].copy_from_slice(&raw[r * src_rb..(r + 1) * src_rb]);
-                }
-                (out, dst_rb)
-            };
-            *bytes += data.len() as u64;
-            Ok(Weight {
-                data: DeviceBuffer::from_slice(device, &data, &stream)?,
-                ty: ops::KernelType(t.ty.id() as i32),
-                rows: rows_to,
-                k: k_to,
-                row_bytes,
-            })
-        };
-
-        let ffp = padded(cfg.n_ff);
-        let mut layers = Vec::with_capacity(cfg.n_layer);
-        for l in 0..cfg.n_layer {
-            let n = |s: &str| format!("v.blk.{l}.{s}");
-            layers.push(Layer {
-                ln1_w: vec_dev(&f32s(&n("ln1.weight"))?, &mut bytes)?,
-                ln1_b: vec_dev(&f32s(&n("ln1.bias"))?, &mut bytes)?,
-                qkv: matrix(&n("attn_qkv.weight"), None, None, &mut bytes)?,
-                qkv_b: vec_dev(&f32s(&n("attn_qkv.bias"))?, &mut bytes)?,
-                out: matrix(&n("attn_out.weight"), None, None, &mut bytes)?,
-                out_b: vec_dev(&f32s(&n("attn_out.bias"))?, &mut bytes)?,
-                ln2_w: vec_dev(&f32s(&n("ln2.weight"))?, &mut bytes)?,
-                ln2_b: vec_dev(&f32s(&n("ln2.bias"))?, &mut bytes)?,
-                up: matrix(&n("ffn_up.weight"), Some(ffp), None, &mut bytes)?,
-                up_b: vec_pad(&n("ffn_up.bias"), ffp, &mut bytes)?,
-                down: matrix(&n("ffn_down.weight"), None, Some(ffp), &mut bytes)?,
-                down_b: vec_dev(&f32s(&n("ffn_down.bias"))?, &mut bytes)?,
-            });
+        let mut layers = Vec::new();
+        if streamed {
+            // Shapes and types are checked now, on the first block.
+            let mut probe = 0u64;
+            let first = up.layer(&cfg, 0, &mut probe)?;
+            stream.synchronize()?;
+            drop(first);
+            bytes += probe;
+        } else {
+            for l in 0..cfg.n_layer {
+                layers.push(up.layer(&cfg, l, &mut bytes)?);
+            }
         }
 
         // The two temporal patch kernels see the same still image: their sum
@@ -320,7 +286,7 @@ impl VisionModel {
             mm2: matrix("mm.2.weight", None, None, &mut bytes)?,
             mm2_b: vec_dev(&f32s("mm.2.bias")?, &mut bytes)?,
             patch_w,
-            layers,
+            layers: Layers::Resident(layers),
             weight_bytes: bytes,
             cfg,
             device,
@@ -331,7 +297,33 @@ impl VisionModel {
             return Err(bad(path, format!("its projection is {} wide, the metadata says {}",
                 model.mm2.rows, model.cfg.proj_dim)));
         }
+        let mut model = model;
+        if streamed {
+            model.layers = Layers::Streamed(g, path.to_path_buf());
+        }
         Ok(model)
+    }
+
+    /// Whether the blocks are uploaded for each image (see [`Self::load`]).
+    pub fn streamed(&self) -> bool {
+        matches!(self.layers, Layers::Streamed(..))
+    }
+
+    /// VRAM the encoder's weights take: all of them resident, or with the
+    /// blocks streamed the rest plus the largest block.
+    pub fn weights_vram(g: &GgufFile, streamed: bool) -> u64 {
+        let all: u64 = g.tensors().iter().map(|t| t.nbytes).sum();
+        if !streamed {
+            return all;
+        }
+        let mut per_block = std::collections::HashMap::<&str, u64>::new();
+        for t in g.tensors() {
+            if let Some(rest) = t.name.strip_prefix("v.blk.") {
+                *per_block.entry(rest.split('.').next().unwrap_or("")).or_default() += t.nbytes;
+            }
+        }
+        let blocks: u64 = per_block.values().sum();
+        all - blocks + per_block.values().copied().max().unwrap_or(0)
     }
 
     pub fn weight_bytes(&self) -> u64 {
@@ -433,7 +425,17 @@ impl VisionModel {
             st.synchronize()?; // `pin` goes out of scope next
         }
         let scale = 1.0 / (hd as f32).sqrt();
-        for l in &self.layers {
+        for li in 0..c.n_layer {
+            // A streamed block is uploaded now and freed at the end of its turn.
+            let uploaded;
+            let l = match &self.layers {
+                Layers::Resident(v) => &v[li],
+                Layers::Streamed(g, path) => {
+                    let up = Uploader { g, path, device: dev, stream: st };
+                    uploaded = up.layer(c, li, &mut 0)?;
+                    &uploaded
+                }
+            };
             vision::layernorm(xb.as_mut_ptr(), x.as_ptr(), l.ln1_w.as_ptr(), l.ln1_b.as_ptr(), n, e, c.eps, st)?;
             self.mm(&l.qkv, xb.as_ptr(), big.as_mut_ptr(), n)?;
             vision::add_bias(big.as_mut_ptr(), l.qkv_b.as_ptr(), n, 3 * e, st)?;
@@ -453,6 +455,9 @@ impl VisionModel {
             self.mm(&l.down, big.as_ptr(), xb.as_mut_ptr(), n)?;
             vision::add_bias(xb.as_mut_ptr(), l.down_b.as_ptr(), n, e, st)?;
             ops::add(x.as_mut_ptr(), xb.as_ptr(), n * e, st)?;
+            if self.streamed() {
+                st.synchronize()?; // the block's weights are freed next
+            }
         }
         vision::layernorm(xb.as_mut_ptr(), x.as_ptr(), self.post_w.as_ptr(), self.post_b.as_ptr(), n, e, c.eps, st)?;
         // Four consecutive patches are one merge window: [n/4][4e] as laid out.
@@ -472,6 +477,90 @@ impl VisionModel {
     fn mm(&self, w: &Weight, x: *const std::ffi::c_void, y: *mut std::ffi::c_void, n: usize) -> Result<()> {
         ops::matvec(w.ty, w.data.as_ptr(), x, y, w.k, w.rows, n, w.row_bytes, &self.stream)?;
         Ok(())
+    }
+}
+
+/// Reads an mmproj file's tensors into VRAM.
+struct Uploader<'a> {
+    g: &'a GgufFile,
+    path: &'a Path,
+    device: i32,
+    stream: &'a Stream,
+}
+
+impl Uploader<'_> {
+    fn f32s(&self, name: &str) -> Result<Vec<f32>> {
+        let t = self.g.tensor(name).ok_or_else(|| bad(self.path, format!("it has no {name}")))?;
+        let n = t.dims.iter().product::<u64>() as usize;
+        let mut out = vec![0f32; n];
+        airun_gguf::dequant::dequantize(t.ty, self.g.tensor_bytes(t)?, n, &mut out)?;
+        Ok(out)
+    }
+
+    fn vec_dev(&self, v: &[f32], bytes: &mut u64) -> Result<DeviceBuffer<f32>> {
+        *bytes += v.len() as u64 * 4;
+        Ok(DeviceBuffer::from_slice(self.device, v, self.stream)?)
+    }
+
+    fn vec_pad(&self, name: &str, to: usize, bytes: &mut u64) -> Result<DeviceBuffer<f32>> {
+        let mut v = self.f32s(name)?;
+        v.resize(to, 0.0);
+        self.vec_dev(&v, bytes)
+    }
+
+    /// A matrix as stored (BF16/F16/F32/quantized), its rows padded to
+    /// `rows_to` and each row's k to `k_to` with zeros (BF16/F16/F32 only).
+    fn matrix(&self, name: &str, rows_to: Option<usize>, k_to: Option<usize>, bytes: &mut u64) -> Result<Weight> {
+        let path = self.path;
+        let t = self.g.tensor(name).ok_or_else(|| bad(path, format!("it has no {name}")))?;
+        let (k, rows) = (t.dims[0] as usize, t.dims.get(1).copied().unwrap_or(1) as usize);
+        let raw = self.g.tensor_bytes(t)?;
+        let (rows_to, k_to) = (rows_to.unwrap_or(rows), k_to.unwrap_or(k));
+        let padded;
+        let (data, row_bytes): (&[u8], usize) = if rows_to == rows && k_to == k {
+            (raw, raw.len() / rows)
+        } else {
+            let el = match t.ty {
+                GgmlType::BF16 | GgmlType::F16 => 2,
+                GgmlType::F32 => 4,
+                other => return Err(bad(path, format!("{name} is {other}; padding it needs a float type"))),
+            };
+            let (src_rb, dst_rb) = (k * el, k_to * el);
+            let mut out = vec![0u8; rows_to * dst_rb];
+            for r in 0..rows {
+                out[r * dst_rb..r * dst_rb + src_rb].copy_from_slice(&raw[r * src_rb..(r + 1) * src_rb]);
+            }
+            padded = out;
+            (&padded, dst_rb)
+        };
+        *bytes += data.len() as u64;
+        Ok(Weight {
+            data: DeviceBuffer::from_slice(self.device, data, self.stream)?,
+            ty: ops::KernelType(t.ty.id() as i32),
+            rows: rows_to,
+            k: k_to,
+            row_bytes,
+        })
+    }
+
+    /// Block `l`'s weights.
+    fn layer(&self, cfg: &VisionConfig, l: usize, bytes: &mut u64) -> Result<Layer> {
+        let ffp = padded(cfg.n_ff);
+        let n = |s: &str| format!("v.blk.{l}.{s}");
+        Ok(Layer {
+            ln1_w: self.vec_dev(&self.f32s(&n("ln1.weight"))?, bytes)?,
+            ln1_b: self.vec_dev(&self.f32s(&n("ln1.bias"))?, bytes)?,
+            qkv: self.matrix(&n("attn_qkv.weight"), None, None, bytes)?,
+            qkv_b: self.vec_dev(&self.f32s(&n("attn_qkv.bias"))?, bytes)?,
+            out: self.matrix(&n("attn_out.weight"), None, None, bytes)?,
+            out_b: self.vec_dev(&self.f32s(&n("attn_out.bias"))?, bytes)?,
+            ln2_w: self.vec_dev(&self.f32s(&n("ln2.weight"))?, bytes)?,
+            ln2_b: self.vec_dev(&self.f32s(&n("ln2.bias"))?, bytes)?,
+            up: self.matrix(&n("ffn_up.weight"), Some(ffp), None, bytes)?,
+            up_b: self.vec_pad(&n("ffn_up.bias"), ffp, bytes)?,
+            down: self.matrix(&n("ffn_down.weight"), None, Some(ffp), bytes)?,
+            down_b: self.vec_dev(&self.f32s(&n("ffn_down.bias"))?, bytes)?,
+        })
     }
 }
 

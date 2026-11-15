@@ -107,7 +107,7 @@ pub fn run(args: PerplexityArgs) -> Result<()> {
     run_args.ctx_size = Some(args.ctx_size);
     run_args.expert_cache = args.expert_cache;
     run_args.kv_type = args.kv_type;
-    run_args.batch_size = if args.batched { args.chunk.max(1) } else { 1 };
+    run_args.batch_size = Some(if args.batched { args.chunk.max(1) } else { 1 });
     run_args.gpus = args.gpus.clone();
     run_args.tensor_split = args.tensor_split.clone();
     run_args.single_gpu = args.single_gpu;

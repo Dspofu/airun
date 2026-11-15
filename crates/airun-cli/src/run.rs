@@ -84,9 +84,12 @@ pub struct RunArgs {
     #[arg(long, default_value = "f16", value_parser = parse_kv_type)]
     pub kv_type: KvType,
 
-    /// Tokens processed per forward pass during prompt ingestion.
-    #[arg(short = 'b', long, default_value_t = 512)]
-    pub batch_size: usize,
+    /// Tokens processed per forward pass during prompt ingestion. Default:
+    /// 512, or 256/128 when the weights do not fit the GPUs and the smaller
+    /// prefill scratch keeps enough layers off the CPU to decode clearly
+    /// faster (a note says so).
+    #[arg(short = 'b', long)]
+    pub batch_size: Option<usize>,
 
     /// Speculative decoding with the model's own MTP head: tokens drafted per
     /// step (0 turns it off; default 4 on dense models, 2 on MoE models that
@@ -226,7 +229,7 @@ impl RunArgs {
             raw: true,
             predict: 128,
             ctx_size: Some(4096),
-            batch_size: 512,
+            batch_size: None,
             draft: Some(0),
             mtp: None,
             mmproj: None,
@@ -278,7 +281,9 @@ impl RunArgs {
         LoadOptions {
             ctx: self.ctx_size.unwrap_or(4096),
             ctx_auto: self.ctx_size.is_none(),
-            batch: self.batch_size,
+            batch: self.batch_size.unwrap_or(512),
+            batch_auto: self.batch_size.is_none(),
+            vision: None,
             gpus: self.gpus.clone(),
             split,
             gpu_layers: None,
@@ -333,7 +338,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     let quiet = args.quiet;
     let mut opts = args.load_options();
     if let Some(mm) = &args.mmproj {
-        opts.reserve_bytes += crate::media::vision_reserve(mm, args.image_max_tokens)?;
+        opts.vision = Some(crate::media::vision_reserve(mm, args.image_max_tokens)?);
     }
     let images: Vec<airun_core::vision::Rgb> =
         args.image.iter().map(|p| crate::media::read_image(p)).collect::<Result<_>>()?;
@@ -366,7 +371,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     let mut image_ids = Vec::new();
     if let Some(mm) = &args.mmproj {
         let t = std::time::Instant::now();
-        let vision = crate::media::load_vision(mm, &runtime, args.image_max_tokens)?;
+        let vision = crate::media::load_vision(mm, &runtime, args.image_max_tokens, report.vision_streamed)?;
         for img in &images {
             image_ids.push(crate::media::encode_image(&vision, &mut runtime, img)?);
         }

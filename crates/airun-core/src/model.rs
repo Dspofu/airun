@@ -534,6 +534,23 @@ pub struct LayerWeights {
     /// For a layer whose weights stay in RAM (or on disk), the copies that
     /// stage them into VRAM before it runs on the GPU.
     pub ram_copies: Vec<RamCopy>,
+    /// The feed-forward columns kept in RAM (plan::split_ffn); `ffn` then
+    /// holds the others.
+    pub ffn_cpu: Option<FfnCpu>,
+}
+
+/// The last intermediate columns of a dense feed-forward, in pinned RAM:
+/// rows of gate and up, a column block of down, each a matrix of its own
+/// (`ram` set). The CPU multiplies them alongside the GPU's part, whose
+/// products add up to the whole feed-forward's; a prompt chunk stages them
+/// through `copies` into staging slot `slot` (layers alternate, so one copies
+/// while the other runs).
+pub struct FfnCpu {
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
+    pub copies: Vec<RamCopy>,
+    pub slot: usize,
 }
 
 /// The multi-token-prediction head stored after the main layers
@@ -576,6 +593,10 @@ pub struct Model {
     /// The VRAM that layers kept in RAM are staged through, one per GPU that
     /// runs any (sized by the planner for the largest such layer).
     pub ram_staging: Vec<DeviceBuffer<u8>>,
+    /// Two slots of split feed-forward columns per GPU that has them.
+    pub ffn_staging: Vec<DeviceBuffer<u8>>,
+    /// The allocations the layers' matrices are views into (see LayerArena).
+    pub weight_arenas: Vec<Box<DeviceBuffer<u8>>>,
     /// Fetches the layers read from the file ahead of use (--disk-offload).
     pub disk: Option<crate::disk::Prefetcher>,
 }
@@ -687,7 +708,11 @@ impl Model {
                 t
             }
         } else {
-            let t = load_packed(gguf, "output.weight", out_dev, stream_for(out_dev)?, &config)?;
+            let t = if HEAD_Q8.load(std::sync::atomic::Ordering::Relaxed) {
+                load_head_q8(gguf, out_dev, stream_for(out_dev)?, &config)?
+            } else {
+                load_packed(gguf, "output.weight", out_dev, stream_for(out_dev)?, &config)?
+            };
             total_bytes += t.bytes() as u64;
             t
         };
@@ -713,6 +738,16 @@ impl Model {
             }
         }
 
+        // Two layers' worth of feed-forward columns, for split plans.
+        let mut ffn_staging: Vec<DeviceBuffer<u8>> = Vec::new();
+        for s in &placement.shards {
+            if s.ffn_cpu_cols > 0 && s.ffn_stage_bytes > 0 {
+                ffn_staging.push(DeviceBuffer::<u8>::new(s.device, s.ffn_stage_bytes as usize / 512 * 256 * 2)?);
+                crate::cpu::set_in_use();
+            }
+        }
+
+        let mut weight_arenas: Vec<Box<DeviceBuffer<u8>>> = Vec::new();
         let mut layers = Vec::with_capacity(n_run);
         for l in 0..n_run {
             let dev = placement
@@ -727,6 +762,20 @@ impl Model {
             let staging = placement.layer_in_ram(l).then(|| {
                 ram_staging.iter().find(|b| b.device() == dev).map(|b| (b.as_ptr() as u64, b.len()))
             }).flatten();
+            // A layer in VRAM takes one allocation for its matrices (dense
+            // models; expert stacks manage their own).
+            let arena = if staging.is_none() && config.moe.is_none() {
+                let prefix = name("");
+                let keep = placement.ffn_cpu_cols(dev).map_or(config.ffn_len, |c| config.ffn_len.saturating_sub(c));
+                let need: usize = gguf.tensors().iter().filter(|t| t.name.starts_with(&prefix)).map(|t| {
+                    let ffn = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"].iter().any(|s| t.name.ends_with(s));
+                    let bytes = t.nbytes as usize;
+                    (if ffn && config.ffn_len > 0 { bytes / config.ffn_len * keep } else { bytes }) + 256
+                }).sum();
+                LayerArena::open(dev, need)
+            } else {
+                None
+            };
             let cursor = std::cell::Cell::new(0usize);
             let copies = RefCell::new(Vec::new());
             let packed = |n: &str| -> Result<GpuTensor> {
@@ -792,6 +841,7 @@ impl Model {
                 }),
             };
 
+            let mut ffn_cpu = None;
             let ffn = if config.moe.is_some() {
                 let shared = if gguf.tensor(&name("ffn_gate_shexp.weight")).is_some() {
                     Some(SharedExpert {
@@ -813,6 +863,14 @@ impl Model {
                         order.as_deref())?,
                     shared,
                 }
+            } else if let (Some(cols), None) = (placement.ffn_cpu_cols(dev).filter(|&c| c > 0), staging) {
+                let buf = ffn_staging.iter().find(|b| b.device() == dev).ok_or_else(|| CoreError::Other(
+                    "split feed-forward without a staging buffer; this is a bug".into()))?;
+                let slot = l % 2;
+                let base = buf.as_ptr() as u64 + (slot * buf.len() / 2) as u64;
+                let (gate, up, down, cpu) = load_ffn_split(gguf, l, dev, stream, &config, cols, base, buf.len() / 2)?;
+                ffn_cpu = Some(FfnCpu { slot, ..cpu });
+                FfnWeights::Dense { gate, up, down }
             } else {
                 FfnWeights::Dense {
                     gate: packed(&name("ffn_gate.weight"))?,
@@ -850,9 +908,13 @@ impl Model {
                     _ => None,
                 },
                 ram_copies: copies.into_inner(),
+                ffn_cpu,
             };
             total_bytes += layer_bytes(&w);
             layers.push(w);
+            if let Some(a) = arena {
+                weight_arenas.push(a.close());
+            }
             gguf.release(&format!("blk.{l}."));
 
             done += 1;
@@ -896,6 +958,8 @@ impl Model {
             total_bytes,
             expert_profile: None,
             ram_staging,
+            ffn_staging,
+            weight_arenas,
             disk,
         })
     }
@@ -1083,6 +1147,7 @@ fn load_mtp_weights(gguf: &Arc<GgufFile>, config: &Config, dev: i32, stream: &St
         hc: None,
         ple: None,
         ram_copies: Vec::new(),
+        ffn_cpu: None,
     };
     let head_norm = if gguf.tensor(&name("nextn.shared_head_norm.weight")).is_some() {
         load_f32(gguf, &name("nextn.shared_head_norm.weight"), dev, stream)?
@@ -1130,6 +1195,75 @@ fn describe_packed(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Confi
         global_scale: global_scale_of(gguf, name),
         ram: None,
     })
+}
+
+thread_local! {
+    /// The allocation the layer being loaded carves its matrices from, and
+    /// how much of it is taken (see [`LayerArena`]).
+    static ARENA: RefCell<Option<(*const DeviceBuffer<u8>, usize)>> = const { RefCell::new(None) };
+}
+
+/// One VRAM allocation for all of a layer's packed matrices while it loads:
+/// cudaMalloc rounds each large allocation up to 2 MiB, which over a 27B
+/// model's ~500 matrices was some 300 MiB of VRAM that held no weight. Clears
+/// the thread's arena on drop, so a failed load leaves no dangling one.
+struct LayerArena(Box<DeviceBuffer<u8>>);
+
+impl LayerArena {
+    /// None when the allocation fails: the matrices then allocate their own.
+    fn open(device: i32, bytes: usize) -> Option<Self> {
+        let size = bytes.div_ceil(2 << 20) * (2 << 20);
+        let buf = match DeviceBuffer::<u8>::new(device, size) {
+            Ok(b) => Box::new(b),
+            Err(_) => {
+                // SAFETY: only reads and resets the runtime's last-error slot.
+                unsafe { airun_cuda::ffi::airun_clear_error() };
+                return None;
+            }
+        };
+        ARENA.with(|a| *a.borrow_mut() = Some((&*buf as *const _, 0)));
+        Some(Self(buf))
+    }
+
+    fn close(self) -> Box<DeviceBuffer<u8>> {
+        ARENA.with(|a| *a.borrow_mut() = None);
+        // SAFETY: moves the box out; Drop is skipped, the arena already cleared.
+        let me = std::mem::ManuallyDrop::new(self);
+        unsafe { std::ptr::read(&me.0) }
+    }
+}
+
+impl Drop for LayerArena {
+    fn drop(&mut self) {
+        ARENA.with(|a| *a.borrow_mut() = None);
+    }
+}
+
+/// `bytes` of packed weights in VRAM: out of the open [`LayerArena`] when it
+/// is on this device and has the room, else an allocation of their own.
+fn upload_packed(device: i32, bytes: &[u8], stream: &Stream) -> Result<DeviceBuffer<u8>> {
+    let view = ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        let (arena, used) = a.as_mut()?;
+        // SAFETY: the pointer is the live LayerArena's box (cleared on its drop).
+        let arena = unsafe { &**arena };
+        let end = *used + bytes.len();
+        if arena.device() != device || end > arena.len() {
+            return None;
+        }
+        let at = *used;
+        *used = end.div_ceil(256) * 256;
+        // SAFETY: the model keeps the arena for as long as its tensors (Model::weight_arenas).
+        unsafe { DeviceBuffer::<u8>::view(arena, at, bytes.len()) }.ok()
+    });
+    match view {
+        Some(v) => {
+            v.copy_from_host_at(0, bytes, stream)?;
+            stream.synchronize()?;
+            Ok(v)
+        }
+        None => Ok(DeviceBuffer::<u8>::from_slice(device, bytes, stream)?),
+    }
 }
 
 /// The per-tensor NVFP4 global scale, stored in these files as a one-element
@@ -1237,7 +1371,7 @@ fn load_cached(
             file: Arc::clone(gguf), info: info.clone(), slots: RefCell::new(ExpertSlots::new(slots)),
         }))
     } else {
-        let data = DeviceBuffer::<u8>::from_slice(device, gguf.tensor_bytes(info)?, stream)?;
+        let data = upload_packed(device, gguf.tensor_bytes(info)?, stream)?;
         // ggml reads a 0x7F NVFP4 run scale as zero and the FP4 tensor cores as
         // NaN; zeroing it keeps every path on ggml's reading.
         if info.ty == airun_gguf::GgmlType::NVFP4 && airun_cuda::ops::fp4_supported() {
@@ -1300,6 +1434,107 @@ fn load_ram(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Config, stag
     Ok(t)
 }
 
+/// Layer `l`'s dense feed-forward split at intermediate column
+/// `ffn_len - cols`: the first columns' gate and up rows and down column
+/// block uploaded to VRAM, the last `cols` in pinned RAM as an [`FfnCpu`]
+/// whose copies stage to `stage` (at most `cap` bytes). The two parts'
+/// products add up to the feed-forward's.
+#[allow(clippy::too_many_arguments)]
+fn load_ffn_split(gguf: &Arc<GgufFile>, l: usize, device: i32, stream: &Stream, config: &Config, cols: usize,
+                  stage: u64, cap: usize) -> Result<(GpuTensor, GpuTensor, GpuTensor, FfnCpu)> {
+    let f = config.ffn_len;
+    let keep = f - cols;
+    let pin = |bytes: &[u8], what: &str, ty: airun_gguf::GgmlType| -> Result<airun_cuda::PinnedBuffer<u8>> {
+        let mut host = airun_cuda::PinnedBuffer::<u8>::new(bytes.len()).map_err(|e| CoreError::Other(format!(
+            "cannot pin {} of RAM for {what} ({e}); free RAM, lower --ctx-size so less stays in RAM, or use \
+             --alloc gpu", airun_cuda::human_bytes(bytes.len() as u64))))?;
+        host.as_mut_slice().copy_from_slice(bytes);
+        // As load_ram: a 0x7F NVFP4 run scale reads as zero.
+        if ty == airun_gguf::GgmlType::NVFP4 && airun_cuda::ops::fp4_supported() {
+            for block in host.as_mut_slice().chunks_exact_mut(36) {
+                for d in &mut block[..4] {
+                    if *d == 0x7F {
+                        *d = 0;
+                    }
+                }
+            }
+        }
+        Ok(host)
+    };
+    let upload = |bytes: &[u8], ty: airun_gguf::GgmlType| -> Result<DeviceBuffer<u8>> {
+        let data = upload_packed(device, bytes, stream)?;
+        if ty == airun_gguf::GgmlType::NVFP4 && airun_cuda::ops::fp4_supported() {
+            airun_cuda::ops::nvfp4_sanitize(data.as_mut_ptr(), data.len() / 36, stream)?;
+        }
+        Ok(data)
+    };
+    let mut cursor = 0usize;
+    let mut copies = Vec::new();
+    let mut place = |host: &airun_cuda::PinnedBuffer<u8>| -> Result<u64> {
+        let at = stage + cursor as u64;
+        if cursor + host.len() > cap {
+            return Err(CoreError::Other(format!(
+                "layer {l}'s feed-forward columns in RAM do not fit their {} staging slot; this is a bug",
+                airun_cuda::human_bytes(cap as u64))));
+        }
+        copies.push(RamCopy { host: host.as_slice().as_ptr() as usize, dev: at, bytes: host.len(), nvfp4_blocks: 0,
+            on_disk: false });
+        cursor += host.len().div_ceil(256) * 256;
+        Ok(at)
+    };
+    // Gate and up: the first rows to VRAM, the last `cols` to RAM.
+    let mut rows = |kind: &str| -> Result<(GpuTensor, GpuTensor)> {
+        let name = format!("blk.{l}.ffn_{kind}.weight");
+        let info = tensor_info(gguf, &name, &config.arch_name)?;
+        let bytes = gguf.tensor_bytes(info)?;
+        let mut gpu = describe_packed(gguf, &name, device, config)?;
+        let mut cpu = describe_packed(gguf, &name, device, config)?;
+        if gpu.rows != f || bytes.len() != f * gpu.row_bytes {
+            return Err(CoreError::ShapeMismatch { name, found: info.dims.clone(), expected: vec![config.n_embd as u64, f as u64] });
+        }
+        let at = keep * gpu.row_bytes;
+        gpu.data = upload(&bytes[..at], info.ty)?;
+        gpu.rows = keep;
+        let host = pin(&bytes[at..], &name, info.ty)?;
+        let staged = place(&host)?;
+        cpu.rows = cols;
+        cpu.ram = Some(RamWeights { host: HostBytes::Pinned(host), staged });
+        Ok((gpu, cpu))
+    };
+    let (gate, gate_c) = rows("gate")?;
+    let (up, up_c) = rows("up")?;
+    // Down: each row's first column blocks to VRAM, the rest to RAM.
+    let name = format!("blk.{l}.ffn_down.weight");
+    let info = tensor_info(gguf, &name, &config.arch_name)?;
+    let bytes = gguf.tensor_bytes(info)?;
+    let layout = info.ty.layout().ok_or_else(|| CoreError::UnsupportedTensorType { name: name.clone(), ty: info.ty.to_string() })?;
+    let mut down = describe_packed(gguf, &name, device, config)?;
+    let mut down_c = describe_packed(gguf, &name, device, config)?;
+    let el = layout.elements as usize;
+    if down.k != f || keep % el != 0 || bytes.len() != down.rows * down.row_bytes {
+        return Err(CoreError::ShapeMismatch { name, found: info.dims.clone(), expected: vec![f as u64, config.n_embd as u64] });
+    }
+    let split = keep / el * layout.bytes as usize;
+    let rb = down.row_bytes;
+    let mut head = Vec::with_capacity(down.rows * split);
+    let mut tail = Vec::with_capacity(down.rows * (rb - split));
+    for row in bytes.chunks_exact(rb) {
+        head.extend_from_slice(&row[..split]);
+        tail.extend_from_slice(&row[split..]);
+    }
+    down.data = upload(&head, info.ty)?;
+    down.k = keep;
+    down.row_bytes = split;
+    let host = pin(&tail, &name, info.ty)?;
+    let staged = place(&host)?;
+    down_c.k = cols;
+    down_c.row_bytes = rb - split;
+    down_c.ram = Some(RamWeights { host: HostBytes::Pinned(host), staged });
+    // The uploads read `head` and the file's pages; let them land.
+    stream.synchronize()?;
+    Ok((gate, up, down, FfnCpu { gate: gate_c, up: up_c, down: down_c, copies, slot: 0 }))
+}
+
 /// A matrix left in the model file (`--disk-offload`): nothing is read now;
 /// the CPU kernels read the mapping, and a pass on the GPU stages it to
 /// `staged` (see [`HostBytes::File`]).
@@ -1314,6 +1549,86 @@ fn load_disk(gguf: &Arc<GgufFile>, name: &str, device: i32, config: &Config, sta
     let mut t = describe_packed(gguf, name, device, config)?;
     t.ram = Some(RamWeights { host: HostBytes::File { file: Arc::clone(gguf), info }, staged });
     Ok(t)
+}
+
+/// Set by the loader when the weights do not fit the GPUs and the output head
+/// is stored at 16 or 32 bits: the head is then uploaded as Q8_0.
+static HEAD_Q8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The output head's bytes once requantized to Q8_0 by [`set_head_q8`], or
+/// `None` when it stays as stored (tied to the embedding, already quantized,
+/// or AIRUN_NO_HEAD_Q8=1).
+pub fn head_q8_bytes(gguf: &GgufFile) -> Option<(u64, u64)> {
+    use airun_gguf::GgmlType;
+    if std::env::var("AIRUN_NO_HEAD_Q8").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    let t = gguf.tensor("output.weight")?;
+    if !matches!(t.ty, GgmlType::BF16 | GgmlType::F16 | GgmlType::F32) || t.row_size() % 32 != 0 {
+        return None;
+    }
+    let elems = t.row_size() * t.n_rows();
+    Some((t.nbytes, elems / 32 * 34))
+}
+
+/// Upload the output head as Q8_0 (see [`head_q8_bytes`]).
+pub fn set_head_q8() {
+    HEAD_Q8.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `output.weight` requantized to Q8_0 on the CPU threads, then uploaded.
+///
+/// A 16-bit head is read whole every token (and again per MTP draft). When
+/// the weights do not fit the GPUs, its extra gigabyte is a gigabyte of
+/// layers multiplied on the CPU instead: Qwen3.8-27B Q4_K_M with a BF16 head
+/// (2.37 GiB) on one 16 GB card.
+fn load_head_q8(gguf: &Arc<GgufFile>, device: i32, stream: &Stream, config: &Config) -> Result<GpuTensor> {
+    let info = tensor_info(gguf, "output.weight", &config.arch_name)?;
+    let (k, rows) = (info.row_size() as usize, info.n_rows() as usize);
+    let src = gguf.tensor_bytes(info)?;
+    let src_row = src.len() / rows;
+    let row_bytes = k / 32 * 34;
+    let mut dst = vec![0u8; rows * row_bytes];
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let per = rows.div_ceil(threads);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        for (i, out) in dst.chunks_mut(per * row_bytes).enumerate() {
+            let failed = &failed;
+            sc.spawn(move || {
+                let mut row = vec![0f32; k];
+                let mut buf = Vec::with_capacity(row_bytes);
+                for (j, o) in out.chunks_exact_mut(row_bytes).enumerate() {
+                    let r = i * per + j;
+                    if airun_gguf::dequantize(info.ty, &src[r * src_row..(r + 1) * src_row], k, &mut row).is_err()
+                        || { buf.clear(); airun_gguf::quantize(airun_gguf::GgmlType::Q8_0, &row, k, &mut buf).is_err() }
+                    {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    o.copy_from_slice(&buf);
+                }
+            });
+        }
+    });
+    if failed.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(CoreError::Other("could not requantize output.weight to Q8_0; run with AIRUN_NO_HEAD_Q8=1 \
+            to keep it as stored".into()));
+    }
+    Ok(GpuTensor {
+        data: DeviceBuffer::<u8>::from_slice(device, &dst, stream)?,
+        host_experts: None,
+        mapped: None,
+        ty: airun_gguf::GgmlType::Q8_0,
+        k,
+        rows,
+        row_bytes,
+        expert_stride: 0,
+        n_experts: 1,
+        device,
+        global_scale: 1.0,
+        ram: None,
+    })
 }
 
 /// Set by the loader when --disk-offload finds no RAM for mapped experts.
@@ -1480,9 +1795,11 @@ fn validate_shapes(cfg: &Config, layers: &[LayerWeights], embd: &GpuTensor) -> R
 
         match &layer.ffn {
             FfnWeights::Dense { gate, up, down } => {
-                check(format!("blk.{i}.ffn_gate.weight"), (gate.k, gate.rows), (cfg.n_embd, cfg.ffn_len))?;
-                check(format!("blk.{i}.ffn_up.weight"), (up.k, up.rows), (cfg.n_embd, cfg.ffn_len))?;
-                check(format!("blk.{i}.ffn_down.weight"), (down.k, down.rows), (cfg.ffn_len, cfg.n_embd))?;
+                // A split feed-forward: its two parts make up the shape.
+                let (cg, cu, cd) = layer.ffn_cpu.as_ref().map_or((0, 0, 0), |c| (c.gate.rows, c.up.rows, c.down.k));
+                check(format!("blk.{i}.ffn_gate.weight"), (gate.k, gate.rows + cg), (cfg.n_embd, cfg.ffn_len))?;
+                check(format!("blk.{i}.ffn_up.weight"), (up.k, up.rows + cu), (cfg.n_embd, cfg.ffn_len))?;
+                check(format!("blk.{i}.ffn_down.weight"), (down.k + cd, down.rows), (cfg.ffn_len, cfg.n_embd))?;
             }
             FfnWeights::Moe {
                 router,

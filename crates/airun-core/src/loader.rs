@@ -25,6 +25,9 @@ pub struct LoadOptions {
     /// weight in VRAM (see auto_ctx), `ctx` being the floor.
     pub ctx_auto: bool,
     pub batch: usize,
+    /// No prompt batch was asked for: a smaller one may be taken when the
+    /// weights do not fit (see auto_batch), `batch` being the default.
+    pub batch_auto: bool,
     /// GPUs to use. Empty means every supported device.
     pub gpus: Vec<i32>,
     pub split: SplitMode,
@@ -60,6 +63,11 @@ pub struct LoadOptions {
     pub ram_reserve: Option<u64>,
     /// What the automatic context favours between GPUs of different speeds.
     pub prefer: Prefer,
+    /// A vision encoder comes after this load: the VRAM it needs with all of
+    /// its weights resident, and with its blocks uploaded for each image.
+    /// The load reserves the first when the text model then still fits the
+    /// GPUs whole, else the second (see `LoadReport::vision_streamed`).
+    pub vision: Option<(u64, u64)>,
 }
 
 /// What the automatic context gives up when the GPUs differ in speed
@@ -124,6 +132,8 @@ impl Default for LoadOptions {
             ctx: 4096,
             ctx_auto: false,
             batch: 512,
+            batch_auto: false,
+            vision: None,
             gpus: Vec::new(),
             split: SplitMode::Auto,
             gpu_layers: None,
@@ -197,6 +207,9 @@ pub struct LoadReport {
     pub load_ms: f64,
     /// Adjustments made to get the model to fit.
     pub fallbacks: Vec<String>,
+    /// The vision encoder is to upload its blocks for each image
+    /// (`LoadOptions::vision`): its VRAM went to the text model's weights.
+    pub vision_streamed: bool,
 }
 
 /// Opens, plans, uploads and wraps a model into a ready [`Runtime`].
@@ -221,6 +234,47 @@ pub fn load(
 
     let devices = select_devices(&opts.gpus)?;
     let mut sizes = WeightSizes::from_gguf(&gguf, config.n_layers);
+    // The vision encoder's VRAM, on top of the reserve: all of it when the
+    // text model's weights still fit the GPUs at the default context, else
+    // only what one block at a time takes (27B Q4_K_M with a 1.72 GiB F32
+    // mmproj on a 16 GB card: 5888 feed-forward columns a layer on the CPU
+    // with it resident). AIRUN_VISION_RESIDENT=1 keeps it resident.
+    let with_vision;
+    let mut vision_streamed = false;
+    let opts = match opts.vision {
+        Some((resident, streamed)) => {
+            let mut probe = sizes.clone();
+            if crate::model::embeds_on_host(&config) {
+                probe.embedding = 0;
+            }
+            let fits = |reserve: u64| plan(&config, &probe, &devices, &PlacementRequest {
+                ctx: opts.ctx,
+                batch: opts.batch,
+                split: opts.split.clone(),
+                gpu_layers: opts.gpu_layers,
+                reserve_bytes: reserve,
+                allow_ctx_shrink: false,
+                alloc: AllocMode::Gpu,
+                main_gpu: opts.main_gpu,
+                device_order: Vec::new(),
+            }).is_ok();
+            let keep = std::env::var("AIRUN_VISION_RESIDENT").is_ok_and(|v| v.trim() == "1");
+            vision_streamed = !keep && opts.alloc != AllocMode::Gpu && streamed < resident
+                && !fits(opts.reserve_bytes + resident);
+            if vision_streamed {
+                eprintln!("note: the weights do not fit the GPUs with the vision encoder beside them, so it uploads \
+                           its blocks for each image ({} of VRAM instead of {}; an image takes a little longer); \
+                           AIRUN_VISION_RESIDENT=1 keeps it in VRAM",
+                    airun_cuda::human_bytes(streamed), airun_cuda::human_bytes(resident));
+            }
+            with_vision = LoadOptions {
+                reserve_bytes: opts.reserve_bytes + if vision_streamed { streamed } else { resident },
+                ..opts.clone()
+            };
+            &with_vision
+        }
+        None => opts,
+    };
     if crate::model::embeds_on_host(&config) {
         sizes.embedding = 0;
     }
@@ -306,6 +360,38 @@ pub fn load(
             }
         }
     }
+    // A 16/32-bit output head on weights that do not fit the GPUs goes in as
+    // Q8_0: every byte it saves keeps a layer's share off the CPU (27B Q4_K_M
+    // with a BF16 head, one RTX 5060 Ti 16 GB: 1.1 GiB more of layers in
+    // VRAM). Same test as auto_ctx's: the plan at the default context with
+    // every weight in VRAM.
+    if opts.alloc != AllocMode::Gpu && !config.tied_embeddings {
+        if let Some((stored, q8)) = crate::model::head_q8_bytes(&gguf) {
+            let mut probe = sizes.clone();
+            if load_mtp {
+                probe.output += head_bytes + config.kv_bytes_per_layer(opts.ctx);
+            }
+            let req = PlacementRequest {
+                ctx: opts.ctx,
+                batch: opts.batch,
+                split: opts.split.clone(),
+                gpu_layers: opts.gpu_layers,
+                reserve_bytes: opts.reserve_bytes,
+                allow_ctx_shrink: false,
+                alloc: AllocMode::Gpu,
+                main_gpu: opts.main_gpu,
+                device_order: Vec::new(),
+            };
+            if plan(&config, &probe, &devices, &req).is_err() {
+                crate::model::set_head_q8();
+                sizes.output = sizes.output - stored + q8;
+                eprintln!("note: the weights do not fit the GPUs, so the {} output head goes in as Q8_0 ({} instead \
+                           of {}), leaving that VRAM to layers that would run on the CPU; AIRUN_NO_HEAD_Q8=1 keeps \
+                           it as stored", gguf.tensor("output.weight").map_or(String::new(), |t| t.ty.to_string()),
+                           airun_cuda::human_bytes(q8), airun_cuda::human_bytes(stored));
+            }
+        }
+    }
     let auto;
     let opts = if opts.ctx_auto {
         let ctx = auto_ctx(&config, &sizes, &devices, opts, load_mtp.then_some(head_bytes));
@@ -318,6 +404,14 @@ pub fn load(
         // The head and its own KV cache sit with the output projection.
         sizes.output += head_bytes + config.kv_bytes_per_layer(opts.ctx);
     }
+    let auto_b;
+    let opts = match auto_batch(&gguf, &config, &sizes, &devices, opts) {
+        Some(batch) => {
+            auto_b = LoadOptions { batch, ..opts.clone() };
+            &auto_b
+        }
+        None => opts,
+    };
     let mut split = opts.split.clone();
     let mut device_order: Vec<i32> = Vec::new();
     let mut expert_note = None;
@@ -466,6 +560,11 @@ pub fn load(
             placement.notes.push(format!("KV cache {}", opts.kv_type.name()));
         }
         place_on_disk(&mut placement, &sizes, &gguf, &config, ram_budget, mapped_expert_bytes, opts.disk_offload);
+        split_ffn_plan(&mut placement, &gguf, &config, batch);
+        // AIRUN_SHOW_PLAN=1: the memory plan as `bench` prints it, from any command.
+        if std::env::var("AIRUN_SHOW_PLAN").is_ok_and(|v| v.trim() == "1") {
+            eprint!("{}", placement.report());
+        }
 
         if placement.ctx != ctx {
             fallbacks.push(format!(
@@ -556,9 +655,37 @@ pub fn load(
                 weight_bytes,
                 load_ms: start.elapsed().as_secs_f64() * 1000.0,
                 fallbacks,
+                vision_streamed,
             },
         ));
     }
+}
+
+/// Turns whole layers in RAM into feed-forward columns of every layer in RAM
+/// (plan::split_ffn), where the model and the plan allow: one GPU, dense
+/// feed-forwards, the RAM part multiplied on the CPU. Qwen3.8-27B Q4_K_M on
+/// one RTX 5060 Ti 16 GB (PCIe 3.0 x8, DDR4): see AGENTS.md.
+/// AIRUN_NO_FFN_SPLIT=1 keeps whole layers.
+fn split_ffn_plan(placement: &mut Placement, gguf: &GgufFile, config: &Config, batch: usize) {
+    let off = |v: &str| std::env::var(v).is_ok_and(|v| v.trim() != "0");
+    if config.moe.is_some() || config.hc.is_some() || config.ple.is_some() || off("AIRUN_NO_FFN_SPLIT")
+        || off("AIRUN_RAM_ON_GPU") {
+        return;
+    }
+    let f = config.ffn_len as u64;
+    let mut align = 1usize;
+    let mut col_bytes = Vec::with_capacity(config.n_run_layers());
+    for l in 0..config.n_run_layers() {
+        let t = |kind: &str| gguf.tensor(&format!("blk.{l}.ffn_{kind}.weight"));
+        let (Some(g), Some(u), Some(d)) = (t("gate"), t("up"), t("down")) else { return };
+        let Some(layout) = d.ty.layout() else { return };
+        if g.n_rows() != f || u.n_rows() != f || d.row_size() != f || 256 % layout.elements as usize != 0 {
+            return;
+        }
+        align = align.max(layout.elements as usize);
+        col_bytes.push((g.nbytes + u.nbytes + d.nbytes).div_ceil(f));
+    }
+    crate::plan::split_ffn(placement, config, &col_bytes, batch, align);
 }
 
 /// Of the weights the plan keeps in RAM, moves what `ram_budget` (free RAM
@@ -832,6 +959,65 @@ fn auto_ctx(config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &Loa
         eprintln!("context: {lo} tokens, {note} (-c sets it)");
     }
     lo
+}
+
+/// What a weight byte read by the CPU costs a decode step against one read
+/// from VRAM: about their bandwidths' ratio (RTX 5060 Ti 448 GB/s against
+/// dual-channel DDR4's 27 GB/s through the AVX2 kernels; DDR5 and wider
+/// cards keep it in the same range).
+const CPU_BYTE_COST: f64 = 16.0;
+
+/// Predicted decode gain a smaller prompt batch must bring to be chosen.
+const AUTO_BATCH_GAIN: f64 = 0.05;
+
+/// The prompt batch to use when none was asked for and the weights do not
+/// fit the GPUs: a smaller one, when its smaller prefill scratch keeps enough
+/// layers off the CPU to make decoding at least AUTO_BATCH_GAIN faster.
+/// Qwen3.8-27B Q4_K_M on one RTX 5060 Ti 16 GB, feed-forward columns in RAM
+/// (plan::split_ffn): 256 leaves 1536 columns a layer to the CPU where 512
+/// leaves 1792, 16.8 -> 18.3 tok/s, for 5% slower long prompts (881 -> 832
+/// tok/s at 3.8k tokens); 128 moves no more. Dense models only: a MoE's
+/// experts in RAM are planned apart.
+fn auto_batch(gguf: &GgufFile, config: &Config, sizes: &WeightSizes, devices: &[Device], opts: &LoadOptions)
+    -> Option<usize> {
+    if !opts.batch_auto || opts.alloc == AllocMode::Gpu || config.moe.is_some() || opts.gpu_layers.is_some() {
+        return None;
+    }
+    // The embedding is only gathered from, a row per token.
+    let total = sizes.total().saturating_sub(sizes.embedding) as f64;
+    let cost = |batch: usize| -> Option<f64> {
+        let req = PlacementRequest {
+            ctx: opts.ctx,
+            batch,
+            split: opts.split.clone(),
+            gpu_layers: None,
+            reserve_bytes: opts.reserve_bytes,
+            allow_ctx_shrink: false,
+            alloc: opts.alloc,
+            main_gpu: opts.main_gpu,
+            device_order: Vec::new(),
+        };
+        let mut p = plan(config, sizes, devices, &req).ok().filter(|p| p.ctx == opts.ctx && p.batch == batch)?;
+        // As the load does: feed-forward columns in RAM where that applies.
+        split_ffn_plan(&mut p, gguf, config, batch);
+        Some(total + (CPU_BYTE_COST - 1.0) * crate::plan::ram_weight_bytes(&p) as f64)
+    };
+    let base = cost(opts.batch)?;
+    if base <= total {
+        return None;
+    }
+    // The largest batch within half a percent of the best.
+    let tries: Vec<(usize, f64)> = [256, 128].into_iter().filter(|&b| b < opts.batch)
+        .filter_map(|b| cost(b).map(|c| (b, c))).collect();
+    let best = tries.iter().map(|&(_, c)| c).fold(base, f64::min);
+    let (batch, c) = tries.into_iter().find(|&(_, c)| c <= best * 1.005)?;
+    let gain = base / c - 1.0;
+    if gain < AUTO_BATCH_GAIN {
+        return None;
+    }
+    eprintln!("note: prompt batch {batch} instead of {}: its smaller scratch keeps more weights in VRAM, about {:.0}% \
+               faster decoding (-b {} ingests long prompts faster)", opts.batch, gain * 100.0, opts.batch);
+    Some(batch)
 }
 
 /// How a MoE model too big for the GPUs is spread: expert slots per layer,
