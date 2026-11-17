@@ -309,6 +309,10 @@ struct MoeScratch {
     /// offsets, the sorted pairs, and per-pair down projections.
     /// (counts, offsets, perm, ypair, fp16 activations) of the expert-major batch path.
     grouped: Option<(DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<i32>, DeviceBuffer<f32>, DeviceBuffer<u16>)>,
+    /// The pairs' SwiGLU outputs quantized for the integer down projection
+    /// (hybrid::moe_mmq), which quantizes the layer input into the fp16
+    /// activations' buffer above (1.125 bytes a value where that holds 2).
+    mmq_hq: Option<DeviceBuffer<u8>>,
     /// Streamed experts, expert-major batches (see Runtime::moe_waves): the
     /// slot address of each expert of the wave for gate, up and down, and a
     /// residency map that is all ones.
@@ -509,6 +513,13 @@ fn rows_batched_disabled() -> bool {
 fn mixed_graphs_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var("AIRUN_NO_ROWS_GRAPH").is_ok_and(|v| v.trim() != "0"))
+}
+
+/// AIRUN_HOST_TIMING=1: how long the host takes to queue each batch's forward
+/// pass, on stderr. A pass whose kernels are short waits on that, not on them.
+fn host_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AIRUN_HOST_TIMING").is_ok_and(|v| v.trim() != "0"))
 }
 
 /// Whether AIRUN_NO_GRAPH=1 turned off decode graph capture, or some
@@ -1023,11 +1034,17 @@ impl Runtime {
                         None
                     },
                     mapped_hits: std::cell::Cell::new((0, 0)),
-                    grouped: if b >= GROUPED_MIN {
+                    grouped: if b >= MOE_MMQ_MIN {
                         Some((DeviceBuffer::new(dev, moe.n_experts)?, DeviceBuffer::new(dev, moe.n_experts + 1)?,
                               DeviceBuffer::new(dev, b * moe.n_experts_used)?,
                               DeviceBuffer::new(dev, b * moe.n_experts_used * cfg.n_embd)?,
                               DeviceBuffer::new(dev, b * cfg.n_embd)?))
+                    } else {
+                        None
+                    },
+                    mmq_hq: if b >= MOE_MMQ_MIN {
+                        let (_, hq) = hybrid::moe_mmq_scratch_bytes(cfg.n_embd, moe.expert_ff, moe.n_experts_used);
+                        Some(DeviceBuffer::new(dev, b * hq)?)
                     } else {
                         None
                     },
@@ -1901,7 +1918,11 @@ impl Runtime {
         let n = tokens.len();
         let positions: Vec<i32> = (0..n).map(|i| (self.n_past + i) as i32).collect();
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let issued = host_timing().then(std::time::Instant::now);
         self.queue_forward(&token_ids, &positions)?;
+        if let Some(t) = issued {
+            eprintln!("host: {n} tokens queued in {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
         self.n_past += n;
         self.history.extend_from_slice(tokens);
         Ok(())
@@ -2180,10 +2201,18 @@ impl Runtime {
             }
         }
         for si in 0..self.states.len() {
+            let t = host_timing().then(std::time::Instant::now);
             if si > 0 {
                 self.handoff(si, token_ids.len())?;
+                if let Some(t) = t {
+                    eprintln!("host:   handoff to shard {si} in {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+                }
             }
+            let t = host_timing().then(std::time::Instant::now);
             self.queue_shard(si, token_ids, positions, upload, true, true)?;
+            if let Some(t) = t {
+                eprintln!("host:   shard {si} queued in {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+            }
         }
         Ok(())
     }
@@ -4225,15 +4254,9 @@ impl Runtime {
         // accumulate on top, which avoids a separate buffer and a second add.
         if let Some(s) = shared {
             matvec_reuse(&s.router, &st.xb, &m.shared_logit, n, &st.q8act, stream)?;
-            matvec_reuse(&s.gate, &st.xb, &st.gate, n, &st.q8act, stream)?;
-            matvec_reuse(&s.up, &st.xb, &st.up, n, &st.q8act, stream)?;
-            ops::swiglu(
-                st.gate.as_mut_ptr(),
-                st.up.as_ptr(),
-                n * moe.shared_expert_ff,
-                stream,
-            )?;
-            matvec(&s.down, &st.gate, &st.xb2, n, &st.q8act, stream)?;
+            // As a dense feed-forward: gate, up and the SwiGLU in one launch
+            // where the integer kernels take them (three launches before).
+            dense_ffn(st, &s.gate, &s.up, &s.down, &st.xb2, n, stream)?;
             hybrid::sigmoid_scale_rows(
                 st.xb2.as_mut_ptr(),
                 m.shared_logit.as_ptr(),
@@ -4254,18 +4277,36 @@ impl Runtime {
         }
         // A batch goes expert-major: each expert's weights are read once for
         // all the tokens routed to it, wherever they live.
-        if let (Some((scratch, offsets, perm, ypair, xh)), true) = (&m.grouped, n >= GROUPED_MIN && m.upload.is_none()) {
+        let ew = |t: &GpuTensor| hybrid::ExpertWeights {
+            ty: t.kernel_type(),
+            tab: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.table.as_ptr()),
+            base: t.ptr(),
+            stride: t.expert_stride,
+            row_bytes: t.row_bytes,
+            resident: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.resident.as_ptr()),
+        };
+        // Experts in VRAM of a type the integer kernels take go expert-major
+        // from MOE_MMQ_MIN tokens (hybrid::moe_mmq); the others from
+        // GROUPED_MIN, as before.
+        let (g, u, d) = (ew(gate_exps), ew(up_exps), ew(down_exps));
+        let unscaled = [gate_exps, up_exps, down_exps].iter().all(|t| t.global_scale == 1.0);
+        let mmq = n >= MOE_MMQ_MIN && m.mmq_hq.is_some() && unscaled
+            && hybrid::moe_mmq_supported(&g, &u, &d, cfg.n_embd, moe.expert_ff);
+        if let (Some((scratch, offsets, perm, ypair, xh)), true) = (&m.grouped,
+            (n >= GROUPED_MIN || mmq) && m.upload.is_none()) {
             let k = moe.n_experts_used;
             hybrid::moe_sort(m.ids.as_ptr(), n * k, moe.n_experts, scratch.as_mut_ptr(), offsets.as_mut_ptr(),
                 perm.as_mut_ptr(), stream)?;
-            let ew = |t: &GpuTensor| hybrid::ExpertWeights {
-                ty: t.kernel_type(),
-                tab: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.table.as_ptr()),
-                base: t.ptr(),
-                stride: t.expert_stride,
-                row_bytes: t.row_bytes,
-                resident: t.mapped.as_ref().map_or(std::ptr::null(), |mp| mp.resident.as_ptr()),
-            };
+            // The integer kernels, then only the combine of the fp16 path.
+            if let Some(hq) = m.mmq_hq.as_ref().filter(|_| mmq) {
+                hybrid::moe_mmq(&g, &u, &d, st.xb.as_ptr(), xh.as_mut_ptr(), perm.as_ptr(), offsets.as_ptr(),
+                    m.h.as_mut_ptr(), hq.as_mut_ptr(), ypair.as_mut_ptr(), cfg.n_embd, moe.expert_ff, n, k,
+                    moe.n_experts, stream)?;
+                hybrid::moe_grouped_phase(g, u, d, st.xb.as_ptr(), perm.as_ptr(), offsets.as_ptr(),
+                    m.weights.as_ptr(), m.h.as_mut_ptr(), ypair.as_mut_ptr(), st.xb2.as_mut_ptr(), cfg.n_embd,
+                    moe.expert_ff, n, k, moe.n_experts, xh.as_mut_ptr(), None, hybrid::GROUPED_COMBINE, stream)?;
+                return Ok(());
+            }
             hybrid::moe_grouped(ew(gate_exps), ew(up_exps), ew(down_exps), st.xb.as_ptr(), perm.as_ptr(),
                 offsets.as_ptr(), m.weights.as_ptr(), m.h.as_mut_ptr(), ypair.as_mut_ptr(), st.xb2.as_mut_ptr(),
                 cfg.n_embd, moe.expert_ff, n, k, moe.n_experts, xh.as_mut_ptr(),
@@ -4964,7 +5005,18 @@ fn fp4_glu_disabled() -> bool {
 }
 
 fn fp4_prefill(w: &GpuTensor, n: usize, q8: &QAct) -> bool {
-    !on_cpu(w) && n >= 32 && q8.fp4.is_some() && w.kernel_type().0 == 40 && w.k % 256 == 0 && !matvec_f32_forced()
+    !on_cpu(w) && n >= fp4_min_tokens() && q8.fp4.is_some() && w.kernel_type().0 == 40 && w.k % 256 == 0
+        && !matvec_f32_forced()
+}
+
+/// Batches from which NVFP4 weights take the FP4 tensor cores rather than
+/// the integer MMQ kernel (AIRUN_FP4_MIN overrides). It was 32; up to 64
+/// tokens -- one 64-token MMQ tile -- MMQ is the faster one. 27B NVFP4 on a
+/// 5070 Ti, prompt tokens per second, FP4 against MMQ: 32: 370-421 / 547-608,
+/// 48: 574-732 / 845-850, 64: 1066 / 1078-1088, 72: 1194 / 808, 96: 1789 / 1046.
+fn fp4_min_tokens() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("AIRUN_FP4_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(65))
 }
 
 /// Decode on the integer kernel for this weight; see
@@ -4985,6 +5037,10 @@ fn matvec_f32_forced() -> bool {
 
 /// Batches at least this big run the experts expert-major (see run_moe).
 const GROUPED_MIN: usize = 16;
+/// Tokens from which experts in VRAM take the grouped integer kernels
+/// (hybrid::moe_mmq). Below 16 every (token, expert) pair read its expert on
+/// its own, and 8 tokens of the 35B-A3B took as long as 16.
+const MOE_MMQ_MIN: usize = 8;
 /// Whether run_moe copies host-side experts on a side stream while the
 /// resident ones compute (AIRUN_MOE_OVERLAP=0 turns it off).
 fn moe_overlap() -> bool {

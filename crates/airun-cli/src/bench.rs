@@ -75,6 +75,12 @@ pub struct BenchArgs {
     #[arg(long)]
     pub text_file: Option<PathBuf>,
 
+    /// Build prompts from random token ids, as llama.cpp's llama-bench does.
+    /// On a MoE model random ids do not route like text does, so this is for
+    /// comparing against that tool, not for judging real prompts.
+    #[arg(long, conflicts_with = "text_file")]
+    pub random_tokens: bool,
+
     /// Sampling temperature for the decode tests; 0 is greedy. Greedy decoding
     /// tends to loop, which again flatters an expert cache.
     #[arg(long, default_value_t = 0.0)]
@@ -168,6 +174,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
         None => None,
     };
     let source = match &text {
+        _ if args.random_tokens => {
+            // A fixed seed: every run and every build measures the same ids.
+            let vocab = report.config.vocab_size.max(1) as u64;
+            let mut s = 0x9E37_79B9_7F4A_7C15u64;
+            (0..8192).map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % vocab) as u32
+            }).collect()
+        }
         Some(t) => runtime.tokenizer.encode(t, false),
         None => vec![filler],
     };
@@ -179,6 +196,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
     };
 
     let mut results = Vec::new();
+    // AIRUN_BENCH_PROGRESS=1: a line on stderr as each run ends, for a run
+    // that never returns.
+    let progress = std::env::var("AIRUN_BENCH_PROGRESS").is_ok_and(|v| v.trim() != "0");
 
     for &n in &args.prefill {
         if n + 8 >= runtime.ctx() {
@@ -206,6 +226,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 fed += take;
             }
             let ms = start.elapsed().as_secs_f64() * 1000.0;
+            if progress {
+                eprintln!("bench: prefill {n} run {i} done in {ms:.0} ms");
+            }
             if i >= args.warmup {
                 samples.push(ms);
             }
@@ -246,7 +269,13 @@ pub fn run(args: BenchArgs) -> Result<()> {
             params.temperature = args.temp;
             params.seed = 1 + i as u64;
             let mut sampler = Sampler::new(params);
+            if progress {
+                eprintln!("bench: decode at {depth} run {i} starts");
+            }
             let stats = runtime.generate(&prompt, args.decode, &mut sampler, |_, _| true)?;
+            if progress {
+                eprintln!("bench: decode at {depth} run {i} done");
+            }
             if i >= args.warmup && stats.generated_tokens > 0 {
                 // Normalize to the tokens actually produced; an early stop would
                 // otherwise inflate the rate.

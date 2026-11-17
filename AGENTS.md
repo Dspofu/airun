@@ -2193,3 +2193,139 @@ in its cache: the same build did 29 tok/s of prefill and 15 of decode with a
 warm cache and 18-20 and 8-9 after the cache was emptied. Compare only runs
 alternated in one window; the "before" columns of the section above were
 taken with a warm cache.
+
+## Against llama.cpp b12433; small batches; the GPU that fell off the bus (2026-11-16/17, 5070 Ti + 5060 Ti)
+
+**The GPU loss.** With 13fffab, a 27B Q6_K split over both cards lost the
+5070 Ti ("GPU is lost. Reboot the system to recover this GPU", nvlddmkm 153
+TDR) once every one to four `airun bench` processes. Cause: **stream-K MMQ on
+batches under 32 tokens** (13fffab brought MMQ down to 9 tokens; stream-K was
+only ever exercised from 32). `mmq_streamk_plan` now refuses those batches and
+they split K, as before. Evidence, each a run of `bench --prefill 2048
+--decode 1 --runs 16` processes (each ends with a 16-token prompt):
+
+| build / setting | result |
+|---|---|
+| 13fffab or later, defaults | lost the GPU within 1-4 processes, 9 times |
+| `AIRUN_MMQ_MIN=32` | 12/12 clean |
+| `AIRUN_NO_MMQ_STREAMK=1` | 12/12 clean |
+| e33a703 (MMQ from 32) | 12/12 clean |
+| `CUDA_LAUNCH_BLOCKING=1` | 12/12 clean |
+| NVFP4 27B in the same 21/43 split | 12/12 clean |
+| **fix: stream-K from 32 tokens only** | **24/24 clean**, prefill 2048 1890 tok/s |
+
+Ruled out on the way, each with at least one loss: a newer BIOS (FE -> FHd),
+VRAM headroom (4 more layers on the 5060 Ti), the handoff staged through
+pinned RAM instead of cudaMemcpyPeerAsync, a bounded or strictly alternating
+prefill queue, no async MMQ kernel, no fused gate/up. Both GPUs at full load
+with no Q6_K (two NVFP4 benches, 291 W + 158 W) ran clean. How small-batch
+stream-K brings the card down was not found; the head blocks spin on their
+tails' flags, and with one token tile every tile is cut across several blocks.
+An `AIRUN_NO_MMQ_STREAMK=1` run is the first thing to try if a card is lost
+again. **Testing this costs a reboot per loss**; `AIRUN_BENCH_PROGRESS=1`
+makes `bench` print a line per run, which says where a process stopped.
+
+**Smaller batches.**
+- **MoE grouped MMA kernels from 16 tokens** (`moe.cu`, `MMA_MIN_TOKENS`, was
+  64; `AIRUN_MOE_MMA_MIN`). 35B-A3B Q5_K_M, 16/32/48 tokens: 217/319/374 ->
+  405/793/964 tok/s. Perplexity at 32-token chunks 5.12 -> 5.05; at 16,
+  12.41 -> 12.27.
+- **The expert sort's scan in parallel** (`moe_sort_scan_kernel`): one thread
+  walking 256 counts took 33 us per layer per batch.
+- **MMQ warps with no tokens skip the MMAs** (`mmq.cuh`, `wc < toks_valid`).
+  Q6_K 27B, 16/32 tokens: 215/425 -> 261/510.
+
+**Planner: the full batch with one layer on the slow card** (`plan.rs`,
+`edge`). A model that fits the fastest GPU only at a reduced prompt batch
+now gives the embedding and the first layer or two (at most n_layers/32) to a
+slower card and keeps the batch. 27B NVFP4 at 8k context: prefill 512/2048
+2750/2670 -> 3900/3860 tok/s, decode 48.5 -> 46.4. Not with `--main-gpu`,
+`--alloc memory` or a tied head.
+
+**`bench --random-tokens`**: prompts of random ids, as `llama-bench` builds
+them, for a like-for-like comparison (not for MoE expert-cache judgements).
+
+## Short prompts: MoE experts on the integer kernels, the router, FP4 from 65 tokens (2026-11-17)
+
+**Grouped MoE on MMQ** (`airun_moe_mmq`, `MmqGroups` in `mmq.cuh`). Experts in
+VRAM of Q8_0/Q4_K/Q5_K/Q6_K now run as two grouped launches of
+`matvec_mmq_async_kernel` (template flag `GROUPED`): block (row tile, expert)
+takes every pair routed to the expert, reads its activations through `perm`
+and writes its output to the pair's row, so `moe_sort` and the combine are the
+fp16 path's. Gate and up go through the kernel's GLU epilogue into `h` (f32),
+`h` is quantized, down writes `ypair`. The fp16 grouped kernels (`moe.cu`)
+decoded every weight to float and read a 32-row tile's activations from L2
+again for every tile (about 1 GB of L2 reads a layer at 512 tokens).
+`AIRUN_NO_MOE_MMQ=1` brings them back; experts in host memory, with address
+tables or an NVFP4 global scale keep them. From 8 tokens (`MOE_MMQ_MIN`);
+below 16 the pairs used to read their experts one by one, and 8 tokens took as
+long as 16. 35B-A3B Q5_K_M, tok/s:
+
+| tokens | fp16 grouped | MMQ grouped |
+|---|---|---|
+| 10 / 12 / 15 | 315 / 370 / 384 | 421 / 435-485 / 525-575 |
+| 128 | 1874 | 2172 |
+| 512 | 3789 | 4697 |
+| 2048 | 5667 | 6883 |
+
+Perplexity (AGENTS.md text, batched chunks) unchanged within the int8
+activation rounding: 512: 13.63 -> 13.58, 64: 30.08 -> 30.15, 16: 114.17 ->
+114.42, 12: 85.93 -> 85.85, 8: 143.17 -> 143.64.
+
+**Two superblock buffers for Q5_K/Q6_K up to 64-token tiles**
+(`mmq_async_sb2`): superblock s + 1 is asked for as s's first chunk starts.
+With one buffer it was asked for after s's second chunk was decoded, and a
+small batch waited out the copy every superblock. A3B +2-7%; the dense Q6_K
+27B did not move (its small-batch MMQ is not bound by that wait, cause not
+found: the Nsight Compute here, 2022.4, predates sm_120).
+
+**Small matrices against a batch** (`matmul.cu`):
+- `matvec_few_rows_kernel`: up to 4 rows (the shared-expert gate, 1 row), a
+  warp per token. Row-parallel, one block did all the tokens.
+- `matvec_f32_rows_kernel`: F32, 5-511 rows (the router, 256 x 2048), a warp
+  per row, activations staged in shared memory, blocks over 4 rows x 32 tokens;
+  exact f32 as before. `matvec_tallk_kernel` took ~80 us a layer at 16 tokens.
+  A3B, with against without (`AIRUN_NO_FEW_ROWS=1`): 64 tokens 1567 / 1375,
+  128: 2392 / 2229, 256: 3563 / 3436. With 8 rows and all tokens per block
+  (32 blocks) it lost from 128 tokens.
+- The shared expert goes through `dense_ffn` (fused gate/up/SwiGLU).
+- `moe_sort_one_kernel`: the sort in one block (it was a memset and three
+  kernels a layer).
+
+**NVFP4 takes the FP4 tensor cores from 65 tokens** (`fp4_min_tokens`, was
+32; `AIRUN_FP4_MIN`). Up to one 64-token MMQ tile, MMQ is faster, and its 8-bit
+activations are closer than FP4's 4-bit ones (27B, 48-token chunks: 17.48
+against 17.60). Prompt tok/s, FP4 / MMQ: 32: 370-421 / 547-608, 48: 574-732 /
+845-850, 64: 1066 / 1078-1088, 72: 1194 / 808, 96: 1789 / 1046.
+
+**Where a short prompt's time goes.** A 16-token pass of the A3B is ~1580
+kernel launches; `AIRUN_HOST_TIMING=1` prints how long the host takes to queue
+each pass and its shards (10-13 ms here, against ~30 ms of GPU work, so the
+host is not what bounds it). Under nsys the per-kernel times of these short
+kernels come out inflated and disagree with `bench`; judge by `bench`.
+
+**Against llama.cpp b12433 afterwards** (5070 Ti + 5060 Ti, alternated, two
+rounds; tok/s). `llama-bench` against `airun bench -c 8192`:
+
+| model | pp16 | pp128 | pp512 | pp2048 | tg |
+|---|---|---|---|---|---|
+| 27B Q6_K, llama / airun | 305-308 / 208-209 | 1039 / 1101 | 1143-1151 / 1231-1240 | 1513-1520 / 1922-1923 | 22.7 / 26.6 |
+| 27B NVFP4 | 336-404 / 262 | 2103-2142 / 2677-2682 | 2692-2693 / 3930 | 3478-3479 / 3927-3942 | 30.6-30.7 / 46.7 |
+| 35B-A3B Q5_K_M | 771-842 / 480-517 | 2543-2562 / 2475-2604 | 4624-4691 / 4850-4978 | 6095-6141 / 7273-7294 | 130-131 / 153 |
+
+Through each engine's server (a ~3980-token prompt, then 400 tokens greedy;
+MTP: airun `--draft 4`, llama.cpp `--spec-type draft-mtp`, the better of 3
+and 4 drafts):
+
+| model | prefill | decode | decode, MTP |
+|---|---|---|---|
+| 27B Q6_K, llama / airun | 1317-1329 / 1950-1959 | 22.0 / 26.2-26.3 | 47.2-47.4 / 66.2-66.3 |
+| 27B NVFP4 | 2591-2634 / 3457-3471 | 29.2-29.5 / 45.9-46.0 | 52-62 / 91-93 |
+| 35B-A3B | 4659-4798 / 6711-7043 | 119.5-119.7 / 149.4-149.9 | 133-136 / 184-186 |
+
+The servers' short prompts went the same way (the 27B NVFP4's 55-token first
+request: 344 ms against 155). What llama.cpp still wins is `llama-bench`'s
+16-token pass, by about a third, and the A3B at 128 tokens is level. Qwen4
+Flash-Next with `--disk-offload` (990-token prompt, 108 tokens): prefill
+29.5-31.7 -> 40.0-44.5, decode 19.3-20.6 -> 24.2-24.4 (the file cache's state
+moves these; see above).

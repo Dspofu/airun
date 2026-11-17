@@ -488,9 +488,11 @@ pub fn scratch_bytes(cfg: &Config, batch: usize, hosts_output: bool) -> u64 {
             total += (2 * wide + b * cfg.n_embd as u64 + b * (p.n_heads() * p.head_dim) as u64) * f32_size;
         }
     }
-    // Batched MoE keeps every (token, expert) pair's output for the combine.
+    // Batched MoE keeps every (token, expert) pair's output for the combine,
+    // and the pairs' SwiGLU outputs quantized for the integer down projection.
     if let Some(moe) = &cfg.moe {
         total += b * (moe.n_experts_used * cfg.n_embd) as u64 * f32_size;
+        total += b * (moe.n_experts_used * moe.expert_ff / 32 * 36) as u64;
     }
     // The QSA indexer's queries and keys.
     if let Some(ix) = &cfg.indexer {
@@ -737,10 +739,23 @@ fn try_place(
             // the halved batch, decode 26.4 against 26.5.
             let twin = fastest.is_some_and(|f| ordered.iter().skip(1)
                 .any(|d| d.perf_score() >= 0.9 * f.perf_score() && f.perf_score() >= 0.9 * d.perf_score()));
+            // ...or unless the full batch fits once the embedding and a layer
+            // or two leave for a slower card: the batch is worth more to a
+            // prompt than those layers cost a decode step. Qwen3.8-27B NVFP4
+            // at 8k context on a 5070 Ti + 5060 Ti, layer 0 and the embedding
+            // on the 5060 Ti: 2048 prompt tokens at 3922 tok/s against 2670
+            // at a batch of 128 on the 5070 Ti alone, decode 46.1 against
+            // 48.5. More layers than that on a card with half the bandwidth
+            // and the decode pays more than the prompt gains.
+            let edge = shrunk
+                .filter(|_| !twin && req.main_gpu.is_none() && req.alloc != AllocMode::Memory
+                    && !cfg.tied_embeddings && ordered.len() > 1)
+                .and_then(|_| fill_fastest_last(ordered, &budgets, &layer_cost, sizes, cfg, req.batch))
+                .filter(|a| a.last().is_some_and(|&(_, fast)| n_layers - fast <= (n_layers / 32).max(1)));
             // With a main GPU named, "the fastest" means it.
             let single = if fastest.is_some_and(|d| fits(d, req.batch)) {
                 fastest
-            } else if req.main_gpu.is_some() {
+            } else if req.main_gpu.is_some() || edge.is_some() {
                 None
             } else if let Some((d, b)) = shrunk.filter(|_| !twin) {
                 batch = b;
@@ -756,6 +771,12 @@ fn try_place(
                     d.ordinal, d.name
                 ));
                 vec![(d.ordinal, n_layers)]
+            } else if let Some(a) = edge {
+                notes.push(format!(
+                    "GPU {} (the fastest) holds all but the first {} layer(s) and the embedding, which sit on \
+                     another GPU so the prefill keeps its batch of {}",
+                    ordered[0].ordinal, n_layers - a.last().map_or(0, |&(_, fast)| fast), req.batch));
+                a
             } else {
                 let caps: Vec<f32> = ordered
                     .iter()
@@ -1312,6 +1333,34 @@ mod tests {
 
     fn layers(p: &Placement) -> Vec<usize> {
         p.shards.iter().map(|s| s.layers.len()).collect()
+    }
+
+    /// A model that fits the fast card only at a reduced prompt batch, with a
+    /// slower card beside it: the embedding and the first layer go to the slow
+    /// one and the batch stays whole. A tied head needs the table at both
+    /// ends, so that model stays on the fast card at the smaller batch.
+    #[test]
+    fn a_model_short_of_the_full_batch_lends_the_slow_card_its_first_layer() {
+        let mut cfg = config(40);
+        cfg.tied_embeddings = false;
+        let mut sz = sizes(40, 300);
+        sz.output = 600 << 20;
+        let req = PlacementRequest::default();
+        let whole = plan(&cfg, &sz, &[device(0, 64, 70, 256)], &req).unwrap().shards[0].total_bytes();
+        let mut fast = device(0, 16, 70, 256);
+        fast.free_mem = whole + req.reserve_bytes - (16 << 20);
+        let devs = vec![fast, device(1, 16, 36, 128)];
+
+        let p = plan(&cfg, &sz, &devs, &req).unwrap();
+        assert_eq!(layers(&p), [1, 39]);
+        assert_eq!((p.shards[0].device, p.shards[1].device), (1, 0));
+        assert!(p.shards[0].hosts_embedding && p.shards[1].hosts_output);
+        assert_eq!(p.batch, req.batch);
+
+        cfg.tied_embeddings = true;
+        let p = plan(&cfg, &sz, &devs, &req).unwrap();
+        assert_eq!(layers(&p), [40]);
+        assert!(p.batch < req.batch);
     }
 
     /// An untied model over a fast and a slow card: the fast one takes the

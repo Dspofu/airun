@@ -284,6 +284,120 @@ __global__ __launch_bounds__(128) void matvec_tallk_kernel(
     }
 }
 
+// A matrix of a few rows against several tokens: a warp per token, its lanes
+// over the row's groups, every row of the matrix in turn. A MoE's shared-expert
+// gate is a single row; parallel over rows, one block did all the tokens --
+// 40 to 80 us a layer on the 35B-A3B at 16 to 128 prompt tokens, where reading
+// the activations once takes a few. The rows come from L2 after the first warp.
+#define FEW_ROWS 4
+template <int TYPE>
+__global__ __launch_bounds__(128) void matvec_few_rows_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens,
+    const size_t row_bytes) {
+
+    const int lane = threadIdx.x & 31;
+    const int t = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (t >= n_tokens) return;
+    const float* xt = x + (size_t)t * K;
+    const int groups = K / 32;
+    float acc[FEW_ROWS] = {};
+    for (int g = lane; g < groups; g += 32) {
+        float xv[32];
+        const float4* xg = (const float4*)xt + g * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float4 v = xg[i];
+            xv[i * 4 + 0] = v.x; xv[i * 4 + 1] = v.y; xv[i * 4 + 2] = v.z; xv[i * 4 + 3] = v.w;
+        }
+#pragma unroll
+        for (int r = 0; r < FEW_ROWS; ++r) {
+            if (r >= n_rows) break;
+            float vals[32];
+            decode_group<TYPE>(w + (size_t)r * row_bytes, g, vals);
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) s = fmaf(vals[i], xv[i], s);
+            acc[r] += s;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < FEW_ROWS; ++r) {
+        if (r >= n_rows) break;
+        const float s = warp_reduce_sum(acc[r]);
+        if (lane == 0) y[(size_t)t * n_rows + r] = s;
+    }
+}
+
+// An F32 matrix of a few hundred rows (a MoE router: 256 x 2048) against a
+// batch, in exact f32: a warp per row, its lanes four columns each, the batch's
+// activations staged 128 columns at a time in shared memory for the block's
+// four rows; blocks split the rows and the tokens, 32 at a time (with eight rows
+// and every token in a block, the router's 32 blocks lost to the WMMA kernel
+// from 128 tokens). matvec_tallk_kernel, a block per row and
+// per token, took 80 us a layer for 16 tokens on the 35B-A3B; the fp16 WMMA
+// kernel 110 us for 128. Rows past the end compute row 0 and are not stored.
+#define F32_ROWS_TT 32
+#define F32_ROWS_RB 4
+__global__ __launch_bounds__(32 * F32_ROWS_RB) void matvec_f32_rows_kernel(
+    const float* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens) {
+
+    __shared__ float4 xs[F32_ROWS_TT * 32];   // [token][128 columns]
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * F32_ROWS_RB + warp;
+    const bool row_ok = r < n_rows;
+    const float4* wr = (const float4*)(w + (size_t)(row_ok ? r : 0) * K);
+    {
+        const int t0 = blockIdx.y * F32_ROWS_TT;
+        const int nt = min(F32_ROWS_TT, n_tokens - t0);
+        float acc[F32_ROWS_TT];
+#pragma unroll
+        for (int t = 0; t < F32_ROWS_TT; ++t) acc[t] = 0.0f;
+        for (int k0 = 0; k0 < K; k0 += 128) {
+            __syncthreads();   // every warp is done with the previous slice
+            for (int i = threadIdx.x; i < nt * 32; i += 32 * F32_ROWS_RB) {
+                xs[i] = ((const float4*)(x + (size_t)(t0 + i / 32) * K + k0))[i % 32];
+            }
+            __syncthreads();
+            const float4 wv = wr[k0 / 4 + lane];
+#pragma unroll
+            for (int t = 0; t < F32_ROWS_TT; ++t) {
+                if (t < nt) {
+                    const float4 xv = xs[t * 32 + lane];
+                    acc[t] = fmaf(wv.x, xv.x, fmaf(wv.y, xv.y, fmaf(wv.z, xv.z, fmaf(wv.w, xv.w, acc[t]))));
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < F32_ROWS_TT; ++t) {
+            if (t < nt) {
+                const float s = warp_reduce_sum(acc[t]);
+                if (lane == 0 && row_ok) y[(size_t)(t0 + t) * n_rows + r] = s;
+            }
+        }
+    }
+}
+
+// AIRUN_NO_FEW_ROWS=1 sends a matrix of a few rows back to the row-parallel
+// kernels.
+static bool few_rows_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_FEW_ROWS");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 #define PREFILL_ROWS 4
 // Tokens up to which a narrow matrix stays on matvec_tallk_kernel.
 #define TALLK_TOKENS 16
@@ -1340,9 +1454,18 @@ static bool mmq_streamk_disabled() {
 // whole waves as whole tiles, the leftover tiles shared by one wave of blocks.
 // False when the tiles already make whole waves, or the launch cannot use it:
 // a stream being captured into a graph would freeze the flag epoch into it.
-static bool mmq_streamk_plan(const void* kernel, size_t smem, int tiles, int tok_tiles,
+//
+// Not below MMQ_ALWAYS_TOKENS (32) either: those batches (one token tile, so
+// a tile is cut across several blocks that wait on each other) took the GPU
+// off the bus. A 27B Q6_K split over a 5060 Ti and a 5070 Ti (driver 621.01)
+// lost the 5070 Ti ("GPU is lost", a reboot to recover) once every few
+// processes, each a 16-token prompt and some 2048-token ones; with MMQ from
+// 32 tokens, or without stream-K, 12 processes in a row ran clean each, and
+// the build before MMQ came down to 9 tokens likewise. Those batches split K
+// instead (mmq_splits), as below 32 tokens before stream-K came in.
+static bool mmq_streamk_plan(const void* kernel, size_t smem, int tiles, int tok_tiles, int n_tokens,
                              size_t slot_floats, cudaStream_t stream, MmqStreamK& sk) {
-    if (mmq_streamk_disabled()) return false;
+    if (mmq_streamk_disabled() || n_tokens < MMQ_ALWAYS_TOKENS) return false;
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
         capture != cudaStreamCaptureStatusNone) {
@@ -1426,7 +1549,7 @@ static void launch_mmq_tc(const void* w, const void* xq, void* y, int k, int n_r
             const void* kernel = (const void*)matvec_mmq_async_kernel<TYPE, TC>;
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
             MmqStreamK sk = {};
-            if (mmq_streamk_plan(kernel, smem, tiles, tok_tiles, (size_t)MMQ_TR * TC, stream, sk)) {
+            if (mmq_streamk_plan(kernel, smem, tiles, tok_tiles, n_tokens, (size_t)MMQ_TR * TC, stream, sk)) {
                 matvec_mmq_async_kernel<TYPE, TC><<<sk.dp + sk.sk, 256, smem, stream>>>(
                     (const uint8_t*)w, nullptr, (const block_q8a*)xq, (float*)y, nullptr, k,
                     n_rows, n_tokens, (size_t)row_bytes, sk);
@@ -1514,7 +1637,7 @@ static void launch_mmq_glu_tc(const void* wg, const void* wu, const void* xq, vo
     // stream-K slots carry the raw gate and up sums, and the epilogue runs once
     // the head block has all of them.
     MmqStreamK sk = {};
-    const bool streamk = mmq_streamk_plan(kernel, smem, tok_tiles * row_tiles, tok_tiles,
+    const bool streamk = mmq_streamk_plan(kernel, smem, tok_tiles * row_tiles, tok_tiles, n_tokens,
                                           (size_t)MMQ_TR * TC, stream, sk);
     const dim3 grid = streamk ? dim3(sk.dp + sk.sk) : dim3(tok_tiles, row_tiles);
     matvec_mmq_async_kernel<TYPE, TC, true><<<grid, 256, smem, stream>>>(
@@ -1580,6 +1703,147 @@ extern "C" airun_status airun_matvec_q8_glu(
     }
     AIRUN_CHECK_LAUNCH();
 }
+// --- grouped MoE on the integer kernels ---------------------------------------
+// A MoE layer's experts as two grouped launches of matvec_mmq_async_kernel (see
+// MmqGroups): gate and up with the SwiGLU into h, then down into ypair, each
+// expert's weights read once for all its pairs. The fp16 grouped kernels in
+// moe.cu decoded every weight to float and read a 32-row tile's activations from
+// L2 again for each tile: on the 35B-A3B (Q5_K_M) their gate/up launch was 405,
+// 972 and 1580 us per layer at 16, 128 and 512 prompt tokens.
+
+// AIRUN_NO_MOE_MMQ=1 keeps the fp16 grouped kernels.
+static bool moe_mmq_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_MOE_MMQ");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Every expert of the tensor at `base`, `stride` bytes apart, is readable by
+// the asynchronous kernel.
+template <int TYPE>
+static bool moe_mmq_fits(const void* base, uint64_t stride, int k, int n_rows, uint64_t row_bytes) {
+    if constexpr (!mmq_async<TYPE>::OK) {
+        return false;
+    } else {
+        return base && stride % 16 == 0 && mmq_async_fits<TYPE>(base, base, k, n_rows, row_bytes);
+    }
+}
+
+template <int TYPE>
+static bool moe_mmq_type_fits(int32_t type_id, const void* base, uint64_t stride, int k, int n_rows,
+                              uint64_t row_bytes) {
+    return type_id == TYPE && moe_mmq_fits<TYPE>(base, stride, k, n_rows, row_bytes);
+}
+
+// The types the grouped launches are built for. NVFP4 is left out: its experts
+// would need their global scale applied per expert.
+#define AIRUN_FOR_EACH_MOE_MMQ_TYPE(X) \
+    X(AIRUN_TYPE_Q8_0)                 \
+    X(AIRUN_TYPE_Q4_K)                 \
+    X(AIRUN_TYPE_Q5_K)                 \
+    X(AIRUN_TYPE_Q6_K)
+
+static bool moe_mmq_ok(int32_t type_id, const void* base, uint64_t stride, int k, int n_rows, uint64_t row_bytes) {
+    switch (type_id) {
+#define MOE_FIT(TYPE) case TYPE: return moe_mmq_type_fits<TYPE>(type_id, base, stride, k, n_rows, row_bytes);
+        AIRUN_FOR_EACH_MOE_MMQ_TYPE(MOE_FIT)
+#undef MOE_FIT
+        default: return false;
+    }
+}
+
+template <int TYPE, int TC>
+static void launch_moe_mmq_glu(const void* gate_w, const void* up_w, const void* xq, void* h,
+                               const MmqGroups& g, int k, int ff, uint64_t row_bytes, int n_experts,
+                               cudaStream_t stream) {
+    constexpr size_t smem = mmq_async_smem<TYPE, TC>();
+    cudaFuncSetAttribute(matvec_mmq_async_kernel<TYPE, TC, true, true>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    const dim3 grid((ff + MMQ_TR / 2 - 1) / (MMQ_TR / 2), n_experts);
+    matvec_mmq_async_kernel<TYPE, TC, true, true><<<grid, 256, smem, stream>>>(
+        (const uint8_t*)gate_w, (const uint8_t*)up_w, (const block_q8a*)xq, (float*)h, nullptr, k, ff, 0,
+        (size_t)row_bytes, MmqStreamK{}, g);
+}
+
+template <int TYPE, int TC>
+static void launch_moe_mmq_down(const void* down_w, const void* hq, void* ypair, const MmqGroups& g, int ff,
+                                int n_embd, uint64_t row_bytes, int n_experts, cudaStream_t stream) {
+    constexpr size_t smem = mmq_async_smem<TYPE, TC>();
+    cudaFuncSetAttribute(matvec_mmq_async_kernel<TYPE, TC, false, true>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    const dim3 grid((n_embd + MMQ_TR - 1) / MMQ_TR, n_experts);
+    matvec_mmq_async_kernel<TYPE, TC, false, true><<<grid, 256, smem, stream>>>(
+        (const uint8_t*)down_w, nullptr, (const block_q8a*)hq, (float*)ypair, nullptr, ff, n_embd, 0,
+        (size_t)row_bytes, MmqStreamK{}, g);
+}
+
+extern "C" int32_t airun_moe_mmq_supported(int32_t gate_type, int32_t down_type, const void* gate_w,
+                                           const void* up_w, const void* down_w, uint64_t gate_stride,
+                                           uint64_t down_stride, uint64_t gate_row_bytes, uint64_t down_row_bytes,
+                                           int32_t k, int32_t ff) {
+    if (moe_mmq_disabled() || !airun_mmq_supported() || k % 32 != 0 || ff % 32 != 0) return 0;
+    return moe_mmq_ok(gate_type, gate_w, gate_stride, k, ff, gate_row_bytes) &&
+           moe_mmq_ok(gate_type, up_w, gate_stride, k, ff, gate_row_bytes) &&
+           moe_mmq_ok(down_type, down_w, down_stride, ff, k, down_row_bytes) ? 1 : 0;
+}
+
+// The routed experts of a batch, expert-major: x (n_tokens x k, f32) is
+// quantized into xq, gate and up of each pair go through the SwiGLU into h
+// (pairs x ff, f32, row = pair id), h is quantized into hq, and down writes
+// ypair (pairs x k, row = pair id). `perm` and `offsets` are moe_sort's.
+extern "C" airun_status airun_moe_mmq(
+    int32_t gate_type, int32_t down_type, const void* gate_w, const void* up_w, const void* down_w,
+    uint64_t gate_stride, uint64_t down_stride, uint64_t gate_row_bytes, uint64_t down_row_bytes,
+    const void* x, void* xq, const void* perm, const void* offsets, void* h, void* hq, void* ypair,
+    int32_t k, int32_t ff, int32_t n_tokens, int32_t top_k, int32_t n_experts, cudaStream_t stream) {
+    if (n_tokens <= 0) return AIRUN_OK;
+    if (!airun_moe_mmq_supported(gate_type, down_type, gate_w, up_w, down_w, gate_stride, down_stride,
+                                 gate_row_bytes, down_row_bytes, k, ff)) {
+        return AIRUN_ERR_BAD_TYPE;
+    }
+    const int64_t n_pairs = (int64_t)n_tokens * top_k;
+    const int threads = 256;
+    {
+        const int64_t groups = (int64_t)n_tokens * k / 32;
+        quantize_q8a_kernel<<<(unsigned)((groups * 32 + threads - 1) / threads), threads, 0, stream>>>(
+            (const float*)x, (block_q8a*)xq, groups);
+    }
+    // 64-token tiles once an expert averages that many pairs; below, 32.
+    const bool wide = n_pairs >= (int64_t)48 * n_experts;
+    const MmqGroups gu{(const int32_t*)offsets, (const int32_t*)perm, top_k, (size_t)gate_stride};
+    switch (gate_type) {
+#define MOE_GLU(TYPE) case TYPE:                                                                          \
+        if (wide) launch_moe_mmq_glu<TYPE, 64>(gate_w, up_w, xq, h, gu, k, ff, gate_row_bytes, \
+                                               n_experts, stream);                                         \
+        else launch_moe_mmq_glu<TYPE, 32>(gate_w, up_w, xq, h, gu, k, ff, gate_row_bytes,      \
+                                          n_experts, stream);                                              \
+        break;
+        AIRUN_FOR_EACH_MOE_MMQ_TYPE(MOE_GLU)
+#undef MOE_GLU
+        default: return AIRUN_ERR_BAD_TYPE;
+    }
+    {
+        const int64_t groups = n_pairs * ff / 32;
+        quantize_q8a_kernel<<<(unsigned)((groups * 32 + threads - 1) / threads), threads, 0, stream>>>(
+            (const float*)h, (block_q8a*)hq, groups);
+    }
+    const MmqGroups dn{(const int32_t*)offsets, (const int32_t*)perm, 1, (size_t)down_stride};
+    switch (down_type) {
+#define MOE_DOWN(TYPE) case TYPE:                                                                       \
+        if (wide) launch_moe_mmq_down<TYPE, 64>(down_w, hq, ypair, dn, ff, k, down_row_bytes, n_experts, \
+                                                stream);                                                \
+        else launch_moe_mmq_down<TYPE, 32>(down_w, hq, ypair, dn, ff, k, down_row_bytes, n_experts, stream); \
+        break;
+        AIRUN_FOR_EACH_MOE_MMQ_TYPE(MOE_DOWN)
+#undef MOE_DOWN
+        default: return AIRUN_ERR_BAD_TYPE;
+    }
+    AIRUN_CHECK_LAUNCH();
+}
+
 extern "C" {
 // cudaErrorInvalidValue, returned for a type this build has no kernel for;
 // defined above, where the gate/up entry point first needs it.
@@ -1612,7 +1876,21 @@ airun_status airun_matvec(
     const dim3 block(32, ROWS_PER_BLOCK);
     const int grid_rows = (n_rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
 
-    if ((n_tokens == 1 || (n_tokens <= TALLK_TOKENS && !tallk_tokens_disabled())) && n_rows < 512) {
+    if (type_id == AIRUN_TYPE_F32 && n_tokens > 1 && n_tokens <= 256 && n_rows > FEW_ROWS && n_rows < 512
+        && k % 128 == 0 && !few_rows_disabled()) {
+        const dim3 fgrid((n_rows + F32_ROWS_RB - 1) / F32_ROWS_RB, (n_tokens + F32_ROWS_TT - 1) / F32_ROWS_TT);
+        matvec_f32_rows_kernel<<<fgrid, 32 * F32_ROWS_RB, 0, stream>>>((const float*)w, (const float*)x,
+                                                                       (float*)y, k, n_rows, n_tokens);
+    } else if (n_tokens > 1 && n_rows <= FEW_ROWS && !few_rows_disabled()) {
+#define LAUNCH(TYPE)                                                                        \
+        matvec_few_rows_kernel<TYPE><<<(n_tokens + 3) / 4, 128, 0, stream>>>(               \
+            (const uint8_t*)w, (const float*)x, (float*)y, k, n_rows, n_tokens, (size_t)row_bytes);
+        switch (type_id) {
+            AIRUN_FOR_EACH_TYPE(AIRUN_CASE)
+            default: return AIRUN_ERR_BAD_TYPE;
+        }
+#undef LAUNCH
+    } else if ((n_tokens == 1 || (n_tokens <= TALLK_TOKENS && !tallk_tokens_disabled())) && n_rows < 512) {
         // Narrow decode matrices: one block per row (see matvec_tallk_kernel),
         // and per token. With 4 tokens the tiled kernel below ran 3 blocks:
         // 55us for a 48-row delta-net gate, against 5us for one token.

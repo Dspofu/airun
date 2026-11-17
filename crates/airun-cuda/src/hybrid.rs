@@ -188,6 +188,14 @@ unsafe extern "C" {
         n_tokens: i32, top_k: i32, n_experts: i32, gate_row_bytes: u64, down_row_bytes: u64,
         gate_res: *const c_void, down_res: *const c_void, xh: *mut c_void, side: ffi::Stream, ev_fork: *mut c_void,
         ev_join: *mut c_void, phase: i32, stream: ffi::Stream) -> Status;
+    fn airun_moe_mmq_supported(gate_type: i32, down_type: i32, gate_w: *const c_void, up_w: *const c_void,
+        down_w: *const c_void, gate_stride: u64, down_stride: u64, gate_row_bytes: u64, down_row_bytes: u64,
+        k: i32, ff: i32) -> i32;
+    fn airun_moe_mmq(gate_type: i32, down_type: i32, gate_w: *const c_void, up_w: *const c_void,
+        down_w: *const c_void, gate_stride: u64, down_stride: u64, gate_row_bytes: u64, down_row_bytes: u64,
+        x: *const c_void, xq: *mut c_void, perm: *const c_void, offsets: *const c_void, h: *mut c_void,
+        hq: *mut c_void, ypair: *mut c_void, k: i32, ff: i32, n_tokens: i32, top_k: i32, n_experts: i32,
+        stream: ffi::Stream) -> Status;
 
     fn airun_sigmoid_scale_rows(
         x: *mut c_void,
@@ -941,6 +949,55 @@ pub fn moe_grouped_phase(gate: ExpertWeights, up: ExpertWeights, down: ExpertWei
     }
     #[cfg(not(airun_cuda))]
     needs_cuda!(gate.ty, x, perm, offsets, weights, h, ypair, y, k, ff, n_tokens, top_k, n_experts, phase, stream)
+}
+
+/// Whether [`moe_mmq`] takes these experts: in VRAM at `base` + e * `stride`
+/// (no address tables), of a type the grouped integer kernels are built for,
+/// aligned for their asynchronous copies. AIRUN_NO_MOE_MMQ=1 says no.
+pub fn moe_mmq_supported(gate: &ExpertWeights, up: &ExpertWeights, down: &ExpertWeights, k: usize, ff: usize)
+    -> bool {
+    if !gate.tab.is_null() || !up.tab.is_null() || !down.tab.is_null() || gate.ty != up.ty
+        || gate.row_bytes != up.row_bytes || gate.stride != up.stride {
+        return false;
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: inspects the arguments and the device's capability; touches no memory.
+    unsafe {
+        airun_moe_mmq_supported(gate.ty.0, down.ty.0, gate.base, up.base, down.base, gate.stride as u64,
+            down.stride as u64, gate.row_bytes as u64, down.row_bytes as u64, k as i32, ff as i32) != 0
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = (down, k, ff);
+        false
+    }
+}
+
+/// Bytes of the two activation buffers [`moe_mmq`] quantizes into, per token
+/// of the batch: `xq` (the layer input) and `hq` (the pairs' SwiGLU outputs).
+pub fn moe_mmq_scratch_bytes(k: usize, ff: usize, top_k: usize) -> (usize, usize) {
+    (k / 32 * 36, top_k * ff / 32 * 36)
+}
+
+/// The routed experts of a batch on the integer tensor-core kernels: `x`
+/// (n_tokens x k, f32) is quantized into `xq`, each pair's gate and up go
+/// through the SwiGLU into `h` (pairs x ff), which is quantized into `hq`, and
+/// down writes `ypair` (pairs x k) -- rows indexed by pair id, as
+/// [`moe_grouped`] leaves them for its combine. `perm` and `offsets` are
+/// [`moe_sort`]'s; `xq` and `hq` hold [`moe_mmq_scratch_bytes`] per token.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_mmq(gate: &ExpertWeights, up: &ExpertWeights, down: &ExpertWeights, x: *const c_void, xq: *mut c_void,
+    perm: *const c_void, offsets: *const c_void, h: *mut c_void, hq: *mut c_void, ypair: *mut c_void, k: usize,
+    ff: usize, n_tokens: usize, top_k: usize, n_experts: usize, stream: &Stream) -> Result<()> {
+    #[cfg(airun_cuda)]
+    // SAFETY: sizes as documented; base + e * stride is one expert of each tensor.
+    unsafe {
+        ffi::check(airun_moe_mmq(gate.ty.0, down.ty.0, gate.base, up.base, down.base, gate.stride as u64,
+            down.stride as u64, gate.row_bytes as u64, down.row_bytes as u64, x, xq, perm, offsets, h, hq, ypair,
+            k as i32, ff as i32, n_tokens as i32, top_k as i32, n_experts as i32, stream.raw()))
+    }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(gate.ty, up.ty, down.ty, x, xq, perm, offsets, h, hq, ypair, k, ff, n_tokens, top_k, n_experts, stream)
 }
 
 /// `counts[ids[i]] += 1` for the `n` routed ids (u32 counts).

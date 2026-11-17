@@ -395,10 +395,13 @@ __device__ __forceinline__ void mmq_stage_xds(const int8_t (*xs)[MMQ_XLD], MmqSc
     }
 }
 
+// `tok_map`, when given, is the output row of each of the tile's tokens (a
+// grouped MoE tile writes its tokens' rows where their (token, expert) pairs
+// sit); without it token t writes row t.
 template <int TC>
 __device__ __forceinline__ void mmq_store(float* y, float acc[MMQ_MT][TC / 32][4], int row0,
                                           int tok0, int wr, int wc, int lane, int n_rows,
-                                          int n_tokens) {
+                                          int n_tokens, const int32_t* tok_map = nullptr) {
     const int gid = lane >> 2;
     const int tig = lane & 3;
 #pragma unroll
@@ -411,7 +414,10 @@ __device__ __forceinline__ void mmq_store(float* y, float acc[MMQ_MT][TC / 32][4
             for (int e = 0; e < 4; ++e) {
                 const int row = r + (e >= 2 ? 8 : 0);
                 const int tok = t + (e & 1);
-                if (row < n_rows && tok < n_tokens) y[(size_t)tok * n_rows + row] = acc[mt][nt][e];
+                if (row < n_rows && tok < n_tokens) {
+                    const size_t out = tok_map ? (size_t)tok_map[tok] : (size_t)tok;
+                    y[out * n_rows + row] = acc[mt][nt][e];
+                }
             }
         }
     }
@@ -575,10 +581,22 @@ template <> struct mmq_async<AIRUN_TYPE_NVFP4> {
     __device__ static __forceinline__ int skew(int g0) { return (g0 / 2 * 36) & 15; }
 };
 
+// Weight copy buffers: two, except for a BLOCK2 type at 128-token tiles, where
+// two superblock copies do not fit beside the activations. Below that a BLOCK2
+// type alternates two superblock buffers (mmq_async_sb2).
+template <int TYPE, int TC>
+__host__ __device__ constexpr int mmq_async_wstages() {
+    return (mmq_async<TYPE>::BLOCK2 && TC > 64) ? 1 : 2;
+}
+template <int TYPE, int TC>
+__host__ __device__ constexpr bool mmq_async_sb2() {
+    return mmq_async<TYPE>::BLOCK2 && mmq_async_wstages<TYPE, TC>() == 2;
+}
+
 template <int TYPE, int TC>
 constexpr size_t mmq_async_smem() {
     return (size_t)MMQ_TR * MMQ_LDW + sizeof(MmqScales<TC>)
-         + (mmq_async<TYPE>::BLOCK2 ? 1 : 2) * (size_t)MMQ_TR * mmq_async<TYPE>::STRIDE
+         + mmq_async_wstages<TYPE, TC>() * (size_t)MMQ_TR * mmq_async<TYPE>::STRIDE
          + 2 * (size_t)TC * MMQ_XLD;
 }
 
@@ -619,30 +637,75 @@ struct MmqStreamK {
     unsigned* flags;    // [sk]
 };
 
+// GROUPED: the experts of a MoE layer in one launch, expert-major. Block
+// (x, y) takes row tile x of expert y and every (token, expert) pair routed to
+// it, TC at a time: pairs offsets[y]..offsets[y + 1] of `perm`, which lists
+// pair ids in expert order. A pair reads the activation row perm[pos] / x_div
+// (its token, for gate and up; the pair itself, for down) and its output goes
+// to row perm[pos] of y, where the per-pair results are combined. Each expert's
+// weights are read once for all its tokens, decoded to integer codes as the
+// dense kernel does; the fp16 grouped kernels (moe.cu) decoded every weight to
+// float and read each 32-row tile's activations from L2 again.
+struct MmqGroups {
+    const int32_t* offsets;   // [n_experts + 1]
+    const int32_t* perm;      // [pairs] pair ids, expert-major
+    int x_div;                // activation row of a pair: perm[pos] / x_div
+    size_t expert_stride;     // bytes from one expert's matrix to the next
+};
+
 // GLU: the tile's rows 0..63 are rows of w (a gate projection) and rows
 // 64..127 the same rows of w2 (up); the block writes silu(gate) * up for its 64
 // rows, the SwiGLU the FFN applies next. Gate and up read the same activations,
 // and this skips writing both products out and reading them back in a separate
 // swiglu pass (6.7 ms of a 512-token Qwen3-4B prefill).
-template <int TYPE, int TC, bool GLU = false>
+template <int TYPE, int TC, bool GLU = false, bool GROUPED = false>
 __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
-    const uint8_t* __restrict__ w,
-    const uint8_t* __restrict__ w2,
+    const uint8_t* __restrict__ w_arg,
+    const uint8_t* __restrict__ w2_arg,
     const block_q8a* __restrict__ xq,
     float* __restrict__ y,
     float* __restrict__ partial,
     const int K,
     const int n_rows,
-    const int n_tokens,
+    const int n_tokens_arg,
     const size_t row_bytes,
-    const MmqStreamK sk) {
+    const MmqStreamK sk,
+    const MmqGroups grp = MmqGroups{}) {
 
     using D = mmq_decode<TYPE>;
     using A = mmq_async<TYPE>;
+    // A grouped block's expert: its weights, and its run of pairs.
+    const uint8_t* w = w_arg;
+    const uint8_t* w2 = w2_arg;
+    int n_tokens = n_tokens_arg;
+    int p0 = 0;
+    if constexpr (GROUPED) {
+        const int e = blockIdx.y;
+        p0 = grp.offsets[e];
+        n_tokens = grp.offsets[e + 1] - p0;
+        if (n_tokens <= 0) return;
+        w = w_arg + (size_t)e * grp.expert_stride;
+        if constexpr (GLU) w2 = w2_arg + (size_t)e * grp.expert_stride;
+    }
+    // Where token `tok` of the launch (or of the block's expert) reads its
+    // activations.
+    auto x_row = [&](int tok) -> const block_q8a* {
+        if constexpr (GROUPED) {
+            return xq + (size_t)(grp.perm[p0 + tok] / grp.x_div) * (K / 32);
+        } else {
+            return xq + (size_t)tok * (K / 32);
+        }
+    };
     extern __shared__ __align__(16) unsigned char mmq_smem[];
     int8_t* ws = (int8_t*)mmq_smem;
     MmqScales<TC>& S = *(MmqScales<TC>*)(mmq_smem + MMQ_TR * MMQ_LDW);
-    constexpr int WSTAGES = A::BLOCK2 ? 1 : 2;
+    constexpr int WSTAGES = mmq_async_wstages<TYPE, TC>();
+    // BLOCK2 with two buffers: superblock s sits in buffer s & 1, and s + 1 is
+    // asked for as the first chunk of s starts, so it streams in during both of
+    // s's chunks. With one buffer it was asked for only once s's second chunk
+    // was decoded, and at small batches -- little MMA work per chunk -- the
+    // block then waited out the whole copy every superblock.
+    constexpr bool SB2 = mmq_async_sb2<TYPE, TC>();
     unsigned char* wraw = mmq_smem + MMQ_TR * MMQ_LDW + sizeof(MmqScales<TC>);   // [WSTAGES][TR][STRIDE]
     unsigned char* xraw = wraw + WSTAGES * MMQ_TR * A::STRIDE;                    // [2][TC][XLD]
 
@@ -698,7 +761,7 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
             const int task = tid + i * 256;
             const int t = task / XP, k = task % XP;
             const bool ok = task < TC * XP && t < toks_valid;
-            xsrc_t[i] = ok ? (const unsigned char*)(xq + (size_t)(tok0 + t) * n_groups) + k * 16 : nullptr;
+            xsrc_t[i] = ok ? (const unsigned char*)x_row(tok0 + t) + k * 16 : nullptr;
             xdst_t[i] = t * MMQ_XLD + k * 16;
         }
         auto commit = [&]() {
@@ -740,13 +803,23 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
         }
 #pragma unroll
         for (int e = 0; e < E; ++e) a[e] = 0.0f;
-        issue_w(g_begin, 0);
+        issue_w(g_begin, SB2 ? (g_begin / 8) & 1 : 0);
         issue_x(g_begin, 0);
         commit();
         int stage = 0;
+        // SB2: the previous chunk committed a superblock copy after its
+        // activations', so this chunk may leave that newest group pending.
+        bool w_last = false;
         for (int g0 = g_begin; g0 < g_end; g0 += MMQ_KG, stage ^= 1) {
+            // SB2: the first chunk a block takes of a superblock needs that
+            // superblock's copy; its second chunk only its own activations.
+            const bool sb_first = (g0 % 8 == 0) || g0 == g_begin;
 #if __CUDA_ARCH__ >= 800
-            asm volatile("cp.async.wait_group 0;\n" ::);
+            if (SB2 && !sb_first && w_last) {
+                asm volatile("cp.async.wait_group 1;\n" ::);
+            } else {
+                asm volatile("cp.async.wait_group 0;\n" ::);
+            }
 #endif
             // After this barrier every warp has finished the previous chunk's MMAs,
             // so the other stage is free: the next copy goes out here and needs no
@@ -754,16 +827,28 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
             // chunk; ncu put ~10% of the samples on the waits after them).
             __syncthreads();
             const bool more = g0 + MMQ_KG < g_end;
-            // BLOCK2: one copy of a superblock serves both of its chunks, and
-            // there is a single weight buffer -- the copies of two would not
-            // leave room for a 128-token tile. The next superblock is asked
-            // for below, once this one's second chunk is decoded.
+            // BLOCK2: one copy of a superblock serves both of its chunks. With
+            // a single weight buffer -- the copies of two would not leave room
+            // for a 128-token tile -- the next superblock is asked for below,
+            // once this one's second chunk is decoded.
             if (more) {
                 if constexpr (!A::BLOCK2) issue_w(g0 + MMQ_KG, stage ^ 1);
                 issue_x(g0 + MMQ_KG, stage ^ 1);
                 commit();
             }
-            const unsigned char* wsrc = wraw + (A::BLOCK2 ? 0 : (size_t)stage * MMQ_TR * A::STRIDE);
+            if constexpr (SB2) {
+                // The other buffer last held superblock s - 1, whose chunks
+                // every warp finished before the barrier above.
+                w_last = false;
+                const int next = (g0 / 8 + 1) * 8;
+                if (sb_first && next < g_end) {
+                    issue_w(next, (next / 8) & 1);
+                    commit();
+                    w_last = true;
+                }
+            }
+            const unsigned char* wsrc = wraw + (SB2 ? (size_t)((g0 / 8) & 1) * MMQ_TR * A::STRIDE
+                                                    : A::BLOCK2 ? 0 : (size_t)stage * MMQ_TR * A::STRIDE);
             const int skew = A::skew(g0);
             // ROW_SKEW: the block sits in its row's copy as far past the
             // start as it sat past the 16-byte boundary (low 4 bits of its
@@ -783,7 +868,7 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
             mmq_decode_tile<D, TC>(ws, S, src, g0, A::base_group(g0), rows_valid, MMQ_KG, tid, GLU);
             mmq_stage_xds<TC>(xs, S, tid);
             __syncthreads();
-            if constexpr (A::BLOCK2) {
+            if constexpr (A::BLOCK2 && !SB2) {
                 // Every thread is done reading the weight buffer: the next
                 // superblock streams in while this chunk's MMAs run.
                 if (more && ((g0 / MMQ_KG) & 1)) {
@@ -791,7 +876,10 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
                     commit();
                 }
             }
-            mmq_chunk<TC, D::SPLIT, D::HAS_MIN>(ws, S, xs, acc, wr, wc, lane);
+            // A warp whose token columns lie past the batch has nothing to
+            // multiply: its accumulators stay zero and are never stored. A
+            // 16-token batch keeps two of the eight warps on the tensor cores.
+            if (wc < toks_valid) mmq_chunk<TC, D::SPLIT, D::HAS_MIN>(ws, S, xs, acc, wr, wc, lane);
         }
     };
 
@@ -818,12 +906,24 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
                     const float g = a[e];
                     a[e] = (g / (1.0f + __expf(-g))) * ex[e * 32 + lane];   // as swiglu_kernel
                 }
-                mmq_store<TC>(out, acc, row0, tok0, 0, wc, lane, n_rows, n_tokens);
+                mmq_store<TC>(out, acc, row0, tok0, 0, wc, lane, n_rows, n_tokens,
+                              GROUPED ? grp.perm + p0 : nullptr);
             }
         } else {
-            mmq_store<TC>(out, acc, row0, tok0, wr, wc, lane, n_rows, n_tokens);
+            mmq_store<TC>(out, acc, row0, tok0, wr, wc, lane, n_rows, n_tokens,
+                          GROUPED ? grp.perm + p0 : nullptr);
         }
     };
+
+    if constexpr (GROUPED) {
+        // Row tile blockIdx.x of the expert, its pairs TC at a time, whole K.
+        const int row0 = blockIdx.x * ROWS;
+        for (int tok0 = 0; tok0 < n_tokens; tok0 += TC) {
+            run(row0, tok0, 0, n_groups);
+            finish(y, row0, tok0);
+        }
+        return;
+    }
 
     if (sk.tiles == 0) {
         // Tokens fastest: see matvec_mmq_kernel.

@@ -619,6 +619,9 @@ __global__ void moe_sort_count_kernel(const int32_t* __restrict__ ids, int32_t* 
     if (i < n) atomicAdd(counts + ids[i], 1);
 }
 
+// Experts up to which the sort runs as one block (moe_sort_one_kernel).
+#define MOE_SCAN_MAX 1024
+// More experts than that: one thread walks the counts.
 __global__ void moe_sort_scan_kernel(int32_t* __restrict__ counts, int32_t* __restrict__ offsets, const int n_experts) {
     if (threadIdx.x == 0) {
         int acc = 0;
@@ -635,6 +638,41 @@ __global__ void moe_sort_scatter_kernel(const int32_t* __restrict__ ids, int32_t
                                         int32_t* __restrict__ perm, const int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) perm[atomicAdd(cursor + ids[i], 1)] = i;
+}
+
+// The whole sort in one block of MOE_SCAN_MAX threads, for up to that many
+// experts: counts, their scan (log-step, a thread per expert) and the scatter
+// in shared memory. The three kernels and the memset above were four launches
+// a layer -- 160 of a 16-token prompt's ~1600 on the 35B-A3B -- and one thread
+// walking 256 counts in global memory took 33 us of them. A pair's place within its expert's
+// run follows the atomics' order, as in the scatter kernel; every pair is
+// computed on its own and written to its own row, so the order changes nothing.
+__global__ __launch_bounds__(MOE_SCAN_MAX) void moe_sort_one_kernel(
+    const int32_t* __restrict__ ids, int32_t* __restrict__ offsets, int32_t* __restrict__ perm,
+    const int n, const int n_experts) {
+    __shared__ int32_t buf[2][MOE_SCAN_MAX];
+    __shared__ int32_t cursor[MOE_SCAN_MAX];
+    const int t = threadIdx.x;
+    if (t < n_experts) cursor[t] = 0;
+    __syncthreads();
+    for (int i = t; i < n; i += MOE_SCAN_MAX) atomicAdd(&cursor[ids[i]], 1);
+    __syncthreads();
+    int cur = 0;
+    if (t < n_experts) buf[0][t] = cursor[t];
+    __syncthreads();
+    for (int d = 1; d < n_experts; d <<= 1) {
+        if (t < n_experts) buf[cur ^ 1][t] = buf[cur][t] + (t >= d ? buf[cur][t - d] : 0);
+        __syncthreads();
+        cur ^= 1;
+    }
+    if (t < n_experts) {
+        const int before = t ? buf[cur][t - 1] : 0;
+        offsets[t] = before;
+        cursor[t] = before;
+        if (t == n_experts - 1) offsets[n_experts] = buf[cur][t];
+    }
+    __syncthreads();
+    for (int i = t; i < n; i += MOE_SCAN_MAX) perm[atomicAdd(&cursor[ids[i]], 1)] = i;
 }
 
 // h[pair][row] for every pair routed to expert blockIdx.y.
@@ -797,7 +835,19 @@ __global__ void moe_combine_kernel(const float* __restrict__ ypair, const float*
 #define MMA_LD (MMA_KC + 8) // halves per staged row: conflict-free fragment loads
 #define MMA_GU_ROWS 16     // gate rows (and up rows) per gate/up block
 #define MMA_DN_ROWS 32     // down rows per block
-#define MMA_MIN_TOKENS 64  // smaller batches stay on the f32 grouped kernels
+// Smaller batches stay on the f32 grouped kernels (AIRUN_MOE_MMA_MIN moves
+// it). It was 64, and the batches from 16 (where the grouped path starts) to
+// 63 took longer than one of 64: Qwen3.8-35B-A3B Q5_K_M, 16/32/48 prompt
+// tokens at 217/319/374 tok/s on the f32 kernels, 397/719/964 on these.
+static int moe_mma_min_tokens() {
+    static const int v = [] {
+        const char* e = getenv("AIRUN_MOE_MMA_MIN");
+        const int n = e ? atoi(e) : 0;
+        return n > 0 ? n : 16;
+    }();
+    return v;
+}
+#define MMA_MIN_TOKENS moe_mma_min_tokens()
 
 __device__ __forceinline__ void moe_mma16816(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
 #if __CUDA_ARCH__ >= 800
@@ -1252,6 +1302,11 @@ airun_status airun_moe_stage_copy(const void* tab, const void* list, const void*
 airun_status airun_moe_sort(const void* ids, int32_t n, int32_t n_experts, void* scratch, void* offsets, void* perm,
                             cudaStream_t stream) {
     if (n <= 0) return AIRUN_OK;
+    if (n_experts <= MOE_SCAN_MAX) {
+        moe_sort_one_kernel<<<1, MOE_SCAN_MAX, 0, stream>>>((const int32_t*)ids, (int32_t*)offsets, (int32_t*)perm,
+                                                            n, n_experts);
+        AIRUN_CHECK_LAUNCH();
+    }
     cudaMemsetAsync(scratch, 0, (size_t)n_experts * sizeof(int32_t), stream);
     moe_sort_count_kernel<<<(n + 255) / 256, 256, 0, stream>>>((const int32_t*)ids, (int32_t*)scratch, n);
     moe_sort_scan_kernel<<<1, 32, 0, stream>>>((int32_t*)scratch, (int32_t*)offsets, n_experts);
@@ -1276,8 +1331,8 @@ airun_status airun_moe_grouped(
     // experts, 4 combines the pairs into y; 8 says every expert with pairs
     // is in VRAM, so the staged pass is skipped. 7 is the whole thing.
     const bool do_prep = phase & 1, do_experts = phase & 2, do_combine = phase & 4, all_direct = phase & 8;
-    // Below MMA_MIN_TOKENS the f32 kernels are cheap enough and keep a short
-    // prompt's numbers those of the reference; fp16 can tip a near tie.
+    // Below MMA_MIN_TOKENS the f32 kernels keep a short prompt's numbers
+    // those of the reference; fp16 can tip a near tie.
     if (n_tokens >= MMA_MIN_TOKENS && xh && moe_mma_usable(k, ff)) {
         // Experts in VRAM decode straight from it: staging their rows only
         // cost shared memory, and with it occupancy (20 ms against 6 per
