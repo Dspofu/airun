@@ -158,15 +158,31 @@ suit it.
 
 ## Results
 
-Each measurement has a script, raw output and a report in
-[`benchmarks/`](benchmarks/). The GPUs in these tests **have no P2P**: what
+The GPUs in these tests **have no P2P**: what
 moves from one card to the other goes through RAM. Numbers in tokens per
 second.
+
+### Against llama.cpp b12433 (RTX 5070 Ti + RTX 5060 Ti, 2026-11-17)
+
+Real text through each server, a ~3980-token prompt then 400 tokens, two
+alternated rounds
+(2026-11-17):
+
+| Model | Prompt | | Generation | | Generation with MTP | |
+|---|---:|---:|---:|---:|---:|---:|
+| | airun | llama.cpp | airun | llama.cpp | airun | llama.cpp |
+| Qwen3.8-27B Q6_K | **1955** | 1323 | **26.3** | 22.0 | **66.2** | 47.3 |
+| Qwen3.8-27B NVFP4 | **3464** | 2612 | **46.0** | 29.4 | **92** | 52-62 |
+| Qwen3.8-35B-A3B Q5_K_M | **6877** | 4729 | **149.7** | 119.6 | **185** | 134 |
+| Qwen4 Flash-Next 78 GB, `--disk-offload` | **42** | 19 | **24.3** | 15 | — | — |
+
+`llama-bench`'s 16-token pass is the one test llama.cpp still wins (by about a
+third); from 128 tokens airun is level or ahead on all three.
 
 ### Qwen3.8-27B NVFP4, one GPU (RTX 5070 Ti)
 
 Best of 3 alternated rounds
-([`benchmarks/2026-11-01`](benchmarks/2026-11-01/RESULTS.md)):
+(2026-11-01):
 
 | Test | airun | llama.cpp b11760 | |
 |---|---:|---:|---:|
@@ -179,7 +195,7 @@ Best of 3 alternated rounds
 
 Qwen3.8-27B NVFP4, `serve --kv-type q4_0 -c 131072`, prompts of real source
 code, 200 tokens generated, one run per point
-([`benchmarks/2026-11-12`](benchmarks/2026-11-12/RESULTS.md)). The x axis is
+(2026-11-12). The x axis is
 the prompt size in thousands of tokens.
 
 ```mermaid
@@ -253,7 +269,7 @@ With a short prompt generation reaches 73-75 tok/s.
 ### Qwen4 Flash-Next (78 GB MoE, larger than both GPUs combined)
 
 792-token prompt, prompt / generation
-([`benchmarks/2026-11-01d`](benchmarks/2026-11-01d/RESULTS.md)):
+(2026-11-01d):
 
 | | airun | Strata 0.1.55 | llama.cpp |
 |---|---:|---:|---:|
@@ -396,7 +412,6 @@ crates/
   airun-core/   tokenizer, VRAM planner, runtime, sampling, grammars, MTP, vision
   airun-cli/    the binary: run, serve, bench, perplexity, convert...
 tests/          API conformance against llama-server
-benchmarks/     every published measurement, with script and raw output
 docs/           option reference
 ```
 

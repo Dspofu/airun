@@ -11,3 +11,7 @@ Thumbs.db
 desktop.ini
 # A second, CUDA-free build directory used for quick type checks.
 /target-check
+
+# Measurement scripts and raw output: kept locally, not published (the
+# README carries the results).
+/benchmarks
