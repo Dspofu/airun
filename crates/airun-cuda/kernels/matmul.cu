@@ -1255,6 +1255,117 @@ __global__ __launch_bounds__(128) void matvec_half_kernel(
     }
 }
 
+// matvec_tallk_kernel for BF16/F16 with matvec_half_kernel's loads: a block
+// per row and token, each lane 8 weights (16 bytes) a step, so a warp reads
+// 512 contiguous bytes and a lane holds 8 floats instead of a 32-value group.
+// Qwen4 Flash-Next's hyper-connection down projections (320 rows of 10240
+// BF16, two a layer) ran at ~190 GB/s of an RTX 3060's ~360 on the group
+// kernel, which also fit fewer blocks per SM.
+template <int TYPE>
+__global__ __launch_bounds__(128) void matvec_half_tallk_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const size_t row_bytes) {
+
+    const int row = blockIdx.x;
+    if (row >= n_rows) return;
+    x += (size_t)blockIdx.y * K;
+    y += (size_t)blockIdx.y * n_rows;
+    const uint8_t* wr = w + (size_t)row * row_bytes;
+
+    float acc = 0.0f;
+    for (int k0 = threadIdx.x * 8; k0 < K; k0 += 128 * 8) {
+        const uint4 q = *(const uint4*)(wr + (size_t)k0 * 2);
+        const float4 a = *(const float4*)(x + k0);
+        const float4 b = *(const float4*)(x + k0 + 4);
+        const float xv[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
+        const uint32_t u[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float lo, hi;
+            if constexpr (TYPE == AIRUN_TYPE_BF16) {
+                lo = bf16_to_f32((uint16_t)(u[j] & 0xFFFF));
+                hi = bf16_to_f32((uint16_t)(u[j] >> 16));
+            } else {
+                lo = __half2float(__ushort_as_half((unsigned short)(u[j] & 0xFFFF)));
+                hi = __half2float(__ushort_as_half((unsigned short)(u[j] >> 16)));
+            }
+            acc = fmaf(lo, xv[2 * j], acc);
+            acc = fmaf(hi, xv[2 * j + 1], acc);
+        }
+    }
+
+    __shared__ float red[4];
+    acc = block_reduce_sum(acc, red);
+    if (threadIdx.x == 0) {
+        y[row] = acc;
+    }
+}
+
+// BF16/F16 rows too short for a warp each, against one token: eight lanes per
+// row, each over a fixed K/8 slice of x it keeps in registers for every row
+// its group takes. Qwen4 Flash-Next's hyper-connection up projections (10240
+// rows of 320, two a layer) left 22 of 32 lanes idle on the group kernel
+// (10 groups a row) and ran at ~234 GB/s of an RTX 3060's ~360.
+#define SHORTK_MAX 512
+#define SHORTK_ROWS 4    // rows each 8-lane group takes
+template <int TYPE>
+__global__ __launch_bounds__(128) void matvec_half_shortk_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const size_t row_bytes) {
+
+    const int lane8 = threadIdx.x & 7;
+    const int group = (blockIdx.x * blockDim.x + threadIdx.x) >> 3;
+    const int slice = K >> 3;                // elements a lane covers, a multiple of 8
+    const int k0 = lane8 * slice;
+    float xv[SHORTK_MAX / 8];
+#pragma unroll
+    for (int i = 0; i < SHORTK_MAX / 8; i += 4) {
+        if (i < slice) {
+            const float4 v = *(const float4*)(x + k0 + i);
+            xv[i] = v.x; xv[i + 1] = v.y; xv[i + 2] = v.z; xv[i + 3] = v.w;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < SHORTK_ROWS; ++r) {
+        const int row = group * SHORTK_ROWS + r;
+        float acc = 0.0f;
+        if (row < n_rows) {
+            const uint8_t* wr = w + (size_t)row * row_bytes + (size_t)k0 * 2;
+#pragma unroll
+            for (int i = 0; i < SHORTK_MAX / 8; i += 8) {
+                if (i < slice) {
+                    const uint4 q = *(const uint4*)(wr + (size_t)i * 2);
+                    const uint32_t u[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        float lo, hi;
+                        if constexpr (TYPE == AIRUN_TYPE_BF16) {
+                            lo = bf16_to_f32((uint16_t)(u[j] & 0xFFFF));
+                            hi = bf16_to_f32((uint16_t)(u[j] >> 16));
+                        } else {
+                            lo = __half2float(__ushort_as_half((unsigned short)(u[j] & 0xFFFF)));
+                            hi = __half2float(__ushort_as_half((unsigned short)(u[j] >> 16)));
+                        }
+                        acc = fmaf(lo, xv[i + 2 * j], acc);
+                        acc = fmaf(hi, xv[i + 2 * j + 1], acc);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane8 == 0 && row < n_rows) y[row] = acc;
+    }
+}
+
 // AIRUN_NO_TALLK_TOKENS=1 sends narrow matrices with 2+ tokens back to the
 // tiled kernel.
 static bool tallk_tokens_disabled() {
@@ -1896,6 +2007,17 @@ airun_status airun_matvec(
         // 55us for a 48-row delta-net gate, against 5us for one token.
         const dim3 tgrid(n_rows, n_tokens);
         const dim3 tblock(128);
+        if ((type_id == AIRUN_TYPE_BF16 || type_id == AIRUN_TYPE_F16) && k % 8 == 0 && row_bytes % 16 == 0
+            && ((uintptr_t)w & 15) == 0 && ((uintptr_t)x & 15) == 0 && !half_matvec_disabled()) {
+            if (type_id == AIRUN_TYPE_BF16) {
+                matvec_half_tallk_kernel<AIRUN_TYPE_BF16><<<tgrid, tblock, 0, stream>>>(
+                    (const uint8_t*)w, (const float*)x, (float*)y, k, n_rows, (size_t)row_bytes);
+            } else {
+                matvec_half_tallk_kernel<AIRUN_TYPE_F16><<<tgrid, tblock, 0, stream>>>(
+                    (const uint8_t*)w, (const float*)x, (float*)y, k, n_rows, (size_t)row_bytes);
+            }
+            AIRUN_CHECK_LAUNCH();
+        }
 
 #define LAUNCH(TYPE)                                                           matvec_tallk_kernel<TYPE><<<tgrid, tblock, 0, stream>>>(                       (const uint8_t*)w, (const float*)x, (float*)y,                             k, n_rows, (size_t)row_bytes);
 
@@ -1904,6 +2026,17 @@ airun_status airun_matvec(
             default: return AIRUN_ERR_BAD_TYPE;
         }
 #undef LAUNCH
+    } else if ((type_id == AIRUN_TYPE_BF16 || type_id == AIRUN_TYPE_F16) && n_tokens == 1 && k % 64 == 0
+               && k <= SHORTK_MAX && k % 256 != 0 && row_bytes % 16 == 0 && ((uintptr_t)w & 15) == 0
+               && ((uintptr_t)x & 15) == 0 && !half_matvec_disabled()) {
+        const int blocks = (n_rows + 128 / 8 * SHORTK_ROWS - 1) / (128 / 8 * SHORTK_ROWS);
+        if (type_id == AIRUN_TYPE_BF16) {
+            matvec_half_shortk_kernel<AIRUN_TYPE_BF16><<<blocks, 128, 0, stream>>>(
+                (const uint8_t*)w, (const float*)x, (float*)y, k, n_rows, (size_t)row_bytes);
+        } else {
+            matvec_half_shortk_kernel<AIRUN_TYPE_F16><<<blocks, 128, 0, stream>>>(
+                (const uint8_t*)w, (const float*)x, (float*)y, k, n_rows, (size_t)row_bytes);
+        }
     } else if ((type_id == AIRUN_TYPE_BF16 || type_id == AIRUN_TYPE_F16) && n_tokens <= 8
                && k % 256 == 0 && !half_matvec_disabled()) {
         const dim3 hblock(32, 4);

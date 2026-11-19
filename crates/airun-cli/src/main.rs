@@ -107,6 +107,9 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Windows throttles a console process in the background within seconds
+    // (see airun_core::cpu::keep_full_speed); every command here is one.
+    airun_core::cpu::keep_full_speed();
     hide::apply(&cli.hide_gpu)?;
     match cli.command {
         Command::Run(args) => run::run(args),

@@ -1,4 +1,4 @@
-﻿//! `airun selftest` -- check every GPU kernel against the CPU reference.
+//! `airun selftest` -- check every GPU kernel against the CPU reference.
 //!
 //! The CPU decoders in airun-gguf are the oracle. A quantization layout that is
 //! subtly wrong produces text that looks almost right, which is far worse than a
@@ -168,6 +168,7 @@ pub fn run(args: SelftestArgs) -> Result<()> {
     println!("\n== mixture of experts ==");
     test_moe_router(args.device, &stream, &mut report)?;
     test_moe_ffn(args.device, &stream, &mut report)?;
+    test_moe_decode_types(args.device, &stream, &mut report)?;
 
     println!(
         "\n{} passed, {} failed",
@@ -1380,11 +1381,17 @@ fn test_delta_defer(device: i32, stream: &Stream, report: &mut Report) -> Result
 
 /// matvec with 1..8 tokens, as a --parallel step or an MTP verify feeds it:
 /// BF16/F16 matrices of 512+ rows go to matvec_half_kernel, narrow ones to
-/// matvec_tallk_kernel (one block per row and token). Against the f64 CPU
-/// product, held to f32 accumulation error.
+/// matvec_half_tallk_kernel (one block per row and token), other types to
+/// matvec_tallk_kernel. Against the f64 CPU product, held to f32
+/// accumulation error.
 fn test_matvec_few_tokens(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
-    const K: usize = 512;
-    for (ty, n_rows) in [(GgmlType::BF16, 600usize), (GgmlType::F16, 600), (GgmlType::F32, 48), (GgmlType::Q8_0, 48)] {
+    // K 320 and 192: one token goes to matvec_half_shortk_kernel (rows of
+    // fewer than 512 values, not a multiple of 256).
+    for (ty, n_rows, k) in [(GgmlType::BF16, 600usize, 512usize), (GgmlType::F16, 600, 512), (GgmlType::BF16, 320, 512),
+                            (GgmlType::F16, 48, 512), (GgmlType::F32, 48, 512), (GgmlType::Q8_0, 48, 512),
+                            (GgmlType::BF16, 1030, 320), (GgmlType::F16, 700, 192)] {
+        #[allow(non_snake_case)]
+        let K = k;
         let layout = ty.layout().unwrap();
         let blocks_per_row = K / layout.elements as usize;
         let row_bytes = blocks_per_row * layout.bytes as usize;
@@ -1420,7 +1427,7 @@ fn test_matvec_few_tokens(device: i32, stream: &Stream, report: &mut Report) -> 
                 }
             }
         }
-        report.case(&format!("matvec 1..8 tokens {ty} ({n_rows} rows)"),
+        report.case(&format!("matvec 1..8 tokens {ty} ({n_rows} rows of {K})"),
             format!("error/bound {worst:.3}x"), worst <= 1.0);
     }
     Ok(())
@@ -2187,6 +2194,97 @@ fn test_moe_ffn(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
     let peak = scale_of(&a);
     report.case(&format!("moe expert-major batch vs token-major, {n2} tokens"),
         format!("max_abs {abs:.3e}, peak {peak:.3e}"), abs <= peak * 2e-3 && peak > 1e-3);
+    }
+    Ok(())
+}
+
+/// The decode's expert kernels for the types Qwen4 Flash-Next keeps its
+/// experts in (the IQ lattice types, IQ4, Q2_0), each against the CPU
+/// reference on the f32 path and on the integer one, plus the model's two
+/// mixes, whose down projection is of another type than gate and up.
+fn test_moe_decode_types(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const N_EXPERTS: usize = 4;
+    const TOP_K: usize = 2;
+    const N_TOKENS: usize = 2;
+    // (gate/up type, down type, n_embd, expert ff)
+    let cases = [
+        (GgmlType::IQ4_NL, GgmlType::IQ4_NL, 256, 256),
+        (GgmlType::IQ4_XS, GgmlType::IQ4_XS, 256, 256),
+        (GgmlType::IQ2_S, GgmlType::IQ2_S, 256, 256),
+        (GgmlType::IQ3_XXS, GgmlType::IQ3_XXS, 256, 256),
+        (GgmlType::IQ3_S, GgmlType::IQ3_S, 256, 256),
+        (GgmlType::Q2_0, GgmlType::Q2_0, 256, 256),
+        (GgmlType::IQ3_XXS, GgmlType::IQ4_NL, 512, 640),
+        (GgmlType::IQ2_S, GgmlType::Q2_0, 512, 640),
+    ];
+    let mut rng = Rng::new(0x17_5000);
+    for (gty, dty, n_embd, ff) in cases {
+        let (gl, dl) = (gty.layout().unwrap(), dty.layout().unwrap());
+        let (ge, de) = (gl.elements as usize, dl.elements as usize);
+        let g_row = n_embd / ge * gl.bytes as usize;
+        let d_row = ff / de * dl.bytes as usize;
+        let (g_stride, d_stride) = (ff * g_row, n_embd * d_row);
+        let (mut gate_w, mut up_w, mut down_w) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..N_EXPERTS {
+            gate_w.extend_from_slice(&random_blocks(&mut rng, gty, ff * n_embd / ge));
+            up_w.extend_from_slice(&random_blocks(&mut rng, gty, ff * n_embd / ge));
+            down_w.extend_from_slice(&random_blocks(&mut rng, dty, n_embd * ff / de));
+        }
+        let x = rng.floats(N_TOKENS * n_embd);
+        let ids: Vec<i32> = (0..N_TOKENS * TOP_K).map(|i| ((i * 3 + 1) % N_EXPERTS) as i32).collect();
+        let weights: Vec<f32> = (0..N_TOKENS * TOP_K).map(|i| 0.3 + 0.1 * (i % 4) as f32).collect();
+
+        let row = |ty: GgmlType, packed: &[u8], base: usize, k: usize| -> Vec<f32> {
+            let mut out = vec![0f32; k];
+            dequant::dequantize(ty, &packed[base..], k, &mut out).unwrap();
+            out
+        };
+        let mut cpu = vec![0f32; N_TOKENS * n_embd];
+        for t in 0..N_TOKENS {
+            let xt = &x[t * n_embd..(t + 1) * n_embd];
+            for slot in 0..TOP_K {
+                let e = ids[t * TOP_K + slot] as usize;
+                let h: Vec<f32> = (0..ff).map(|r| {
+                    let gd: f32 = row(gty, &gate_w, e * g_stride + r * g_row, n_embd).iter().zip(xt).map(|(a, b)| a * b).sum();
+                    let ud: f32 = row(gty, &up_w, e * g_stride + r * g_row, n_embd).iter().zip(xt).map(|(a, b)| a * b).sum();
+                    gd / (1.0 + (-gd).exp()) * ud
+                }).collect();
+                for r in 0..n_embd {
+                    let dot: f32 = row(dty, &down_w, e * d_stride + r * d_row, ff).iter().zip(&h).map(|(a, b)| a * b).sum();
+                    cpu[t * n_embd + r] += weights[t * TOP_K + slot] * dot;
+                }
+            }
+        }
+
+        let d_gate = DeviceBuffer::<u8>::from_slice(device, &gate_w, stream)?;
+        let d_up = DeviceBuffer::<u8>::from_slice(device, &up_w, stream)?;
+        let d_down = DeviceBuffer::<u8>::from_slice(device, &down_w, stream)?;
+        let d_x = DeviceBuffer::<f32>::from_slice(device, &x, stream)?;
+        let d_ids = DeviceBuffer::<i32>::from_slice(device, &ids, stream)?;
+        let d_w = DeviceBuffer::<f32>::from_slice(device, &weights, stream)?;
+        let d_h = DeviceBuffer::<f32>::new(device, N_TOKENS * TOP_K * ff)?;
+        let q8 = DeviceBuffer::<u8>::new(device, airun_cuda::hybrid::moe_q8_scratch_bytes(n_embd, TOP_K, ff))?;
+        let peak = scale_of(&cpu);
+        for int8 in [false, true] {
+            let scratch = if int8 { q8.as_mut_ptr().cast() } else { std::ptr::null_mut() };
+            let d_y = DeviceBuffer::<f32>::zeroed(device, N_TOKENS * n_embd, stream)?;
+            airun_cuda::hybrid::moe_gate_up(ops::KernelType(gty.id() as i32), d_gate.as_ptr(), d_up.as_ptr(),
+                d_x.as_ptr(), d_ids.as_ptr(), d_h.as_mut_ptr(), n_embd, ff, N_TOKENS, TOP_K, g_row, g_stride,
+                scratch, stream)?;
+            airun_cuda::hybrid::moe_down(ops::KernelType(dty.id() as i32), d_down.as_ptr(), d_h.as_ptr(),
+                d_ids.as_ptr(), d_w.as_ptr(), d_y.as_mut_ptr(), ff, n_embd, N_TOKENS, TOP_K, d_row, d_stride,
+                scratch, stream)?;
+            let gpu = d_y.to_vec(stream)?;
+            let (abs, _) = compare(&cpu, &gpu);
+            // The int8 path rounds the activations to 8 bits per 32 (twice:
+            // the input and h), the f32 one only reorders the sums.
+            let bound = if int8 { 0.02 } else { 1e-4 };
+            report.case(
+                &format!("moe {gty}/{dty} experts, {}", if int8 { "int8" } else { "f32" }),
+                format!("max_abs {abs:.3e} ({:.3}% of the output peak {peak:.3e})", 100.0 * abs / peak),
+                abs <= bound * peak && peak > 1e-3,
+            );
+        }
     }
     Ok(())
 }

@@ -2329,3 +2329,146 @@ request: 344 ms against 155). What llama.cpp still wins is `llama-bench`'s
 Flash-Next with `--disk-offload` (990-token prompt, 108 tokens): prefill
 29.5-31.7 -> 40.0-44.5, decode 19.3-20.6 -> 24.2-24.4 (the file cache's state
 moves these; see above).
+
+## Flash-Next on one RTX 3060: IQ experts on the integer path, RAM experts on the CPU, Windows' power throttling (2026-11-18)
+
+RTX 3060 12 GB alone (PCIe 4.0 x16), i7-13700, 2x32 GB DDR5-4800. Qwen3.8
+Flash-Next GSQ-RCO IQ3_S (`qwen4exp`, 78 GiB; experts IQ3_XXS/IQ2_S/IQ3_S
+gate/up, IQ4_NL/Q2_0 down): 59 expert slots a layer in VRAM, the other ~41 GiB
+pinned in RAM, ~48% of routings hit VRAM. `run`, 35-token prompt, 200 tokens
+at `--temp 0.7`; tok/s of generation.
+
+**Where a token went (nsys, 87 ms):** the RAM->VRAM copy of the missed
+experts 38.6 ms (~15 GB/s), the expert kernels 27 ms (the IQ types and Q2_0
+had no integer kernel: f32 decoders at 15-35 GB/s), host gaps ~5 ms (16 PLE
+rows read through the mapping, ~2 ms; `cudaGraphLaunch` of ~2900 nodes,
+~2 ms, with the GPU idle), the rebalance's swaps ~4-5 ms amortized.
+
+**What changed, in order:**
+- **Integer MoE decode kernels for IQ4_NL, IQ4_XS, IQ2_S, IQ3_XXS, IQ3_S and
+  Q2_0** (`vdot_*` in `vecdotq.cuh`, `AIRUN_FOR_EACH_MOE_Q8_TYPE`; the dense
+  paths keep their list). Signs go on as a byte mask (`__vsub4(v ^ m, m)`),
+  Q2_0's -1 into the bytes (exact integer dot). Selftest: every type and the
+  model's two mixes, f32 and int8 (0.6-1.4% of the peak, as Q8_0's).
+  12.0 -> 14.9 (f32) / 16.7 tok/s.
+- **Stage copy with a fixed number of blocks** (`moe_stage_copy_flat_kernel`,
+  `AIRUN_STAGE_STREAMS`, default 6). `tests/pcie_bench.rs`: DMA 23-24 GB/s for
+  any size; kernel reads of mapped RAM 23 GB/s with ~6 blocks of 32 KiB in
+  flight, 16.9 with 24, 13.2 with 64 (four blocks per expert, six experts,
+  was the decode's case). Expert prefetch (`AIRUN_EXPERT_PREFETCH=1`) still
+  loses here (16.2 against 16.7).
+- **Decode graph in pieces** (`decode_pieces`, `AIRUN_GRAPH_LAYERS`, default
+  8): the layers before the PLE layer, the PLE layer alone, then 8 at a time.
+  The host reads the PLE rows while the first piece runs and submits each
+  piece while the GPU runs the previous one.
+- **PLE rows of a decode step by positional reads** (`PleTable::reader`, 16
+  handles): faulting them in through the mapping serializes on the working-set
+  lock.
+- **RAM experts on the CPU** (`moe_cpu.rs`, `cpu::moe_experts`): after the
+  router, `moe_cpu_post` writes the row, the missed experts' table addresses
+  and weights to a mailbox in mapped pinned memory and bumps a sequence
+  number; a leader thread spinning on it runs the experts on the CPU pool
+  (AVX2 kernels for the six types, one pool job for gate/up and down with a
+  ready flag per expert) and echoes the number; `moe_cpu_wait` spins on the
+  echo (50 ms at most, then the GPU takes those experts back, see the
+  pitfalls) and adds the sum. The GPU computes the resident experts meanwhile.
+  Everything stays in the decode graph. `AIRUN_MOE_GPU_SHARE` keeps a share of
+  the missed experts on the PCIe copy at the same time: with 12 CPU threads
+  0.25 helped (26.6 against ~24 tok/s; 0.4 gave 25.2), with 16 it lost (24.2
+  against 27.2) -- the CPU and the GPU's reads of RAM share the DDR5's
+  bandwidth -- so it is 0 by default. The pool takes two thirds of the
+  logical cores (16 on a 13700: 26.9 tok/s, 12 gave 23.9). `AIRUN_MOE_CPU=0`
+  turns it off.
+- **Windows' power throttling (EcoQoS) -- the finding of the session.** A
+  console process without a foreground window is throttled a few seconds after
+  it starts: its threads go to the E-cores at a capped clock. The same CPU
+  expert call took 0.26 ms right after allocating and 3.6 ms six seconds later;
+  plain reads of pinned RAM fell from 67 to 9 GB/s (`tests/cpu_bench.rs`,
+  `rounds` and `raw` with `AIRUN_BENCH_WAIT_S=6`). No page faults, no data
+  dependence: only time. `cpu::keep_full_speed` (SetProcessInformation,
+  ProcessPowerThrottling, EXECUTION_SPEED cleared) at startup fixes it:
+  the first CPU-expert run went from 5.0 to 23.9 tok/s. **Every CPU-side
+  number measured on Windows before this (the RAM-layer CPU matmuls of the
+  27B, the host side of every decode) may have been throttled.** The decoy on
+  the way: random test bytes (NaN, infinite, subnormal f16 scales) made the
+  kernels slow too -- from subnormal arithmetic (18x a normal FMA, `exp_cost`),
+  now flushed (`cpu::flush_denormals` in the pool threads), not what slowed the
+  model.
+- **Smaller kernels:** BF16 tall-K rows (`matvec_half_tallk_kernel`, the 320 x
+  10240 hyper-connection down projections, ~190 -> ~295 GB/s), BF16 short-K
+  rows (`matvec_half_shortk_kernel`, the 10240 x 320 up projections, 8 lanes a
+  row), a parallel `moe_stage_plan`, the Q6_K output head on the integer
+  decode kernel, the CPU activation quantization in AVX2.
+
+**Measured** (same machine, one round each, 200 tokens):
+
+| | tok/s |
+|---|---|
+| before | 12.0 |
+| integer IQ expert kernels | 16.7 |
+| + stage copy, graph pieces | 18.6 |
+| + CPU experts, 12 threads, after the throttling fix | 23.9 |
+| + 16 threads | 26.9 |
+| + head int8, PLE reads, short-K, batched swaps (fixed) | 26.7-27.2 |
+| 400 tokens, 20 threads (hit rate 57%) | 29.5-29.6 |
+| + hyper-connections in Q8_0 | 30.3-30.4 |
+| the defaults (16 threads, no GPU share), alternated with 20 threads (30.2/30.3) and 20 + share 0.2 (31.1/30.5) | **30.6/31.0** |
+
+Qwen3.8-27B TurboFCFusion Q4_K_M with MTP (17.2 GiB, `qwen35`, dense) on the
+same card: 39 of 64 layers in VRAM, 25 streamed from pinned RAM each step.
+200 tokens: 6.3 tok/s without a draft, 11.0 with `--draft 3` (61% of drafts
+accepted), 8.7 with 4 (45%), 8.6 with 5.
+
+**Pitfalls.**
+- `cargo test` runs the tests a filter matches in parallel threads: `moe`
+  matched two benchmarks at once.
+- Under nsys the graph launches are inflated; judge speed by `run`.
+- The rebalance's swaps were ~9 `cudaMemcpyAsync` per swapped expert (~35 us
+  of overhead each, 20-100 us gaps in the trace): with the copies and the gaps
+  ~8 ms of every token on average. Rebalancing every 32 tokens instead of 8
+  (`AIRUN_REBALANCE_EVERY`) gave 26.0 against 24.2 tok/s but the hit rate fell
+  from 47% to 33%. The swaps are now batched (`SwapBatch`,
+  `MappedExperts::swap_jobs`/`publish_jobs`): a rebalance's swaps in three
+  `moe_copy_jobs` launches (VRAM slots to the stage areas, the incoming
+  experts' host copies into the slots, the stage areas over those host
+  copies, plus the tables) while the stage areas have room, the rest and
+  loans as before. **The first version wrote garbage** (fluent-looking
+  repetition after ~25 tokens and a fake 76% hit rate): it counted the stage
+  area in experts times the current layer's stride, but one area serves every
+  layer and their experts differ in size (IQ4_NL down vs Q2_0 down), so a
+  layer's evicted experts overlapped another's. `SwapBatch::used` counts bytes
+  now. The batching itself measured within noise (26.7 against 27.2), and
+  rebalancing never (`AIRUN_REBALANCE_EVERY=100000`) is slower (24.8): the
+  swaps are not the bottleneck any more. `AIRUN_MAX_SWAPS` (default 16) caps
+  the swaps a layer per rebalance; 2-16 all measured the same.
+- **A CPU that answers late must not kill the generation.** With other
+  programs busy (the user's games and launchers on the same PC), a request
+  once took the pool over half a second and the run aborted ("the CPU did not
+  compute the experts of decode request ... in time"). Now `moe_cpu_wait`
+  gives up after 50 ms, re-marks the request's CPU experts in `sidx` as -1 and
+  a fallback pass of the expert kernels after the wait (`only` = 3 in
+  `run_moe`, launched as 1) reads them from RAM over PCIe; normally the wait
+  marks every slot -2 and that pass does nothing (no measurable cost). While
+  the leader is still behind (`DONE != seq`) and for 96 layers after a
+  timeout (`seq[2]`), `moe_cpu_post` posts nothing and leaves the listed
+  experts to the resident pass. `MBOX_LATE` counts those layers; the runtime
+  prints a note at 1, 100, 10 000... Forced with 64 pool threads on 24 cores:
+  3.2 tok/s and a stream of timeouts before the cooldown, 7.9 with it, the
+  text intact either way. The GPU writes the counter with a plain volatile
+  increment: atomics on host-mapped memory need PCIe atomics.
+- **Wider sweeps of the knobs at 400 tokens** (rebalancing keeps improving
+  the hit rate, 48% at 200 tokens, 57% at 400): 20 CPU threads and
+  `AIRUN_MOE_GPU_SHARE` 0 / 0.2 / 0.3 gave 29.5-29.6 / 29.4-29.9 / 27.5-28.7.
+  More VRAM slots do not pay: `--vram-reserve 128` gave 62 slots, the same
+  hit rate and 20.9 tok/s (WDDM under memory pressure).
+- **Hyper-connection matrices in Q8_0** (`load_hc_matrix`, default;
+  `AIRUN_HC_Q8=0` keeps BF16): four 10240 x 320 BF16 matrices a layer were
+  1.26 GB of the ~3.4 GB of dense weights a token reads. Converted at load:
+  29.6/30.0 -> 30.4/30.3 tok/s (alternated, two rounds), token-by-token
+  perplexity 3.96 either way (mean loss 1.3771 BF16, 1.3762 Q8_0; the exact
+  f32 path 3.95). The memory plan still budgets them at their file size
+  (0.6 GiB of VRAM left unused).
+- **What is left** (nsys, CPU path): ~22 ms of GPU kernels a token, near the
+  bandwidth already (Q6_K at ~290 GB/s, the output head 310), and ~10 ms of
+  the GPU waiting for the CPU: ~4 RAM experts a layer at ~47 us each (~42 GB/s
+  of the DDR5's ~67), against ~60 us of resident work to hide them behind.

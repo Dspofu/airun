@@ -179,6 +179,14 @@ unsafe extern "C" {
         pre_list: *const c_void, n_pre: *const c_void, sidx: *mut c_void, list: *mut c_void, n_list: *mut c_void,
         first: *mut c_void, stats: *mut c_void, stream: ffi::Stream) -> Status;
     fn airun_moe_count(ids: *const c_void, counts: *mut c_void, n: i32, stream: ffi::Stream) -> Status;
+    fn airun_moe_cpu_post(ids: *const c_void, weights: *const c_void, sidx: *mut c_void, n_list: *const c_void,
+        n_copy: *mut c_void, keep: i32, top_k: i32, gate_tab: *const c_void, up_tab: *const c_void,
+        down_tab: *const c_void, x: *const c_void, n_embd: i32, seq: *mut c_void, layer: i32, mbox: *mut c_void,
+        stream: ffi::Stream) -> Status;
+    fn airun_moe_cpu_wait(seq: *const c_void, mbox: *mut c_void, y: *mut c_void, n_embd: i32, sidx: *mut c_void,
+        top_k: i32, stream: ffi::Stream) -> Status;
+    fn airun_moe_copy_jobs(src: *const c_void, dst: *const c_void, start: *const c_void, n_jobs: i32, blocks: i32,
+        stream: ffi::Stream) -> Status;
     fn airun_moe_sort(ids: *const c_void, n: i32, n_experts: i32, scratch: *mut c_void, offsets: *mut c_void,
         perm: *mut c_void, stream: ffi::Stream) -> Status;
     fn airun_moe_grouped(gate_type: i32, down_type: i32, gate_tab: *const c_void, up_tab: *const c_void,
@@ -1001,6 +1009,57 @@ pub fn moe_mmq(gate: &ExpertWeights, up: &ExpertWeights, down: &ExpertWeights, x
 }
 
 /// `counts[ids[i]] += 1` for the `n` routed ids (u32 counts).
+/// Hands one decode token's host-side experts to the CPU: of the `top_k`
+/// routed slots whose `sidx` is set (moe_stage_plan), all but the first
+/// `keep`/256 of them go, with their table addresses and weights and the row
+/// `x`, into the mapped mailbox `mbox`, and are re-marked in `sidx` so no
+/// expert kernel here computes them; `n_copy` gets how many the GPU keeps (to
+/// copy over PCIe as before). `seq` (one u32 on the device) numbers the
+/// request. See airun-core's moe_cpu.rs.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_cpu_post(ids: *const c_void, weights: *const c_void, sidx: *mut c_void, n_list: *const c_void,
+    n_copy: *mut c_void, keep: u32, top_k: usize, gate_tab: *const c_void, up_tab: *const c_void,
+    down_tab: *const c_void, x: *const c_void, n_embd: usize, seq: *mut c_void, layer: usize, mbox: *mut c_void,
+    stream: &Stream) -> Result<()> {
+    #[cfg(airun_cuda)]
+    // SAFETY: ids/weights/sidx hold top_k entries of one token, the tables one
+    // address per expert, x n_embd floats; mbox is the mapped mailbox of at
+    // least 1024 + 8 * n_embd bytes.
+    unsafe { ffi::check(airun_moe_cpu_post(ids, weights, sidx, n_list, n_copy, keep as i32, top_k as i32, gate_tab,
+        up_tab, down_tab, x, n_embd as i32, seq, layer as i32, mbox, stream.raw())) }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(ids, weights, sidx, n_list, n_copy, keep, top_k, gate_tab, up_tab, down_tab, x, n_embd, seq, layer,
+        mbox, stream)
+}
+
+/// Waits for the CPU's answer to the last [`moe_cpu_post`] and adds its
+/// n_embd floats to `y`; after half a second it gives up and flags the
+/// mailbox instead.
+/// Then readies `sidx` (top_k entries) for the fallback expert pass that must
+/// follow (only = 1): the CPU's experts when it was late, else nothing.
+pub fn moe_cpu_wait(seq: *const c_void, mbox: *mut c_void, y: *mut c_void, n_embd: usize, sidx: *mut c_void,
+    top_k: usize, stream: &Stream) -> Result<()> {
+    #[cfg(airun_cuda)]
+    // SAFETY: as moe_cpu_post; y holds n_embd floats, sidx top_k ints.
+    unsafe { ffi::check(airun_moe_cpu_wait(seq, mbox, y, n_embd as i32, sidx, top_k as i32, stream.raw())) }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(seq, mbox, y, n_embd, sidx, top_k, stream)
+}
+
+/// `n_jobs` copies in one launch over `blocks` blocks: job j moves
+/// `start[j + 1] - start[j]` 16-byte units from `src[j]` to `dst[j]` (u64
+/// device addresses, 16-byte aligned, any of them in mapped host memory).
+/// The three arrays (n_jobs, n_jobs and n_jobs + 1 entries) live on the device.
+pub fn moe_copy_jobs(src: *const c_void, dst: *const c_void, start: *const c_void, n_jobs: usize, blocks: usize,
+    stream: &Stream) -> Result<()> {
+    #[cfg(airun_cuda)]
+    // SAFETY: the arrays hold the entries above, each job naming a live range
+    // that no other job of the launch writes.
+    unsafe { ffi::check(airun_moe_copy_jobs(src, dst, start, n_jobs as i32, blocks as i32, stream.raw())) }
+    #[cfg(not(airun_cuda))]
+    needs_cuda!(src, dst, start, n_jobs, blocks, stream)
+}
+
 pub fn moe_count(ids: *const c_void, counts: *mut c_void, n: usize, stream: &Stream) -> Result<()> {
     #[cfg(airun_cuda)]
     // SAFETY: `ids` holds n expert ids, each below counts' length.

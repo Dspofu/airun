@@ -497,7 +497,7 @@ pub fn can_decode(ty: GgmlType) -> bool {
 /// A 7-bit sign code plus its parity as the eighth sign: the IQ types keep
 /// an even number of negative values per 8, so the last sign is implied.
 #[inline]
-pub(crate) fn ksigns_iq2xs(i: u8) -> u8 {
+pub fn ksigns_iq2xs(i: u8) -> u8 {
     i | (((i.count_ones() & 1) as u8) << 7)
 }
 

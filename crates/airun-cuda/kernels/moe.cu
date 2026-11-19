@@ -186,7 +186,8 @@ __global__ __launch_bounds__(32 * MOE_ROWS_PER_BLOCK) void moe_gate_up_kernel(
     const uint8_t* u_base = up_tab ? (const uint8_t*)up_tab[expert] : up_w + (size_t)expert * expert_stride;
     // An expert outside VRAM was copied into the staging area beforehand.
     const int st = sidx ? sidx[(size_t)token * top_k + slot] : -1;
-    if (only != 0 && (only == 2) != (st >= 0)) return;   // the whole block is one slot
+    // st <= -2: an expert the CPU computes (moe_cpu_post), in no pass here.
+    if (st <= -2 || (only != 0 && (only == 2) != (st >= 0))) return;   // the whole block is one slot
     if (st >= 0) {
         g_base = gate_stage + (size_t)st * expert_stride;
         u_base = up_stage + (size_t)st * expert_stride;
@@ -268,7 +269,7 @@ __global__ __launch_bounds__(32 * MOE_ROWS_PER_BLOCK) void moe_down_kernel(
         const int st = sidx ? sidx[(size_t)token * top_k + lane] : -1;
         if (st >= 0) d_base = down_stage + (size_t)st * expert_stride;
         my_row = d_base + (size_t)row * row_bytes;
-        if (only != 0 && (only == 2) != (st >= 0)) my_row = nullptr;   // another pass's slot
+        if (st <= -2 || (only != 0 && (only == 2) != (st >= 0))) my_row = nullptr;   // another pass's slot
     }
     const int groups = ff / 32;
     const int pairs = top_k * groups;
@@ -316,13 +317,40 @@ __global__ void moe_stage_plan_kernel(
         if (!resident[e]) at[e] = 0;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        int n = 0;
-        for (int e = 0; e < n_experts; ++e) {
-            if (at[e] == 0) { at[e] = n; list[n] = e; ++n; }
-        }
-        n_list[0] = n;
+    // Staging indices in expert order, as one thread walking the experts gave
+    // them (8.5 us of a decode layer on an RTX 3060 for 512 experts): each
+    // thread counts a contiguous run, a block scan gives each run its start.
+    __shared__ int warp_sum[32];
+    const int per = (n_experts + blockDim.x - 1) / blockDim.x;
+    const int e0 = threadIdx.x * per;
+    const int e1 = min(n_experts, e0 + per);
+    int count = 0;
+    for (int e = e0; e < e1; ++e) count += at[e] == 0;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int incl = count;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xffffffffu, incl, o);
+        if (lane >= o) incl += v;
     }
+    if (lane == 31) warp_sum[warp] = incl;
+    __syncthreads();
+    if (warp == 0) {
+        const int nw = (blockDim.x + 31) >> 5;
+        int w = lane < nw ? warp_sum[lane] : 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, w, o);
+            if (lane >= o) w += v;
+        }
+        if (lane < nw) warp_sum[lane] = w;   // inclusive over warps
+    }
+    __syncthreads();
+    int n = incl - count + (warp > 0 ? warp_sum[warp - 1] : 0);
+    for (int e = e0; e < e1; ++e) {
+        if (at[e] == 0) { at[e] = n; list[n] = e; ++n; }
+    }
+    if (threadIdx.x == blockDim.x - 1) n_list[0] = n;
     __syncthreads();
     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) sidx[i] = at[ids[i]];
 }
@@ -395,6 +423,42 @@ __global__ void moe_stage_copy_kernel(
     for (; i < n16; i += step) dst[i] = src[i];
 }
 
+// moe_stage_copy_kernel with the listed experts taken as one run of 16-byte
+// units cut into gridDim.x equal slices, a block each. What is in flight over
+// PCIe is then set by the grid, not by how many experts missed: on an RTX
+// 3060 (PCIe 4.0 x16, tests/pcie_bench.rs) reads of mapped memory peak at
+// 6 blocks of 8 x 4 KiB (23.3 GB/s), and more of them in flight only queue:
+// 24 blocks gave 16.9 GB/s, 64 gave 14.0. A decode's three launches of four
+// blocks per missed expert ran at ~15 GB/s.
+__global__ void moe_stage_copy_flat_kernel(
+    const unsigned long long* __restrict__ tab, const int32_t* __restrict__ list, const int32_t* __restrict__ n_list,
+    const int32_t* __restrict__ first, uint8_t* __restrict__ stage, const size_t stride) {
+    const size_t n16 = stride / 16;
+    const size_t total = (size_t)n_list[0] * n16;
+    const size_t per = (total + gridDim.x - 1) / gridDim.x;
+    size_t lo = (size_t)blockIdx.x * per;
+    const size_t hi = min(total, lo + per);
+    const size_t f = first ? (size_t)first[0] : 0;
+    const size_t step = blockDim.x;
+    while (lo < hi) {
+        const size_t j = lo / n16;
+        const size_t off = lo - j * n16;
+        const size_t len = min(hi - lo, n16 - off);
+        const uint4* src = (const uint4*)tab[list[j]] + off;
+        uint4* dst = (uint4*)(stage + (j + f) * stride) + off;
+        size_t i = threadIdx.x;
+        for (; i + 7 * step < len; i += 8 * step) {
+            uint4 v[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) v[u] = src[i + u * step];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) dst[i + u * step] = v[u];
+        }
+        for (; i < len; i += step) dst[i] = src[i];
+        lo += len;
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Decode: the dense decode's integer path
@@ -441,7 +505,8 @@ __global__ __launch_bounds__(32 * MOE_ROWS_PER_BLOCK) void moe_gate_up_q8_kernel
     const int token = blockIdx.z;
     const int expert = ids[(size_t)token * top_k + slot];
     const int st = sidx ? sidx[(size_t)token * top_k + slot] : -1;
-    if (only != 0 && (only == 2) != (st >= 0)) return;   // the whole block is one slot
+    // st <= -2: an expert the CPU computes (moe_cpu_post), in no pass here.
+    if (st <= -2 || (only != 0 && (only == 2) != (st >= 0))) return;   // the whole block is one slot
 
     const int row0 = (blockIdx.x * MOE_ROWS_PER_BLOCK + threadIdx.y) * MOE_Q8_ROWS;
     if (row0 >= ff) return;
@@ -511,7 +576,7 @@ __global__ __launch_bounds__(32 * MOE_ROWS_PER_BLOCK) void moe_down_q8_kernel(
         const int st = sidx ? sidx[(size_t)token * top_k + lane] : -1;
         if (st >= 0) d_base = down_stage + (size_t)st * expert_stride;
         my_row = d_base + (size_t)row * row_bytes;
-        if (only != 0 && (only == 2) != (st >= 0)) my_row = nullptr;
+        if (st <= -2 || (only != 0 && (only == 2) != (st >= 0))) my_row = nullptr;
     }
     const int groups = ff / 32;
     const int pairs = top_k * groups;
@@ -564,7 +629,7 @@ static bool moe_q8_ok(int32_t type_id, const void* q8, int32_t n_tokens) {
     if (off) return false;
     switch (type_id) {
 #define Q8CASE(TYPE) case TYPE:
-        AIRUN_FOR_EACH_Q8_TYPE(Q8CASE)
+        AIRUN_FOR_EACH_MOE_Q8_TYPE(Q8CASE)
 #undef Q8CASE
         return true;
         default:
@@ -1047,6 +1112,175 @@ __global__ __launch_bounds__(128) void moe_mma_down_kernel(
 }
 
 // counts[e] += how often the batch routed to expert e.
+// A batch of copies in one launch: job j moves start[j + 1] - start[j]
+// 16-byte units from src[j] to dst[j] (16-byte aligned device addresses, any
+// of them in mapped host memory). The jobs are taken as one run of units cut
+// into gridDim.x equal slices, as moe_stage_copy_flat_kernel, so a few blocks
+// keep PCIe at its bandwidth. The rebalance's expert swaps were three
+// cudaMemcpyAsync per tensor per expert, ~35 us of overhead each: ~600 a
+// rebalance on Qwen4 Flash-Next, 4-8 ms of every token on average.
+__global__ void moe_copy_jobs_kernel(const unsigned long long* __restrict__ src,
+                                     const unsigned long long* __restrict__ dst,
+                                     const unsigned long long* __restrict__ start, const int n_jobs) {
+    const unsigned long long total = start[n_jobs];
+    const unsigned long long per = (total + gridDim.x - 1) / gridDim.x;
+    unsigned long long lo = (unsigned long long)blockIdx.x * per;
+    const unsigned long long hi = min(total, lo + per);
+    int j = 0;
+    while (j + 1 < n_jobs && start[j + 1] <= lo) ++j;
+    const size_t step = blockDim.x;
+    while (lo < hi && j < n_jobs) {
+        const unsigned long long end = min(hi, start[j + 1]);
+        if (end > lo) {
+            const size_t off = (size_t)(lo - start[j]);
+            const size_t len = (size_t)(end - lo);
+            const uint4* s = (const uint4*)src[j] + off;
+            uint4* d = (uint4*)dst[j] + off;
+            size_t i = threadIdx.x;
+            for (; i + 7 * step < len; i += 8 * step) {
+                uint4 v[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) v[u] = s[i + u * step];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) d[i + u * step] = v[u];
+            }
+            for (; i < len; i += step) d[i] = s[i];
+            lo = end;
+        }
+        ++j;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode: host-side experts multiplied by the CPU (airun-core/src/moe_cpu.rs)
+// ---------------------------------------------------------------------------
+//
+// A mailbox in mapped pinned memory; byte offsets mirrored in moe_cpu.rs.
+#define MBOX_SEQ   0      // u32, GPU -> CPU, written last
+#define MBOX_LAYER 4      // i32
+#define MBOX_N     8      // i32: experts listed
+#define MBOX_ERR   12     // u32: a request the CPU could not serve
+#define MBOX_LATE  16     // u32: requests the GPU computed itself, the CPU being late
+#define MBOX_ADDR  64     // u64 [MBOX_SLOTS][3]: gate, up, down as the tables give them
+#define MBOX_W     832    // f32 [MBOX_SLOTS]: routing weights
+#define MBOX_DONE  960    // u32, CPU -> GPU, written last
+#define MBOX_X     1024   // f32 [n_embd] input row, then f32 [n_embd] result
+#define MBOX_SLOTS 32
+// A request takes the CPU ~0.2 ms; one it has not answered in 50 ms (its
+// threads descheduled by other programs) the GPU computes itself, well
+// inside Windows' 2 s watchdog, which would reset the GPU.
+#define MBOX_TIMEOUT_NS 50000000ull
+
+__device__ __forceinline__ unsigned long long globaltimer_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// One token's routed experts that moe_stage_plan listed (not in VRAM), and
+// the row they multiply, handed to the CPU; `seq` (device) numbers the
+// requests. One block.
+//
+// The first `keep` of every 256ths of the listed experts stay on the GPU
+// (copied over PCIe as before, `n_copy[0]` of them), so both ways into RAM
+// work at once; the CPU's are re-marked in `sidx` as -2 - their mailbox
+// index, which every expert kernel here skips.
+//
+// While the CPU is still on a request the GPU gave up on (its echo behind
+// `seq`), nothing is posted: the listed experts stay -1, read from RAM by the
+// resident pass, and `seq[1]` tells moe_cpu_wait there is nothing to wait for.
+// So do the MBOX_COOLDOWN layers after a timeout (`seq[2]` counts them down),
+// so a CPU kept busy by other programs costs one timeout every few tokens.
+#define MBOX_COOLDOWN 96
+__global__ void moe_cpu_post_kernel(
+    const int32_t* __restrict__ ids, const float* __restrict__ weights, int32_t* __restrict__ sidx,
+    const int32_t* __restrict__ n_list, int32_t* __restrict__ n_copy, const int keep, const int top_k,
+    const unsigned long long* __restrict__ gate_tab, const unsigned long long* __restrict__ up_tab,
+    const unsigned long long* __restrict__ down_tab, const float* __restrict__ x, const int n_embd,
+    unsigned int* __restrict__ seq, const int layer, uint8_t* __restrict__ mbox) {
+    const int listed = n_list[0];
+    __shared__ int behind;
+    if (threadIdx.x == 0) {
+        behind = seq[2] > 0 || *(const volatile unsigned int*)(mbox + MBOX_DONE) != seq[0];
+        if (seq[2] > 0) seq[2] -= 1;
+    }
+    __syncthreads();
+    if (behind) {
+        for (int s = threadIdx.x; s < top_k; s += blockDim.x) if (sidx[s] >= 0) sidx[s] = -1;
+        if (threadIdx.x == 0) {
+            n_copy[0] = 0;
+            seq[1] = 1;
+            *(volatile unsigned int*)(mbox + MBOX_LATE) += 1u;   // one writer: kernels of one stream
+            __threadfence_system();
+        }
+        return;
+    }
+    const int g = min(listed, (listed * keep + 128) >> 8);
+    volatile float* xo = (volatile float*)(mbox + MBOX_X);
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) xo[i] = x[i];
+    volatile unsigned long long* addr = (volatile unsigned long long*)(mbox + MBOX_ADDR);
+    volatile float* w = (volatile float*)(mbox + MBOX_W);
+    for (int s = threadIdx.x; s < top_k; s += blockDim.x) {
+        const int c = sidx[s] - g;
+        if (c >= 0 && c < MBOX_SLOTS) {
+            const int e = ids[s];
+            addr[3 * c + 0] = gate_tab[e];
+            addr[3 * c + 1] = up_tab[e];
+            addr[3 * c + 2] = down_tab[e];
+            w[c] = weights[s];
+            sidx[s] = -2 - c;
+        }
+    }
+    // Every thread's stores reach host memory before the number does.
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        n_copy[0] = g;
+        seq[1] = 0;
+        const unsigned int s = *seq + 1;
+        *seq = s;
+        *(volatile int*)(mbox + MBOX_LAYER) = layer;
+        *(volatile int*)(mbox + MBOX_N) = min(listed - g, MBOX_SLOTS);
+        __threadfence_system();
+        *(volatile unsigned int*)(mbox + MBOX_SEQ) = s;
+    }
+}
+
+// Waits for the CPU's answer to the last request and adds it to y. One block.
+//
+// Then readies `sidx` for the fallback pass that follows (expert kernels with
+// only = 1): every slot skipped once the CPU answered, and on a timeout the
+// CPU's experts (-2 - c) as -1, read from RAM there, the rest skipped.
+__global__ void moe_cpu_wait_kernel(unsigned int* __restrict__ seq, uint8_t* __restrict__ mbox,
+                                    float* __restrict__ y, const int n_embd, int32_t* __restrict__ sidx,
+                                    const int top_k) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        int good = 1;
+        if (seq[1] == 0) {
+            const unsigned int s = seq[0];
+            const volatile unsigned int* done = (const volatile unsigned int*)(mbox + MBOX_DONE);
+            const unsigned long long t0 = globaltimer_ns();
+            while (*done != s) {
+                if (globaltimer_ns() - t0 > MBOX_TIMEOUT_NS) {
+                    good = 0;
+                    *(volatile unsigned int*)(mbox + MBOX_LATE) += 1u;   // one writer: kernels of one stream
+                    seq[2] = MBOX_COOLDOWN;
+                    break;
+                }
+                __nanosleep(100);
+            }
+            __threadfence_system();
+        }
+        ok = good;
+    }
+    __syncthreads();
+    for (int s = threadIdx.x; s < top_k; s += blockDim.x) sidx[s] = (!ok && sidx[s] <= -2) ? -1 : -2;
+    if (!ok || seq[1] != 0) return;
+    const volatile float* r = (const volatile float*)(mbox + MBOX_X) + n_embd;
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) y[i] += r[i];
+}
+
 __global__ void moe_count_kernel(const int32_t* __restrict__ ids, unsigned* __restrict__ counts, const int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) atomicAdd(counts + ids[i], 1u);
@@ -1158,7 +1392,7 @@ airun_status airun_moe_gate_up_tab(
         (const unsigned long long*)gate_tab, (const unsigned long long*)up_tab,  \
         (const int32_t*)sidx, (const uint8_t*)gate_stage, (const uint8_t*)up_stage, only);
         switch (type_id) {
-            AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)
+            AIRUN_FOR_EACH_MOE_Q8_TYPE(AIRUN_CASE)
             default: return AIRUN_ERR_BAD_ARG;
         }
 #undef LAUNCH
@@ -1204,7 +1438,7 @@ airun_status airun_moe_down_tab(
         (size_t)row_bytes, (size_t)expert_stride, (const unsigned long long*)down_tab, \
         (const int32_t*)sidx, (const uint8_t*)down_stage, only);
         switch (type_id) {
-            AIRUN_FOR_EACH_Q8_TYPE(AIRUN_CASE)
+            AIRUN_FOR_EACH_MOE_Q8_TYPE(AIRUN_CASE)
             default: return AIRUN_ERR_BAD_ARG;
         }
 #undef LAUNCH
@@ -1278,6 +1512,18 @@ airun_status airun_moe_stage_copy(const void* tab, const void* list, const void*
                                   void* stage, uint64_t stride, int32_t cap, cudaStream_t stream) {
     if (cap <= 0) return AIRUN_OK;
     if (stride % 16 != 0) return AIRUN_ERR_BAD_ARG;
+    // Blocks for the whole copy (moe_stage_copy_flat_kernel):
+    // AIRUN_STAGE_STREAMS, else 6; 0 goes back to blocks per expert below.
+    static const int streams = [] {
+        const char* v = getenv("AIRUN_STAGE_STREAMS");
+        return v ? atoi(v) : 6;
+    }();
+    if (streams > 0) {
+        moe_stage_copy_flat_kernel<<<streams, 256, 0, stream>>>(
+            (const unsigned long long*)tab, (const int32_t*)list, (const int32_t*)n_list, (const int32_t*)first,
+            (uint8_t*)stage, (size_t)stride);
+        AIRUN_CHECK_LAUNCH();
+    }
     // Blocks per expert: AIRUN_STAGE_BLOCKS, else 4. The copy runs beside the
     // resident experts' kernels, and each of its blocks holds SM slots for the
     // whole PCIe round trip: at 32 blocks an expert (256 at once) it filled
@@ -1457,6 +1703,34 @@ airun_status airun_moe_grouped(
         moe_combine_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
             (const float*)ypair, (const float*)weights, (float*)y, n_tokens, top_k, k);
     }
+    AIRUN_CHECK_LAUNCH();
+}
+
+airun_status airun_moe_cpu_post(const void* ids, const void* weights, void* sidx, const void* n_list,
+                                void* n_copy, int32_t keep, int32_t top_k, const void* gate_tab, const void* up_tab,
+                                const void* down_tab, const void* x, int32_t n_embd, void* seq, int32_t layer,
+                                void* mbox, cudaStream_t stream) {
+    if (top_k <= 0 || top_k > MBOX_SLOTS || keep < 0 || keep > 256) return AIRUN_ERR_BAD_ARG;
+    moe_cpu_post_kernel<<<1, 256, 0, stream>>>((const int32_t*)ids, (const float*)weights, (int32_t*)sidx,
+        (const int32_t*)n_list, (int32_t*)n_copy, keep, top_k, (const unsigned long long*)gate_tab,
+        (const unsigned long long*)up_tab, (const unsigned long long*)down_tab, (const float*)x, n_embd,
+        (unsigned int*)seq, layer, (uint8_t*)mbox);
+    AIRUN_CHECK_LAUNCH();
+}
+
+// `n_jobs` copies (moe_copy_jobs_kernel) over `blocks` blocks.
+airun_status airun_moe_copy_jobs(const void* src, const void* dst, const void* start, int32_t n_jobs, int32_t blocks,
+                                 cudaStream_t stream) {
+    if (n_jobs <= 0) return AIRUN_OK;
+    moe_copy_jobs_kernel<<<blocks > 0 ? blocks : 1, 256, 0, stream>>>(
+        (const unsigned long long*)src, (const unsigned long long*)dst, (const unsigned long long*)start, n_jobs);
+    AIRUN_CHECK_LAUNCH();
+}
+
+airun_status airun_moe_cpu_wait(const void* seq, void* mbox, void* y, int32_t n_embd, void* sidx, int32_t top_k,
+                                cudaStream_t stream) {
+    moe_cpu_wait_kernel<<<1, 256, 0, stream>>>((unsigned int*)seq, (uint8_t*)mbox, (float*)y, n_embd,
+                                               (int32_t*)sidx, top_k);
     AIRUN_CHECK_LAUNCH();
 }
 

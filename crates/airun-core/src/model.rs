@@ -150,6 +150,13 @@ impl MappedExperts {
         (self.host.as_raw() as *const u8).wrapping_add(j * stride) as *const std::ffi::c_void
     }
 
+    /// The host-side experts' allocation: its host address, the address the
+    /// GPU's table uses for it, and its length -- so the CPU can read the
+    /// experts the table points at (moe_cpu.rs).
+    pub fn host_region(&self) -> (usize, u64, usize) {
+        (self.host.as_raw() as usize, self.host_dev, self.host.len())
+    }
+
     /// Replaces the loans; any expert in the old ones goes back to its host
     /// copy. The caller publishes the table.
     pub fn set_loans(&self, loans: Vec<Loan>) {
@@ -247,6 +254,50 @@ impl MappedExperts {
         place[hot] = Ok(slot);
         place[cold] = Err(j);
         Ok(())
+    }
+
+    /// [`Self::swap`] as the three copies it makes, for one batched launch per
+    /// phase (hybrid::moe_copy_jobs): `cold`'s slot to `stage`, `hot`'s host
+    /// copy into the slot, then `stage` over that host copy -- the (source,
+    /// destination) device addresses, in that order, `place` updated. `None`
+    /// (and nothing changed) when `cold` sits in a loan, which `swap` handles.
+    pub fn swap_jobs(&self, data: &DeviceBuffer<u8>, stride: usize, hot: usize, cold: usize, stage: u64)
+        -> Result<Option<[(u64, u64); 3]>> {
+        let mut place = self.place.borrow_mut();
+        let (Err(j), Ok(slot)) = (place[hot], place[cold]) else {
+            return Err(CoreError::Other("expert swap between two experts on the same side; this is a bug".into()));
+        };
+        if slot >= self.base {
+            return Ok(None);
+        }
+        let slot_addr = data.as_ptr() as u64 + (slot * stride) as u64;
+        let host_addr = self.host_dev + (j * stride) as u64;
+        place[hot] = Ok(slot);
+        place[cold] = Err(j);
+        Ok(Some([(slot_addr, stage), (host_addr, slot_addr), (stage, host_addr)]))
+    }
+
+    /// [`Self::publish`] as copies for a batched launch: fills the host
+    /// mirrors from `place` and returns (source, destination, bytes) of the
+    /// table and of the residency map, the sources the mirrors' device
+    /// addresses. `None` when a size is not a whole number of 16-byte units
+    /// (`publish` it then).
+    pub fn publish_jobs(&self, data: &DeviceBuffer<u8>, stride: usize) -> Result<Option<[(u64, u64, u64); 2]>> {
+        let n = self.place.borrow().len();
+        if n % 16 != 0 {
+            return Ok(None);
+        }
+        let mut mirror = self.mirror.borrow_mut();
+        let mut res = self.resident_mirror.borrow_mut();
+        for (e, p) in self.place.borrow().iter().enumerate() {
+            mirror.as_mut_slice()[e] = self.addr(data, stride, *p);
+            res.as_mut_slice()[e] = p.is_ok() as u8;
+        }
+        let dev = data.device();
+        Ok(Some([
+            (mirror.device_ptr(dev)? as u64, self.table.as_ptr() as u64, (8 * n) as u64),
+            (res.device_ptr(dev)? as u64, self.resident.as_ptr() as u64, n as u64),
+        ]))
     }
 
     /// Rewrites the kernels' table from `place`.
@@ -448,7 +499,17 @@ pub struct PleTable {
     head_dim: usize,
     /// Reads the rows in parallel: most are random SSD reads (gather_pool).
     pool: crate::gather_pool::GatherPool,
+    /// A decode step's few rows, read with positional reads on handles of
+    /// their own instead of faulting the mapping in: the faults serialize on
+    /// the process's working-set lock, and 16 of them took ~1.5-2 ms of every
+    /// token on Windows while the GPU waited. None if the file cannot be
+    /// reopened (the mapping is used then).
+    reader: Option<crate::expert_reader::ExpertReader>,
 }
+
+/// Rows a gather reads with `PleTable::reader`; more go through the mapping
+/// with the page prefetch.
+const PLE_READ_ROWS: usize = 64;
 
 /// Rows the gather threads keep in flight. More only contended on the
 /// working-set lock their page faults take (128 measured slower than 32).
@@ -506,6 +567,21 @@ impl PleTable {
             return Err(CoreError::Other("PLE gather given too small an output; this is a bug".into()));
         }
         let (hd, rb, ty) = (self.head_dim, self.row_bytes, self.info.ty);
+        if let Some(reader) = self.reader.as_ref().filter(|_| rows.len() <= PLE_READ_ROWS) {
+            let mut raw = vec![0u8; rows.len() * rb];
+            let reads = raw.chunks_exact_mut(rb).zip(rows)
+                .map(|(buf, &r)| (self.info.shard, self.info.file_offset + r * rb as u64, buf)).collect();
+            if reader.read_all(reads).is_ok() {
+                for (i, src) in raw.chunks_exact(rb).enumerate() {
+                    if airun_gguf::dequant::dequantize(ty, src, hd, &mut out[i * hd..(i + 1) * hd]).is_err() {
+                        return Err(CoreError::Other(format!(
+                            "cannot decode the PLE table's {ty} rows; check the model file with airun inspect")));
+                    }
+                }
+                return Ok(());
+            }
+            // A failed read falls back to the mapping, which reports its own errors.
+        }
         if rows.len() > 64 {
             const PAGE: usize = 4096;
             let base = bytes.as_ptr() as usize;
@@ -687,8 +763,11 @@ impl Model {
                         name: info.name.clone(), found: info.dims.clone(), expected: vec![p.head_dim as u64] });
                 }
                 let row_bytes = p.head_dim / layout.elements as usize * layout.bytes as usize;
+                // AIRUN_PLE_MAP=1 reads every gather through the mapping.
+                let reader = (!std::env::var("AIRUN_PLE_MAP").is_ok_and(|v| v.trim() == "1"))
+                    .then(|| crate::expert_reader::ExpertReader::new(&gguf.shard_paths(), 16).ok()).flatten();
                 Some(PleTable { file: Arc::clone(gguf), info, row_bytes, head_dim: p.head_dim,
-                    pool: crate::gather_pool::GatherPool::new(PLE_READERS) })
+                    pool: crate::gather_pool::GatherPool::new(PLE_READERS), reader })
             }
             None => None,
         };
@@ -999,13 +1078,47 @@ fn load_hc_mix(gguf: &Arc<GgufFile>, prefix: &str, dev: i32, stream: &Stream, co
     inject: bool) -> Result<HcMix> {
     Ok(HcMix {
         norm: load_f32(gguf, &format!("{prefix}_norm.weight"), dev, stream)?,
-        down: load_packed(gguf, &format!("{prefix}_down.weight"), dev, stream, config)?,
-        up: load_packed(gguf, &format!("{prefix}_up.weight"), dev, stream, config)?,
+        down: load_hc_matrix(gguf, &format!("{prefix}_down.weight"), dev, stream, config)?,
+        up: load_hc_matrix(gguf, &format!("{prefix}_up.weight"), dev, stream, config)?,
         inject: if inject {
             Some(load_packed(gguf, &format!("{prefix}_inject.weight"), dev, stream, config)?)
         } else {
             None
         },
+    })
+}
+
+/// A hyper-connection mix matrix; a BF16 one is converted to Q8_0 at load:
+/// half the bytes read every token, four per layer. On Qwen4 Flash-Next (one
+/// RTX 3060) 29.8 -> 30.35 tok/s, perplexity 3.96 either way (exact f32 path
+/// 3.95). AIRUN_HC_Q8=0 keeps them BF16.
+fn load_hc_matrix(gguf: &Arc<GgufFile>, name: &str, dev: i32, stream: &Stream, config: &Config) -> Result<GpuTensor> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("AIRUN_HC_Q8").map_or(true, |v| v.trim() != "0"));
+    let info = tensor_info(gguf, name, &config.arch_name)?;
+    let k = info.row_size() as usize;
+    if !on || info.ty != airun_gguf::GgmlType::BF16 || k % 32 != 0 || info.dims.len() != 2 {
+        return load_packed(gguf, name, dev, stream, config);
+    }
+    let src: Vec<f32> = gguf.tensor_bytes(info)?.chunks_exact(2)
+        .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect();
+    let mut q = Vec::new();
+    airun_gguf::quantize(airun_gguf::GgmlType::Q8_0, &src, k, &mut q)
+        .map_err(|e| CoreError::Other(format!("cannot convert {name} to Q8_0 ({e}); set AIRUN_HC_Q8=0 to keep it BF16")))?;
+    let rows = info.n_rows() as usize;
+    Ok(GpuTensor {
+        data: upload_packed(dev, &q, stream)?,
+        host_experts: None,
+        mapped: None,
+        ty: airun_gguf::GgmlType::Q8_0,
+        k,
+        rows,
+        row_bytes: k / 32 * 34,
+        expert_stride: 0,
+        n_experts: 1,
+        device: dev,
+        global_scale: 1.0,
+        ram: None,
     })
 }
 

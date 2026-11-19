@@ -320,6 +320,113 @@ struct MoeScratch {
     /// With mapped experts: the prediction of a layer's experts made as the
     /// layer starts (see Runtime::moe_prefetch).
     pre: Option<Prefetch>,
+    /// With mapped experts: a decode token's host-side experts multiplied on
+    /// the CPU (moe_cpu.rs) instead of copied into `stage`.
+    cpu: Option<crate::moe_cpu::CpuExperts>,
+}
+
+/// A rebalance's expert moves as three batched copy launches
+/// (hybrid::moe_copy_jobs): phase 0 the evicted experts' VRAM slots into the
+/// stage areas, phase 1 the incoming experts' host copies into those slots,
+/// phase 2 the stage areas over those host copies, and the tables' uploads.
+/// Each swap used to be three cudaMemcpyAsync a tensor (~35 us of overhead
+/// each, ~600 a rebalance): 4-8 ms of every token of Qwen4 Flash-Next.
+#[derive(Default)]
+struct SwapBatch {
+    /// Stage bytes taken, per tensor of a layer (gate, up, down): one area
+    /// serves every layer, and their experts differ in size (a count of
+    /// experts times the layer's stride overlapped another layer's).
+    used: [usize; 3],
+    /// Per phase: sources, destinations, and the running total of 16-byte
+    /// units (the jobs' boundaries, starting at 0).
+    phases: [(Vec<u64>, Vec<u64>, Vec<u64>); 3],
+}
+
+impl SwapBatch {
+    /// One copy of `bytes` (a multiple of 16) into phase `p`.
+    fn copy(&mut self, p: usize, src: u64, dst: u64, bytes: u64) {
+        let ph = &mut self.phases[p];
+        if ph.2.is_empty() {
+            ph.2.push(0);
+        }
+        let last = *ph.2.last().expect("starts with 0");
+        ph.0.push(src);
+        ph.1.push(dst);
+        ph.2.push(last + bytes / 16);
+    }
+
+    /// The three copies of one tensor's swap (MappedExperts::swap_jobs).
+    fn swap(&mut self, tensor: usize, jobs: [(u64, u64); 3], stride: usize) {
+        for (p, &(s, d)) in jobs.iter().enumerate() {
+            self.copy(p, s, d, stride as u64);
+        }
+        self.used[tensor] += stride;
+    }
+
+    /// Queues the phases on `stream`; the returned buffers hold the job
+    /// lists and must outlive the launches.
+    fn launch(self, device: i32, stream: &Stream) -> Result<Vec<DeviceBuffer<u64>>> {
+        let mut keep = Vec::new();
+        // The VRAM-to-VRAM phase takes many blocks; the PCIe ones a few, as
+        // moe_stage_copy_flat_kernel (more in flight only queue).
+        for (p, (src, dst, start)) in self.phases.into_iter().enumerate() {
+            if src.is_empty() {
+                continue;
+            }
+            let n = src.len();
+            let all: Vec<u64> = src.into_iter().chain(dst).chain(start).collect();
+            let buf = DeviceBuffer::<u64>::from_slice(device, &all, stream)?;
+            hybrid::moe_copy_jobs(buf.as_ptr(), buf.offset_ptr(n), buf.offset_ptr(2 * n), n,
+                if p == 0 { 64 } else { 8 }, stream)?;
+            keep.push(buf);
+        }
+        Ok(keep)
+    }
+}
+
+/// Fails if a CPU expert request since the last check could not be served:
+/// that step's output is missing those experts. Layers the GPU computed
+/// itself because the CPU was late are only reported, once a while.
+fn cpu_experts_ok(states: &[DeviceState]) -> Result<()> {
+    static LATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for st in states {
+        let Some(cx) = st.moe.as_ref().and_then(|m| m.cpu.as_ref()) else { continue };
+        if let Some(e) = cx.take_error() {
+            return Err(CoreError::Other(format!(
+                "the CPU could not compute the experts of decode request {e}; rerun with AIRUN_MOE_CPU=0 \
+                 to copy them to the GPU instead, and report this with the model and the command")));
+        }
+        let late = u64::from(cx.take_late());
+        if late > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let total = LATE.fetch_add(late, Relaxed) + late;
+            // At 1, 100, 10 000... late layers: a timeout costs 50 ms, then the
+            // next 96 layers skip the CPU.
+            let warned = WARNED.load(Relaxed);
+            if total >= warned.max(1) {
+                WARNED.store(total.saturating_mul(100), Relaxed);
+                eprintln!("note: the CPU fell behind on {total} decode layer(s) (other programs busy?); the GPU \
+                    read those experts from RAM instead. Fewer CPU threads (AIRUN_CPU_THREADS) or AIRUN_MOE_CPU=0 \
+                    avoid it if it keeps happening");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The CPU's view of layer `l`'s host-side experts, when it can multiply
+/// all three of its expert tensors (moe_cpu.rs).
+fn cpu_expert_layer(layer: &crate::model::LayerWeights, top_k: usize) -> Option<crate::moe_cpu::LayerRef> {
+    let FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } = &layer.ffn else { return None };
+    let r = |t: &GpuTensor| {
+        let m = t.mapped.as_ref()?;
+        let (host, dev, len) = m.host_region();
+        (crate::cpu::moe_expert_type(t.ty) && t.global_scale == 1.0)
+            .then_some(crate::moe_cpu::TensorRef { ty: t.ty, host, dev, len, stride: t.expert_stride })
+    };
+    let (gate, up, down) = (r(gate_exps)?, r(up_exps)?, r(down_exps)?);
+    (gate.ty == up.ty && top_k <= crate::moe_cpu::SLOTS).then_some(crate::moe_cpu::LayerRef { gate, up, down })
 }
 
 /// A decode's host-side experts copied while the layer's attention runs.
@@ -481,11 +588,32 @@ struct DeviceState {
 
 /// The captured decode step and the pinned staging its replays read.
 struct DecodeGraph {
-    /// One per shard, each replayed on its device's stream; the residual
-    /// rows cross between GPUs outside the graphs.
-    graphs: Vec<Option<airun_cuda::Graph>>,
+    /// Per shard, the pieces of its step (see [`Runtime::decode_pieces`]) in
+    /// launch order, each replayed on the device's stream; empty until
+    /// captured. The residual rows cross between GPUs outside the graphs.
+    graphs: Vec<Vec<airun_cuda::Graph>>,
     token: airun_cuda::PinnedBuffer<i32>,
     position: airun_cuda::PinnedBuffer<i32>,
+}
+
+/// One piece of a shard's decode step: its layers (local indices), and
+/// whether it starts with the embedding, the PLE rows' upload, or ends with
+/// the logits.
+struct DecodePiece {
+    layers: std::ops::Range<usize>,
+    input: bool,
+    ple: bool,
+    output: bool,
+}
+
+/// Layers per piece of a decode graph (AIRUN_GRAPH_LAYERS; 0 keeps one graph
+/// per shard). Launching a graph costs the host about a microsecond per node
+/// on Windows, and the GPU waited for all of it: Qwen4 Flash-Next's ~2900
+/// nodes took 2 ms of every token before its second layer could start. In
+/// pieces the GPU runs each one while the host submits the next.
+fn graph_piece_layers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("AIRUN_GRAPH_LAYERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8))
 }
 
 /// Captured [`Runtime::decode_rows`] passes, one per list of slots (in row
@@ -1012,7 +1140,7 @@ impl Runtime {
                     scores: std::cell::RefCell::new({
                         let mut sc = vec![0.0; mapped_layers * moe.n_experts];
                         if let (true, Some(p)) = (mapped_layers > 0, &model.expert_profile) {
-                            let steady = REBALANCE_EVERY as f32 * moe.n_experts_used as f32 / (1.0 - REBALANCE_DECAY);
+                            let steady = rebalance_every() as f32 * moe.n_experts_used as f32 / (1.0 - REBALANCE_DECAY);
                             for (local, &l) in shard.layers.iter().enumerate() {
                                 if let Some(sh) = p.borrow().shares(l) {
                                     for (d, x) in sc[local * moe.n_experts..][..moe.n_experts].iter_mut().zip(sh) {
@@ -1077,6 +1205,19 @@ impl Runtime {
                         FfnWeights::Moe { gate_exps, .. } if gate_exps.host_experts.is_some() =>
                             Some(gate_exps.cache_capacity() / moe.n_experts_used), _ => None,
                     }).min().unwrap_or(1).max(1),
+                    cpu: if mapped_layers > 0 && crate::moe_cpu::enabled() {
+                        let mut refs: Vec<Option<crate::moe_cpu::LayerRef>> = vec![None; model.layers.len()];
+                        for &l in &shard.layers {
+                            refs[l] = cpu_expert_layer(&model.layers[l], moe.n_experts_used);
+                        }
+                        if refs.iter().any(Option::is_some) {
+                            Some(crate::moe_cpu::CpuExperts::new(dev, refs, cfg.n_embd, moe.expert_ff, &stream)?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    },
                 }),
                 None => None,
             };
@@ -1556,7 +1697,8 @@ impl Runtime {
         let host = self.logits_host.as_mut().expect("allocated above");
         logits.copy_to_host(host.as_mut_slice(), &st.stream)?;
         st.stream.synchronize()?;
-        Ok(host.as_mut_slice())
+        cpu_experts_ok(&self.states)?;
+        Ok(self.logits_host.as_mut().expect("allocated above").as_mut_slice())
     }
 
     /// [`forward`] for greedy decoding: the argmax of the logits, computed on
@@ -1583,7 +1725,9 @@ impl Runtime {
                     std::ptr::null_mut(), &st.stream)?;
         dev.copy_to_host(host.as_mut_slice(), &st.stream)?;
         st.stream.synchronize()?;
-        Ok(host.as_slice()[0] as u32)
+        let pick = host.as_slice()[0] as u32;
+        cpu_experts_ok(&self.states)?;
+        Ok(pick)
     }
 
     /// Whether greedy decode can run as a [`ChainGraph`]: where the graphed
@@ -1681,9 +1825,9 @@ impl Runtime {
     /// counts read back is a synchronization, and each swap moves three
     /// experts each way across PCIe.
     pub(crate) fn rebalance_experts(&mut self) -> Result<()> {
-        const MAX_SWAPS: usize = 16;
+        let max_swaps = max_swaps();
         self.since_rebalance += 1;
-        if self.since_rebalance < REBALANCE_EVERY {
+        if self.since_rebalance < rebalance_every() {
             return Ok(());
         }
         self.since_rebalance = 0;
@@ -1697,6 +1841,10 @@ impl Runtime {
             counts.fill_zero(&st.stream)?;
             let mut scores = m.scores.borrow_mut();
             let (mut hits, mut misses) = m.mapped_hits.get();
+            // The swaps' copies, batched into three launches for the whole
+            // rebalance while the stage areas (STAGE_CAP experts a tensor)
+            // have room; the rest, and loans, copy as before.
+            let mut batch = SwapBatch::default();
             for (local, &layer) in st.layers.iter().enumerate() {
                 let FfnWeights::Moe { gate_exps, up_exps, down_exps, .. } = &self.model.layers[layer].ffn else {
                     continue;
@@ -1715,14 +1863,14 @@ impl Runtime {
                 }
                 // A free loan takes a hot expert for one copy, a third of a
                 // swap's.
-                let filled = self.loan_fill(st, layer, sc, MAX_SWAPS, SWAP_MARGIN)?;
+                let filled = self.loan_fill(st, layer, sc, max_swaps, SWAP_MARGIN)?;
                 let place = if filled > 0 { gm.place.borrow().clone() } else { place };
                 let mut resident: Vec<usize> = (0..ne).filter(|&e| place[e].is_ok()).collect();
                 let mut outside: Vec<usize> = (0..ne).filter(|&e| place[e].is_err()).collect();
                 resident.sort_by(|&a, &b| sc[a].total_cmp(&sc[b]));
                 outside.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]));
                 let mut swapped = 0;
-                for (&hot, &cold) in outside.iter().zip(&resident).take(MAX_SWAPS) {
+                for (&hot, &cold) in outside.iter().zip(&resident).take(max_swaps) {
                     // A swap moves both experts across PCIe, three times
                     // what one miss costs; it pays only when the hot expert
                     // is expected to be routed a few times more than the
@@ -1730,21 +1878,37 @@ impl Runtime {
                     if sc[hot] <= sc[cold] * 1.25 + SWAP_MARGIN {
                         break;
                     }
-                    for t in tensors {
+                    for (ti, t) in tensors.iter().enumerate() {
                         let tm = t.mapped.as_ref().ok_or_else(|| CoreError::Other(
                             "a layer's expert tensors disagree on where their experts live; reload the model".into()))?;
-                        tm.swap(&t.data, t.expert_stride, hot, cold, staging, &st.stream)?;
+                        // Bytes, not experts: the layers' experts differ in size.
+                        let jobs = match m.stage.as_ref() {
+                            Some((areas, ..)) if batch.used[ti] + t.expert_stride <= areas[ti].len() => {
+                                let stage = areas[ti].as_ptr() as u64 + batch.used[ti] as u64;
+                                tm.swap_jobs(&t.data, t.expert_stride, hot, cold, stage)?
+                            }
+                            _ => None,
+                        };
+                        match jobs {
+                            Some(jobs) => batch.swap(ti, jobs, t.expert_stride),
+                            None => tm.swap(&t.data, t.expert_stride, hot, cold, staging, &st.stream)?,
+                        }
                     }
                     swapped += 1;
                 }
                 if swapped + filled > 0 {
                     for t in tensors {
                         if let Some(tm) = &t.mapped {
-                            tm.publish(&t.data, t.expert_stride, &st.stream)?;
+                            match tm.publish_jobs(&t.data, t.expert_stride)? {
+                                Some(jobs) => jobs.iter().for_each(|&(s, d, b)| batch.copy(2, s, d, b)),
+                                None => tm.publish(&t.data, t.expert_stride, &st.stream)?,
+                            }
                         }
                     }
                 }
             }
+            // Kept until the stream is synchronized below.
+            let _jobs = batch.launch(st.device, &st.stream)?;
             m.mapped_hits.set((hits, misses));
             // The table mirrors are reused by the next publish.
             st.stream.synchronize()?;
@@ -1906,6 +2070,13 @@ impl Runtime {
         if let Some(sp) = self.spec.as_mut() {
             sp.synced = false;
         }
+        if tokens.len() == 1 {
+            for st in &self.states {
+                if let Some(cx) = st.moe.as_ref().and_then(|m| m.cpu.as_ref()) {
+                    cx.kick();
+                }
+            }
+        }
 
         // Decode goes through a captured CUDA graph where possible: a step is
         // hundreds of tiny launches, and issuing them one by one measured
@@ -2055,7 +2226,7 @@ impl Runtime {
                         let ids: Vec<i32> = tokens[off..off + n].iter().map(|&t| t as i32).collect();
                         let pos: Vec<i32> = (0..n).map(|i| (pos0 + i) as i32).collect();
                         if k == 0 && si == 0 {
-                            self.shard_input(0, &ids, &pos, true, true, true, &cfg)?;
+                            self.shard_input(0, &ids, &pos, true, true, true, true, &cfg)?;
                         } else {
                             device::set_device(dev)?;
                             crate::cpu::set_pass(n);
@@ -2118,7 +2289,7 @@ impl Runtime {
         let mut dg = match self.decode_graph.take() {
             Some(dg) => dg,
             None => DecodeGraph {
-                graphs: (0..self.states.len()).map(|_| None).collect(),
+                graphs: (0..self.states.len()).map(|_| Vec::new()).collect(),
                 token: airun_cuda::PinnedBuffer::new(1)?,
                 position: airun_cuda::PinnedBuffer::new(1)?,
             },
@@ -2130,7 +2301,7 @@ impl Runtime {
         // replay the latest token and position, and the prompt came out
         // garbled (`-b 1` answered "The capital of France is" with "a 2013
         // American comedy"). Wait for the previous replay to have run.
-        if dg.graphs.iter().any(Option::is_some) {
+        if dg.graphs.iter().any(|g| !g.is_empty()) {
             for st in &self.states {
                 device::set_device(st.device)?;
                 st.stream.synchronize()?;
@@ -2138,41 +2309,105 @@ impl Runtime {
         }
         dg.token.as_mut_slice()[0] = token as i32;
         dg.position.as_mut_slice()[0] = self.n_past as i32;
-        // The PLE rows are hashed on the host; a captured graph only copies
-        // them from the pinned staging, so refresh it before replaying.
-        let ple_built = self.model.config.ple.as_ref()
-            .and_then(|p| self.states.iter().position(|s| s.layers.contains(&p.layer)))
-            .is_some_and(|si| dg.graphs[si].is_some());
-        if ple_built {
-            self.ple_fill(dg.token.as_slice())?;
-        }
 
+        let timing = host_timing().then(|| (std::time::Instant::now(), std::cell::Cell::new(0.0f64)));
         let mut result = Ok(());
-        for si in 0..self.states.len() {
+        'shards: for si in 0..self.states.len() {
             if si > 0 {
                 result = self.handoff(si, 1);
                 if result.is_err() { break; }
             }
             device::set_device(self.states[si].device)?;
-            if dg.graphs[si].is_none() {
-                // SAFETY of the capture: everything queue_shard touches lives
-                // in `self` or in `dg`, both of which outlive the graph.
-                airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
-                let queued = self.queue_shard(si, dg.token.as_slice(), dg.position.as_slice(), true, true, false);
-                let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
-                match queued.and_then(|_| Ok(ended?)) {
-                    Ok(g) => dg.graphs[si] = Some(g),
-                    Err(e) => { result = Err(e); break; }
+            let built = !dg.graphs[si].is_empty();
+            for (pi, piece) in self.decode_pieces(si).iter().enumerate() {
+                if !built {
+                    // SAFETY of the capture: everything queue_piece touches
+                    // lives in `self` or in `dg`, both of which outlive the graph.
+                    airun_cuda::Graph::begin_capture(&self.states[si].stream)?;
+                    let queued = self.queue_piece(si, piece, dg.token.as_slice(), dg.position.as_slice());
+                    let ended = airun_cuda::Graph::end_capture(&self.states[si].stream);
+                    match queued.and_then(|_| Ok(ended?)) {
+                        Ok(g) => dg.graphs[si].push(g),
+                        Err(e) => {
+                            dg.graphs[si].clear();
+                            result = Err(e);
+                            break 'shards;
+                        }
+                    }
+                } else if piece.ple {
+                    // The PLE rows are hashed and read on the host -- mostly
+                    // random SSD reads -- while the pieces before this one run;
+                    // the graph only copies them from the pinned staging.
+                    let t = std::time::Instant::now();
+                    result = self.ple_fill(dg.token.as_slice());
+                    if let Some((_, ple)) = &timing { ple.set(t.elapsed().as_secs_f64() * 1000.0); }
+                    if result.is_err() { break 'shards; }
                 }
+                result = dg.graphs[si][pi].launch(&self.states[si].stream).map_err(Into::into);
+                if result.is_err() { break 'shards; }
             }
-            result = dg.graphs[si].as_ref().expect("graph was just built")
-                .launch(&self.states[si].stream).map_err(Into::into);
-            if result.is_err() { break; }
+        }
+        if let Some((t, ple)) = timing {
+            eprintln!("host: decode step queued in {:.2} ms ({:.2} of them reading PLE rows), {} graphs",
+                t.elapsed().as_secs_f64() * 1000.0, ple.get(), dg.graphs.iter().map(Vec::len).sum::<usize>());
         }
         self.decode_graph = Some(dg);
         result?;
         self.n_past += 1;
         self.history.push(token);
+        Ok(())
+    }
+
+    /// How shard `si`'s decode step splits into graphs: a first piece up to
+    /// the PLE layer (so the host reads the PLE rows while it runs), the PLE
+    /// layer alone, then [`graph_piece_layers`] layers at a time.
+    fn decode_pieces(&self, si: usize) -> Vec<DecodePiece> {
+        let layers = &self.states[si].layers;
+        let n = layers.len();
+        let ple_at = self.model.config.ple.as_ref().and_then(|p| layers.iter().position(|&l| l == p.layer));
+        let chunk = graph_piece_layers();
+        let mut cuts = vec![0usize];
+        if chunk > 0 {
+            if let Some(p) = ple_at {
+                if p > 0 {
+                    cuts.push(p);
+                }
+                // The PLE layer alone: the GPU waits on its launch once the
+                // rows are read, and one layer launches in a fraction of the
+                // time eight do; the next piece is queued while it runs.
+                if p + 1 < n {
+                    cuts.push(p + 1);
+                }
+            }
+            while cuts[cuts.len() - 1] + chunk < n {
+                let at = cuts[cuts.len() - 1] + chunk;
+                cuts.push(at);
+            }
+        }
+        cuts.push(n);
+        let last_shard = si + 1 == self.states.len();
+        cuts.windows(2).map(|w| DecodePiece {
+            layers: w[0]..w[1],
+            input: w[0] == 0,
+            ple: ple_at.is_some_and(|p| w[0] <= p && p < w[1]),
+            output: last_shard && w[1] == n,
+        }).collect()
+    }
+
+    /// Queues one decode piece of shard `si` (see [`Self::decode_pieces`]):
+    /// [`Self::queue_shard`]'s work for its layers.
+    fn queue_piece(&mut self, si: usize, piece: &DecodePiece, token_ids: &[i32], positions: &[i32]) -> Result<()> {
+        let cfg = self.model.config.clone();
+        if piece.input {
+            self.shard_input(si, token_ids, positions, true, false, false, false, &cfg)?;
+        }
+        if piece.ple {
+            self.shard_ple(si, token_ids, true, false)?;
+        }
+        self.shard_layers(si, piece.layers.clone(), token_ids.len(), &cfg)?;
+        if piece.output {
+            self.shard_output(token_ids.len(), &cfg)?;
+        }
         Ok(())
     }
 
@@ -2251,7 +2486,7 @@ impl Runtime {
         -> Result<()> {
         let cfg = self.model.config.clone();
         let n = token_ids.len();
-        self.shard_input(si, token_ids, positions, upload, fill_ple, record_ple_event, &cfg)?;
+        self.shard_input(si, token_ids, positions, upload, true, fill_ple, record_ple_event, &cfg)?;
         self.shard_layers(si, 0..self.states[si].layers.len(), n, &cfg)?;
         if si + 1 < self.states.len() {
             return Ok(());
@@ -2260,10 +2495,10 @@ impl Runtime {
     }
 
     /// The start of [`Self::queue_shard`]: the embedding on the first shard,
-    /// the positions, the PLE rows.
+    /// the positions, and with `with_ple` the PLE rows ([`Self::shard_ple`]).
     #[allow(clippy::too_many_arguments)]
-    fn shard_input(&mut self, si: usize, token_ids: &[i32], positions: &[i32], upload: bool, fill_ple: bool,
-                   record_ple_event: bool, cfg: &Config) -> Result<()> {
+    fn shard_input(&mut self, si: usize, token_ids: &[i32], positions: &[i32], upload: bool, with_ple: bool,
+                   fill_ple: bool, record_ple_event: bool, cfg: &Config) -> Result<()> {
         let n = token_ids.len();
         device::set_device(self.states[si].device)?;
         crate::cpu::set_pass(n);
@@ -2302,13 +2537,21 @@ impl Runtime {
             let st = &self.states[si];
             st.positions.copy_from_host_at(0, positions, &st.stream)?;
         }
-        if cfg.ple.as_ref().is_some_and(|p| self.states[si].layers.contains(&p.layer)) {
+        if with_ple {
+            self.shard_ple(si, token_ids, fill_ple, record_ple_event)?;
+        }
+        Ok(())
+    }
+
+    /// On the shard holding the PLE layer, the batch's PLE rows: hashed and
+    /// gathered on the host with `fill_ple`, then queued for upload.
+    fn shard_ple(&self, si: usize, token_ids: &[i32], fill_ple: bool, record_ple_event: bool) -> Result<()> {
+        if self.model.config.ple.as_ref().is_some_and(|p| self.states[si].layers.contains(&p.layer)) {
             if fill_ple {
                 self.ple_fill(token_ids)?;
             }
-            self.ple_upload(si, n, record_ple_event)?;
+            self.ple_upload(si, token_ids.len(), record_ple_event)?;
         }
-
         Ok(())
     }
 
@@ -2387,22 +2630,28 @@ impl Runtime {
             .ok_or_else(|| CoreError::Other("output shard has no logits buffer".into()))?;
 
         // Only the final position matters for sampling, so project one row.
-        // A single row is decode, and decode stays on the exact f32 kernels --
-        // see matvec_reuse for the measured reasoning.
-        let last_row = st.xb.offset_ptr((n - 1) * cfg.n_embd);
-        ops::matvec(
-            out_w.kernel_type(),
-            out_w.ptr(),
-            last_row,
-            logits.as_mut_ptr(),
-            cfg.n_embd,
-            cfg.vocab_size,
-            1,
-            out_w.row_bytes,
-            &st.stream,
-        )?;
-        if out_w.global_scale != 1.0 {
-            ops::scale(logits.as_mut_ptr(), out_w.global_scale, cfg.vocab_size, &st.stream)?;
+        // A single row is decode, and takes the decode kernels' choice (see
+        // matvec_reuse): exact f32, but the integer kernel for the types that
+        // prefer it -- Qwen4 Flash-Next's 521 MB Q6_K head took 1.9 ms a token
+        // on the f32 kernel of an RTX 3060.
+        if n == 1 && !on_cpu(out_w) {
+            matvec(out_w, &st.xb, logits, 1, &st.q8act, &st.stream)?;
+        } else {
+            let last_row = st.xb.offset_ptr((n - 1) * cfg.n_embd);
+            ops::matvec(
+                out_w.kernel_type(),
+                out_w.ptr(),
+                last_row,
+                logits.as_mut_ptr(),
+                cfg.n_embd,
+                cfg.vocab_size,
+                1,
+                out_w.row_bytes,
+                &st.stream,
+            )?;
+            if out_w.global_scale != 1.0 {
+                ops::scale(logits.as_mut_ptr(), out_w.global_scale, cfg.vocab_size, &st.stream)?;
+            }
         }
 
         if std::env::var("AIRUN_TRACE_LAYERS").is_ok_and(|v| v.trim() == "sum") {
@@ -4250,6 +4499,26 @@ impl Runtime {
             stream,
         )?;
 
+        // A decode token whose host-side experts the CPU multiplies
+        // (moe_cpu.rs): they are handed over here, before the shared expert,
+        // so the CPU starts as early as it can.
+        let cpu_cx = match (&gate_exps.mapped, m.cpu.as_ref(), m.stage.as_ref()) {
+            (Some(gm), Some(cx), Some((_, sidx, list, n_list))) if n == 1 && cx.serves(layer) => {
+                let (Some(um), Some(dm)) = (&up_exps.mapped, &down_exps.mapped) else {
+                    return Err(CoreError::Other(
+                        "a layer's expert tensors disagree on where their experts live; reload the model".into()));
+                };
+                let k = moe.n_experts_used;
+                hybrid::moe_stage_plan(m.ids.as_ptr(), k, gm.resident.as_ptr(), moe.n_experts, sidx.as_mut_ptr(),
+                    list.as_mut_ptr(), n_list.as_mut_ptr(), stream)?;
+                hybrid::moe_cpu_post(m.ids.as_ptr(), m.weights.as_ptr(), sidx.as_mut_ptr(), n_list.as_ptr(),
+                    cx.n_copy.as_mut_ptr(), cx.keep, k, gm.table.as_ptr(), um.table.as_ptr(), dm.table.as_ptr(),
+                    st.xb.as_ptr(), cfg.n_embd, cx.seq.as_mut_ptr(), layer, cx.mbox_dev(), stream)?;
+                Some(cx)
+            }
+            _ => None,
+        };
+
         // The shared expert writes the output first; the routed experts then
         // accumulate on top, which avoids a separate buffer and a second add.
         if let Some(s) = shared {
@@ -4320,6 +4589,47 @@ impl Runtime {
                 return Err(CoreError::Other("gate and up experts differ in size; this model needs the streamed expert path (AIRUN_EXPERTS=stream)".into()));
             }
             let k = moe.n_experts_used;
+            // A decode token: the host-side experts went to the CPU above
+            // while the resident ones run here; nothing crosses PCIe but the
+            // row and the CPU's sum.
+            if let Some(cx) = cpu_cx {
+                // With a GPU share, its experts cross PCIe on the side stream
+                // while the resident ones compute, as below.
+                let copy = cx.keep > 0 && moe_overlap();
+                if copy {
+                    st.fork.record(stream)?;
+                    st.side.wait_for(&st.fork)?;
+                    for (t, area) in [gate_exps, up_exps, down_exps].iter().zip(areas) {
+                        let tm = t.mapped.as_ref().expect("checked above");
+                        hybrid::moe_stage_copy(tm.table.as_ptr(), list.as_ptr(), cx.n_copy.as_ptr(), std::ptr::null(),
+                            area.as_mut_ptr(), t.expert_stride, k, &st.side)?;
+                    }
+                }
+                // The last pass, after the wait, is the fallback: the experts
+                // of a request the CPU did not answer in time, read from RAM
+                // (moe_cpu_wait marks them; normally it marks none).
+                let passes: &[i32] = if copy { &[1, 2, 3] } else { &[1, 3] };
+                for &only in passes {
+                    if only == 2 {
+                        st.join.record(&st.side)?;
+                        stream.wait_for(&st.join)?;
+                    }
+                    if only == 3 {
+                        hybrid::moe_cpu_wait(cx.seq.as_ptr(), cx.mbox_dev(), st.xb2.as_mut_ptr(), cfg.n_embd,
+                            sidx.as_mut_ptr(), k, stream)?;
+                    }
+                    let only = if only == 3 { 1 } else { only };
+                    let pass = |t: &GpuTensor| hybrid::Staged { sidx: sidx.as_ptr(), stride: t.expert_stride, only };
+                    hybrid::moe_gate_up_tab(gate_exps.kernel_type(), gm.table.as_ptr(), um.table.as_ptr(),
+                        st.xb.as_ptr(), m.ids.as_ptr(), m.h.as_mut_ptr(), cfg.n_embd, moe.expert_ff, 1, k,
+                        gate_exps.row_bytes, Some((pass(gate_exps), areas[0].as_ptr(), areas[1].as_ptr())),
+                        m.q8.as_mut_ptr().cast(), stream)?;
+                    hybrid::moe_down_tab(down_exps.kernel_type(), dm.table.as_ptr(), m.h.as_ptr(), m.ids.as_ptr(),
+                        m.weights.as_ptr(), st.xb2.as_mut_ptr(), moe.expert_ff, cfg.n_embd, 1, k, down_exps.row_bytes,
+                        Some((pass(down_exps), areas[2].as_ptr())), m.q8.as_mut_ptr().cast(), stream)?;
+                }
+                return Ok(());
+            }
             // Tokens per pass, so the host-side experts they route to fit
             // the staging area even if none of them is resident.
             let per = (STAGE_CAP / k).max(1);
@@ -4699,7 +5009,12 @@ impl Runtime {
                 None => {
                     let logits = self.logits_host.as_mut().ok_or_else(|| CoreError::Other(
                         "generate has no logits to sample; the prompt must not be empty".into()))?;
-                    sampler.sample(logits.as_mut_slice(), &history)
+                    let t = host_timing().then(std::time::Instant::now);
+                    let token = sampler.sample(logits.as_mut_slice(), &history);
+                    if let Some(t) = t {
+                        eprintln!("host: sampled in {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    token
                 }
             };
             if self.tokenizer.is_eog(token) {
@@ -5055,9 +5370,19 @@ fn stream_grouped() -> bool {
     *ON.get_or_init(|| !std::env::var("AIRUN_NO_STREAM_GROUPED").is_ok_and(|v| v.trim() != "0"))
 }
 
-/// Forward passes between expert rebalances, and the decay of the routing
-/// scores at each one.
-const REBALANCE_EVERY: usize = 8;
+/// Forward passes between expert rebalances (AIRUN_REBALANCE_EVERY, default
+/// 8), and the decay of the routing scores at each one.
+/// Swaps per layer and rebalance at most: AIRUN_MAX_SWAPS, default 16.
+fn max_swaps() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("AIRUN_MAX_SWAPS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16))
+}
+
+fn rebalance_every() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("AIRUN_REBALANCE_EVERY").ok().and_then(|v| v.trim().parse().ok())
+        .filter(|&n: &usize| n > 0).unwrap_or(8))
+}
 const REBALANCE_DECAY: f32 = 0.9;
 /// Routings a swapped-in expert must be ahead of the one it evicts by.
 const SWAP_MARGIN: f32 = 4.0;

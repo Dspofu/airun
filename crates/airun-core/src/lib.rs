@@ -12,6 +12,7 @@ pub mod grammar;
 mod expert_reader;
 pub mod loader;
 pub mod model;
+pub mod moe_cpu;
 pub mod plan;
 pub mod runtime;
 pub mod sample;

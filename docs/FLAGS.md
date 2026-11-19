@@ -98,6 +98,16 @@ them at once. The ones it approves come for free.
   experts in VRAM and the rest in RAM. The GPU reads the missing ones from RAM
   on a parallel channel while it computes the others, and the hottest migrate
   into VRAM as routing shifts.
+- **RAM experts on the CPU during generation:** when the CPU has AVX2 and has
+  kernels for the experts' types (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0,
+  Q6_K, Q8_0), each generated token's experts that are in RAM are multiplied
+  by the CPU, reading them straight from RAM, while the GPU computes the ones
+  in VRAM; only the activations cross PCIe. The prompt still copies them to the
+  GPU. It uses two thirds of the logical cores (`AIRUN_CPU_THREADS`
+  overrides), which stay busy while tokens are generated. When other programs
+  keep those cores busy and a layer's answer is 50 ms late, the GPU reads that
+  layer's experts from RAM itself and the next 96 layers skip the CPU, with a
+  note on stderr. `AIRUN_MOE_CPU=0` turns it off.
 - **Experts in the unused KV cache:** a long context reserves its whole KV
   cache up front. The rows the conversation has not reached yet hold copies of
   more experts (35B-A3B at 262k in q8_0: ~1,100 experts, 2.6 GB), handed back
@@ -691,5 +701,14 @@ machine, another program drawing on the GPU delays kernels by ~300 µs every
 | `AIRUN_NO_KV_LOAN=1` | MoE experts in RAM no longer borrow the KV cache's still-unused rows (see [MoE: what is automatic](#moe-what-is-automatic)). |
 | `AIRUN_MOE_OVERLAP=0` | MoE decode computes resident and copied experts in one pass on one stream, instead of the copy running beside the resident ones. Slower; makes the sum order independent of where experts live (use it to compare greedy text). |
 | `AIRUN_MOE_F32=1` | MoE decode experts on the float kernels instead of int8 (dp4a). |
-| `AIRUN_STAGE_BLOCKS=<n>` | Blocks per expert in the RAM→VRAM expert copy (default 4). |
+| `AIRUN_STAGE_STREAMS=<n>` | Blocks for the whole RAM→VRAM expert copy of a decode step, each copying an equal slice (default 6). Reads of mapped RAM peak with ~6 blocks in flight on PCIe 4.0 x16 (23 GB/s) and fall to 14 GB/s with 64; `0` goes back to `AIRUN_STAGE_BLOCKS` blocks per expert. |
+| `AIRUN_STAGE_BLOCKS=<n>` | With `AIRUN_STAGE_STREAMS=0`: blocks per expert in the RAM→VRAM expert copy (default 4). |
+| `AIRUN_MOE_CPU=0` | Decode no longer multiplies the experts that live in RAM on the CPU; they are copied to VRAM over PCIe as before. See [MoE: what is automatic](#moe-what-is-automatic). |
+| `AIRUN_MOE_GPU_SHARE=<0..1>` | With the CPU experts on: the share of a layer's RAM experts still copied to the GPU, so PCIe and the CPU work at once (default 0). |
+| `AIRUN_MOE_CPU_STATS=1` | Every 480 CPU expert requests (10 tokens of a 48-layer model), the mean time serving one and how many experts it held. |
+| `AIRUN_REBALANCE_EVERY=<n>` | Tokens between rebalances of the experts kept in VRAM (default 8). Less often costs fewer swaps but a lower hit rate (Flash-Next: every 32, 47% → 33%). |
+| `AIRUN_HC_Q8=0` | Keeps BF16 hyper-connection matrices (Qwen4) in BF16; by default they are converted to Q8_0 at load, half the bytes per token at the same perplexity. |
+| `AIRUN_MAX_SWAPS=<n>` | Experts swapped into VRAM per layer at each rebalance, at most (default 16). |
+| `AIRUN_PLE_MAP=1` | The PLE rows of a generated token are read through the file's memory mapping instead of with positional reads. |
+| `AIRUN_GRAPH_LAYERS=<n>` | Layers per piece of the decode CUDA graph (default 8; `0` = one graph per GPU). Launching a graph costs the host about 1 µs per node on Windows; in pieces the GPU starts on the first while the host submits the rest. |
 | `AIRUN_EXPERT_PREFETCH=1` | Predicts a layer's experts as it starts and copies the ones in RAM while attention runs. Off by default: it lost on an RTX 3060 (67–69 against 70 tok/s). |
