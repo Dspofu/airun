@@ -14,10 +14,10 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## In progress
 
-- commit `pending` | `Dspofu` - `Claude` | Docs cleanup: AGENTS.md rewritten as current state, rules against doc junk, Tasks.md
-  - Also documents NVFP4 on GPUs without FP4 tensor cores in the README.
-
 ## Fixed
+
+[X] - commit `12e1276` | `Dspofu` - `Claude` | Docs cleanup: AGENTS.md rewritten as current state, rules against doc junk, Tasks.md
+  - Also documents NVFP4 on GPUs without FP4 tensor cores in the README.
 
 ## Warn
 
