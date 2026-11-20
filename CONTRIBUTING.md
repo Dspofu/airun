@@ -72,13 +72,15 @@ builds for RTX 20 through 50.
 
 Always, in this order:
 
-```powershell
+```bash
 cargo test --release                    # unit tests (no GPU)
 cargo build --release
-.\target\release\airun.exe selftest     # every kernel against the CPU reference
-.\target\release\airun.exe run model.gguf -p "2+2?" -n 20 --temp 0
-.\target\release\airun.exe perplexity model.gguf    # loss and top-1
+./target/release/airun selftest         # every kernel against the CPU reference
+./target/release/airun run model.gguf -p "2+2?" -n 20 --temp 0
+./target/release/airun perplexity model.gguf    # loss and top-1
 ```
+
+On Windows the binary is `.\target\release\airun.exe`.
 
 - **The selftest passes and generation turned to garbage?** The problem is in
   the runtime (order of operations, KV cache, RoPE), not in the kernels.
@@ -99,11 +101,9 @@ cargo build --release
 
 ## Benchmarks
 
-A measurement that goes into the repository lives in `benchmarks/<date>/` with
-three things: the **script** that produced it, the **raw output** (`.csv`,
-`.log`) and a **RESULTS.md** with the table and what changed since the
-previous one. A reader should be able to repeat the measurement with one
-command.
+Scripts and raw output stay local in `benchmarks/<date>/`, which is
+git-ignored. Only the result goes into the repository: the table in the
+README, or one line in the pull request, with the command that reproduces it.
 
 - **Same conditions on both sides:** same model, same prompt, same prompt
   batch size, same context depth.

@@ -571,14 +571,12 @@ Tokens are fed **one at a time**, which is the path decoding actually takes —
 a wrongly updated recurrent state would be invisible in a single batched
 pass.
 
-Reference values on this machine, on the built-in passage:
+Reference values on the built-in passage:
 
 | Model | Loss | Top-1 |
 |---|---|---|
-| Qwen3-8B Q4_K (dense, correct) | 2.20 | 50.9% |
-| Qwen3-1.7B Q8_K_XL (dense, correct) | 2.43 | 47.2% |
-| Qwen3.5-9B Q4_K_M (hybrid) | 4.40 | 20.1% |
-| Qwen3.6-35B-A3B Q4_K_XL (hybrid + MoE) | 11.86 | 1.9% |
+| Qwen3-8B Q4_K (dense) | 2.20 | 50.9% |
+| Qwen3-1.7B Q8_K_XL (dense) | 2.43 | 47.2% |
 
 `ln(248320) = 12.4` is the value of a model guessing uniformly.
 
@@ -656,9 +654,8 @@ measured again after the 2026-09-26 fix and is the best.
 Each one turns off (or forces) an optimization, to measure its gain without
 recompiling. None changes the result beyond rounding — the ones that change
 the order of sums are covered by the selftest and perplexity. Always measure
-alternating the runs (see `benchmarks/2026-09-26/scoreboard.ps1`): on this
-machine, another program drawing on the GPU delays kernels by ~300 µs every
-4 ms, and two separate sessions vary by ~15%.
+alternating the runs in the same session: another program drawing on the GPU
+can delay kernels by ~8%, and two separate sessions vary by ~15%.
 
 | Variable | Effect |
 |---|---|

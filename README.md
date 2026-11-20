@@ -343,6 +343,15 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 to each weight (`<name>.scale`). airun reads and applies that factor; without
 it, the model generates garbage.
 
+**NVFP4 without FP4 tensor cores** (RTX 20/30/40). Doubled, the E2M1 values
+(`0, 0.5, 1, 1.5, 2, 3, 4, 6`) are the integers `0..12`, so they fit int8
+losslessly; the ½ goes into the UE4M3 scale. Weights stay in NVFP4 in VRAM
+and each kernel turns the nibbles into int8 in registers (a 16-entry lookup
+via `__byte_perm`), runs the dot product in int8 (dp4a for decode, MMQ for
+prefill) and applies the per-16 scale at the end. Same result as the FP4
+path; `fp4_supported()` picks the path per GPU. Converting to int8 at load
+time would double the bytes read per token, and decode is bandwidth-bound.
+
 ---
 
 ## Why it is fast

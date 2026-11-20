@@ -15,3 +15,11 @@ desktop.ini
 # Measurement scripts and raw output: kept locally, not published (the
 # README carries the results).
 /benchmarks
+
+# Tracking and monitoring files (notes, progress logs, profiles, scratch
+# scripts): local only, never committed. See AGENTS.md §13.
+/local/
+*.local.*
+*.nsys-rep
+*.ncu-rep
+*.sqlite

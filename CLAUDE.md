@@ -22,6 +22,23 @@ procedure. This file is only the summary.
 3. **Every error message tells the user what to do.** See
    `crates/airun-core/src/error.rs` for the pattern.
 
+4. **Keep the docs clean** ([AGENTS.md §13](AGENTS.md#13-keeping-the-docs-clean)).
+   The `.md` files describe the current state: update sections in place, no
+   dated session logs, no per-run numbers or machine descriptions, failed
+   experiments as one line in AGENTS.md §12, and no references to files
+   outside the repository.
+
+5. **Tasks and progress go in [Tasks.md](Tasks.md).** Create or update its
+   entry when you start, finish or find a problem: `In progress`, `Fixed` or
+   `Warn`, in the format at the top of the file. Use `pending` as the hash
+   until the commit exists, then replace it. Never delete entries: the
+   maintainer prunes the file.
+
+6. **Other tracking or monitoring files are never committed.** Notes, logs,
+   benchmark output, profiles and scratch scripts go in `benchmarks/`,
+   `local/` or a `*.local.*` name, all git-ignored. A new location goes into
+   `.gitignore` in the same change.
+
 ## Environment
 
 - **Rust** 1.85+ (via rustup). If it is not on PATH, set
@@ -41,12 +58,14 @@ Qwen3-1.7B, is enough for the quick tests below).
 
 ## Verification
 
-```powershell
+```bash
 cargo test --release
 cargo build --release
-.\target\release\airun.exe selftest
-.\target\release\airun.exe run small-model.gguf -p "2+2?" -n 20 --temp 0
+./target/release/airun selftest
+./target/release/airun run small-model.gguf -p "2+2?" -n 20 --temp 0
 ```
+
+On Windows the binary is `.\target\release\airun.exe`.
 
 ## Git
 

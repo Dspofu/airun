@@ -703,8 +703,8 @@ pub fn load(
 
 /// Turns whole layers in RAM into feed-forward columns of every layer in RAM
 /// (plan::split_ffn), where the model and the plan allow: one GPU, dense
-/// feed-forwards, the RAM part multiplied on the CPU. Qwen3.8-27B Q4_K_M on
-/// one RTX 5060 Ti 16 GB (PCIe 3.0 x8, DDR4): see AGENTS.md.
+/// feed-forwards, the RAM part multiplied on the CPU while the GPU runs the
+/// rest (Qwen3.8-27B Q4_K_M on a 16 GB card: 12.4 -> 18.7 tok/s).
 /// AIRUN_NO_FFN_SPLIT=1 keeps whole layers.
 fn split_ffn_plan(placement: &mut Placement, gguf: &GgufFile, config: &Config, batch: usize) {
     let off = |v: &str| std::env::var(v).is_ok_and(|v| v.trim() != "0");
