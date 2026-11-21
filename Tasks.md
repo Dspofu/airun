@@ -16,10 +16,10 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## Fixed
 
-[X] - commit `pending` | `Dspofu` - `Claude` | Dense IQ prefill on int8 tensor cores (MMQ) from 64 tokens: IQ2_S, IQ3_XXS (cp.async) and IQ3_S, codebook in shared memory, fused gate/up
+[X] - commit `772e19c` | `Dspofu` - `Claude` | Dense IQ prefill on int8 tensor cores (MMQ) from 64 tokens: IQ2_S, IQ3_XXS (cp.async) and IQ3_S, codebook in shared memory, fused gate/up
   - 27B IQ2_M on the 3060, pp512: 139 to 492 t/s (llama-bench 509), pp128 91 to 443. Perplexity unchanged (11.70 both paths). AIRUN_NO_IQ_MMQ=1 goes back.
 
-[X] - commit `pending` | `Dspofu` - `Claude` | MoE files the kernels misread were loaded and wrote "!!!!"; now refused with a message
+[X] - commit `772e19c` | `Dspofu` - `Claude` | MoE files the kernels misread were loaded and wrote "!!!!"; now refused with a message
   - Per-expert NVFP4 `.scale` sidecars (F32[n_experts]) and gate/up experts of different types. Qwen3.6-35B-A3B-NVFP4-MTP-HQ has both. Support is open (see Warn).
 
 [X] - commit `09ab5c4` | `Dspofu` - `Claude` | Web UI and API take documents: text files in any encoding and PDFs; scanned pages go to the vision model as images
@@ -42,7 +42,7 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## Warn
 
-- commit `pending` | `Dspofu` - `Claude` | MoE kernels cannot apply per-expert NVFP4 scales nor read gate/up of different types (such files are refused)
+- commit `772e19c` | `Dspofu` - `Claude` | MoE kernels cannot apply per-expert NVFP4 scales nor read gate/up of different types (such files are refused)
   - Qwen3.6-35B-A3B-NVFP4-MTP-HQ needs both: layers 32-39 have gate NVFP4 and up Q4_K.
 
 - commit `-` | `Dspofu` - `Claude` | 35B-A3B Q4_K_M decode measured 63.6 tok/s (natural text, q8_0 KV) where 73-75 was recorded; not bisected
