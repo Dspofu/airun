@@ -546,8 +546,8 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     for &ty in TYPES {
         let kty = ops::KernelType(ty.id() as i32);
         // The IQ types and Q2_0 have the integer kernel for decode-sized batches only.
-        let decode_only = n_tokens <= ops::Q8_DECODE_ONLY_MAX && ops::matvec_q8_decode_only(kty);
-        if !ops::matvec_supports_q8(kty) && !decode_only {
+        let decode_only = ops::matvec_q8_decode_only(kty) && ops::matvec_q8_takes(kty, n_tokens);
+        if !ops::matvec_q8_takes(kty, n_tokens) {
             continue;
         }
         let layout = ty.layout().unwrap();
@@ -802,7 +802,7 @@ fn test_mmq_glu(device: i32, stream: &Stream, report: &mut Report) -> Result<()>
     for n_tokens in [100usize, 300] {
         for &ty in TYPES {
             let kty = ops::KernelType(ty.id() as i32);
-            if !ops::matvec_supports_q8(kty) {
+            if !ops::matvec_q8_takes(kty, n_tokens) {
                 continue;
             }
             let layout = ty.layout().unwrap();

@@ -185,6 +185,44 @@ template <> struct mmq_decode<AIRUN_TYPE_NVFP4> {
     }
 };
 
+// The grid IQ types (IQ2_S, IQ3_S, IQ3_XXS): the codes q8decode gives the
+// decode kernels, decoded straight from global memory (they have no cp.async
+// layout: 82/110/98-byte superblocks are 2-byte aligned). IQ2_S has a scale
+// per 16 and takes the split k16 products; the IQ3 types one per group. Before
+// this, 64+ token batches of these types went to the fp16 WMMA kernel, which
+// spent its time on the grid lookups (a 27B IQ2_M prefilled at a quarter of
+// llama.cpp's rate).
+// The codebook is copied to shared memory once per block (GRID_BYTES): read
+// from global memory, a warp's 32 scattered indices were up to 32 L1
+// wavefronts per lookup.
+template <int TYPE, bool SPLIT_> struct mmq_decode_iq {
+    static constexpr bool SPLIT = SPLIT_, HAS_MIN = false;
+    using grid_t = typename q8decode<TYPE>::grid_t;
+    static constexpr int GRID_BYTES = q8decode<TYPE>::GRID * (int)sizeof(grid_t);
+    struct Raw { q8codes c; };
+    __device__ static __forceinline__ void load(const uint8_t* wr, int g, Raw& r,
+                                                const grid_t* grid = nullptr) {
+        q8decode<TYPE>::run(wr, g, r.c, grid);
+    }
+    __device__ static __forceinline__ void decode(const Raw& r, int, uint32_t q[8],
+                                                  float& s0, float& s1, float& m) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) q[i] = (uint32_t)r.c.v[i];
+        s0 = r.c.w0;
+        s1 = r.c.w1;
+        m = 0.0f;
+    }
+};
+template <> struct mmq_decode<AIRUN_TYPE_IQ2_S> : mmq_decode_iq<AIRUN_TYPE_IQ2_S, true> {};
+template <> struct mmq_decode<AIRUN_TYPE_IQ3_S> : mmq_decode_iq<AIRUN_TYPE_IQ3_S, false> {};
+template <> struct mmq_decode<AIRUN_TYPE_IQ3_XXS> : mmq_decode_iq<AIRUN_TYPE_IQ3_XXS, false> {};
+
+// Shared-memory bytes a type's decoder wants for its codebook (0: none).
+template <typename D, typename = void> struct mmq_grid_bytes { static constexpr int value = 0; };
+template <typename D> struct mmq_grid_bytes<D, decltype((void)D::GRID_BYTES, void())> {
+    static constexpr int value = D::GRID_BYTES;
+};
+
 // Integer results leave the MMA already as floats: the accumulator starts at
 // the bit pattern of 1.5 * 2^23, whose ulp is 1, so adding an integer v to it
 // gives the float 1.5 * 2^23 + v exactly for |v| < 2^22 -- far above the 516129
@@ -360,7 +398,7 @@ __device__ __forceinline__ void mmq_chunk(
 template <typename D, int TC, typename Src>
 __device__ __forceinline__ void mmq_decode_tile(
     int8_t* ws, MmqScales<TC>& S, Src src, int g0, int rel0,
-    int rows_valid, int groups_valid, int tid, bool glu = false) {
+    int rows_valid, int groups_valid, int tid, bool glu = false, const void* grid = nullptr) {
 #pragma unroll
     for (int i = 0; i < MMQ_WTASKS; ++i) {
         const int task = tid + i * 256;
@@ -371,7 +409,11 @@ __device__ __forceinline__ void mmq_decode_tile(
         // In a gate/up tile rows 64..127 repeat rows 0..63 of the other matrix.
         if ((glu ? (r & 63) : r) < rows_valid && gg < groups_valid) {
             typename D::Raw raw;
-            D::load(src(r), g0 + gg - rel0, raw);
+            if constexpr (mmq_grid_bytes<D>::value > 0) {
+                D::load(src(r), g0 + gg - rel0, raw, (const typename D::grid_t*)grid);
+            } else {
+                D::load(src(r), g0 + gg - rel0, raw);
+            }
             D::decode(raw, g0 + gg, q, s0, s1, m);
         }
         *(uint4*)(ws + r * MMQ_LDW + mmq_swz(r, 2 * gg)) = make_uint4(q[0], q[1], q[2], q[3]);
@@ -446,9 +488,10 @@ __global__ void mmq_reduce_kernel(float* __restrict__ y, const float* __restrict
 }
 
 // --- synchronous kernel: any alignment, any group count ---------------------
-template <int TC>
+template <int TYPE, int TC>
 constexpr int mmq_sync_smem() {
-    return MMQ_TR * MMQ_LDW + TC * MMQ_XLD + (int)sizeof(MmqScales<TC>);
+    return MMQ_TR * MMQ_LDW + TC * MMQ_XLD + (int)sizeof(MmqScales<TC>)
+         + mmq_grid_bytes<mmq_decode<TYPE>>::value;
 }
 
 template <int TYPE, int TC>
@@ -469,6 +512,17 @@ __global__ __launch_bounds__(256, 2) void matvec_mmq_kernel(
     int8_t* ws = (int8_t*)mmq_smem;
     int8_t (*xs)[MMQ_XLD] = (int8_t (*)[MMQ_XLD])(mmq_smem + MMQ_TR * MMQ_LDW);
     MmqScales<TC>& S = *(MmqScales<TC>*)(mmq_smem + MMQ_TR * MMQ_LDW + TC * MMQ_XLD);
+    constexpr int GRID_BYTES = mmq_grid_bytes<D>::value;
+    const void* grid = nullptr;
+    if constexpr (GRID_BYTES > 0) {
+        using G = typename D::grid_t;
+        G* g = (G*)(mmq_smem + MMQ_TR * MMQ_LDW + TC * MMQ_XLD + sizeof(MmqScales<TC>));
+        const G* t = q8decode<TYPE>::table();
+        for (int i = threadIdx.x; i < q8decode<TYPE>::GRID; i += 256) g[i] = t[i];
+        grid = g;
+        // The first chunk's barrier comes after its decode; the table must be whole before.
+        __syncthreads();
+    }
 
     // Tokens vary fastest across the grid, so the blocks resident together
     // share one weight tile: DRAM serves it once and L2 the rest. Rows-fastest
@@ -489,7 +543,7 @@ __global__ __launch_bounds__(256, 2) void matvec_mmq_kernel(
     mmq_split_range(n_groups, g_begin, g_end);
 
     for (int g0 = g_begin; g0 < g_end; g0 += MMQ_KG) {
-        mmq_decode_tile<D, TC>(ws, S, src, g0, 0, n_rows - row0, n_groups - g0, tid);
+        mmq_decode_tile<D, TC>(ws, S, src, g0, 0, n_rows - row0, n_groups - g0, tid, false, grid);
         // Activations: a token's MMQ_KG blocks are contiguous, 9 words each.
         for (int task = tid; task < TC * MMQ_KG * 9; task += 256) {
             const int t = task / (MMQ_KG * 9);
@@ -581,6 +635,28 @@ template <> struct mmq_async<AIRUN_TYPE_NVFP4> {
     __device__ static __forceinline__ int skew(int g0) { return (g0 / 2 * 36) & 15; }
 };
 
+// IQ2_S (82-byte superblocks) and IQ3_XXS (98): 2-byte aligned and rows that
+// are not 16-byte multiples, so copied as Q6_K is (ROW_SKEW, a whole superblock
+// once for both chunks). A block starts 0 to 14 bytes past a boundary; 6 and 7
+// sixteen-byte pieces cover it wherever it falls, and the matrix's last block
+// (whose end is the matrix's 16-byte-aligned end) starts exactly 14 past one,
+// so its copies end inside the matrix. IQ3_S (110 bytes) would need 8 pieces
+// where its last block takes 7, reading past the matrix: it stays synchronous.
+template <> struct mmq_async<AIRUN_TYPE_IQ2_S> {
+    static constexpr bool OK = true, ROW_SKEW = true, BLOCK2 = true;
+    static constexpr int BYTES = 96, STRIDE = 96, COPY = 16, GROUP_MULTIPLE = 8;
+    __device__ static __forceinline__ int base_group(int g0) { return (g0 / 8) * 8; }
+    __device__ static __forceinline__ size_t offset(int g0) { return (size_t)(g0 / 8) * 82; }
+    __device__ static __forceinline__ int skew(int) { return 0; }
+};
+template <> struct mmq_async<AIRUN_TYPE_IQ3_XXS> {
+    static constexpr bool OK = true, ROW_SKEW = true, BLOCK2 = true;
+    static constexpr int BYTES = 112, STRIDE = 112, COPY = 16, GROUP_MULTIPLE = 8;
+    __device__ static __forceinline__ int base_group(int g0) { return (g0 / 8) * 8; }
+    __device__ static __forceinline__ size_t offset(int g0) { return (size_t)(g0 / 8) * 98; }
+    __device__ static __forceinline__ int skew(int) { return 0; }
+};
+
 // Weight copy buffers: two, except for a BLOCK2 type at 128-token tiles, where
 // two superblock copies do not fit beside the activations. Below that a BLOCK2
 // type alternates two superblock buffers (mmq_async_sb2).
@@ -597,7 +673,7 @@ template <int TYPE, int TC>
 constexpr size_t mmq_async_smem() {
     return (size_t)MMQ_TR * MMQ_LDW + sizeof(MmqScales<TC>)
          + mmq_async_wstages<TYPE, TC>() * (size_t)MMQ_TR * mmq_async<TYPE>::STRIDE
-         + 2 * (size_t)TC * MMQ_XLD;
+         + 2 * (size_t)TC * MMQ_XLD + mmq_grid_bytes<mmq_decode<TYPE>>::value;
 }
 
 template <int BYTES>
@@ -708,6 +784,16 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
     constexpr bool SB2 = mmq_async_sb2<TYPE, TC>();
     unsigned char* wraw = mmq_smem + MMQ_TR * MMQ_LDW + sizeof(MmqScales<TC>);   // [WSTAGES][TR][STRIDE]
     unsigned char* xraw = wraw + WSTAGES * MMQ_TR * A::STRIDE;                    // [2][TC][XLD]
+    // The IQ codebook (see mmq_decode_iq), after the activations; run()'s first
+    // barrier comes before any decode reads it.
+    const void* grid = nullptr;
+    if constexpr (mmq_grid_bytes<D>::value > 0) {
+        using G = typename D::grid_t;
+        G* g = (G*)(xraw + 2 * TC * MMQ_XLD);
+        const G* t = q8decode<TYPE>::table();
+        for (int i = threadIdx.x; i < q8decode<TYPE>::GRID; i += 256) g[i] = t[i];
+        grid = g;
+    }
 
     constexpr int ROWS = GLU ? MMQ_TR / 2 : MMQ_TR;   // output rows per tile
     constexpr int E = MMQ_MT * (TC / 32) * 4;          // accumulators per thread
@@ -865,7 +951,7 @@ __global__ __launch_bounds__(256, 1) void matvec_mmq_async_kernel(
                 }
             };
             const int8_t (*xs)[MMQ_XLD] = (const int8_t (*)[MMQ_XLD])(xraw + (size_t)stage * TC * MMQ_XLD);
-            mmq_decode_tile<D, TC>(ws, S, src, g0, A::base_group(g0), rows_valid, MMQ_KG, tid, GLU);
+            mmq_decode_tile<D, TC>(ws, S, src, g0, A::base_group(g0), rows_valid, MMQ_KG, tid, GLU, grid);
             mmq_stage_xds<TC>(xs, S, tid);
             __syncthreads();
             if constexpr (A::BLOCK2 && !SB2) {

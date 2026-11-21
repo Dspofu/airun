@@ -699,7 +699,7 @@ fn dense_ffn(st: &DeviceState, gate: &GpuTensor, up: &GpuTensor, down: &GpuTenso
     let no_scale = gate.global_scale == 1.0 && up.global_scale == 1.0 && !on_cpu(gate);
     let glu = n > 1 && no_scale && !matvec_f32_forced() && same_shape(&[gate, up])
         && !fp4_prefill(gate, n, &st.q8act)
-        && ops::matvec_supports_q8(gate.kernel_type())
+        && ops::matvec_q8_takes(gate.kernel_type(), n)
         && ops::mmq_glu_supported(gate.kernel_type(), gate.ptr(),
             up.ptr(), st.q8act.buf.as_ptr(), gate.k, gate.rows, gate.row_bytes, n);
     if n == 1 && no_scale && same_shape(&[gate, up]) && !q8_decode(gate) {
@@ -5585,7 +5585,8 @@ fn matvec_reuse(
     let wants_q8 = if n == 1 {
         q8_decode(w)
     } else if ops::matvec_q8_decode_only(ty) {
-        n <= ops::Q8_DECODE_ONLY_MAX && ty.prefers_q8_decode()
+        // 64+ tokens: MMQ for the grid IQ types, fp16 WMMA for the others.
+        (n <= ops::Q8_DECODE_ONLY_MAX && ty.prefers_q8_decode()) || ops::matvec_q8_iq_mmq(ty)
     } else {
         batch_q8 && ops::matvec_supports_q8(ty)
     };

@@ -640,6 +640,7 @@ measured again after the 2026-09-26 fix and is the best.
 | `AIRUN_NO_WMMA=1` | Keeps large batches on the register kernels (measures the tensor-core path against them without a rebuild). |
 | `AIRUN_NO_MMQ=1` | Batches of 64+ tokens leave the int8 tensor cores (MMQ) and go back to fp16 (WMMA). |
 | `AIRUN_NO_MMQ_ASYNC=1` | Keeps MMQ, but the synchronous version (no `cp.async`). |
+| `AIRUN_NO_IQ_MMQ=1` | Batches of 64+ tokens of IQ2_S, IQ3_S and IQ3_XXS go back to fp16 (WMMA) instead of the int8 tensor cores. |
 | `AIRUN_NO_FLASH=1` | Prefill uses the old attention kernel (one block per query) instead of flash attention. |
 | `AIRUN_NO_GQA_DECODE=1` | Decode uses the per-query-head attention kernel instead of the one grouped by KV head. |
 | `AIRUN_ABLATE=ssm,attn,ffn` | Zeroes these blocks' contribution to the residual. A correct block always scores better than no block. Sanity: `ffn` on the dense 8B takes the loss from 2.20 to 25.96 — if it does **not** move, the flag is not wired on that path. |

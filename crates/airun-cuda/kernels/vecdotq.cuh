@@ -350,10 +350,11 @@ __device__ __forceinline__ float vdot_q2_0(const uint8_t* wr, int g, const block
     X(AIRUN_TYPE_Q6_K)            \
     X(AIRUN_TYPE_NVFP4)
 
-// Types with an integer dot but no tiled or tensor-core kernel: the dense
-// path uses them for decode, MTP verify and short chunks (airun_matvec_q8 with up to
-// AIRUN_Q8_DECODE_ONLY_MAX tokens; ops.rs mirrors the limit), larger batches
-// stay on the f32 kernels.
+// Types with an integer dot but no tiled kernel: the dense path uses them for
+// decode, MTP verify and short chunks (airun_matvec_q8 with up to
+// AIRUN_Q8_DECODE_ONLY_MAX tokens; ops.rs mirrors the limit). Larger batches
+// go to MMQ for the AIRUN_FOR_EACH_IQ_MMQ_TYPE ones and stay on the fp16
+// kernels for the rest.
 #define AIRUN_Q8_DECODE_ONLY_MAX 63
 #define AIRUN_FOR_EACH_Q8_DECODE_ONLY_TYPE(X) \
     X(AIRUN_TYPE_IQ4_NL)              \
@@ -362,6 +363,14 @@ __device__ __forceinline__ float vdot_q2_0(const uint8_t* wr, int g, const block
     X(AIRUN_TYPE_IQ3_XXS)             \
     X(AIRUN_TYPE_IQ3_S)               \
     X(AIRUN_TYPE_Q2_0)
+
+// Decode-only types that also have an MMQ decoder (mmq.cuh): past
+// AIRUN_Q8_DECODE_ONLY_MAX tokens airun_matvec_q8 runs them on the integer
+// tensor cores (synchronous kernel) on sm_80+.
+#define AIRUN_FOR_EACH_IQ_MMQ_TYPE(X) \
+    X(AIRUN_TYPE_IQ2_S)               \
+    X(AIRUN_TYPE_IQ3_XXS)             \
+    X(AIRUN_TYPE_IQ3_S)
 
 // The MoE decode kernels' integer types: both lists above.
 #define AIRUN_FOR_EACH_MOE_Q8_TYPE(X) \

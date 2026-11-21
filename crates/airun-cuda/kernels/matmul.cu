@@ -1991,7 +1991,7 @@ static void launch_mmq_tc(const void* w, const void* xq, void* y, int k, int n_r
         }
     }
     if (!async) {
-        constexpr int smem = mmq_sync_smem<TC>();
+        constexpr int smem = mmq_sync_smem<TYPE, TC>();
         cudaFuncSetAttribute(matvec_mmq_kernel<TYPE, TC>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         matvec_mmq_kernel<TYPE, TC><<<grid, 256, smem, stream>>>(
@@ -2023,7 +2023,10 @@ static void launch_mmq(const void* w, const void* xq, void* y, int k, int n_rows
     // superblock once for its two chunks (mmq_async's BLOCK2), 84 and 90 KiB.
     // A 96-token tile was measured too (Q5_K, 2048 tokens: 51.6 T MAC/s at 64,
     // 59.4 at 96) and loses to 128 wherever 128 fits.
-    constexpr bool wide_fits = !mmq_async<TYPE>::OK || mmq_async_smem<TYPE, 128>() <= 99 * 1024;
+    // The synchronous kernel wants two blocks an SM (100 KiB on sm_86): IQ2_S's
+    // 8 KiB codebook pushes its 128-token tile past that, so it keeps 64.
+    constexpr bool wide_fits = mmq_async<TYPE>::OK ? mmq_async_smem<TYPE, 128>() <= 99 * 1024
+                                                   : 2 * mmq_sync_smem<TYPE, 128>() <= 98 * 1024;
     const int forced = mmq_forced_tc();
     // Measured on Qwen3-4B (best of 3): at 128 tokens the wide tile wins 13%
     // even as a single token tile (split-K fills the grid), ties at 192 and
@@ -2085,13 +2088,20 @@ static bool mmq_glu_disabled() {
     return cached == 1;
 }
 
+extern "C" int32_t airun_matvec_q8_decode_only(int32_t type_id);
+extern "C" int32_t airun_matvec_q8_iq_mmq(int32_t type_id);
+
 extern "C" int32_t airun_mmq_glu_supported(int32_t type_id, const void* wg, const void* wu,
                                            const void* xq, int32_t k, int32_t n_rows,
                                            uint64_t row_bytes, int32_t n_tokens) {
     if (mmq_glu_disabled() || k % 32 != 0) return 0;
+    // The IQ types keep their own kernels up to AIRUN_Q8_DECODE_ONLY_MAX tokens.
+    if (airun_matvec_q8_decode_only(type_id) &&
+        (n_tokens <= AIRUN_Q8_DECODE_ONLY_MAX || !airun_matvec_q8_iq_mmq(type_id))) return 0;
     switch (type_id) {
 #define GLU_CASE(TYPE) case TYPE: return mmq_glu_ok<TYPE>(wg, wu, xq, k, n_rows, row_bytes, n_tokens) ? 1 : 0;
         AIRUN_FOR_EACH_Q8_TYPE(GLU_CASE)
+        AIRUN_FOR_EACH_IQ_MMQ_TYPE(GLU_CASE)
 #undef GLU_CASE
         default: return 0;
     }
@@ -2116,6 +2126,8 @@ extern "C" airun_status airun_matvec_q8_glu(
         GLU_LAUNCH(AIRUN_TYPE_Q5_K)
         GLU_LAUNCH(AIRUN_TYPE_Q6_K)
         GLU_LAUNCH(AIRUN_TYPE_NVFP4)
+        GLU_LAUNCH(AIRUN_TYPE_IQ2_S)
+        GLU_LAUNCH(AIRUN_TYPE_IQ3_XXS)
 #undef GLU_LAUNCH
         default: return AIRUN_ERR_BAD_TYPE;
     }
@@ -2543,6 +2555,25 @@ int32_t airun_matvec_q8_decode_only(int32_t type_id) {
     }
 }
 
+// 1 when airun_matvec_q8 also takes this decode-only type past
+// AIRUN_Q8_DECODE_ONLY_MAX tokens, on MMQ (sm_80+, AIRUN_NO_IQ_MMQ unset).
+int32_t airun_matvec_q8_iq_mmq(int32_t type_id) {
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char* v = getenv("AIRUN_NO_IQ_MMQ");
+        disabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (disabled || !airun_mmq_supported()) return 0;
+    switch (type_id) {
+#define Q8CASE(TYPE) case TYPE:
+        AIRUN_FOR_EACH_IQ_MMQ_TYPE(Q8CASE)
+#undef Q8CASE
+        return 1;
+        default:
+            return 0;
+    }
+}
+
 airun_status airun_quantize_act(
     const void* x,
     void* out,
@@ -2582,8 +2613,17 @@ airun_status airun_matvec_q8(
     // kernel decodes each weight through the grid tables and FMAs it, which
     // kept a 27B IQ2_M entirely in VRAM compute-bound at a fraction of its
     // bandwidth.
+    if (airun_matvec_q8_decode_only(type_id) && n_tokens > AIRUN_Q8_DECODE_ONLY_MAX) {
+        if (!airun_matvec_q8_iq_mmq(type_id)) return AIRUN_ERR_BAD_TYPE;
+#define LAUNCH(TYPE) launch_mmq<TYPE>(w, xq, y, k, n_rows, n_tokens, row_bytes, stream);
+        switch (type_id) {
+            AIRUN_FOR_EACH_IQ_MMQ_TYPE(AIRUN_CASE)
+            default: return AIRUN_ERR_BAD_TYPE;
+        }
+#undef LAUNCH
+        AIRUN_CHECK_LAUNCH();
+    }
     if (airun_matvec_q8_decode_only(type_id)) {
-        if (n_tokens > AIRUN_Q8_DECODE_ONLY_MAX) return AIRUN_ERR_BAD_TYPE;
         constexpr int R = 2;
         const int blocks = (n_rows + R - 1) / R;
         const int groups = k / 32;

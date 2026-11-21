@@ -209,9 +209,10 @@ Every one of these has already produced a wrong conclusion here.
   Q6_K back on f32. The IQ types and Q2_0 take dp4a up to 63 tokens
   (`AIRUN_FOR_EACH_Q8_DECODE_ONLY_TYPE`, `Q8_DECODE_ONLY_MAX`), in passes of
   up to 8. Their f32 kernel was compute-bound on the grid lookups, and a 27B
-  IQ2_M in VRAM ran several times slower on it. They have no `mmq_decode`, so
-  64+ tokens stay on fp16 tensor cores. The grid types (IQ2_S, IQ3_S,
-  IQ3_XXS) use `matvec_iq_kernel`:
+  IQ2_M in VRAM ran several times slower on it. From 64 tokens the grid
+  types go to MMQ (below); IQ4_NL, IQ4_XS and Q2_0 have no `mmq_decode` and
+  stay on fp16 tensor cores. The grid types (IQ2_S, IQ3_S, IQ3_XXS) use
+  `matvec_iq_kernel` up to 63 tokens:
   - a warp per row (2 rows a warp for one token, 4 for more), so a 5120-wide
     row is 5 groups a lane;
   - the codebook copied into shared memory, with persistent blocks, as many
@@ -234,8 +235,13 @@ Every one of these has already produced a wrong conclusion here.
   every token (the MTP verify lives here).
 - **From 9 tokens (`AIRUN_MMQ_MIN`):** int8 tensor cores (MMQ, `mmq.cuh`) on
   sm_80+ for Q8_0/Q4_K/Q5_K/Q6_K/NVFP4, `cp.async` version
-  (`matvec_mmq_async_kernel`). Other types and older GPUs go to fp16 tensor
-  cores (`matvec_wmma_kernel`). While a graph is being captured, batches under
+  (`matvec_mmq_async_kernel`); from 64 tokens also for IQ2_S, IQ3_XXS (both
+  `cp.async`, copied like Q6_K) and IQ3_S (synchronous: its 110-byte blocks
+  would need copies past the matrix's end), with the codebook staged in shared
+  memory (`mmq_decode_iq`; from global memory it ran at half the speed) and
+  gate+up+SwiGLU fused. A 27B IQ2_M prefilled 512 tokens 3.5x faster than on
+  WMMA, about llama.cpp's rate. `AIRUN_NO_IQ_MMQ=1`. Other types and older
+  GPUs go to fp16 tensor cores (`matvec_wmma_kernel`). While a graph is being captured, batches under
   32 keep the few-token kernels.
 - `AIRUN_MATVEC_F32=1` forces the exact path everywhere; `AIRUN_NO_MMQ=1`,
   `AIRUN_NO_MMQ_ASYNC=1` and `AIRUN_NO_WMMA=1` turn each off. Each path has
@@ -487,6 +493,10 @@ Every one of these has already produced a wrong conclusion here.
   IQ types and Q2_0; `AIRUN_MOE_F32=1`); grouped MMQ from 8 tokens for experts
   in VRAM (`airun_moe_mmq`, `AIRUN_NO_MOE_MMQ=1`); grouped fp16 MMA kernels
   from 16 tokens otherwise (`AIRUN_MOE_MMA_MIN`).
+- **Refused at load:** gate and up experts of different types (every MoE
+  kernel reads both with the gate's type), and NVFP4 expert stacks with one
+  scale per expert (vllm/ModelOpt `.scale` F32[n_experts]). Both loaded
+  before and wrote garbage (Qwen3.6-35B-A3B-NVFP4-MTP-HQ has both).
 - **MTP with experts in RAM loses** (each verified token wakes its own
   experts), so MoE drafts by default only when the model fits whole
   (`MOE_DEFAULT_DRAFT` = 2).
@@ -676,7 +686,9 @@ Measured; do not repeat without a new reason.
   overlap; kept only with layers on disk or a single GPU).
 
 **Open levers:** a 3-bit weight format and a block drafter (the two big
-jumps); the PCIe wait for experts in RAM; wide-load q8_0 KV dequant in
+jumps); per-expert NVFP4 scales and mixed gate/up types in the MoE kernels
+(the up and down scales fold into the routing weights, the gate's sits inside
+the SiLU); the PCIe wait for experts in RAM; wide-load q8_0 KV dequant in
 attention; Q6_K's split k16 MMAs; automatic `-b` for streamed experts;
 admission of several prefills at once in `--parallel`; a learned draft
 vocabulary; the CPU-vs-copy choice for RAM layers ignores the weight type and

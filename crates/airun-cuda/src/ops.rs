@@ -57,6 +57,7 @@ unsafe extern "C" {
 
     fn airun_matvec_has_q8(type_id: i32) -> i32;
     fn airun_matvec_q8_decode_only(type_id: i32) -> i32;
+    fn airun_matvec_q8_iq_mmq(type_id: i32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn airun_matvec_glu(type_id: i32, wg: *const c_void, wu: *const c_void, x: *const c_void,
         y: *mut c_void, k: i32, n_rows: i32, row_bytes: u64, stream: ffi::Stream) -> Status;
@@ -465,6 +466,28 @@ pub fn matvec_q8_decode_only(ty: KernelType) -> bool {
     }
 }
 
+/// Whether [`matvec_q8`] also takes this [`matvec_q8_decode_only`] type past
+/// [`Q8_DECODE_ONLY_MAX`] tokens, on the integer tensor cores (the grid IQ
+/// types on sm_80+; `AIRUN_NO_IQ_MMQ=1` turns it off).
+pub fn matvec_q8_iq_mmq(ty: KernelType) -> bool {
+    #[cfg(airun_cuda)]
+    // SAFETY: pure function of the id (and the current device), touches nothing.
+    unsafe {
+        airun_matvec_q8_iq_mmq(ty.0) != 0
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = ty;
+        false
+    }
+}
+
+/// Whether [`matvec_q8`] has an integer kernel for `n_tokens` of this type.
+pub fn matvec_q8_takes(ty: KernelType, n_tokens: usize) -> bool {
+    matvec_supports_q8(ty)
+        || (matvec_q8_decode_only(ty) && (n_tokens <= Q8_DECODE_ONLY_MAX || matvec_q8_iq_mmq(ty)))
+}
+
 /// Whether [`matvec_q8`] runs large batches on integer tensor cores on the
 /// current device (sm_80+, and not disabled with `AIRUN_NO_MMQ=1`). Where it
 /// does, that beats the fp16 path of [`matvec`] for batches of 64 and more.
@@ -644,7 +667,7 @@ pub fn matvec_q8(
     row_bytes: usize,
     stream: &Stream,
 ) -> Result<()> {
-    if !(matvec_supports_q8(ty) || (n_tokens <= Q8_DECODE_ONLY_MAX && matvec_q8_decode_only(ty))) {
+    if !matvec_q8_takes(ty, n_tokens) {
         return Err(bad_arg(format!(
             "no integer matvec kernel for ggml type id {}; check matvec_supports_q8 first",
             ty.0

@@ -715,6 +715,7 @@ impl Model {
         };
 
         let n_run = config.n_run_layers();
+        check_expert_types(gguf, &config, n_run)?;
         let total_steps = n_run + 3;
         let mut done = 0usize;
         let mut total_bytes = 0u64;
@@ -1406,6 +1407,27 @@ fn global_scale_of(gguf: &GgufFile, name: &str) -> f32 {
     airun_gguf::dequant::dequantize(info.ty, bytes, 1, &mut v).map(|_| v[0]).unwrap_or(1.0)
 }
 
+/// Every MoE kernel reads a layer's gate and up experts with one weight type
+/// (the gate's). A file that mixes them -- Qwen3.6-35B-A3B-NVFP4-MTP-HQ has
+/// NVFP4 gates and Q4_K ups in layers 32-39 -- decoded the ups as NVFP4 and
+/// wrote garbage, so it is refused before anything is uploaded.
+fn check_expert_types(gguf: &GgufFile, config: &Config, n_run: usize) -> Result<()> {
+    if config.moe.is_none() {
+        return Ok(());
+    }
+    for l in 0..n_run {
+        let (g, u) = (format!("blk.{l}.ffn_gate_exps.weight"), format!("blk.{l}.ffn_up_exps.weight"));
+        let (Some(gi), Some(ui)) = (gguf.tensor(&g), gguf.tensor(&u)) else { continue };
+        if gi.ty != ui.ty {
+            return Err(CoreError::Other(format!(
+                "layer {l} stores its gate experts as {} and its up experts as {}; airun's MoE kernels need both \
+                 in one type, so this file would only write garbage. Use another quantization of the same \
+                 model (a Q4_K_M or Q5_K_M GGUF, for example)", gi.ty, ui.ty)));
+        }
+    }
+    Ok(())
+}
+
 fn load_packed(
     gguf: &Arc<GgufFile>,
     name: &str,
@@ -1446,6 +1468,19 @@ fn load_cached(
         _ => (info.n_rows() as usize, 1),
     };
     let expert_stride = if n_experts > 1 { rows * row_bytes } else { 0 };
+    // vllm/ModelOpt MoE exports give each expert its own scale (F32[n_experts],
+    // ~1e-5); global_scale_of only reads a single one, and ignoring them made
+    // the experts' outputs ~1e5 too large (the model wrote "!!!!").
+    let per_expert_scale = n_experts > 1 && name.strip_suffix(".weight")
+        .and_then(|b| gguf.tensor(&format!("{b}.scale")))
+        .is_some_and(|s| s.n_elements() as usize == n_experts);
+    if per_expert_scale {
+        return Err(CoreError::Other(format!(
+            "{name} is an NVFP4 expert stack with one scale per expert (a `.scale` sidecar of {n_experts} values, \
+             as vllm/ModelOpt exports write), which the MoE kernels do not apply yet, so the model would only \
+             write garbage; use another quantization of the same model (a Q4_K_M or Q5_K_M GGUF, for \
+             example)")));
+    }
 
     let mapped_mode = experts_mapped();
     let mut mapped = None;
