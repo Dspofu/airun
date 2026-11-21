@@ -170,6 +170,15 @@ details.think.live > summary { color: var(--think); }
 .chip button { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%;
                background: var(--surface-2); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; }
 .chip .icon { width: 12px; height: 12px; }
+.chip.doc, .msg .docs .doc { display: flex; align-items: center; gap: 8px; height: 56px; max-width: 240px; padding: 0 12px;
+       border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); font-size: 13px; }
+.doc .icon { width: 18px; height: 18px; flex: none; color: var(--muted); }
+.doc .meta { display: flex; flex-direction: column; min-width: 0; }
+.doc .meta b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc .meta span { color: var(--muted); font-size: 12px; }
+.chip.doc.busy { opacity: .6; }
+.msg .docs { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-bottom: 6px; }
+.msg .docs .doc { cursor: pointer; text-align: left; color: var(--text); font: inherit; font-size: 13px; }
 .row-in { display: flex; align-items: flex-end; gap: 6px; }
 #input { flex: 1; border: 0; outline: none; resize: none; background: transparent; color: var(--text); font: inherit;
          max-height: 240px; padding: 6px 0; }
@@ -301,8 +310,8 @@ details.think.live > summary { color: var(--think); }
     <div class="box">
       <div class="chips" id="chips"></div>
       <div class="row-in">
-        <button class="ibtn" id="attach" title="Attach image" hidden data-icon="image"></button>
-        <input type="file" id="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+        <button class="ibtn" id="attach" title="Attach files (text, code, PDF; images with --mmproj)" data-icon="clip"></button>
+        <input type="file" id="file" multiple hidden>
         <textarea id="input" rows="1" placeholder="Write a message…"></textarea>
         <button class="ibtn" id="send" title="Send (Enter)" data-icon="send" disabled></button>
         <button class="ibtn" id="stop" title="Stop (Esc)" data-icon="stop" hidden></button>
@@ -388,6 +397,8 @@ const ICONS = {
   brain: '<path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04Z"/>',
   send: '<path d="M12 19V5M5 12l7-7 7 7"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
+  clip: '<path d="m21.4 11.1-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/>',
+  file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h5"/>',
   image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>',
   copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
@@ -414,6 +425,7 @@ let props = {};
 let controller = null;
 let streamingChat = null;
 let attached = [];   // data URLs waiting in the composer
+let attachedDocs = [];  // {name, text, pages, tokens} (or {name, busy}) waiting in the composer
 
 function load() {
   try { db = JSON.parse(localStorage.getItem(STORE)) || db; } catch (_) {}
@@ -428,8 +440,13 @@ function save(now) {
       // Over the browser's quota: keep the text, drop the oldest images.
       for (const c of db.chats.slice().sort((a, b) => a.updated - b.updated))
         for (const t of c.turns) if (t.images?.length) { t.images = []; t.imagesDropped = true; }
-      try { localStorage.setItem(STORE, JSON.stringify(db)); toast("Browser storage full: old images were discarded."); }
-      catch (_) { toast("Could not save the chat (browser storage full)."); }
+      try { localStorage.setItem(STORE, JSON.stringify(db)); toast("Browser storage full: old images were discarded."); return; }
+      catch (_) {}
+      // Then the text of documents attached in other chats (names stay).
+      for (const c of db.chats) if (c.id !== db.current)
+        for (const t of c.turns) for (const f of t.files || []) if (f.text) { f.text = ""; f.dropped = true; }
+      try { localStorage.setItem(STORE, JSON.stringify(db)); toast("Browser storage full: images and attached documents of other chats were discarded."); }
+      catch (_) { toast("Could not save the chat (browser storage full): delete old chats or attach smaller files."); }
     }
   };
   if (now) write(); else saveTimer = setTimeout(write, 300);
@@ -650,6 +667,9 @@ function messageEl(t, index) {
   el.className = "msg " + t.role;
   el.dataset.index = index;
   if (t.role === "user") {
+    if (t.files?.length) el.insertAdjacentHTML("beforeend", '<div class="docs">' +
+      t.files.map((f, i) => `<button class="doc" data-act="doc" data-doc="${i}" title="Show the extracted text">` +
+        docInner(f) + "</button>").join("") + "</div>");
     if (t.images?.length) el.insertAdjacentHTML("beforeend", '<div class="imgs">' +
       t.images.map((src) => `<img src="${src}" alt="image" data-act="zoom">`).join("") + "</div>");
     const b = document.createElement("div");
@@ -740,7 +760,8 @@ const input = $("input");
 function syncComposer() {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 240) + "px";
-  $("send").disabled = !!controller || (!input.value.trim() && !attached.length);
+  $("send").disabled = !!controller || (!input.value.trim() && !attached.length && !attachedDocs.length)
+    || attachedDocs.some((d) => d.busy);
   $("send").hidden = !!controller;
   $("stop").hidden = !controller;
 }
@@ -760,12 +781,16 @@ document.addEventListener("keydown", (e) => {
 
 function submit() {
   const text = input.value.trim();
-  if (controller || (!text && !attached.length)) return;
+  if (controller || (!text && !attached.length && !attachedDocs.length) || attachedDocs.some((d) => d.busy)) return;
   let c = chat();
   if (!c) c = newChat();
-  c.turns.push({ role: "user", content: text, images: attached.slice() });
-  if (c.title === "New chat" || c.title === "New chat") c.title = (text || "Image").replace(/\s+/g, " ").slice(0, 48);
+  const turn = { role: "user", content: text,
+    images: [...attachedDocs.flatMap((d) => d.images || []), ...attached] };
+  if (attachedDocs.length) turn.files = attachedDocs.map(({ images, ...d }) => d);
+  c.turns.push(turn);
+  if (c.title === "New chat") c.title = (text || turn.files?.[0]?.name || "Image").replace(/\s+/g, " ").slice(0, 48);
   attached = [];
+  attachedDocs = [];
   renderChips();
   input.value = "";
   syncComposer();
@@ -782,10 +807,16 @@ function requestBody(c) {
   if (sys) messages.push({ role: "system", content: sys });
   for (const t of c.turns) {
     if (t.role === "error") continue;
+    // Documents go in front of the message as <file> blocks, the same text
+    // the server makes of API file parts.
+    const text = t.role === "user" && t.files?.length
+      ? t.files.map((f) => `<file name="${f.name.replace(/"/g, "'")}">\n${f.dropped ? "(content not kept by the browser)" : f.text}\n</file>`).join("\n\n") +
+        (t.content ? "\n\n" + t.content : "")
+      : t.content;
     if (t.role === "user" && t.images?.length) {
-      messages.push({ role: "user", content: [{ type: "text", text: t.content },
+      messages.push({ role: "user", content: [{ type: "text", text },
         ...t.images.map((url) => ({ type: "image_url", image_url: { url } }))] });
-    } else messages.push({ role: t.role, content: t.content });
+    } else messages.push({ role: t.role, content: text });
   }
   const body = {
     model: props.model || "airun", messages, stream: true,
@@ -979,27 +1010,66 @@ function readImage(file) {
     img.src = URL.createObjectURL(file);
   });
 }
+function docInner(d) {
+  const meta = d.busy ? "reading…" :
+    [d.pages ? `${d.pages} page${d.pages > 1 ? "s" : ""}` : "", d.tokens != null ? `${d.tokens.toLocaleString()} tok` : "",
+     d.images?.length ? `${d.images.length} scanned` : ""]
+      .filter(Boolean).join(" · ");
+  return `${icon("file")}<span class="meta"><b>${esc(d.name)}</b><span>${meta}</span></span>`;
+}
 function renderChips() {
-  $("chips").innerHTML = attached.map((src, i) =>
+  $("chips").innerHTML = attachedDocs.map((d, i) =>
+    `<div class="chip doc${d.busy ? " busy" : ""}" title="${esc(d.name)}">${docInner(d)}` +
+    (d.busy ? "" : `<button data-rmdoc="${i}" title="Remove">${icon("x")}</button>`) + "</div>").join("") +
+    attached.map((src, i) =>
     `<div class="chip"><img src="${src}" alt=""><button data-rm="${i}" title="Remove">${icon("x")}</button></div>`).join("");
   syncComposer();
 }
+// Text and PDFs go to the server's /extract, which reads every encoding and
+// PDF text layers and counts tokens with the model's tokenizer.
+async function readDoc(f) {
+  const h = headers({ "Content-Type": "application/octet-stream" });
+  const r = await fetch(`./extract?name=${encodeURIComponent(f.name)}`, { method: "POST", headers: h, body: f });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || `could not read ${f.name} (HTTP ${r.status})`);
+  // Scanned PDF pages come back as images, for a model with vision to read.
+  if (j.images?.length && !props.vision)
+    throw new Error(`${f.name} has ${j.images.length} scanned page(s) without text, which only a vision model can read: start the server with --mmproj <mmproj-*.gguf>, or run the PDF through OCR first.`);
+  return { name: f.name, text: j.text, pages: j.pages || 0, tokens: j.tokens, images: j.images || [] };
+}
 async function addFiles(files) {
+  const jobs = [];
   for (const f of files) {
-    if (!f.type.startsWith("image/")) continue;
-    if (!props.vision) { toast("This server has no vision: start it with --mmproj to send images."); return; }
-    try { attached.push(await readImage(f)); } catch (e) { toast(e.message); }
+    if (f.type.startsWith("image/")) {
+      if (!props.vision) { toast(`${f.name}: this server has no vision; start it with --mmproj to send images.`); continue; }
+      try { attached.push(await readImage(f)); } catch (e) { toast(e.message); }
+      continue;
+    }
+    const slot = { name: f.name, busy: true };
+    attachedDocs.push(slot);
+    jobs.push(readDoc(f).then((d) => {
+      Object.assign(slot, d, { busy: false });
+      const total = attachedDocs.reduce((n, x) => n + (x.tokens || 0), 0);
+      if (props.ctx && total > props.ctx * 0.9)
+        toast(`The attachments hold ${total.toLocaleString()} tokens, close to or over the ${props.ctx.toLocaleString()}-token context: remove some or start the server with a larger --ctx.`);
+    }).catch((e) => {
+      attachedDocs.splice(attachedDocs.indexOf(slot), 1);
+      toast(e.message);
+    }).finally(renderChips));
   }
   renderChips();
+  await Promise.all(jobs);
 }
 $("attach").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
 $("chips").addEventListener("click", (e) => {
   const b = e.target.closest("[data-rm]");
   if (b) { attached.splice(+b.dataset.rm, 1); renderChips(); }
+  const d = e.target.closest("[data-rmdoc]");
+  if (d) { attachedDocs.splice(+d.dataset.rmdoc, 1); renderChips(); }
 });
 input.addEventListener("paste", (e) => {
-  const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
+  const files = [...(e.clipboardData?.files || [])];
   if (files.length) { e.preventDefault(); addFiles(files); }
 });
 document.addEventListener("dragover", (e) => e.preventDefault());
@@ -1041,6 +1111,11 @@ wrap.addEventListener("click", (e) => {
   const act = b.dataset.act;
   if (act === "copy-code") return copyText(codeStore[+b.dataset.code], b);
   if (act === "preview") return openPreview(codeStore[+b.dataset.code]);
+  if (act === "doc") {
+    const f = c.turns[index]?.files?.[+b.dataset.doc];
+    if (f) openPreview(`<meta charset="utf-8"><body style="margin:0;padding:16px;background:#fff;color:#111"><pre style="white-space:pre-wrap;font:13px/1.5 ui-monospace,Consolas,monospace">${esc(f.text)}</pre></body>`);
+    return;
+  }
   if (act === "zoom") return openPreview(`<body style="margin:0;background:#111;display:grid;place-items:center;height:100vh"><img src="${b.src}" style="max-width:100%;max-height:100%"></body>`);
   if (act === "tech") {
     const t = c?.turns[index];
@@ -1365,7 +1440,6 @@ async function connect() {
     $("modelName").textContent = props.model || "model";
     $("modelName").title = props.model || "";
     $("thinkCtl").hidden = !props.thinking;
-    $("attach").hidden = !props.vision;
     $("maxTok").max = props.ctx || 131072;
     $("info").innerHTML = modelInfo(props);
     // A page reload draws the open chat before this arrives; repaint once so

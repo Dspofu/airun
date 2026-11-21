@@ -420,6 +420,20 @@ block (Anthropic) or `multimodal_data` (`/completion`). The server does not
 download http URLs. The same image in later turns of a chat is not processed
 again.
 
+**Documents:** a `file` part (`{"file": {"filename", "file_data"}}`, OpenAI
+chat), an `input_file` part (Responses) or a `document` block (Anthropic,
+`base64` or `text` source) becomes a text part `<file name="...">text</file>`.
+Text files in any common encoding (UTF-8, UTF-16 with BOM, Windows-1252) and
+PDFs are read. A PDF page without text (a scan) is sent as an image right
+after the text part, marked `[page N: scanned, sent as image K]` in it; this
+needs `--mmproj`, takes up to 20 pages (about a thousand tokens each), and
+reads scans in JPEG, CCITT fax, Flate or uncompressed form (not JBIG2 or
+JPEG 2000). Word files and other binary formats are refused with what to do.
+`file_id` / `file_url` are not supported. `POST /extract?name=<file>` with the
+raw file as the body returns `{text, pages, tokens, images}` (images as JPEG
+data URLs): the web UI uses it for its attachments. Requests can be up to
+64 MiB.
+
 Accepted fields: `messages`, `prompt`, `max_tokens`, `max_completion_tokens`,
 `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `top_n_sigma`, `seed`,
 `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`,

@@ -840,12 +840,15 @@ pub fn run(args: ServeArgs) -> Result<()> {
         .route("/audio/transcriptions", post(no_transcriptions))
         .route("/v1/audio/transcriptions", post(no_transcriptions))
         .route("/lora-adapters", get(lora_list).post(lora_set))
+        .route("/extract", post(extract_handler))
+        .route("/v1/extract", post(extract_handler))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/apply-template", post(apply_template))
         .route("/v1/stream/{conv_id}", get(stream_replay).delete(stream_stop))
         .route("/v1/streams/lookup", post(streams_lookup))
         .layer(axum::middleware::from_fn(crate::replay::tee))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -860,7 +863,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         eprintln!("\nairun serving {model_name} on http://{addr}");
         eprintln!("  web ui:         http://{addr}/");
         eprintln!("  authentication: {auth}");
-        eprintln!("  endpoints: /v1/chat/completions /v1/responses /v1/messages /v1/completions /completion /infill /tokenize \
+        eprintln!("  endpoints: /v1/chat/completions /v1/responses /v1/messages /v1/completions /completion /infill /extract /tokenize \
                    /detokenize /apply-template /v1/models /props /slots /health /hardware /v1/stream/{{id}}");
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
@@ -2122,6 +2125,145 @@ async fn oai_completions(State(state): State<Arc<AppState>>, headers: HeaderMap,
 // --- chat: prompts and the generation all chat APIs share --------------------------
 
 /// The chat prompt for a request, and whether it leaves a `<think>` block open.
+// --- documents (see document.rs) ---------------------------------------------
+
+/// Body size the server accepts: inline PDFs and images arrive as base64.
+const MAX_BODY: usize = 64 << 20;
+
+/// The text a document becomes in the prompt.
+fn file_block(name: &str, text: &str) -> String {
+    let name = name.replace('"', "'");
+    format!("<file name=\"{name}\">\n{text}\n</file>")
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// Replaces every document part by a text part holding its extracted text,
+/// followed by image parts for the scanned pages of a PDF: OpenAI chat `file`
+/// ({file: {filename, file_data}}), Responses `input_file` ({filename,
+/// file_data}) and Anthropic `document` (base64 or text source).
+fn attach_files(mut req: Value, vision: bool) -> Result<Value, String> {
+    fn part(o: &serde_json::Map<String, Value>, ty: &str, vision: bool) -> Result<Vec<Value>, String> {
+        let s = |v: Option<&Value>, k: &str| v.and_then(|v| v.get(k)).and_then(Value::as_str).map(str::to_string);
+        let text_kind = if ty == "input_file" { "input_text" } else { "text" };
+        let (name, data) = match ty {
+            "file" => {
+                let f = o.get("file");
+                if s(f, "file_id").is_some() && s(f, "file_data").is_none() {
+                    return Err("file_id parts need an uploaded file, which this server does not keep: \
+                                send the content inline as file.file_data (a data: URL)".into());
+                }
+                (s(f, "filename"), s(f, "file_data"))
+            }
+            "input_file" => {
+                if (o.contains_key("file_id") || o.contains_key("file_url")) && !o.contains_key("file_data") {
+                    return Err("input_file parts by file_id or file_url are not fetched: \
+                                send the content inline as file_data (a data: URL)".into());
+                }
+                (o.get("filename").and_then(Value::as_str).map(str::to_string),
+                 o.get("file_data").and_then(Value::as_str).map(str::to_string))
+            }
+            _ => {
+                let src = o.get("source");
+                let name = o.get("title").and_then(Value::as_str).map(str::to_string);
+                match s(src, "type").as_deref() {
+                    Some("text") => return Ok(vec![json!({ "type": "text", "text":
+                        file_block(name.as_deref().unwrap_or("document"), &s(src, "data").unwrap_or_default()) })]),
+                    Some("base64") => (name, s(src, "data").map(|d| format!("data:;base64,{d}"))),
+                    Some(t) => return Err(format!(
+                        "document sources of type {t:?} are not supported: send type \"base64\" or \"text\"")),
+                    None => (name, None),
+                }
+            }
+        };
+        let name = name.unwrap_or_else(|| "document".into());
+        let Some(data) = data else { return Err(format!("the {ty} part {name:?} has no data")) };
+        // file_data is a data: URL; some clients send bare base64.
+        let url = if data.starts_with("data:") { data } else { format!("data:;base64,{data}") };
+        let bytes = decode_data_url(&url).map_err(|e| format!("{name}: {}", e.replace("image", "file")))?;
+        let doc = crate::document::extract(&bytes, &name)?;
+        if !doc.images.is_empty() && !vision {
+            return Err(format!(
+                "{name} has {} scanned page(s) without text, which only a vision model can read: start the \
+                 server with --mmproj <mmproj-*.gguf>, or run the PDF through OCR first", doc.images.len()));
+        }
+        let mut parts = vec![json!({ "type": text_kind, "text": file_block(&name, &doc.text) })];
+        for img in &doc.images {
+            let b64 = base64_encode(img);
+            parts.push(match ty {
+                "file" => json!({ "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{b64}") } }),
+                "input_file" => json!({ "type": "input_image", "image_url": format!("data:image/jpeg;base64,{b64}") }),
+                _ => json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": b64 } }),
+            });
+        }
+        Ok(parts)
+    }
+    fn is_doc(v: &Value) -> Option<String> {
+        let ty = v.get("type").and_then(Value::as_str)?;
+        matches!(ty, "file" | "input_file" | "document").then(|| ty.to_string())
+    }
+    fn walk(v: &mut Value, vision: bool, err: &mut Option<String>) {
+        match v {
+            Value::Array(a) => {
+                let mut out = Vec::with_capacity(a.len());
+                for mut x in std::mem::take(a) {
+                    match is_doc(&x) {
+                        Some(ty) => match part(x.as_object().unwrap(), &ty, vision) {
+                            Ok(parts) => out.extend(parts),
+                            Err(e) => { *err = Some(e); out.push(x) }
+                        },
+                        None => { walk(&mut x, vision, err); out.push(x) }
+                    }
+                }
+                *a = out;
+            }
+            Value::Object(o) => o.values_mut().for_each(|x| walk(x, vision, err)),
+            _ => {}
+        }
+    }
+    let mut err = None;
+    for key in ["messages", "input"] {
+        if let Some(m) = req.get_mut(key) {
+            walk(m, vision, &mut err);
+        }
+    }
+    err.map_or(Ok(req), Err)
+}
+
+/// POST /extract?name=report.pdf with the file as the body: its text, as the
+/// web UI shows and sends an attachment, plus the scanned pages of a PDF as
+/// JPEG data URLs. Tokens are counted with the model's tokenizer so the page
+/// can warn before the context overflows.
+async fn extract_handler(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>, body: axum::body::Bytes) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let name = query.get("name").cloned().unwrap_or_default();
+    let res = tokio::task::spawn_blocking(move || crate::document::extract(&body, &name)).await;
+    match res {
+        Ok(Ok(doc)) => {
+            let tokens = state.tokenizer.encode(&doc.text, false).len();
+            let images: Vec<String> = doc.images.iter()
+                .map(|i| format!("data:image/jpeg;base64,{}", base64_encode(i))).collect();
+            Json(json!({ "text": doc.text, "pages": doc.pages, "tokens": tokens, "images": images })).into_response()
+        }
+        Ok(Err(e)) => api_error(StatusCode::UNPROCESSABLE_ENTITY, e, "invalid_request_error"),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR,
+            "the document reader crashed on this file: print it to a new PDF and try again", "server_error"),
+    }
+}
+
 // --- images (see media.rs) ---------------------------------------------------
 
 /// Where a request's images are kept once encoded: the runtime's sentinel ids
@@ -2134,7 +2276,10 @@ const IMAGES_KEY: &str = "__airun_images";
 /// and Responses `input_image` (image_url) with a data: URL, Anthropic
 /// `image` with a base64 source, and /completion's `multimodal_data` (base64
 /// strings for the prompt's <__media__> markers).
-async fn attach_images(state: &AppState, mut req: Value) -> Result<Value, Response> {
+async fn attach_images(state: &AppState, req: Value) -> Result<Value, Response> {
+    // Documents first: they turn into plain text parts.
+    let mut req = tokio::task::block_in_place(|| attach_files(req, state.vision.is_some()))
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e, "invalid_request_error"))?;
     let mut found: Vec<Vec<u8>> = Vec::new();
     let mut err: Option<String> = None;
     fn walk(v: &mut Value, found: &mut Vec<Vec<u8>>, err: &mut Option<String>) {
@@ -3192,6 +3337,27 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_parts_become_text() {
+        let req = json!({ "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "summarize" },
+            { "type": "file", "file": { "filename": "a.txt", "file_data": "data:text/plain;base64,aGVsbG8=" } },
+            { "type": "document", "title": "b.md", "source": { "type": "text", "data": "world" } },
+        ] }], "input": [{ "role": "user", "content": [
+            { "type": "input_file", "filename": "c.txt", "file_data": "aGVsbG8=" } ] }] });
+        let out = attach_files(req, false).unwrap();
+        let parts = &out["messages"][0]["content"];
+        assert_eq!(parts[1]["text"], "<file name=\"a.txt\">
+hello
+</file>");
+        assert_eq!(parts[2]["text"], "<file name=\"b.md\">
+world
+</file>");
+        assert_eq!(out["input"][0]["content"][0]["type"], "input_text");
+        let bad = json!({ "messages": [{ "role": "user", "content": [{ "type": "file", "file": { "file_id": "f1" } }] }] });
+        assert!(attach_files(bad, false).unwrap_err().contains("file_data"));
+    }
 
     /// The bug this guards: a stop sequence that arrives split across two
     /// tokens used to be streamed to the client before it was recognised.

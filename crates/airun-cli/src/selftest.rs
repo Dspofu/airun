@@ -2792,7 +2792,7 @@ fn test_split_attention_random(device: i32, stream: &Stream, report: &mut Report
             };
             // Random rows; quantized blocks get a small f16 scale so values
             // stay near [-1, 1] like the f16 case.
-            let mut make = |rng: &mut Rng| -> (Vec<u8>, Vec<f32>) {
+            let make = |rng: &mut Rng| -> (Vec<u8>, Vec<f32>) {
                 let mut bytes = Vec::with_capacity(kv_heads * CTX * row);
                 let mut vals = Vec::with_capacity(kv_heads * CTX * dim);
                 for _ in 0..kv_heads * CTX {

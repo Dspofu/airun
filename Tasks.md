@@ -16,6 +16,12 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## Fixed
 
+[X] - commit `pending` | `Dspofu` - `Claude` | Web UI and API take documents: text files in any encoding and PDFs; scanned pages go to the vision model as images
+  - Attach button always visible; /extract for the page; file / input_file / document parts in the APIs; request limit 64 MiB. Scans in JPEG, CCITT, Flate; not JBIG2 / JPEG 2000.
+
+[X] - commit `pending` | `Dspofu` - `Claude` | --mmproj on a full 12 GB card failed ("0 B free") or, forced, paged the model to RAM
+  - WDDM over-reports free VRAM; with vision the plan uses NVML's free memory plus a 320 MiB margin. 27B IQ2_M + vision: loads, ~13 tok/s instead of failing.
+
 [X] - commit `d951d88` | `Dspofu` - `Claude` | FFN split allowed up to 3/4 of the feed-forward in RAM (was 1/2)
   - 27B Q4_K_M on the 3060: 6.1 to 6.5 tok/s, 11.7 to 13.0 with --draft 3. Q8_0 (needs more) unchanged at 2.8 / 5.4: bound by RAM bandwidth.
 

@@ -54,6 +54,9 @@ pub fn read_image(path: &Path) -> Result<Rgb> {
     decode_image(&bytes).with_context(|| path.display().to_string())
 }
 
+/// Planned on top of the encoder's own VRAM (see vision_reserve).
+const VISION_MARGIN: u64 = 320 << 20;
+
 /// VRAM the encoder takes on the GPU it runs on: its weights plus the
 /// scratch of the largest image it accepts. Added to every GPU's reserve
 /// before the text model is placed, so the automatic context leaves room.
@@ -63,8 +66,10 @@ pub fn vision_reserve(mmproj: &Path, max_tokens: usize) -> Result<(u64, u64)> {
     let mut cfg = VisionConfig::from_gguf(mmproj, &g)?;
     cfg.max_tokens = max_tokens;
     let scratch = VisionModel::scratch_bytes(&cfg, max_tokens);
-    // + the FFN padding
-    let need = |streamed: bool| VisionModel::weights_vram(&g, streamed) * 21 / 20 + scratch;
+    // + the FFN padding, + room for what loading takes past the plan (the
+    // CUDA context and kernel modules: the text model's grow into the
+    // default reserve and left the encoder ~250 MiB short on a 12 GB card).
+    let need = |streamed: bool| VisionModel::weights_vram(&g, streamed) * 21 / 20 + scratch + VISION_MARGIN;
     Ok((need(false), need(true)))
 }
 
@@ -85,10 +90,20 @@ pub fn load_vision(mmproj: &Path, runtime: &Runtime, max_tokens: usize, streamed
     }
     let (dev, free) = best.context("no GPU to run the vision encoder on")?;
     let (resident, stream) = vision_reserve(mmproj, max_tokens)?;
+    let (resident, stream) = (resident - VISION_MARGIN, stream - VISION_MARGIN);
+    // The plan kept room for the encoder, but on Windows (WDDM) the free
+    // memory CUDA reports before loading can run past what is really there
+    // (other programs' memory counts as free), so the text model may have
+    // taken that room. Uploading the encoder's blocks per image needs much
+    // less. Past what is free, an allocation can still succeed, but Windows
+    // then moves part of the model to RAM and generation runs ~3x slower,
+    // so the reported number decides.
+    let streamed = streamed || (free < resident && stream < resident);
     let need = if streamed { stream } else { resident };
     if free < need {
-        bail!("the vision encoder needs {} on a GPU and the most free is {} (GPU {dev}); lower --ctx-size or \
-               --image-max-tokens", airun_cuda::human_bytes(need), airun_cuda::human_bytes(free));
+        bail!("the vision encoder needs {} on GPU {dev} and {} is free after the model: lower --ctx-size \
+               (or --expert-cache for MoE) to leave it room, or close programs that use the GPU (games, \
+               browsers, Discord, overlays)", airun_cuda::human_bytes(need), airun_cuda::human_bytes(free));
     }
     let mut v = VisionModel::load(mmproj, dev, streamed)
         .with_context(|| format!("failed to load the vision encoder {}", mmproj.display()))?;

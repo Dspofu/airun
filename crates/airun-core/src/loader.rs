@@ -232,7 +232,21 @@ pub fn load(
         });
     }
 
-    let devices = select_devices(&opts.gpus)?;
+    let mut devices = select_devices(&opts.gpus)?;
+    // On Windows (WDDM) the free memory CUDA reports counts what other
+    // programs hold and Windows could evict; the text model may grow into it,
+    // but the vision encoder, loaded after, then finds nothing left and
+    // forcing it in moves part of the model to RAM (3x slower). With an
+    // encoder to place, the plan starts from what is really free (NVML).
+    if opts.vision.is_some() {
+        for d in &mut devices {
+            if let Some(st) = airun_cuda::nvml::gpu_stats(&d.pci_bus_id()) {
+                if let (Some(total), Some(used)) = (st.mem_total, st.mem_used) {
+                    d.free_mem = d.free_mem.min(total.saturating_sub(used));
+                }
+            }
+        }
+    }
     let mut sizes = WeightSizes::from_gguf(&gguf, config.n_layers);
     // The vision encoder's VRAM, on top of the reserve: all of it when the
     // text model's weights still fit the GPUs at the default context, else

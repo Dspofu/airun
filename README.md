@@ -58,6 +58,9 @@ generating wrong text.
   come in a separate file (`mtp-*.gguf`, as llama.cpp produces).
 - **Vision:** with the model's `mmproj`, it reads images (photos, screenshots,
   pages of text). Works in `run` and in the API.
+- **Documents:** the web UI and the API take text files (any encoding) and
+  PDFs; the model gets their text. Scanned pages go to the model as images
+  when it runs with `--mmproj`.
 - **Several people at once** (`serve --parallel N`): each conversation keeps
   its own cache, and the ones generating advance together. With 4 concurrent
   requests the server delivers 2.2 times more tokens.
@@ -303,12 +306,16 @@ with llama-server's, field by field.
 | `/infill` | Code completion in the middle of a file (FIM) |
 | `/v1/embeddings`, `/embedding` | Embeddings (with `--embeddings`) |
 | `/tokenize`, `/detokenize`, `/apply-template` | Utilities |
+| `/extract` | Text of a document sent as the body (text or PDF), with its token count |
 | `/v1/stream/{id}` | Replay a generation that continued after the client dropped |
 | `/slots`, `/health`, `/props`, `/v1/models` | Server state |
 | `/hardware` | Live GPU load, VRAM, temperature, power, clocks and PCIe traffic (NVML), plus system, process and pinned RAM; the web UI shows it in the sidebar |
 
 - **Images:** with `--mmproj`, send the image as a data URL (OpenAI) or base64
   (Anthropic).
+- **Documents:** `file` (OpenAI), `input_file` (Responses) or `document`
+  (Anthropic) parts, inline in base64; text files and PDFs become text, and
+  scanned PDF pages become images (needs `--mmproj`).
 - **Reasoning:** `reasoning_effort` (`none`, `low`, `medium`, `high`, `max`)
   controls how much the model thinks; `reasoning_budget_tokens` sets the exact
   limit.

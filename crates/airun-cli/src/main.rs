@@ -3,6 +3,7 @@
 
 mod bench;
 mod convert;
+mod document;
 mod gpu;
 mod hide;
 mod inspect;

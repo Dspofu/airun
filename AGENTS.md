@@ -92,7 +92,8 @@ crates/
     tokenizer.rs, sample.rs
 
   airun-cli/           commands (serve.rs, sched.rs for --parallel, chat.rs
-                       for the Jinja template, replay.rs, hide.rs, ...)
+                       for the Jinja template, replay.rs, hide.rs,
+                       document.rs for text/PDF attachments, ...)
 ```
 
 ---
@@ -556,6 +557,17 @@ built for it work unchanged:
   `/(v1/)chat/completions`, `/(v1/)responses` (OpenAI Responses),
   `/v1/messages` (Anthropic), all streaming; token counting endpoints;
   `/tokenize`, `/detokenize`, `/apply-template`.
+- **Documents:** `document.rs` turns text files and PDFs (`pdf-extract`, a
+  utility, behind `catch_unwind`) into text; pages with no text give their
+  largest image (lopdf; JPEG passed through, CCITT via `fax`, Flate/raw in the
+  common color spaces) as a 1280 px JPEG. `attach_files` in serve.rs swaps
+  `file` / `input_file` / `document` parts for a `<file name>` text part plus
+  image parts before images are handled, and `/extract` serves the web UI's
+  attachments (the page stores the text and page images, not the file).
+- **Vision VRAM on Windows:** WDDM's reported free memory counts what other
+  programs hold, so with `--mmproj` the loader plans from NVML's free memory
+  and `vision_reserve` adds a margin for the CUDA context; forcing the encoder
+  past the real free memory made Windows page the model (3x slower decode).
 - **Embeddings** (`--embeddings`, `--pooling`), **slots** save/restore
   (`--slot-save-path`; on a hybrid the only way to resume a long prompt), and
   **controlled reasoning** (budgets, `reasoning_control` +
