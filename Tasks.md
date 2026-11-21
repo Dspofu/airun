@@ -16,13 +16,13 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## Fixed
 
-[X] - commit `pending` | `Dspofu` - `Claude` | FFN split allowed up to 3/4 of the feed-forward in RAM (was 1/2)
+[X] - commit `d951d88` | `Dspofu` - `Claude` | FFN split allowed up to 3/4 of the feed-forward in RAM (was 1/2)
   - 27B Q4_K_M on the 3060: 6.1 to 6.5 tok/s, 11.7 to 13.0 with --draft 3. Q8_0 (needs more) unchanged at 2.8 / 5.4: bound by RAM bandwidth.
 
-[X] - commit `pending` | `Dspofu` - `Claude` | Decode attention on fp16 tensor cores (sm_80+), quantized KV staged raw
+[X] - commit `d951d88` | `Dspofu` - `Claude` | Decode attention on fp16 tensor cores (sm_80+), quantized KV staged raw
   - 35B-A3B Q4_K_M on the 3060, 256k ctx, q4_0 KV, 160k filled: 16.2 to 49.6 tok/s. New selftest: random-cache split decode against the CPU.
 
-[X] - commit `pending` | `Dspofu` - `Claude` | Dense IQ types on integer kernels up to 63 tokens (matvec_iq_kernel), draft vocabulary 64k by default
+[X] - commit `d951d88` | `Dspofu` - `Claude` | Dense IQ types on integer kernels up to 63 tokens (matvec_iq_kernel), draft vocabulary 64k by default
   - 27B IQ2_M on the 3060, 400 tokens: decode 4.5 to 24.8 tok/s; --draft 3 3.5 to ~46 tok/s (code) / ~42 (Portuguese); 32-token prefill 12 to ~71 tok/s.
 
 [X] - commit `12e1276` | `Dspofu` - `Claude` | Docs cleanup: AGENTS.md rewritten as current state, rules against doc junk, Tasks.md
