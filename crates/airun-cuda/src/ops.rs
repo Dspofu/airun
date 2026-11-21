@@ -56,6 +56,7 @@ unsafe extern "C" {
     ) -> Status;
 
     fn airun_matvec_has_q8(type_id: i32) -> i32;
+    fn airun_matvec_q8_decode_only(type_id: i32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn airun_matvec_glu(type_id: i32, wg: *const c_void, wu: *const c_void, x: *const c_void,
         y: *mut c_void, k: i32, n_rows: i32, row_bytes: u64, stream: ffi::Stream) -> Status;
@@ -248,8 +249,17 @@ impl KernelType {
     /// where the integer path has a kernel that reads half a superblock per
     /// thread (`matvec_q6k_wide_kernel`). AIRUN_Q6K_F32_DECODE=1 keeps Q6_K
     /// decode on the exact kernel.
+    ///
+    /// The IQ types and Q2_0 take it as well (`matvec_q8_decode_only`): their
+    /// exact kernel decodes every weight through the grid tables and was
+    /// compute-bound, an IQ2_M 27B in VRAM slower than a Q4_K_M half in RAM.
+    /// AIRUN_IQ_F32_DECODE=1 keeps them on the exact kernel.
     pub fn prefers_q8_decode(self) -> bool {
         static Q6K_F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static IQ_F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if matvec_q8_decode_only(self) {
+            return !*IQ_F32.get_or_init(|| std::env::var("AIRUN_IQ_F32_DECODE").is_ok_and(|v| v.trim() != "0"));
+        }
         self.0 == 40   // NVFP4
             || (self.0 == 14   // Q6_K
                 && !*Q6K_F32.get_or_init(|| std::env::var("AIRUN_Q6K_F32_DECODE").is_ok_and(|v| v.trim() != "0")))
@@ -427,6 +437,26 @@ pub fn matvec_supports_q8(ty: KernelType) -> bool {
     // SAFETY: pure function of the id, touches nothing.
     unsafe {
         airun_matvec_has_q8(ty.0) != 0
+    }
+    #[cfg(not(airun_cuda))]
+    {
+        let _ = ty;
+        false
+    }
+}
+
+/// Most tokens [`matvec_q8`] takes for a [`matvec_q8_decode_only`] type
+/// (`AIRUN_Q8_DECODE_ONLY_MAX` in vecdotq.cuh).
+pub const Q8_DECODE_ONLY_MAX: usize = 63;
+
+/// Whether [`matvec_q8`] has an integer kernel for this type only up to
+/// [`Q8_DECODE_ONLY_MAX`] tokens (the IQ types and Q2_0);
+/// [`matvec_supports_q8`] is false for them.
+pub fn matvec_q8_decode_only(ty: KernelType) -> bool {
+    #[cfg(airun_cuda)]
+    // SAFETY: pure function of the id, touches nothing.
+    unsafe {
+        airun_matvec_q8_decode_only(ty.0) != 0
     }
     #[cfg(not(airun_cuda))]
     {
@@ -614,7 +644,7 @@ pub fn matvec_q8(
     row_bytes: usize,
     stream: &Stream,
 ) -> Result<()> {
-    if !matvec_supports_q8(ty) {
+    if !(matvec_supports_q8(ty) || (n_tokens <= Q8_DECODE_ONLY_MAX && matvec_q8_decode_only(ty))) {
         return Err(bad_arg(format!(
             "no integer matvec kernel for ggml type id {}; check matvec_supports_q8 first",
             ty.0

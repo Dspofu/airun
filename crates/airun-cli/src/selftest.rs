@@ -537,10 +537,17 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     // (Q8_0 only) is 17 groups, which it cannot chunk, so the synchronous one
     // runs.
     // 300 tokens take the 128-token tile, with a partial last tile.
-    for (n_tokens, odd_k) in [(1usize, false), (3, false), (8, false), (12, false), (16, false), (100, false), (100, true), (300, false)] {
+    // K = 17408 (a 27B's ffn_down, 544 groups) for the decode-only types at 1
+    // and 3 tokens: wider than matvec_iq_kernel stages at once, so its
+    // chunked variant runs, with a partial last chunk.
+    for (n_tokens, k) in [(1usize, 512usize), (3, 512), (8, 512), (12, 512), (16, 512), (100, 512), (100, 544), (300, 512),
+                          (1, 17408), (3, 17408)] {
+    let odd_k = k == 544;
     for &ty in TYPES {
         let kty = ops::KernelType(ty.id() as i32);
-        if !ops::matvec_supports_q8(kty) {
+        // The IQ types and Q2_0 have the integer kernel for decode-sized batches only.
+        let decode_only = n_tokens <= ops::Q8_DECODE_ONLY_MAX && ops::matvec_q8_decode_only(kty);
+        if !ops::matvec_supports_q8(kty) && !decode_only {
             continue;
         }
         let layout = ty.layout().unwrap();
@@ -548,7 +555,9 @@ fn test_matvec_q8(device: i32, stream: &Stream, report: &mut Report) -> Result<(
         if odd_k && elems != 32 {
             continue;
         }
-        let k: usize = if odd_k { 544 } else { 512 };
+        if k == 17408 && !decode_only {
+            continue;
+        }
         let blocks_per_row = k / elems;
         let row_bytes = blocks_per_row * layout.bytes as usize;
 
@@ -2304,6 +2313,7 @@ fn test_attention(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     attention_case(device, stream, report, 16, 2, 128, "head_dim 128, 50-token prefill", &chunk)?;
     attention_case(device, stream, report, 16, 4, 256, "head_dim 256, 50-token prefill", &chunk)?;
     test_split_attention_long(device, stream, report)?;
+    test_split_attention_random(device, stream, report)?;
     test_qsa(device, stream, report)?;
     test_fused_prologue(device, stream, report)?;
     test_argmax(device, stream, report)?;
@@ -2761,6 +2771,92 @@ fn test_split_attention_long(device: i32, stream: &Stream, report: &mut Report) 
     }
     report.case("split attention 212992 context, empty splits and sliding windows",
         format!("max_abs {worst:.3e}"), worst.is_finite() && worst < 1e-4);
+    Ok(())
+}
+
+/// Single-token split decode attention against an f64 CPU reference on random
+/// caches in every KV format, in the 35B-A3B's shape (16 heads over 2 KV heads,
+/// head_dim 256) and a GQA 6x one: the tensor-core decode kernel on sm_80+,
+/// the scalar GQA kernel elsewhere. Positions cover a partial last tile, many
+/// splits, and a sliding window. Q and P are fp16 on the tensor-core path, so
+/// the bound is the flash kernel's.
+fn test_split_attention_random(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
+    const CTX: usize = 6000;
+    for (heads, kv_heads, dim) in [(16usize, 2usize, 256usize), (24, 4, 256), (16, 2, 128)] {
+        for kv in [ops::KvType::F16, ops::KvType::Q8_0, ops::KvType::Q4_0] {
+            let mut rng = Rng::new(0x5A_7000 + heads as u64 * 31 + dim as u64);
+            let (row, blk) = match kv {
+                ops::KvType::F16 => (dim * 2, 0),
+                ops::KvType::Q8_0 => (dim / 32 * 34, 34),
+                ops::KvType::Q4_0 => (dim / 32 * 18, 18),
+            };
+            // Random rows; quantized blocks get a small f16 scale so values
+            // stay near [-1, 1] like the f16 case.
+            let mut make = |rng: &mut Rng| -> (Vec<u8>, Vec<f32>) {
+                let mut bytes = Vec::with_capacity(kv_heads * CTX * row);
+                let mut vals = Vec::with_capacity(kv_heads * CTX * dim);
+                for _ in 0..kv_heads * CTX {
+                    match kv {
+                        ops::KvType::F16 => for _ in 0..dim {
+                            let h = half::f16::from_f32(rng.unit());
+                            bytes.extend_from_slice(&h.to_le_bytes());
+                            vals.push(h.to_f32());
+                        },
+                        _ => for _ in 0..dim / 32 {
+                            let d = half::f16::from_f32(if blk == 34 { 1.0 / 127.0 } else { 1.0 / 8.0 } * (0.5 + 0.5 * rng.unit().abs()));
+                            bytes.extend_from_slice(&d.to_le_bytes());
+                            let codes = rng.bytes(blk - 2);
+                            let mut e = [0f32; 32];
+                            for j in 0..32 {
+                                let q = if blk == 34 { codes[j] as i8 as f32 }
+                                        else { ((if j < 16 { codes[j] & 0xF } else { codes[j - 16] >> 4 }) as i32 - 8) as f32 };
+                                // Both kernels decode to fp16 before using a value.
+                                e[j] = half::f16::from_f32(d.to_f32() * q).to_f32();
+                            }
+                            bytes.extend_from_slice(&codes);
+                            vals.extend_from_slice(&e);
+                        },
+                    }
+                }
+                (bytes, vals)
+            };
+            let (kb, kf) = make(&mut rng);
+            let (vb, vf) = make(&mut rng);
+            let q = rng.floats(heads * dim);
+            let d_k = DeviceBuffer::from_slice(device, &kb, stream)?;
+            let d_v = DeviceBuffer::from_slice(device, &vb, stream)?;
+            let d_q = DeviceBuffer::from_slice(device, &q, stream)?;
+            let splits = ops::attention_splits(CTX);
+            let scratch = DeviceBuffer::new(device, heads * splits * (dim + 2))?;
+            let out = DeviceBuffer::<f32>::new(device, heads * dim)?;
+            let scale = 1.0 / (dim as f32).sqrt();
+            let mut worst = 0.0f32;
+            for (pos, window) in [(0usize, 0usize), (15, 0), (16, 0), (1000, 0), (CTX - 1, 0), (4321, 300), (CTX - 1, 17)] {
+                let p = DeviceBuffer::from_slice(device, &[pos as i32], stream)?;
+                ops::attention_split(out.as_mut_ptr(), &scratch, d_q.as_ptr(), d_k.as_ptr(), d_v.as_ptr(),
+                    p.as_ptr(), heads, kv_heads, dim, CTX, scale, window, splits, kv, stream)?;
+                let gpu = out.to_vec(stream)?;
+                let lo = if window == 0 { 0 } else { (pos + 1).saturating_sub(window) };
+                for h in 0..heads {
+                    let kvh = h / (heads / kv_heads);
+                    let qh = &q[h * dim..(h + 1) * dim];
+                    let scores: Vec<f64> = (lo..=pos).map(|j| {
+                        let kr = &kf[(kvh * CTX + j) * dim..(kvh * CTX + j + 1) * dim];
+                        qh.iter().zip(kr).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>() * scale as f64
+                    }).collect();
+                    let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let w: Vec<f64> = scores.iter().map(|&x| (x - mx).exp()).collect();
+                    let total: f64 = w.iter().sum();
+                    for c in 0..dim {
+                        let r: f64 = (lo..=pos).zip(&w).map(|(j, &wj)| wj * vf[(kvh * CTX + j) * dim + c] as f64).sum::<f64>() / total;
+                        worst = worst.max((gpu[h * dim + c] - r as f32).abs());
+                    }
+                }
+            }
+            report.case(&format!("split decode attention {heads}/{kv_heads} heads, dim {dim}, {} cache, random", kv.name()),
+                format!("max_abs {worst:.3e}"), worst.is_finite() && worst < 3e-3);
+        }
+    }
     Ok(())
 }
 

@@ -119,12 +119,17 @@ pub(super) struct ShardedVerifyGraph {
 /// head, which in a byte-level BPE are the earliest merges and so roughly the
 /// most frequent tokens (FR-Spec, arXiv 2502.14856, ranks by corpus counts).
 /// Every draft is still checked by the full-vocabulary verify, so this trades
-/// acceptance for a cheaper head step, never the output. AIRUN_DRAFT_VOCAB
-/// sets it; 0 or anything at least the vocabulary means all of it.
+/// acceptance for a cheaper head step, never the output. Default
+/// DEFAULT_DRAFT_VOCAB: on Qwen's 248k vocabulary each draft read the whole
+/// head, and the first 64k rows kept nearly all the acceptance on English code
+/// and Portuguese prose while the drafts' head reads fell by ~4x.
+/// AIRUN_DRAFT_VOCAB sets it; 0 or anything at least the vocabulary means all
+/// of it.
+const DEFAULT_DRAFT_VOCAB: usize = 65536;
 fn draft_vocab(vocab: usize) -> usize {
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let k = *K.get_or_init(|| std::env::var("AIRUN_DRAFT_VOCAB").ok()
-        .and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+        .and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_DRAFT_VOCAB));
     if k == 0 { vocab } else { k.min(vocab) }
 }
 

@@ -326,7 +326,7 @@ const SPLIT_SLACK: u64 = 32 << 20;
 /// feed-forward weighs (a row of gate and of up, a column of down). `ffn_len`
 /// must be a multiple of `align` (the down projection's block, at most 256).
 /// Returns false, leaving the plan alone, when that does not apply or would
-/// put more than half of the feed-forward in RAM.
+/// put more of the feed-forward in RAM than the cap below.
 pub fn split_ffn(placement: &mut Placement, cfg: &Config, col_bytes: &[u64], batch: usize, align: usize) -> bool {
     let [s] = placement.shards.as_mut_slice() else { return false };
     if s.ram_layers.is_empty() || !s.disk_layers.is_empty() || !s.kv_ram_layers.is_empty()
@@ -345,8 +345,13 @@ pub fn split_ffn(placement: &mut Placement, cfg: &Config, col_bytes: &[u64], bat
     if cfg.ffn_len % step != 0 {
         return false;
     }
+    // At most AIRUN_FFN_SPLIT_MAX (a fraction, default 3/4) of the
+    // feed-forward in RAM.
+    let max_frac: f64 = std::env::var("AIRUN_FFN_SPLIT_MAX").ok().and_then(|v| v.trim().parse().ok())
+        .filter(|f: &f64| *f > 0.0 && *f < 1.0).unwrap_or(0.75);
+    let max_cols = ((cfg.ffn_len as f64 * max_frac) as usize / step) * step;
     let mut cols = step;
-    while cols <= cfg.ffn_len / 2 {
+    while cols <= max_cols {
         let moved: u64 = s.layers.iter().map(|&l| cols as u64 * col_bytes[l]).sum();
         let stage = 2 * (s.layers.iter().map(|&l| cols as u64 * col_bytes[l]).max().unwrap_or(0) + (3 << 16));
         if all + stage <= s.budget_bytes + moved {

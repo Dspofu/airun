@@ -5337,7 +5337,8 @@ fn fp4_min_tokens() -> usize {
 /// Decode on the integer kernel for this weight; see
 /// [`ops::KernelType::prefers_q8_decode`].
 fn q8_decode(w: &GpuTensor) -> bool {
-    !matvec_f32_forced() && w.kernel_type().prefers_q8_decode() && ops::matvec_supports_q8(w.kernel_type())
+    !matvec_f32_forced() && w.kernel_type().prefers_q8_decode()
+        && (ops::matvec_supports_q8(w.kernel_type()) || ops::matvec_q8_decode_only(w.kernel_type()))
 }
 
 /// Whether AIRUN_MATVEC_F32=1 pinned the matvec to the exact f32 path.
@@ -5580,8 +5581,15 @@ fn matvec_reuse(
         return Ok(());
     }
     let batch_q8 = n < 64 || ops::mmq_supported();
-    let wants_q8 = if n == 1 { q8_decode(w) } else { batch_q8 };
-    if wants_q8 && !matvec_f32_forced() && ops::matvec_supports_q8(w.kernel_type()) {
+    let ty = w.kernel_type();
+    let wants_q8 = if n == 1 {
+        q8_decode(w)
+    } else if ops::matvec_q8_decode_only(ty) {
+        n <= ops::Q8_DECODE_ONLY_MAX && ty.prefers_q8_decode()
+    } else {
+        batch_q8 && ops::matvec_supports_q8(ty)
+    };
+    if wants_q8 && !matvec_f32_forced() {
         if !q8.valid.get() {
             ops::quantize_act(x.as_ptr(), q8.buf.as_mut_ptr(), n * w.k, stream)?;
             q8.valid.set(true);

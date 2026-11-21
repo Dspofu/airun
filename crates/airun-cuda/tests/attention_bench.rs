@@ -176,3 +176,48 @@ fn verify_attention_ignores_the_drafts_count() {
     let diff1 = four[..w / 2].iter().zip(&one[..w / 2]).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
     println!("rows 0-1, 4 vs 2 queries: {diff2} of {w} values differ; row 0, 4 vs 1: {diff1}");
 }
+
+/// Decode attention in the 35B-A3B's shape (16 query heads over 2 KV heads,
+/// head_dim 256) per KV format, at the depths a long chat reaches: µs per
+/// layer and GB/s of cache read.
+#[test]
+#[ignore]
+fn decode_attention_moe_shape() {
+    const H: usize = 16;
+    const KVH: usize = 2;
+    let dev: i32 = std::env::var("AIRUN_BENCH_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    device::set_device(dev).unwrap();
+    let stream = Stream::new(dev).unwrap();
+    let ctx = 262144usize;
+    for (kv, row) in [(KvType::F16, HEAD_DIM * 2), (KvType::Q8_0, HEAD_DIM / 32 * 34), (KvType::Q4_0, HEAD_DIM / 32 * 18)] {
+        // Random bytes with small f16 scales: every block decodes to finite values.
+        let fill = |seed: usize| -> Vec<u8> {
+            (0..KVH * ctx * row).map(|i| {
+                let blk = if kv == KvType::F16 { 2 } else { row / (HEAD_DIM / 32) };
+                if kv != KvType::F16 && i % blk < 2 { if i % blk == 0 { 0x00 } else { 0x20 } } else { ((i * 7 + seed) % 251) as u8 }
+            }).collect()
+        };
+        let k = DeviceBuffer::<u8>::from_slice(dev, &fill(1), &stream).unwrap();
+        let v = DeviceBuffer::<u8>::from_slice(dev, &fill(2), &stream).unwrap();
+        let q_host: Vec<f32> = (0..H * HEAD_DIM).map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 0.3).collect();
+        let q = DeviceBuffer::<f32>::from_slice(dev, &q_host, &stream).unwrap();
+        let out = DeviceBuffer::<f32>::new(dev, H * HEAD_DIM).unwrap();
+        let splits = ops::attention_splits(ctx);
+        let partial = DeviceBuffer::<f32>::new(dev, H * splits * (HEAD_DIM + 2)).unwrap();
+        for &depth in &[4096usize, 32768, 65536, 131072, 163840] {
+            let positions = DeviceBuffer::<i32>::from_slice(dev, &[(depth - 1) as i32], &stream).unwrap();
+            let run = || ops::attention_split(out.as_mut_ptr(), &partial, q.as_ptr(), k.as_ptr(), v.as_ptr(),
+                positions.as_ptr(), H, KVH, HEAD_DIM, ctx, 1.0 / (HEAD_DIM as f32).sqrt(), 0, splits,
+                kv, &stream).unwrap();
+            run();
+            stream.synchronize().unwrap();
+            let iters = 30;
+            let t = std::time::Instant::now();
+            for _ in 0..iters { run(); }
+            stream.synchronize().unwrap();
+            let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let bytes = (2 * KVH * depth * row) as f64;
+            println!("{kv:?} depth {depth:>6}: {us:>8.1} us/layer  {:>6.1} GB/s", bytes / us / 1e3);
+        }
+    }
+}

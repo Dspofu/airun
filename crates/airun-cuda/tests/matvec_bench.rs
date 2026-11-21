@@ -34,7 +34,7 @@ fn kquant_matvec_by_tokens() {
     let y = DeviceBuffer::<f32>::new(dev, max_tok * ROWS).unwrap();
     // (name, ggml id, bytes per 256 weights)
     for (name, id, block) in [("Q8_0", 8, 272usize), ("Q4_K", 12, 144), ("Q5_K", 13, 176), ("Q6_K", 14, 210),
-        ("NVFP4", 40, 144)] {
+        ("NVFP4", 40, 144), ("IQ2_S", 22, 82), ("IQ3_S", 21, 110), ("IQ3_XXS", 18, 98)] {
         let row_bytes = K / 256 * block;
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
         let mut w = vec![0u8; ROWS * row_bytes];
@@ -52,6 +52,10 @@ fn kquant_matvec_by_tokens() {
             .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
             .unwrap_or_else(|| vec![1, 5, 16, 128, 512]);
         for n in tokens {
+            // The IQ types have an integer kernel up to Q8_DECODE_ONLY_MAX tokens.
+            if ops::matvec_q8_decode_only(KernelType(id)) && n > ops::Q8_DECODE_ONLY_MAX {
+                continue;
+            }
             ops::quantize_act(act.as_ptr(), xq.as_mut_ptr(), n * K, &stream).unwrap();
             let run = |i: usize| ops::matvec_q8(KernelType(id), ws[i % COPIES].as_ptr(), xq.as_ptr(), y.as_mut_ptr(),
                 K, ROWS, n, row_bytes, &stream).unwrap();

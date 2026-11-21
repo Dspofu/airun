@@ -350,17 +350,122 @@ __device__ __forceinline__ float vdot_q2_0(const uint8_t* wr, int g, const block
     X(AIRUN_TYPE_Q6_K)            \
     X(AIRUN_TYPE_NVFP4)
 
-// The MoE decode kernels' integer types: the above plus the IQ types and
-// Q2_0, which have no tiled or tensor-core kernel (the dense paths keep them
-// on the f32 kernels).
-#define AIRUN_FOR_EACH_MOE_Q8_TYPE(X) \
-    AIRUN_FOR_EACH_Q8_TYPE(X)         \
+// Types with an integer dot but no tiled or tensor-core kernel: the dense
+// path uses them for decode, MTP verify and short chunks (airun_matvec_q8 with up to
+// AIRUN_Q8_DECODE_ONLY_MAX tokens; ops.rs mirrors the limit), larger batches
+// stay on the f32 kernels.
+#define AIRUN_Q8_DECODE_ONLY_MAX 63
+#define AIRUN_FOR_EACH_Q8_DECODE_ONLY_TYPE(X) \
     X(AIRUN_TYPE_IQ4_NL)              \
     X(AIRUN_TYPE_IQ4_XS)              \
     X(AIRUN_TYPE_IQ2_S)               \
     X(AIRUN_TYPE_IQ3_XXS)             \
     X(AIRUN_TYPE_IQ3_S)               \
     X(AIRUN_TYPE_Q2_0)
+
+// The MoE decode kernels' integer types: both lists above.
+#define AIRUN_FOR_EACH_MOE_Q8_TYPE(X) \
+    AIRUN_FOR_EACH_Q8_TYPE(X)         \
+    AIRUN_FOR_EACH_Q8_DECODE_ONLY_TYPE(X)
+
+// A group decoded once to signed 8-bit codes and two weights (words 0..3 and
+// 4..7), for kernels that spend one group on several tokens: the IQ types'
+// grid lookups and sign expansion are most of their dot, and the f32-free
+// multi-token kernel otherwise repeats them per token. dot() is exactly the
+// matching vdot_* for one activation group.
+struct q8codes {
+    int v[8];
+    float w0, w1;
+    __device__ __forceinline__ float dot(const block_q8a& a) const {
+        const int* aw = (const int*)a.qs;
+        int d0 = 0, d1 = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) d0 = __dp4a(v[i], aw[i], d0);
+#pragma unroll
+        for (int i = 4; i < 8; ++i) d1 = __dp4a(v[i], aw[i], d1);
+        return __low2float(a.ds) * (w0 * (float)d0 + w1 * (float)d1);
+    }
+};
+
+// `grid` is the type's codebook: a copy in shared memory (matvec_iq_kernel)
+// or null for the global table.
+template <int TYPE> struct q8decode { static constexpr bool ok = false; };
+
+template <> struct q8decode<AIRUN_TYPE_IQ2_S> {
+    static constexpr bool ok = true;
+    using grid_t = uint64_t;
+    static constexpr int GRID = 1024;
+    __device__ static __forceinline__ const grid_t* table() { return iq2s_grid; }
+    __device__ static __forceinline__ void run(const uint8_t* wr, int g, q8codes& c,
+                                               const grid_t* grid_tab = nullptr) {
+        const grid_t* gt = grid_tab ? grid_tab : iq2s_grid;
+        const uint8_t* b = wr + (size_t)(g / 8) * sizeof(block_iq2_s);
+        const int sub = g % 8;
+        const uint32_t qs = load_u32_align2(b + 2 + 4 * sub);
+        const uint32_t sg = load_u32_align2(b + 34 + 4 * sub);
+        const uint32_t qh = b[66 + sub];
+        const uint32_t sc = b[74 + sub];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int idx = (int)((qs >> (8 * l)) & 0xFF) | (int)((qh << (8 - 2 * l)) & 0x300);
+            const uint64_t grid = gt[idx];
+            const uint32_t s = sg >> (8 * l);
+            c.v[2 * l] = signed_codes4((uint32_t)grid, s);
+            c.v[2 * l + 1] = signed_codes4((uint32_t)(grid >> 32), s >> 4);
+        }
+        const float d = __half2float(*(const half*)b) * 0.25f;
+        c.w0 = d * (0.5f + (float)(sc & 0x0F));
+        c.w1 = d * (0.5f + (float)(sc >> 4));
+    }
+};
+
+template <> struct q8decode<AIRUN_TYPE_IQ3_XXS> {
+    static constexpr bool ok = true;
+    using grid_t = uint32_t;
+    static constexpr int GRID = 256;
+    __device__ static __forceinline__ const grid_t* table() { return iq3xxs_grid; }
+    __device__ static __forceinline__ void run(const uint8_t* wr, int g, q8codes& c,
+                                               const grid_t* grid_tab = nullptr) {
+        const grid_t* gt = grid_tab ? grid_tab : iq3xxs_grid;
+        const uint8_t* b = wr + (size_t)(g / 8) * sizeof(block_iq3_xxs);
+        const int sub = g % 8;
+        const uint32_t aux = load_u32_align2(b + 66 + 4 * sub);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t idx = *(const uint16_t*)(b + 2 + 8 * sub + 2 * l);
+            const uint32_t s = ksigns_iq2xs((aux >> (7 * l)) & 127);
+            c.v[2 * l] = signed_codes4(gt[idx & 0xFF], s);
+            c.v[2 * l + 1] = signed_codes4(gt[idx >> 8], s >> 4);
+        }
+        c.w0 = c.w1 = __half2float(*(const half*)b) * (0.5f + (float)(aux >> 28)) * 0.5f;
+    }
+};
+
+template <> struct q8decode<AIRUN_TYPE_IQ3_S> {
+    static constexpr bool ok = true;
+    using grid_t = uint32_t;
+    static constexpr int GRID = 512;
+    __device__ static __forceinline__ const grid_t* table() { return iq3s_grid; }
+    __device__ static __forceinline__ void run(const uint8_t* wr, int g, q8codes& c,
+                                               const grid_t* grid_tab = nullptr) {
+        const grid_t* gt = grid_tab ? grid_tab : iq3s_grid;
+        const uint8_t* b = wr + (size_t)(g / 8) * sizeof(block_iq3_s);
+        const int sub = g % 8;
+        const uint32_t h = b[66 + sub];
+        const uint32_t sg = load_u32_align2(b + 74 + 4 * sub);
+        const int sc = (b[106 + sub / 2] >> (4 * (sub % 2))) & 0x0F;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t idx = *(const uint16_t*)(b + 2 + 8 * sub + 2 * l);
+            const uint32_t s = sg >> (8 * l);
+            const uint32_t g1 = gt[(idx & 0xFF) | ((h << (8 - 2 * l)) & 256)];
+            const uint32_t g2 = gt[(idx >> 8) | ((h << (7 - 2 * l)) & 256)];
+            c.v[2 * l] = signed_codes4(g1, s);
+            c.v[2 * l + 1] = signed_codes4(g2, s >> 4);
+        }
+        c.w0 = c.w1 = __half2float(*(const half*)b) * (float)(1 + 2 * sc);
+    }
+};
 
 template <int TYPE> struct q8dot;
 #define AIRUN_DEFINE_Q8DOT(TYPE, FN)                                          \

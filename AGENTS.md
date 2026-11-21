@@ -205,7 +205,29 @@ Every one of these has already produced a wrong conclusion here.
   reference), except NVFP4 and Q6_K, which take the integer path at every
   size (`KernelType::prefers_q8_decode`): at 4.5–6.5 bits the f32 vector each
   warp rereads weighs more than the weights. `AIRUN_Q6K_F32_DECODE=1` puts
-  Q6_K back on f32.
+  Q6_K back on f32. The IQ types and Q2_0 take dp4a up to 63 tokens
+  (`AIRUN_FOR_EACH_Q8_DECODE_ONLY_TYPE`, `Q8_DECODE_ONLY_MAX`), in passes of
+  up to 8. Their f32 kernel was compute-bound on the grid lookups, and a 27B
+  IQ2_M in VRAM ran several times slower on it. They have no `mmq_decode`, so
+  64+ tokens stay on fp16 tensor cores. The grid types (IQ2_S, IQ3_S,
+  IQ3_XXS) use `matvec_iq_kernel`:
+  - a warp per row (2 rows a warp for one token, 4 for more), so a 5120-wide
+    row is 5 groups a lane;
+  - the codebook copied into shared memory, with persistent blocks, as many
+    as the kernel's occupancy allows (`AIRUN_IQ_BLOCKS_PER_SM` overrides);
+  - each group decoded once (`q8decode` to `q8codes`) and spent on every
+    token;
+  - for 2–4 tokens, the activations staged in shared memory and read as
+    16-byte loads (`AIRUN_NO_IQ_STAGE=1` turns this off). Rows wider than
+    `IQ_STAGE_GROUPS` (160 groups, a 5120-wide row) are staged chunk by chunk
+    (`matvec_iq_chunk_kernel`);
+  - three blocks an SM for 2+ tokens (`__launch_bounds__`). At two, set by
+    registers and shared memory, a third of the warps were resident and the
+    kernel waited on latency.
+
+  The other decode-only types use `matvec_q8_wide_kernel` and
+  `matvec_q8_dot_multi_kernel`. `AIRUN_NO_IQ_KERNEL=1` sends the grid types
+  there too, and `AIRUN_IQ_F32_DECODE=1` puts the IQ types back on f32.
 - **2–8 tokens:** dp4a over quantized activations; `matvec_q8_multi_kernel`
   and `matvec_q8_wide_multi_kernel` decode each group once and spend it on
   every token (the MTP verify lives here).
@@ -269,11 +291,26 @@ Every one of these has already produced a wrong conclusion here.
   (`AIRUN_NO_FLASH=1`). P·V in fp16 per key tile only when the batch sees
   4096+ keys (`AIRUN_ATTN_PV_F32=1` turns it off; on short prompts it flipped
   a near-tie).
-- Decode: `attention_decode_gqa_kernel`, one kernel per (KV head, split),
-  reading the cache once for the whole GQA group, with the body instantiated
-  for 1/2/4/8 heads. Splits adapt to fill whole waves (16–64 keys per split,
-  up to 256 splits; `AIRUN_NO_SPLIT_WAVES=1`). At long context it reads K/V
-  at ~80% of bandwidth.
+- Decode on sm_80+ with up to 8 query heads per KV head:
+  `attention_decode_mma_kernel`, one warp per (KV head, split). The group's
+  heads are the rows of fp16 `mma.m16n8k16` (rows past the group are zero),
+  for both S = QKᵀ and O += PV. P goes from the S accumulators straight to
+  the A fragments, and V's B fragments come from `ldmatrix.trans`. Tiles are
+  16 keys (`MMA_DECODE_TILE`). Quantized rows that are whole 16-byte units are
+  copied raw with 16-byte loads, with the next tile's K and V in flight while
+  this one computes, and decoded in shared memory (`kv_piece`). Q and P are
+  fp16, like the prefill flash kernel. `AIRUN_NO_MMA_DECODE=1` turns it off.
+  At long context with a quantized cache it is several times faster than the
+  scalar kernel, which is bound by FP32 math and per-element decoding.
+- Decode otherwise (older GPUs, bigger groups, QSA, verify):
+  `attention_decode_gqa_kernel`, one kernel per (KV head, split), reading the
+  cache once for the whole GQA group, with the body instantiated for 1/2/4/8
+  heads. Splits adapt to fill whole waves (16–64 keys per split, up to 256
+  splits; `AIRUN_NO_SPLIT_WAVES=1`). With an f16 cache it reads K/V at ~80% of
+  bandwidth. With quantized caches it is limited by decoding: q4_0 tiles are
+  staged raw (`gqa_scalar_raw`), q8_0 tiles go piece by piece.
+- `cargo test --release -p airun-cuda --test attention_bench decode_attention_moe_shape -- --ignored --nocapture`
+  times decode attention in the 35B-A3B's shape for every KV format.
 - MTP verify and batched verify: `attention_split_multi`, one warp per query
   sharing K/V tiles. Its split boundaries are **fixed**
   (`verify_split_keys`), not position-dependent, so a token gives the same
@@ -387,7 +424,11 @@ Every one of these has already produced a wrong conclusion here.
 - **FFN columns in RAM** (`plan::split_ffn`): on one GPU with dense
   feed-forwards, every layer stays in VRAM except the last N intermediate
   columns, computed on the CPU in parallel with the GPU part.
-  `AIRUN_NO_FFN_SPLIT=1`.
+  `AIRUN_NO_FFN_SPLIT=1`. Up to 3/4 of the feed-forward can go to RAM
+  (`AIRUN_FFN_SPLIT_MAX`, a fraction). The old cap of 1/2 left a 27B Q4_K_M
+  on a 12 GB card with whole layers in RAM, which was slower. Past that, the
+  CPU's share reads at about what pinned RAM gives, so a model that needs
+  most of its weights in RAM is bound by RAM bandwidth, not by a kernel.
 - The output head goes in as Q8_0 when the weights do not fit
   (`AIRUN_NO_HEAD_Q8=1`); hyper-connection matrices are converted to Q8_0 at
   load (`AIRUN_HC_Q8=0`). The vision encoder is uploaded per image when it
@@ -473,9 +514,12 @@ Every one of these has already produced a wrong conclusion here.
   distribution without it. Mirostat has no MTP.
 - The text follows normal decoding but is not guaranteed identical (near-ties
   in the multi-token kernels).
-- `AIRUN_DRAFT_VOCAB=K` restricts the draft's argmax to the first K rows;
-  off by default because it loses on non-English text. A learned shortlist is
-  the open lever.
+- The draft's argmax covers the first 65536 rows of the head
+  (`DEFAULT_DRAFT_VOCAB` in spec.rs). On a 248k vocabulary every draft read
+  the whole head, about a fifth of a 27B IQ2_M verify step. 64k rows kept the
+  acceptance on English code and Portuguese prose, where 16k–48k lost it on
+  Portuguese. `AIRUN_DRAFT_VOCAB=K` sets it, and 0 means the whole
+  vocabulary. A learned shortlist is the open lever.
 
 ### `serve`
 

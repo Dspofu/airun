@@ -772,6 +772,313 @@ __global__ __launch_bounds__(WIDE_THREADS) void matvec_q8_wide_kernel(
     }
 }
 
+// The grid IQ types (IQ2_S, IQ3_S, IQ3_XXS) for 1..NT tokens: a warp per row,
+// so a 5120-wide row is exactly 5 groups a lane (a 128-thread row left the
+// second pass of 160 groups three-quarters idle), the codebook copied into
+// shared memory once per block (the lanes' scattered reads of the global
+// table were many L1 wavefronts each), and persistent blocks walking the rows
+// so the copy is paid ~once per SM. Each group is decoded once and spent on
+// every token (q8codes).
+#define IQ_WARPS 8
+// Rows per warp: each activation group is loaded once for all of them. Two
+// for one token (four measured slower there), four for a verify's few, where
+// the per-token activation loads are the larger cost.
+#ifndef IQ_VERIFY_ROWS
+#define IQ_VERIFY_ROWS 4
+#endif
+template <int NT> struct iq_rows { static constexpr int value = NT == 1 ? 2 : IQ_VERIFY_ROWS; };
+// STAGE: the tokens' activations are copied into shared memory once per block,
+// codes 16-byte aligned, so a lane reads a group's 32 codes as two 16-byte
+// loads instead of eight 4-byte ones (36-byte blocks are only 4-byte
+// aligned). For up to IQ_STAGE_TOKENS tokens of up to IQ_STAGE_GROUPS groups.
+#define IQ_STAGE_TOKENS 4
+#define IQ_STAGE_GROUPS 160   // a 5120-wide row; wider ones go by chunks (matvec_iq_chunk_kernel)
+// Three blocks an SM for a verify (NT > 1): 109 registers and 36 KB of shared
+// memory a block held it to two, a third of the warps, and the kernel waited
+// on latency with DRAM half busy.
+template <int TYPE, int NT, bool STAGE = false>
+__global__ __launch_bounds__(32 * IQ_WARPS, NT > 1 ? 3 : 1) void matvec_iq_kernel(
+    const uint8_t* __restrict__ w,
+    const block_q8a* __restrict__ xq,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens,
+    const size_t row_bytes) {
+    using D = q8decode<TYPE>;
+    using grid_t = typename D::grid_t;
+    constexpr int IQ_ROWS = iq_rows<NT>::value;
+    __shared__ grid_t grid[D::GRID];
+    constexpr int SQ = STAGE ? IQ_STAGE_TOKENS * IQ_STAGE_GROUPS : 1;
+    __shared__ uint4 sq[SQ][2];
+    __shared__ float sd[SQ];
+    for (int i = threadIdx.x; i < D::GRID; i += blockDim.x) grid[i] = D::table()[i];
+    const int groups = K / 32;
+    if constexpr (STAGE) {
+        // Word by word: the source blocks are 4-byte aligned.
+        for (int i = threadIdx.x; i < n_tokens * groups * 8; i += blockDim.x) {
+            const int tg = i >> 3, wd = i & 7;
+            ((uint32_t*)sq[tg])[wd] = ((const uint32_t*)xq[tg].qs)[wd];
+        }
+        for (int i = threadIdx.x; i < n_tokens * groups; i += blockDim.x) sd[i] = __low2float(xq[i].ds);
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int step = gridDim.x * IQ_WARPS * IQ_ROWS;
+    for (int row0 = (blockIdx.x * IQ_WARPS + warp) * IQ_ROWS; row0 < n_rows; row0 += step) {
+        const uint8_t* wr[IQ_ROWS];
+#pragma unroll
+        for (int r = 0; r < IQ_ROWS; ++r) wr[r] = w + (size_t)min(row0 + r, n_rows - 1) * row_bytes;
+        float acc[NT][IQ_ROWS];
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int r = 0; r < IQ_ROWS; ++r) acc[t][r] = 0.0f;
+        for (int g = lane; g < groups; g += 32) {
+            q8codes c[IQ_ROWS];
+#pragma unroll
+            for (int r = 0; r < IQ_ROWS; ++r) D::run(wr[r], g, c[r], grid);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                if (t < n_tokens) {
+                    int av[8];
+                    float da;
+                    if constexpr (STAGE) {
+                        const uint4 lo = sq[t * groups + g][0], hi = sq[t * groups + g][1];
+                        av[0] = (int)lo.x; av[1] = (int)lo.y; av[2] = (int)lo.z; av[3] = (int)lo.w;
+                        av[4] = (int)hi.x; av[5] = (int)hi.y; av[6] = (int)hi.z; av[7] = (int)hi.w;
+                        da = sd[t * groups + g];
+                    } else {
+                        const block_q8a& a = xq[(size_t)t * groups + g];
+                        const int* aw = (const int*)a.qs;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) av[i] = aw[i];
+                        da = __low2float(a.ds);
+                    }
+#pragma unroll
+                    for (int r = 0; r < IQ_ROWS; ++r) {
+                        int d0 = 0, d1 = 0;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) d0 = __dp4a(c[r].v[i], av[i], d0);
+#pragma unroll
+                        for (int i = 4; i < 8; ++i) d1 = __dp4a(c[r].v[i], av[i], d1);
+                        acc[t][r] += da * (c[r].w0 * (float)d0 + c[r].w1 * (float)d1);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= n_tokens) break;
+#pragma unroll
+            for (int r = 0; r < IQ_ROWS; ++r) {
+                const float s = warp_reduce_sum(acc[t][r]);
+                if (lane == 0 && row0 + r < n_rows) y[(size_t)t * n_rows + row0 + r] = s;
+            }
+        }
+    }
+}
+
+// matvec_iq_kernel's STAGE for rows wider than IQ_STAGE_GROUPS groups (a 27B's
+// ffn_down, 544): the activations are staged a chunk of groups at a time,
+// and the block's warps walk their rows chunk by chunk between barriers,
+// keeping the sums in registers. Each chunk is restaged per pass of
+// IQ_WARPS x rows, which the L2 serves.
+template <int TYPE, int NT>
+__global__ __launch_bounds__(32 * IQ_WARPS, 3) void matvec_iq_chunk_kernel(
+    const uint8_t* __restrict__ w,
+    const block_q8a* __restrict__ xq,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens,
+    const size_t row_bytes) {
+    using D = q8decode<TYPE>;
+    using grid_t = typename D::grid_t;
+    constexpr int IQ_ROWS = iq_rows<NT>::value;
+    constexpr int CH = IQ_STAGE_GROUPS;
+    __shared__ grid_t grid[D::GRID];
+    __shared__ uint4 sq[IQ_STAGE_TOKENS * CH][2];
+    __shared__ float sd[IQ_STAGE_TOKENS * CH];
+    for (int i = threadIdx.x; i < D::GRID; i += blockDim.x) grid[i] = D::table()[i];
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int groups = K / 32;
+    constexpr int RPB = IQ_WARPS * IQ_ROWS;
+    for (int base = blockIdx.x * RPB; base < n_rows; base += gridDim.x * RPB) {
+        const int row0 = base + warp * IQ_ROWS;
+        const uint8_t* wr[IQ_ROWS];
+#pragma unroll
+        for (int r = 0; r < IQ_ROWS; ++r) wr[r] = w + (size_t)min(row0 + r, n_rows - 1) * row_bytes;
+        float acc[NT][IQ_ROWS];
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int r = 0; r < IQ_ROWS; ++r) acc[t][r] = 0.0f;
+        for (int c0 = 0; c0 < groups; c0 += CH) {
+            const int cn = min(CH, groups - c0);
+            __syncthreads();   // the previous chunk is no longer read
+            for (int i = threadIdx.x; i < n_tokens * cn * 8; i += blockDim.x) {
+                const int tg = i >> 3, wd = i & 7;
+                const int t = tg / cn, g = tg % cn;
+                ((uint32_t*)sq[t * CH + g])[wd] = ((const uint32_t*)xq[(size_t)t * groups + c0 + g].qs)[wd];
+            }
+            for (int i = threadIdx.x; i < n_tokens * cn; i += blockDim.x) {
+                const int t = i / cn, g = i % cn;
+                sd[t * CH + g] = __low2float(xq[(size_t)t * groups + c0 + g].ds);
+            }
+            __syncthreads();
+            if (row0 >= n_rows) continue;
+            for (int g = lane; g < cn; g += 32) {
+                q8codes c[IQ_ROWS];
+#pragma unroll
+                for (int r = 0; r < IQ_ROWS; ++r) D::run(wr[r], c0 + g, c[r], grid);
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    if (t < n_tokens) {
+                        const uint4 lo = sq[t * CH + g][0], hi = sq[t * CH + g][1];
+                        const int av[8] = {(int)lo.x, (int)lo.y, (int)lo.z, (int)lo.w,
+                                           (int)hi.x, (int)hi.y, (int)hi.z, (int)hi.w};
+                        const float da = sd[t * CH + g];
+#pragma unroll
+                        for (int r = 0; r < IQ_ROWS; ++r) {
+                            int d0 = 0, d1 = 0;
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) d0 = __dp4a(c[r].v[i], av[i], d0);
+#pragma unroll
+                            for (int i = 4; i < 8; ++i) d1 = __dp4a(c[r].v[i], av[i], d1);
+                            acc[t][r] += da * (c[r].w0 * (float)d0 + c[r].w1 * (float)d1);
+                        }
+                    }
+                }
+            }
+        }
+        if (row0 >= n_rows) continue;
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= n_tokens) break;
+#pragma unroll
+            for (int r = 0; r < IQ_ROWS; ++r) {
+                const float s = warp_reduce_sum(acc[t][r]);
+                if (lane == 0 && row0 + r < n_rows) y[(size_t)t * n_rows + row0 + r] = s;
+            }
+        }
+    }
+}
+
+// AIRUN_NO_IQ_KERNEL=1 keeps the grid IQ types on matvec_q8_wide_kernel /
+// matvec_q8_dot_multi_kernel.
+static bool iq_kernel_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_IQ_KERNEL");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// AIRUN_NO_IQ_STAGE=1 reads a verify's activations from global memory.
+static bool iq_stage_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_IQ_STAGE");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Persistent blocks: as many as fit the GPU at once (the kernel's occupancy,
+// or AIRUN_IQ_BLOCKS_PER_SM), never more than the rows need. A block beyond
+// what is resident would wait out a whole other block's rows.
+template <auto KERNEL>
+static int iq_blocks(int n_rows, int rows_per_warp) {
+    static int sms = 0, forced = -1, occ = 0;   // per kernel instantiation
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (sms <= 0) sms = 1;
+        const char* v = getenv("AIRUN_IQ_BLOCKS_PER_SM");
+        forced = v && v[0] ? atoi(v) : 0;
+    }
+    int per_sm = forced;
+    if (per_sm <= 0) {
+        if (occ == 0) {
+            int b = 0;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, KERNEL, 32 * IQ_WARPS, 0) != cudaSuccess || b <= 0) b = 2;
+            occ = b;
+        }
+        per_sm = occ;
+    }
+    const int need = (n_rows + IQ_WARPS * rows_per_warp - 1) / (IQ_WARPS * rows_per_warp);
+    return min(need, sms * per_sm);
+}
+
+// 2..NT tokens for the types without an mmq_decode (IQ, Q2_0): each token
+// takes q8dot against the same group, whose bytes the first one brought into
+// L1, so DRAM sees the weights once per launch. The f32 kernel these batches
+// used before decoded every weight through the grid tables per token and ran
+// a 27B IQ2_M's MTP verify ~25x slower than one decode step.
+template <int TYPE, int R, int NT>
+__global__ __launch_bounds__(WIDE_THREADS) void matvec_q8_dot_multi_kernel(
+    const uint8_t* __restrict__ w,
+    const block_q8a* __restrict__ xq,
+    float* __restrict__ y,
+    const int K,
+    const int n_rows,
+    const int n_tokens,
+    const size_t row_bytes) {
+
+    const int row0 = blockIdx.x * R;
+    const int groups = K / 32;
+    float acc[NT][R];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[t][r] = 0.0f;
+
+    for (int g = threadIdx.x; g < groups; g += WIDE_THREADS) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* wr = w + (size_t)min(row0 + r, n_rows - 1) * row_bytes;
+            if constexpr (q8decode<TYPE>::ok) {
+                q8codes c;
+                q8decode<TYPE>::run(wr, g, c);
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    if (t < n_tokens) acc[t][r] += c.dot(xq[(size_t)t * groups + g]);
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    if (t < n_tokens) acc[t][r] += q8dot<TYPE>::dot(wr, g, xq + (size_t)t * groups);
+                }
+            }
+        }
+    }
+
+    __shared__ float red[NT][R][WIDE_THREADS / 32];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float s = warp_reduce_sum(acc[t][r]);
+            if (lane == 0) red[t][r][warp] = s;
+        }
+    __syncthreads();
+    for (int i = threadIdx.x; i < NT * R; i += WIDE_THREADS) {
+        const int t = i / R, r = i % R;
+        if (t < n_tokens && row0 + r < n_rows) {
+            float s = 0.0f;
+#pragma unroll
+            for (int k = 0; k < WIDE_THREADS / 32; ++k) s += red[t][r][k];
+            y[(size_t)t * n_rows + row0 + r] = s;
+        }
+    }
+}
+
 // matvec_q8_wide_kernel for 2..NT tokens (the speculative verify): each group
 // is decoded once (mmq_decode) and spent against every token's activation.
 template <int TYPE, int R, int NT>
@@ -2223,6 +2530,19 @@ int32_t airun_matvec_has_q8(int32_t type_id) {
     }
 }
 
+// 1 when airun_matvec_q8 serves this type only up to
+// AIRUN_Q8_DECODE_ONLY_MAX tokens.
+int32_t airun_matvec_q8_decode_only(int32_t type_id) {
+    switch (type_id) {
+#define Q8CASE(TYPE) case TYPE:
+        AIRUN_FOR_EACH_Q8_DECODE_ONLY_TYPE(Q8CASE)
+#undef Q8CASE
+        return 1;
+        default:
+            return 0;
+    }
+}
+
 airun_status airun_quantize_act(
     const void* x,
     void* out,
@@ -2256,6 +2576,65 @@ airun_status airun_matvec_q8(
     if (n_rows <= 0 || n_tokens <= 0) return AIRUN_OK;
 
     const dim3 block(32, ROWS_PER_BLOCK);
+
+    // IQ types and Q2_0, up to AIRUN_Q8_DECODE_ONLY_MAX tokens: decode, MTP
+    // verify and short prompt chunks, in passes of up to 8 tokens. The f32
+    // kernel decodes each weight through the grid tables and FMAs it, which
+    // kept a 27B IQ2_M entirely in VRAM compute-bound at a fraction of its
+    // bandwidth.
+    if (airun_matvec_q8_decode_only(type_id)) {
+        if (n_tokens > AIRUN_Q8_DECODE_ONLY_MAX) return AIRUN_ERR_BAD_TYPE;
+        constexpr int R = 2;
+        const int blocks = (n_rows + R - 1) / R;
+        const int groups = k / 32;
+        for (int t0 = 0; t0 < n_tokens; t0 += 8) {
+            const int nt = min(8, n_tokens - t0);
+            const block_q8a* xt = (const block_q8a*)xq + (size_t)t0 * groups;
+            float* yt = (float*)y + (size_t)t0 * n_rows;
+        if ((type_id == AIRUN_TYPE_IQ2_S || type_id == AIRUN_TYPE_IQ3_S || type_id == AIRUN_TYPE_IQ3_XXS)
+            && !iq_kernel_disabled()) {
+            const bool stage = !iq_stage_disabled();
+            const bool chunk = groups > IQ_STAGE_GROUPS;
+#define IQ_LAUNCH(TYPE, NT, ST) matvec_iq_kernel<TYPE, NT, ST><<<iq_blocks<matvec_iq_kernel<TYPE, NT, ST>>(n_rows, iq_rows<NT>::value), 32 * IQ_WARPS, 0, stream>>>( \
+                (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes)
+#define IQ_CHUNK(TYPE, NT) matvec_iq_chunk_kernel<TYPE, NT><<<iq_blocks<matvec_iq_chunk_kernel<TYPE, NT>>(n_rows, iq_rows<NT>::value), 32 * IQ_WARPS, 0, stream>>>( \
+                (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes)
+#define IQ_STAGED(TYPE, NT) do { if (!stage) IQ_LAUNCH(TYPE, NT, false); \
+                else if (chunk) IQ_CHUNK(TYPE, NT); else IQ_LAUNCH(TYPE, NT, true); } while (0)
+#define IQ_TYPE(TYPE) case TYPE:                                                          \
+                if (nt == 1) IQ_LAUNCH(TYPE, 1, false);                                  \
+                else if (nt == 2) IQ_STAGED(TYPE, 2);                                    \
+                else if (nt <= 4) IQ_STAGED(TYPE, 4);                                    \
+                else IQ_LAUNCH(TYPE, 8, false); break;
+            switch (type_id) {
+                IQ_TYPE(AIRUN_TYPE_IQ2_S)
+                IQ_TYPE(AIRUN_TYPE_IQ3_S)
+                IQ_TYPE(AIRUN_TYPE_IQ3_XXS)
+                default: return AIRUN_ERR_BAD_TYPE;
+            }
+#undef IQ_TYPE
+#undef IQ_STAGED
+#undef IQ_CHUNK
+#undef IQ_LAUNCH
+            continue;
+        }
+#define LAUNCH(TYPE)                                                                                  \
+            if (nt == 1) matvec_q8_wide_kernel<TYPE, R><<<blocks, WIDE_THREADS, 0, stream>>>(         \
+                (const uint8_t*)w, xt, yt, k, n_rows, (size_t)row_bytes);                             \
+            else if (nt == 2) matvec_q8_dot_multi_kernel<TYPE, R, 2><<<blocks, WIDE_THREADS, 0, stream>>>( \
+                (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes);                         \
+            else if (nt <= 4) matvec_q8_dot_multi_kernel<TYPE, R, 4><<<blocks, WIDE_THREADS, 0, stream>>>( \
+                (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes);                         \
+            else matvec_q8_dot_multi_kernel<TYPE, R, 8><<<blocks, WIDE_THREADS, 0, stream>>>(         \
+                (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes);
+            switch (type_id) {
+                AIRUN_FOR_EACH_Q8_DECODE_ONLY_TYPE(AIRUN_CASE)
+                default: return AIRUN_ERR_BAD_TYPE;
+            }
+#undef LAUNCH
+        }
+        AIRUN_CHECK_LAUNCH();
+    }
 
     // A graph being captured keeps the few-token kernels below 32 tokens (a
     // batched verify of several conversations): a small MMQ grid wants split-K,
