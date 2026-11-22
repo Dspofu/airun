@@ -16,13 +16,13 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## Fixed
 
-[X] - commit `pending` | `Dspofu` - `Claude` | `serve --parallel N` with KV in RAM put every slot's cache of whole layers there, slot 0 included; now one slot's cache at a time, slot 0 last
+[X] - commit `5abae8e` | `Dspofu` - `Claude` | `serve --parallel N` with KV in RAM put every slot's cache of whole layers there, slot 0 included; now one slot's cache at a time, slot 0 last
   - 27B q4_0, `--parallel 4 -c 248144 --draft 4`, 128k prompt: decode 37.8 to 79.7 tok/s, prefill 2096 to 2279. Each slot still gets the whole -c (llama-server divides it).
 
-[X] - commit `pending` | `Dspofu` - `Claude` | MTP verify attention on fp16 tensor cores; at long context MTP gained nothing (scalar FP32 verify)
+[X] - commit `5abae8e` | `Dspofu` - `Claude` | MTP verify attention on fp16 tensor cores; at long context MTP gained nothing (scalar FP32 verify)
   - 27B q4_0 KV, `--draft 4`, 128k prompt: decode 32.2 to 72.8 tok/s (2k: 74.9 to 86.4). AIRUN_NO_MMA_VERIFY=1 goes back.
 
-[X] - commit `pending` | `Dspofu` - `Claude` | Prefill over a q4_0/q8_0 cache at head_dim 256 ran at half the f16 rate at 128k; rows now staged raw by cp.async
+[X] - commit `5abae8e` | `Dspofu` - `Claude` | Prefill over a q4_0/q8_0 cache at head_dim 256 ran at half the f16 rate at 128k; rows now staged raw by cp.async
   - 27B q4_0, 128k prompt: 1189 to 1790 t/s in bench; with the user's serve command 1440 to 2096.
 
 [X] - commit `772e19c` | `Dspofu` - `Claude` | Dense IQ prefill on int8 tensor cores (MMQ) from 64 tokens: IQ2_S, IQ3_XXS (cp.async) and IQ3_S, codebook in shared memory, fused gate/up
