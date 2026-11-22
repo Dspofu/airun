@@ -374,15 +374,25 @@ fn solo_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("AIRUN_NO_PARALLEL_SOLO").is_ok_and(|v| v.trim() != "0"))
 }
 
-/// The free slot a job goes to: the most reusable prefix first; on a tie
-/// (often none at all) the least recently used, so an unrelated request does
-/// not evict the conversation that will come back next while an idle slot
-/// sits there.
+/// A slot whose KV cache is partly in RAM reads it over PCIe every step (at
+/// 128k that halves decoding): it must hold this many more tokens of the
+/// prompt than one all in VRAM to be picked, about what prefilling them
+/// costs against a few hundred tokens decoded at half speed.
+const RAM_SLOT_PENALTY: usize = 8192;
+
+/// The free slot a job goes to: the most reusable prefix first (less
+/// [`RAM_SLOT_PENALTY`] for a slot with KV in RAM); on a tie (often none at
+/// all) the one with the fewest KV caches in RAM, then the least recently
+/// used, so an unrelated request does not evict the conversation that will
+/// come back next while an idle slot sits there.
 fn pick_slot(rt: &Runtime, tokens: &[u32], active: &[Running], used: &mut [u64]) -> usize {
     let busy: Vec<usize> = active.iter().map(|r| r.slot).collect();
     let free = (0..used.len()).filter(|s| !busy.contains(s));
-    let slot = free.max_by_key(|&s| (rt.slot_prefix(s, tokens), std::cmp::Reverse(used[s]),
-        usize::MAX - s)).expect("a slot is free");
+    let slot = free.max_by_key(|&s| {
+        let in_ram = rt.model.placement.kv_ram_layers_of_slot(s);
+        let reuse = rt.slot_prefix(s, tokens) as i64 - if in_ram > 0 { RAM_SLOT_PENALTY as i64 } else { 0 };
+        (reuse, std::cmp::Reverse(in_ram), std::cmp::Reverse(used[s]), usize::MAX - s)
+    }).expect("a slot is free");
     used[slot] = used.iter().max().copied().unwrap_or(0) + 1;
     slot
 }

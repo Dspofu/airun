@@ -16,6 +16,15 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## Fixed
 
+[X] - commit `pending` | `Dspofu` - `Claude` | `serve --parallel N` with KV in RAM put every slot's cache of whole layers there, slot 0 included; now one slot's cache at a time, slot 0 last
+  - 27B q4_0, `--parallel 4 -c 248144 --draft 4`, 128k prompt: decode 37.8 to 79.7 tok/s, prefill 2096 to 2279. Each slot still gets the whole -c (llama-server divides it).
+
+[X] - commit `pending` | `Dspofu` - `Claude` | MTP verify attention on fp16 tensor cores; at long context MTP gained nothing (scalar FP32 verify)
+  - 27B q4_0 KV, `--draft 4`, 128k prompt: decode 32.2 to 72.8 tok/s (2k: 74.9 to 86.4). AIRUN_NO_MMA_VERIFY=1 goes back.
+
+[X] - commit `pending` | `Dspofu` - `Claude` | Prefill over a q4_0/q8_0 cache at head_dim 256 ran at half the f16 rate at 128k; rows now staged raw by cp.async
+  - 27B q4_0, 128k prompt: 1189 to 1790 t/s in bench; with the user's serve command 1440 to 2096.
+
 [X] - commit `772e19c` | `Dspofu` - `Claude` | Dense IQ prefill on int8 tensor cores (MMQ) from 64 tokens: IQ2_S, IQ3_XXS (cp.async) and IQ3_S, codebook in shared memory, fused gate/up
   - 27B IQ2_M on the 3060, pp512: 139 to 492 t/s (llama-bench 509), pp128 91 to 443. Perplexity unchanged (11.70 both paths). AIRUN_NO_IQ_MMQ=1 goes back.
 
@@ -41,6 +50,12 @@ Newest first. Move an entry between sections instead of duplicating it.
   - Also documents NVFP4 on GPUs without FP4 tensor cores in the README.
 
 ## Warn
+
+- commit `-` | `Dspofu` - `Claude` | A slot with 2 of 16 KV caches in RAM decoded at 20 tok/s at 128k, slower than one with 8 (37.8); not explained
+  - 27B q4_0 `--draft 4`, 5070 Ti: ~280 ms a verify pass, where copying 2 x 151 MB should cost ~15 ms. The current plan avoids it for slot 0.
+
+- commit `-` | `Dspofu` - `Claude` | At long context `fill_fastest_first` leaves the prefill pipeline unbalanced
+  - 27B q4_0, `-c 131328`: 55 of 64 layers on the 5070 Ti, 128k prefill 1790 t/s; `--tensor-split 40,24` gives 2434 (its decode cost not measured).
 
 - commit `772e19c` | `Dspofu` - `Claude` | MoE kernels cannot apply per-expert NVFP4 scales nor read gate/up of different types (such files are refused)
   - Qwen3.6-35B-A3B-NVFP4-MTP-HQ needs both: layers 32-39 have gate NVFP4 and up Q4_K.

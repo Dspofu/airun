@@ -1363,6 +1363,281 @@ __global__ __launch_bounds__(32, 1) void attention_decode_mma_kernel(
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Speculative verify attention on fp16 tensor cores: attention_decode_mma_kernel's
+// MMAs for nq queries over one cache. The scalar verify (one warp per query
+// in attention_decode_gqa_kernel) did every query's products on the FP32
+// pipes, so at 128k a 5-token verify cost about five decode attentions and
+// MTP gained nothing. Warp w takes queries 2w (MMA rows 0..7) and 2w+1 (rows
+// 8..15), the rows the decode kernel leaves zero; a row's sums do not depend
+// on its neighbour's. The block shares each K/V tile, copied by cp.async a
+// tile ahead (raw for quantized rows of whole 16-byte units, decoded in
+// shared memory). Splits have the verify's fixed boundaries
+// (verify_split_keys), so a token's numbers do not depend on how many
+// queries the verify has. AIRUN_NO_MMA_VERIFY=1 keeps the scalar kernel.
+// ---------------------------------------------------------------------------
+#define MMA_VERIFY_TILE 16
+
+template <int D, int KV>
+__host__ __device__ constexpr bool mma_verify_ok() { return KV == KV_F16 || gqa_raw_stage<D, KV>(); }
+
+// Bytes of one stage's K or V tile as copied: fp16 rows padded to LD, or raw rows.
+template <int D, int KV>
+__host__ __device__ constexpr size_t mma_verify_stage() {
+    return KV == KV_F16 ? (size_t)MMA_VERIFY_TILE * GqaShape<D>::LD * 2
+                        : (size_t)MMA_VERIFY_TILE * gqa_row_bytes<D, KV>();
+}
+// f16: K and V in two stages, read in place. Quantized: one fp16 K and V
+// tile, then two raw stages of each.
+template <int D, int KV>
+__host__ __device__ constexpr size_t mma_verify_smem() {
+    return KV == KV_F16 ? 4 * mma_verify_stage<D, KV>()
+                        : 2 * (size_t)MMA_VERIFY_TILE * GqaShape<D>::LD * 2 + 4 * mma_verify_stage<D, KV>();
+}
+
+__device__ __forceinline__ void mma_cp16(void* smem, const void* gmem, bool valid) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(valid ? 16 : 0));
+#else
+    (void)smem; (void)gmem; (void)valid;
+#endif
+}
+
+template <int D, int KV>
+__global__ __launch_bounds__(32 * (GQA_MULTI_MAX / 2), 1) void attention_verify_mma_kernel(
+    float* __restrict__ partial,          // [nq][n_heads][splits][D + 2]
+    const float* __restrict__ q,          // [nq][n_heads][D]
+    const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ v_cache,
+    const int32_t* __restrict__ positions,
+    const int nq,
+    const int n_heads,
+    const int n_kv_heads,
+    const int max_seq,
+    const float scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int LD = GqaShape<D>::LD;
+    constexpr int KS = D / 16;
+    constexpr int NT = D / 8;
+    constexpr int TK = MMA_VERIFY_TILE;
+    constexpr bool F16 = KV == KV_F16;
+    constexpr int RB = gqa_row_bytes<D, KV>();
+    constexpr int PIECES = D / 8;
+    extern __shared__ __align__(16) unsigned char mv_smem[];
+    constexpr size_t STAGE = mma_verify_stage<D, KV>();
+    // f16: K stages at 0 and STAGE, V stages at 2 STAGE and 3 STAGE.
+    // Quantized: fp16 K tile, fp16 V tile, raw K [2], raw V [2].
+    constexpr size_t T16 = (size_t)TK * LD * 2;
+    unsigned char* kstage = F16 ? mv_smem : mv_smem + 2 * T16;
+    unsigned char* vstage = kstage + 2 * STAGE;
+
+    const int nthreads = blockDim.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int G = n_heads / n_kv_heads;
+    const int kvh = blockIdx.x;
+    const int split = blockIdx.y;
+    const int keys = verify_split_keys(max_seq, gridDim.y);
+    const int last = positions[nq - 1];
+    if (split > last / keys) return;   // past every query: the merge does not read it
+    const int begin = split * keys;
+    const int end = min((split + 1) * keys, last + 1);
+
+    const int qa_i = 2 * warp, qb_i = 2 * warp + 1;
+    const bool has_b = qb_i < nq;
+    const int pos_a = positions[qa_i];
+    const int pos_b = has_b ? positions[qb_i] : -1;
+    const bool head_ok = g < G;
+
+    // Q as A fragments: row g is query a's head g, row g + 8 query b's.
+    uint32_t qf[KS][4];
+    {
+        const float* qa = q + ((size_t)qa_i * n_heads + kvh * G + (head_ok ? g : 0)) * D;
+        const float* qb = q + ((size_t)(has_b ? qb_i : qa_i) * n_heads + kvh * G + (head_ok ? g : 0)) * D;
+        const bool ua = head_ok, ub = head_ok && has_b;
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks) {
+            const float2 a0 = ua ? *(const float2*)&qa[ks * 16 + 2 * t] : make_float2(0.f, 0.f);
+            const float2 a2 = ua ? *(const float2*)&qa[ks * 16 + 8 + 2 * t] : make_float2(0.f, 0.f);
+            const float2 b0 = ub ? *(const float2*)&qb[ks * 16 + 2 * t] : make_float2(0.f, 0.f);
+            const float2 b2 = ub ? *(const float2*)&qb[ks * 16 + 8 + 2 * t] : make_float2(0.f, 0.f);
+            qf[ks][0] = pack_half2(a0.x * scale, a0.y * scale);
+            qf[ks][1] = pack_half2(b0.x * scale, b0.y * scale);
+            qf[ks][2] = pack_half2(a2.x * scale, a2.y * scale);
+            qf[ks][3] = pack_half2(b2.x * scale, b2.y * scale);
+        }
+    }
+
+    const size_t row_bytes = kv_row_bytes<KV>(D);
+    const uint8_t* kbase = k_cache + (size_t)kvh * max_seq * row_bytes;
+    const uint8_t* vbase = v_cache + (size_t)kvh * max_seq * row_bytes;
+
+    // Copies tile t0 into stage st; keys at or past `end` arrive as zeros.
+    const auto stage = [&](int t0, int st) {
+        if constexpr (F16) {
+            for (int i = tid; i < TK * PIECES; i += nthreads) {
+                const int r = i / PIECES, c = i % PIECES;
+                const bool ok = t0 + r < end;
+                const size_t off = ok ? (size_t)(t0 + r) * RB + c * 16 : 0;
+                const size_t dst = st * STAGE + ((size_t)r * LD + 8 * c) * 2;
+                mma_cp16(kstage + dst, kbase + off, ok);
+                mma_cp16(vstage + dst, vbase + off, ok);
+            }
+        } else {
+            constexpr int UPR = RB / 16;
+            for (int u = tid; u < TK * UPR; u += nthreads) {
+                const bool ok = t0 + u / UPR < end;
+                const size_t off = ok ? (size_t)t0 * RB + (size_t)u * 16 : 0;
+                mma_cp16(kstage + st * STAGE + u * 16, kbase + off, ok);
+                mma_cp16(vstage + st * STAGE + u * 16, vbase + off, ok);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+
+    float ma = -INFINITY, la = 0.0f, mb = -INFINITY, lb = 0.0f;
+    float o[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
+
+    if (begin < end) stage(begin, 0);
+    int st = 0;
+    for (int t0 = begin; t0 < end; t0 += TK, st ^= 1) {
+        if (t0 + TK < end) {
+            stage(t0 + TK, st ^ 1);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncthreads();
+        const half* kt;
+        const half* vt;
+        if constexpr (F16) {
+            kt = (const half*)(kstage + st * STAGE);
+            vt = (const half*)(vstage + st * STAGE);
+        } else {
+            half* k16 = (half*)mv_smem;
+            half* v16 = (half*)(mv_smem + T16);
+            const uint8_t* kr = kstage + st * STAGE;
+            const uint8_t* vr = vstage + st * STAGE;
+            for (int i = tid; i < TK * PIECES; i += nthreads) {
+                const int r = i / PIECES, c = i % PIECES;
+                *(uint4*)&k16[r * LD + 8 * c] = kv_piece<KV>(kr + r * RB, c);
+                *(uint4*)&v16[r * LD + 8 * c] = kv_piece<KV>(vr + r * RB, c);
+            }
+            __syncthreads();
+            kt = k16;
+            vt = v16;
+        }
+
+        float s[TK / 8][4];
+#pragma unroll
+        for (int j = 0; j < TK / 8; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks) {
+#pragma unroll
+            for (int j = 0; j < TK / 8; ++j) {
+                const half* kr = kt + (j * 8 + g) * LD + ks * 16 + 2 * t;
+                const uint32_t b0 = *(const uint32_t*)kr;
+                const uint32_t b1 = *(const uint32_t*)(kr + 8);
+                mma_16816(s[j][0], s[j][1], s[j][2], s[j][3], qf[ks][0], qf[ks][1], qf[ks][2], qf[ks][3], b0, b1);
+            }
+        }
+
+        // Online softmax: s[.][0..1] are query a's row, s[.][2..3] query b's.
+        float xa = -INFINITY, xb = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < TK / 8; ++j) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int key = t0 + j * 8 + 2 * t + e;
+                s[j][e] = key < end && key <= pos_a ? s[j][e] : -INFINITY;
+                s[j][2 + e] = key < end && key <= pos_b ? s[j][2 + e] : -INFINITY;
+                xa = fmaxf(xa, s[j][e]);
+                xb = fmaxf(xb, s[j][2 + e]);
+            }
+        }
+        xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, 1));
+        xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, 2));
+        xb = fmaxf(xb, __shfl_xor_sync(0xffffffffu, xb, 1));
+        xb = fmaxf(xb, __shfl_xor_sync(0xffffffffu, xb, 2));
+        const float na = fmaxf(ma, xa), nb = fmaxf(mb, xb);
+        const float ca = na == -INFINITY ? 1.0f : __expf(ma - na);
+        const float cb = nb == -INFINITY ? 1.0f : __expf(mb - nb);
+        float sa = 0.0f, sb = 0.0f;
+#pragma unroll
+        for (int j = 0; j < TK / 8; ++j) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                s[j][e] = s[j][e] == -INFINITY ? 0.0f : __expf(s[j][e] - na);
+                s[j][2 + e] = s[j][2 + e] == -INFINITY ? 0.0f : __expf(s[j][2 + e] - nb);
+                sa += s[j][e];
+                sb += s[j][2 + e];
+            }
+        }
+        sa += __shfl_xor_sync(0xffffffffu, sa, 1);
+        sa += __shfl_xor_sync(0xffffffffu, sa, 2);
+        sb += __shfl_xor_sync(0xffffffffu, sb, 1);
+        sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+        la = la * ca + sa;
+        lb = lb * cb + sb;
+        ma = na;
+        mb = nb;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) { o[j][0] *= ca; o[j][1] *= ca; o[j][2] *= cb; o[j][3] *= cb; }
+
+        // O += P V, P's A fragment straight from the scores.
+        const uint32_t vt_s = (uint32_t)__cvta_generic_to_shared(vt);
+#pragma unroll
+        for (int kk = 0; kk < TK / 16; ++kk) {
+            const uint32_t p0 = pack_half2(s[2 * kk][0], s[2 * kk][1]);
+            const uint32_t p1 = pack_half2(s[2 * kk][2], s[2 * kk][3]);
+            const uint32_t p2 = pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+            const uint32_t p3 = pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+            const int vrow = kk * 16 + (lane & 15);
+#pragma unroll
+            for (int j = 0; j < NT; j += 2) {
+                const int vcol = j * 8 + (lane >> 4) * 8;
+                const uint32_t addr = vt_s + (uint32_t)((vrow * LD + vcol) * 2);
+                uint32_t b0, b1, b2, b3;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(addr));
+                mma_16816(o[j][0], o[j][1], o[j][2], o[j][3], p0, p1, p2, p3, b0, b1);
+                mma_16816(o[j + 1][0], o[j + 1][1], o[j + 1][2], o[j + 1][3], p0, p1, p2, p3, b2, b3);
+            }
+        }
+        __syncthreads();   // the stage just read is refilled next iteration
+    }
+
+    if (head_ok) {
+        const size_t per_q = (size_t)n_heads * gridDim.y * (D + 2);
+        const size_t at = ((size_t)(kvh * G + g) * gridDim.y + split) * (D + 2);
+        float* out = partial + qa_i * per_q + at;
+        if (t == 0) { out[0] = ma; out[1] = la; }
+#pragma unroll
+        for (int j = 0; j < NT; ++j) *(float2*)&out[2 + j * 8 + 2 * t] = make_float2(o[j][0], o[j][1]);
+        if (has_b) {
+            out = partial + qb_i * per_q + at;
+            if (t == 0) { out[0] = mb; out[1] = lb; }
+#pragma unroll
+            for (int j = 0; j < NT; ++j) *(float2*)&out[2 + j * 8 + 2 * t] = make_float2(o[j][2], o[j][3]);
+        }
+    }
+#endif
+}
+
+// AIRUN_NO_MMA_VERIFY=1 keeps the speculative verify on the scalar GQA kernel.
+static bool mma_verify_disabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("AIRUN_NO_MMA_VERIFY");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 // AIRUN_NO_MMA_DECODE=1 keeps decode attention on the scalar GQA kernel.
 static bool mma_decode_disabled() {
     static int cached = -1;
@@ -1444,6 +1719,35 @@ static cudaError_t launch_gqa_decode(int kv_type, float* partial, const float* q
     }
 #undef GQA_LAUNCH
     return cudaGetLastError();
+}
+
+// Launches attention_verify_mma_kernel when the cache's rows suit it; false
+// leaves the verify to the scalar kernel.
+template <int D>
+static bool launch_verify_mma(int kv_type, float* partial, const float* q, const uint8_t* k, const uint8_t* v,
+                              const int32_t* pos, int nq, int heads, int kv_heads, int max_seq, float scale,
+                              int splits, cudaStream_t stream, cudaError_t* e) {
+    const dim3 grid(kv_heads, splits);
+    const int threads = 32 * ((nq + 1) / 2);
+#define MV_LAUNCH(KVT)                                                                                   \
+    do {                                                                                                 \
+        if constexpr (mma_verify_ok<D, KVT>()) {                                                         \
+            const size_t smem = mma_verify_smem<D, KVT>();                                               \
+            cudaFuncSetAttribute(attention_verify_mma_kernel<D, KVT>,                                    \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);                \
+            attention_verify_mma_kernel<D, KVT><<<grid, threads, smem, stream>>>(                       \
+                partial, q, k, v, pos, nq, heads, kv_heads, max_seq, scale);                             \
+            *e = cudaGetLastError();                                                                     \
+            return true;                                                                                 \
+        }                                                                                                \
+        return false;                                                                                    \
+    } while (0)
+    switch (kv_type) {
+        case KV_Q8_0: MV_LAUNCH(KV_Q8_0);
+        case KV_Q4_0: MV_LAUNCH(KV_Q4_0);
+        default:      MV_LAUNCH(KV_F16);
+    }
+#undef MV_LAUNCH
 }
 
 // AIRUN_NO_GQA_DECODE=1 keeps decode on the per-query-head split kernel.
@@ -1724,6 +2028,26 @@ struct F2Shape {
     static constexpr size_t SMEM = 4 * TILE;                   // K and V, two stages
 };
 
+// A quantized cache whose rows are whole 16-byte units (head_dim 256: q8_0
+// 272 bytes, q4_0 144) is staged raw: the next tile's rows go in by cp.async
+// while this one computes, and are decoded to fp16 in shared memory
+// (kv_piece). Decoding each element from global memory with kv_load, between
+// barriers, held a 128k q4_0 prefill to half the f16 rate.
+template <int D, int KV>
+__host__ __device__ constexpr bool f2_raw() { return gqa_raw_stage<D, KV>(); }
+
+// One stage of raw K or V rows.
+template <int D, int KV>
+__host__ __device__ constexpr size_t f2_raw_tile() {
+    return (size_t)F2Shape<D>::KT * gqa_row_bytes<D, KV>();
+}
+
+// Raw staging keeps one fp16 K and V tile and two raw stages of each.
+template <int D, int KV>
+__host__ __device__ constexpr size_t f2_smem() {
+    return f2_raw<D, KV>() ? 2 * F2Shape<D>::TILE + 4 * f2_raw_tile<D, KV>() : F2Shape<D>::SMEM;
+}
+
 __device__ __forceinline__ uint32_t f2_pack(float lo, float hi) {
 #if __CUDA_ARCH__ >= 800
     uint32_t r;
@@ -1813,9 +2137,15 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
     constexpr int LD = S::LD;
     constexpr int NJ = S::KT / 8;       // key n8 tiles per KV tile
     constexpr int ND = D / 8;           // head-dim n8 tiles
+    constexpr bool RAW = f2_raw<D, KV>();
+    constexpr int RB = gqa_row_bytes<D, KV>();
     extern __shared__ __align__(16) unsigned char f2_smem[];
-    half* kbuf = (half*)f2_smem;                              // [2][KT][LD]
-    half* vbuf = (half*)(f2_smem + 2 * S::TILE);              // [2][KT][LD]
+    // Raw staging: one fp16 tile each ([KT][LD]), then raw K [2][KT*RB] and
+    // raw V [2][KT*RB]. Otherwise two fp16 stages each ([2][KT][LD]).
+    half* kbuf = (half*)f2_smem;
+    half* vbuf = (half*)(f2_smem + (RAW ? 1 : 2) * S::TILE);
+    uint8_t* rawk = f2_smem + 2 * S::TILE;
+    uint8_t* rawv = rawk + 2 * f2_raw_tile<D, KV>();
     __shared__ int warp_hi[F2_WARPS], warp_lo[F2_WARPS];
 
     const int tok0 = blockIdx.x * F2_QT;
@@ -1885,10 +2215,28 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
 
     // Stage the KV tile starting at key k0 into buffer `st`.
+    constexpr int PIECES = D / 8;                     // 16-byte fp16 pieces per row
     auto stage = [&](int k0, int st) {
+        if constexpr (RAW) {
+            // Rows k0.. are contiguous: copy them as 16-byte units, zeros past
+            // the visible keys (a zero scale decodes to zeros, never NaN).
+            constexpr int UPR = RB / 16;
+            uint8_t* kd = rawk + st * f2_raw_tile<D, KV>();
+            uint8_t* vd = rawv + st * f2_raw_tile<D, KV>();
+            for (int u = tid; u < S::KT * UPR; u += 32 * F2_WARPS) {
+                const int key = k0 + u / UPR;
+                const bool ok = key <= hi && key < max_seq;
+                const size_t off = ok ? (size_t)k0 * RB + (size_t)u * 16 : 0;
+                f2_cp16(kd + u * 16, kbase + off, ok);
+                f2_cp16(vd + u * 16, vbase + off, ok);
+            }
+#if __CUDA_ARCH__ >= 800
+            asm volatile("cp.async.commit_group;\n" ::);
+#endif
+            return;
+        }
         half* kd = kbuf + st * S::KT * LD;
         half* vd = vbuf + st * S::KT * LD;
-        constexpr int PIECES = D / 8;                 // 16-byte pieces per row
         for (int i = tid; i < S::KT * PIECES; i += 32 * F2_WARPS) {
             const int r = i / PIECES, c = i % PIECES;
             const int key = k0 + r;
@@ -1930,6 +2278,18 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
 #endif
         }
         __syncthreads();
+        if constexpr (RAW) {
+            // Decode raw stage `st` into the one fp16 tile; the copy of the
+            // next tile, already issued, overlaps this and the MMAs.
+            const uint8_t* kr = rawk + st * f2_raw_tile<D, KV>();
+            const uint8_t* vr = rawv + st * f2_raw_tile<D, KV>();
+            for (int i = tid; i < S::KT * PIECES; i += 32 * F2_WARPS) {
+                const int r = i / PIECES, c = i % PIECES;
+                *(uint4*)(kbuf + r * LD + c * 8) = kv_piece<KV>(kr + r * RB, c);
+                *(uint4*)(vbuf + r * LD + c * 8) = kv_piece<KV>(vr + r * RB, c);
+            }
+            __syncthreads();
+        }
 
         // Under QSA a warp skips a tile in which none of its queries selected a key.
         bool seen = true;
@@ -1940,8 +2300,8 @@ __global__ __launch_bounds__(32 * F2_WARPS, 1) void flash2_attention_kernel(
             seen = __any_sync(0xffffffffu, any != 0u);
         }
         if (seen && k0 <= whi && k0 + S::KT > wlo) {
-            const half* kt = kbuf + st * S::KT * LD;
-            const half* vt = vbuf + st * S::KT * LD;
+            const half* kt = kbuf + (RAW ? 0 : st) * S::KT * LD;
+            const half* vt = vbuf + (RAW ? 0 : st) * S::KT * LD;
 
             // S = Q K^T for 16 queries x 64 keys.
             float s[NJ][4];
@@ -2094,9 +2454,9 @@ static cudaError_t launch_flash2(int kv_type, float* out, const float* q, const 
                                  int n_kv_heads, int max_seq, float scale, int window,
                                  const uint32_t* mask, int mask_words, bool pv16, cudaStream_t stream) {
     const dim3 grid((n_tokens + F2_QT - 1) / F2_QT, n_heads);
-    const size_t smem = F2Shape<D>::SMEM;
 #define F2_LAUNCH_PV(KVT, PV)                                                               \
     do {                                                                                   \
+        const size_t smem = f2_smem<D, KVT>();                                             \
         cudaFuncSetAttribute(flash2_attention_kernel<D, KVT, PV>,                          \
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
         flash2_attention_kernel<D, KVT, PV><<<grid, 32 * F2_WARPS, smem, stream>>>(        \
@@ -2322,8 +2682,15 @@ airun_status airun_attention_split_multi(
     const int32_t* pp = (const int32_t*)positions;
     float* part = (float*)partial;
     int wave = 0;
-    cudaError_t e;
-    if (dim == 64)       e = launch_gqa_decode<64>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, 1, nullptr, rows);
+    cudaError_t e = cudaSuccess;
+    bool done = false;
+    if (heads / kv_heads <= 8 && !mma_verify_disabled() && !mma_decode_disabled() && mma_decode_device()) {
+        if (dim == 64)       done = launch_verify_mma<64>(kv_type, part, qq, kk, vv, pp, rows, heads, kv_heads, max_seq, scale, splits, stream, &e);
+        else if (dim == 128) done = launch_verify_mma<128>(kv_type, part, qq, kk, vv, pp, rows, heads, kv_heads, max_seq, scale, splits, stream, &e);
+        else                 done = launch_verify_mma<256>(kv_type, part, qq, kk, vv, pp, rows, heads, kv_heads, max_seq, scale, splits, stream, &e);
+    }
+    if (done) {}
+    else if (dim == 64)  e = launch_gqa_decode<64>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, 1, nullptr, rows);
     else if (dim == 128) e = launch_gqa_decode<128>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, 1, nullptr, rows);
     else                 e = launch_gqa_decode<256>(kv_type, part, qq, kk, vv, pp, heads, kv_heads, max_seq, scale, window, splits, nullptr, &wave, stream, 1, nullptr, rows);
     AIRUN_TRY(e);

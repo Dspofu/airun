@@ -62,11 +62,11 @@ impl Runtime {
                 continue;
             }
             let mut chunks: Vec<Loan> = Vec::new();
-            for (local, &l) in st.layers.iter().enumerate() {
-                if self.model.placement.kv_in_ram(l) {
+            for local in 0..st.layers.len() {
+                let LayerState::Kv { k, v, .. } = &st.states[local] else { continue };
+                if k.is_in_ram() {
                     continue;
                 }
-                let LayerState::Kv { k, v, .. } = &st.states[local] else { continue };
                 for buf in [k, v] {
                     let base = buf.as_ptr() as u64;
                     for h in 0..cfg.n_head_kv {

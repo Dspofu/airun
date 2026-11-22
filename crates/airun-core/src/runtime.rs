@@ -554,7 +554,7 @@ struct DeviceState {
     /// split_verify), set up with the drafting.
     verify_partial: Option<DeviceBuffer<f32>>,
     /// The VRAM copy (K, V) of one layer's cache that the attention layers
-    /// whose KV cache stays in RAM run on (see Shard::kv_ram_layers).
+    /// whose KV cache stays in RAM run on (see Shard::kv_ram_cells).
     kv_stage: Option<(DeviceBuffer<u8>, DeviceBuffer<u8>)>,
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
@@ -1032,9 +1032,9 @@ impl Runtime {
                 layer_states.push(match cfg.layer_kind(l) {
                     LayerKind::Attention => LayerState::Kv {
                         k: kv_cache(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim),
-                            placement.kv_in_ram(l), &stream)?,
+                            placement.kv_in_ram(l, 0), &stream)?,
                         v: kv_cache(dev, cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim),
-                            placement.kv_in_ram(l), &stream)?,
+                            placement.kv_in_ram(l, 0), &stream)?,
                         qsa: match qsa_ratio(cfg, l, ctx) {
                             Some(ratio) => {
                                 let dim = cfg.indexer.as_ref().expect("qsa_ratio checked it").dim;
@@ -1299,7 +1299,7 @@ impl Runtime {
                 rows_tab: None,
                 rows_partial: None,
                 verify_partial: None,
-                kv_stage: if shard.kv_ram_layers.is_empty() { None } else {
+                kv_stage: if shard.kv_ram_cells.is_empty() { None } else {
                     let bytes = cfg.n_head_kv * ctx * cfg.kv_type.row_bytes(cfg.head_dim);
                     Some((DeviceBuffer::new(dev, bytes)?, DeviceBuffer::new(dev, bytes)?))
                 },
@@ -2863,9 +2863,10 @@ impl Runtime {
             self.drop_kv_loans()?;
         }
         while self.slots.len() < n {
+            let slot = self.slots.len();
             let mut sets = Vec::with_capacity(self.states.len());
             for si in 0..self.states.len() {
-                sets.push(self.fresh_states(si)?);
+                sets.push(self.fresh_states(si, slot)?);
             }
             self.slots.push(SlotStore { states: sets, ..Default::default() });
         }
@@ -2909,8 +2910,9 @@ impl Runtime {
         }
     }
 
-    /// Zeroed layer states for shard `si`, as the runtime allocates them.
-    fn fresh_states(&self, si: usize) -> Result<Vec<LayerState>> {
+    /// Zeroed layer states of slot `slot` for shard `si`, as the runtime
+    /// allocates them (the plan says which slots' KV caches stay in RAM).
+    fn fresh_states(&self, si: usize, slot: usize) -> Result<Vec<LayerState>> {
         let cfg = &self.model.config;
         let st = &self.states[si];
         device::set_device(st.device)?;
@@ -2919,7 +2921,7 @@ impl Runtime {
             out.push(match cfg.layer_kind(l) {
                 LayerKind::Attention => {
                     let bytes = cfg.n_head_kv * self.ctx * cfg.kv_type.row_bytes(cfg.head_dim);
-                    let in_ram = self.model.placement.kv_in_ram(l);
+                    let in_ram = self.model.placement.kv_in_ram(l, slot);
                     LayerState::Kv {
                         k: kv_cache(st.device, bytes, in_ram, &st.stream)?,
                         v: kv_cache(st.device, bytes, in_ram, &st.stream)?,
@@ -3938,7 +3940,8 @@ impl Runtime {
             let batched = self.rows_tab_at(si, local)
                 .filter(|_| t == 1 && !self.mixed_head)
                 .filter(|_| ops::attention_split_rows_ok(cfg.n_head, cfg.n_head_kv, cfg.head_dim))
-                .filter(|_| !kc.is_in_ram())
+                .filter(|_| rows.iter().all(|&slot| !matches!(self.slot_state(slot, si, local),
+                    LayerState::Kv { k, .. } if k.is_in_ram())))
                 .zip(st.rows_partial.as_ref());
             for (b, &slot) in rows.iter().enumerate() {
                 let state = if self.mixed_head { self.head_kv(slot)? } else { self.slot_state(slot, si, local) };

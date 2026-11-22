@@ -297,7 +297,11 @@ Every one of these has already produced a wrong conclusion here.
 - Prefill of 16+ tokens: flash attention on fp16 tensor cores
   (`AIRUN_NO_FLASH=1`). P·V in fp16 per key tile only when the batch sees
   4096+ keys (`AIRUN_ATTN_PV_F32=1` turns it off; on short prompts it flipped
-  a near-tie).
+  a near-tie). A quantized cache whose rows are whole 16-byte units
+  (head_dim 256) is staged raw by `cp.async` a tile ahead and decoded in
+  shared memory (`f2_raw`, `kv_piece`). Decoding each element from global
+  memory between barriers held a 128k q4_0 prefill to half the f16 rate. Now
+  it is within ~5% of f16 at the same layer split.
 - Decode on sm_80+ with up to 8 query heads per KV head:
   `attention_decode_mma_kernel`, one warp per (KV head, split). The group's
   heads are the rows of fp16 `mma.m16n8k16` (rows past the group are zero),
@@ -318,11 +322,17 @@ Every one of these has already produced a wrong conclusion here.
   staged raw (`gqa_scalar_raw`), q8_0 tiles go piece by piece.
 - `cargo test --release -p airun-cuda --test attention_bench decode_attention_moe_shape -- --ignored --nocapture`
   times decode attention in the 35B-A3B's shape for every KV format.
-- MTP verify and batched verify: `attention_split_multi`, one warp per query
-  sharing K/V tiles. Its split boundaries are **fixed**
-  (`verify_split_keys`), not position-dependent, so a token gives the same
-  result as query 0 of a lone verify or query 2 of a batched one
-  (`--parallel` text stays identical). `AIRUN_NO_SPLIT_VERIFY=1`.
+- MTP verify and batched verify: `attention_split_multi`. Its split
+  boundaries are **fixed** (`verify_split_keys`), not position-dependent, so a
+  token gives the same result as query 0 of a lone verify or query 2 of a
+  batched one (`--parallel` text stays identical; the selftest checks the
+  bits). `AIRUN_NO_SPLIT_VERIFY=1`. On sm_80+ with an f16 cache or rows of
+  whole 16-byte units, `attention_verify_mma_kernel` runs it on fp16 tensor
+  cores: a warp takes two queries (MMA rows 0–7 and 8–15), and the block
+  shares `cp.async` K/V tiles. The scalar form (one warp per query,
+  `AIRUN_NO_MMA_VERIFY=1`) was FP32-bound. At 128k a 5-token verify cost
+  about five decode attentions, and MTP gained nothing there (27B q4_0:
+  32 → 73 tok/s).
 - Quantized KV cache (`--kv-type f16|q8_0|q4_0`): GGUF blocks per head row,
   decoded by the same `dequant`.
 - QSA sparse attention (qwen4exp, `kernels/qsa.cu`, `Runtime::qsa_select`):
@@ -400,7 +410,13 @@ Every one of these has already produced a wrong conclusion here.
 - **Fallback ladder:** with an explicit `-c` that does not fit: everything in
   VRAM → the KV of the last attention layers in RAM → all KV in RAM plus
   weights (`spill_to_ram`). The KV goes first because weights are read whole
-  every pass, the cache only where filled.
+  every pass, the cache only where filled. The unit is one slot's cache of
+  one layer (`Shard::kv_ram_cells`, order `kv_spill_order`: last slot first,
+  slot 0 last). With slot 0 still whole, the layout is made with every other
+  slot's caches in RAM (more layers on the fastest GPU), then `unspill_kv`
+  brings back what each GPU has room for (`AIRUN_KV_RAM_FEWEST=1`: the
+  fewest caches instead). Moving whole layers (every slot's cache) left
+  slot 0 half in RAM: 20 tok/s at 128k instead of ~80.
 - **Buffers allocated after the plan must be in the plan.** MTP scratch, the
   delta-net stash (on every GPU), batch logits and per-slot heads are counted
   (`Config::spec_rows`, `spec_stash_bytes`, `spec_scratch_bytes`) and
@@ -541,7 +557,10 @@ Every one of these has already produced a wrong conclusion here.
   `AIRUN_NO_PARALLEL_SOLO=1`), so `--parallel` costs nothing alone. MTP works
   in the batched steps (`spec_step`, head per slot). Models with QSA,
   hyper-connections or PLE refuse `--parallel` > 1. Overlapping requests'
-  greedy text may differ from one at a time (sum order).
+  greedy text may differ from one at a time (sum order). Every slot gets the
+  whole `-c` (llama-server divides it); `pick_slot` prefers slots with no KV
+  in RAM (`RAM_SLOT_PENALTY` tokens of prefix outweigh that). A batched step
+  with any row's cache in RAM runs the attention row by row.
 - **Turn cache on hybrids** (`TurnSnapshot`): the template rewrites the last
   answer's `<think>`, so the prefill stops before the prompt's last
   `<|im_start|>`, snapshots the recurrent state and restores it next turn

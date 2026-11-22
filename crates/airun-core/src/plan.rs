@@ -125,11 +125,14 @@ pub struct Shard {
     pub ram_layers: Vec<usize>,
     pub ram_bytes: u64,
     pub staging_bytes: u64,
-    /// Attention layers of this shard whose KV cells stay in pinned RAM. A
-    /// pass copies the filled ones into `kv_stage_bytes` of VRAM (one slot's
-    /// K and V of one layer) and writes its new cells back; `kv_bytes` holds
-    /// the rest of the shard's state.
-    pub kv_ram_layers: Vec<usize>,
+    /// The (slot, layer) KV caches of this shard that stay in pinned RAM.
+    /// A pass copies the filled cells of one into `kv_stage_bytes` of VRAM
+    /// (one slot's K and V of one layer) and writes its new cells back;
+    /// `kv_bytes` holds the rest of the shard's state. The planner moves the
+    /// last slot's first, all its layers, then the slot before (see
+    /// [`kv_spill_order`]): a lone conversation runs on slot 0 (the server's
+    /// pick_slot), whose cache then stays in VRAM while it can.
+    pub kv_ram_cells: Vec<(usize, usize)>,
     pub kv_ram_bytes: u64,
     pub kv_stage_bytes: u64,
     /// The part of `ram_layers` read from the model file instead of pinned
@@ -206,9 +209,14 @@ impl Placement {
         self.shards.iter().any(|s| s.disk_layers.contains(&l))
     }
 
-    /// Whether layer `l`'s KV cells stay in RAM.
-    pub fn kv_in_ram(&self, l: usize) -> bool {
-        self.shards.iter().any(|s| s.kv_ram_layers.contains(&l))
+    /// Whether slot `slot`'s KV cells of layer `l` stay in RAM.
+    pub fn kv_in_ram(&self, l: usize, slot: usize) -> bool {
+        self.shards.iter().any(|s| s.kv_ram_cells.contains(&(slot, l)))
+    }
+
+    /// How many of slot `slot`'s attention layers keep their KV cells in RAM.
+    pub fn kv_ram_layers_of_slot(&self, slot: usize) -> usize {
+        self.shards.iter().map(|s| s.kv_ram_cells.iter().filter(|c| c.0 == slot).count()).sum()
     }
 
     /// The feed-forward columns per layer kept in RAM on `device` (see
@@ -293,13 +301,17 @@ impl Placement {
                     airun_cuda::human_bytes(s.disk_bytes),
                 );
             }
-            if !s.kv_ram_layers.is_empty() {
+            if !s.kv_ram_cells.is_empty() {
+                let mut slots: Vec<usize> = s.kv_ram_cells.iter().map(|c| c.0).collect();
+                slots.dedup();
+                let which: Vec<String> = slots.iter().rev().map(|&slot| {
+                    let n = s.kv_ram_cells.iter().filter(|c| c.0 == slot).count();
+                    format!("slot {slot}: {n} layers")
+                }).collect();
                 let _ = writeln!(
                     out,
-                    "      KV cache of {} attention layers ({}..{}) in RAM: {} pinned, read through {} of VRAM",
-                    s.kv_ram_layers.len(),
-                    s.kv_ram_layers[0],
-                    s.kv_ram_layers[s.kv_ram_layers.len() - 1],
+                    "      KV cache in RAM ({}): {} pinned, read through {} of VRAM",
+                    which.join(", "),
                     airun_cuda::human_bytes(s.kv_ram_bytes),
                     airun_cuda::human_bytes(s.kv_stage_bytes),
                 );
@@ -329,7 +341,7 @@ const SPLIT_SLACK: u64 = 32 << 20;
 /// put more of the feed-forward in RAM than the cap below.
 pub fn split_ffn(placement: &mut Placement, cfg: &Config, col_bytes: &[u64], batch: usize, align: usize) -> bool {
     let [s] = placement.shards.as_mut_slice() else { return false };
-    if s.ram_layers.is_empty() || !s.disk_layers.is_empty() || !s.kv_ram_layers.is_empty()
+    if s.ram_layers.is_empty() || !s.disk_layers.is_empty() || !s.kv_ram_cells.is_empty()
         || col_bytes.len() < s.layers.len() || align == 0 || cfg.ffn_len % align != 0 {
         return false;
     }
@@ -579,27 +591,44 @@ pub fn plan(
         if first.is_ok() || !kv_to_ram {
             return first;
         }
-        // The fewest layers whose cache, moved, lets the rest fit; the last
-        // ones, which sit with the output head on the fastest GPU.
-        for k in 1..=attention.len() {
-            let moved = &attention[attention.len() - k..];
-            if let Ok(p) = try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone(), moved, false) {
-                return Ok(p);
-            }
+        // The fewest caches that, moved, let the rest fit (see kv_spill_order).
+        let order = kv_spill_order(&attention, cfg.slots);
+        let others = (cfg.slots.max(1) - 1) * attention.len();
+        for k in 1..=order.len() {
+            let Ok(p) = try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone(), &order[..k], false)
+            else { continue };
+            // While slot 0 keeps its cache, lay the layers out with every
+            // other slot's in RAM, then bring back what the GPUs still hold
+            // (unspill_kv): the fewest caches moved hold the other slots'
+            // in VRAM at the cost of layers on the fastest GPU. 27B, --parallel
+            // 4 -c 248144, 128k prompt: 30 of 64 layers on the 5070 Ti, prefill
+            // 1652 t/s, decode 70.9; laid out without them, 40 layers and the
+            // head there.
+            let p = if k < others && std::env::var("AIRUN_KV_RAM_FEWEST").is_err() {
+                try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone(), &order[..others], false)
+                    .unwrap_or(p)
+            } else {
+                p
+            };
+            return Ok(unspill_kv(p, cfg, ctx));
         }
         // Then weights too. The cache goes back to VRAM first: weights in
         // RAM are read from DDR by the CPU (cpu.rs), a cache in RAM crosses
         // PCIe every pass, growing with the conversation (27B on one RTX 5060
         // behind PCIe 3.0 x1: 78 MB a token at 4096 cells, ~100 ms).
         try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes.clone(), &[], true)
-            .or_else(|_| try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes, &attention, true))
+            .or_else(|_| try_place(cfg, sizes, &ordered, &budgets, req, ctx, notes,
+                &kv_spill_order(&attention, cfg.slots), true))
     };
 
     // Shrink the context until the plan fits, if permitted. Each attempt is a
     // full placement, so what succeeds is exactly what will be allocated.
     loop {
         match place(ctx, notes.clone()) {
-            Ok(p) => return Ok(p),
+            Ok(mut p) => {
+                kv_ram_note(&mut p, cfg, req.alloc);
+                return Ok(p);
+            }
             Err(shortfall) => {
                 let min_ctx = 512;
                 if !req.allow_ctx_shrink || ctx <= min_ctx {
@@ -625,6 +654,67 @@ pub fn plan(
     }
 }
 
+/// The order (slot, layer) KV caches go to RAM in: the last slot's first,
+/// from its last attention layer (they sit with the output head on the
+/// fastest GPU) back, then the slot before. One cache at a time, so the plan
+/// moves no more than the GPUs miss, and slot 0, where a lone conversation
+/// runs, is the last to lose its cache. Whole layers (every slot's cache of
+/// one) left slot 0 of `--parallel 4 -c 248144` on the 27B with 2 caches
+/// in RAM and unused VRAM on the other GPU.
+fn kv_spill_order(attention: &[usize], slots: usize) -> Vec<(usize, usize)> {
+    (0..slots.max(1)).rev().flat_map(|s| attention.iter().rev().map(move |&l| (s, l))).collect()
+}
+
+/// Brings KV caches a plan put in RAM back to VRAM on every GPU with room
+/// for them, slot 0's first, without moving a layer. The last one on a GPU
+/// always fits: its stage, then freed, is the size of one cache.
+fn unspill_kv(mut p: Placement, cfg: &Config, ctx: usize) -> Placement {
+    let one = cfg.kv_stage_bytes(ctx);
+    for s in &mut p.shards {
+        s.kv_ram_cells.sort();
+        while let Some(&cell) = s.kv_ram_cells.first() {
+            let freed = if s.kv_ram_cells.len() == 1 { s.kv_stage_bytes } else { 0 };
+            if s.headroom() + (freed as i64) < one as i64 {
+                break;
+            }
+            s.kv_ram_cells.retain(|&c| c != cell);
+            s.kv_bytes += one;
+            s.kv_ram_bytes -= one;
+            if s.kv_ram_cells.is_empty() {
+                s.kv_stage_bytes = 0;
+            }
+        }
+        // Back in spill order (the last slot's last layer first), for the report.
+        s.kv_ram_cells.sort_by(|a, b| b.cmp(a));
+    }
+    p
+}
+
+/// The plan's note on KV caches it keeps in RAM, if any.
+fn kv_ram_note(p: &mut Placement, cfg: &Config, alloc: AllocMode) {
+    let cells: Vec<(usize, usize)> = p.shards.iter().flat_map(|s| s.kv_ram_cells.iter().copied()).collect();
+    if cells.is_empty() {
+        return;
+    }
+    let n_attn = (0..cfg.n_run_layers()).filter(|&l| cfg.layer_kind(l) == crate::config::LayerKind::Attention).count();
+    let slots = cfg.slots.max(1);
+    if slots == 1 {
+        p.notes.push(format!(
+            "the KV cache of {} of {n_attn} attention layers stays in RAM (--alloc {}): each pass copies the \
+             filled cells to VRAM, so decoding slows as the conversation grows; a smaller -c (or leaving -c \
+             out, which picks the largest that fits) keeps it all in VRAM",
+            cells.len(), alloc.name()));
+    } else {
+        let in_vram = (0..slots).filter(|&s| !cells.iter().any(|c| c.0 == s)).count();
+        p.notes.push(format!(
+            "{} of the {} per-slot layer caches stay in RAM (--alloc {}); slots with their whole cache in \
+             VRAM: {in_vram} of {slots}, which take requests first. A conversation on another slot slows as it grows \
+             (each pass copies its filled cells to VRAM); fewer --parallel or a smaller -c keeps every slot \
+             in VRAM",
+            cells.len(), n_attn * slots, alloc.name()));
+    }
+}
+
 struct Shortfall {
     needed: u64,
     detail: String,
@@ -638,28 +728,29 @@ fn try_place(
     req: &PlacementRequest,
     ctx: usize,
     mut notes: Vec<String>,
-    kv_ram: &[usize],
+    kv_ram: &[(usize, usize)],
     spill: bool,
 ) -> std::result::Result<Placement, Shortfall> {
     // Per-layer state depends on what the layer is: softmax-attention layers
     // carry a KV cache that scales with context, linear-attention layers a
-    // recurrent state that does not, and MTP layers are never run. Layers in
-    // `kv_ram` keep their KV cells in RAM, the rest of their state in VRAM.
-    let moved = cfg.kv_cells_bytes_per_layer(ctx);
+    // recurrent state that does not, and MTP layers are never run. The
+    // (slot, layer) caches in `kv_ram` keep their KV cells in RAM, the rest
+    // of the layer's state stays in VRAM.
+    let moved = cfg.kv_stage_bytes(ctx);
+    let moved_of = |l: usize| kv_ram.iter().filter(|c| c.1 == l).count() as u64 * moved;
     let per_layer_state = |l: usize| -> u64 {
         if l >= cfg.n_run_layers() {
             return 0;
         }
         match cfg.layer_kind(l) {
-            crate::config::LayerKind::Attention if kv_ram.contains(&l) => cfg.kv_bytes_per_layer(ctx) - moved,
-            crate::config::LayerKind::Attention => cfg.kv_bytes_per_layer(ctx),
+            crate::config::LayerKind::Attention => cfg.kv_bytes_per_layer(ctx) - moved_of(l),
             crate::config::LayerKind::LinearAttention => cfg.ssm_bytes_per_layer(),
         }
     };
     // The VRAM copy those caches are read through, charged to the last of
     // them while the layers are spread (and then to every GPU holding any).
     let stage = if kv_ram.is_empty() { 0 } else { cfg.kv_stage_bytes(ctx) };
-    let stage_layer = kv_ram.iter().max().copied();
+    let stage_layer = kv_ram.iter().map(|c| c.1).max();
     let state_cost = |l: usize| per_layer_state(l) + if Some(l) == stage_layer { stage } else { 0 };
 
     let n_layers = cfg.n_run_layers();
@@ -906,9 +997,9 @@ fn try_place(
             staging_bytes: staging_for(&ram_layers, sizes),
             ram_layers,
             ram_bytes,
-            kv_stage_bytes: if layers.iter().any(|l| kv_ram.contains(l)) { stage } else { 0 },
-            kv_ram_bytes: layers.iter().filter(|l| kv_ram.contains(l)).count() as u64 * moved,
-            kv_ram_layers: layers.iter().copied().filter(|l| kv_ram.contains(l)).collect(),
+            kv_stage_bytes: if kv_ram.iter().any(|c| layers.contains(&c.1)) { stage } else { 0 },
+            kv_ram_bytes: layers.iter().map(|&l| moved_of(l)).sum(),
+            kv_ram_cells: kv_ram.iter().copied().filter(|c| layers.contains(&c.1)).collect(),
             disk_layers: Vec::new(),
             disk_bytes: 0,
             ffn_cpu_cols: 0,
@@ -948,15 +1039,6 @@ fn try_place(
     // Drop GPUs a proportional split left with nothing to do.
     shards.retain(|s| !s.layers.is_empty() || s.hosts_embedding || s.hosts_output);
 
-    if !kv_ram.is_empty() {
-        notes.push(format!(
-            "the KV cache of {} of {} attention layers stays in RAM (--alloc {}): each pass copies the filled \
-             cells to VRAM, so decoding slows as the conversation grows; a smaller -c (or leaving -c out, \
-             which picks the largest that fits) keeps it all in VRAM",
-            kv_ram.len(),
-            (0..n_layers).filter(|&l| cfg.layer_kind(l) == crate::config::LayerKind::Attention).count(),
-            req.alloc.name()));
-    }
     if shards.len() > 1 {
         notes.push(format!(
             "{} activation handoff(s) per forward pass between GPUs",
@@ -1426,6 +1508,26 @@ mod tests {
         assert!(plan(&cfg, &sz, &devs, &bad).is_err());
     }
 
+    /// With several slots the caches go to RAM one (slot, layer) at a time,
+    /// the last slot's first: slot 0 keeps its whole cache in VRAM, and no
+    /// more than the GPU misses leaves it.
+    #[test]
+    fn slots_lose_their_kv_cache_from_the_last_one() {
+        let mut cfg = config(40);
+        cfg.slots = 4;
+        let sz = sizes(40, 300);
+        let devs = vec![device(0, 15, 70, 256)];
+        let req = PlacementRequest { ctx: 8192, ..Default::default() };
+        let p = plan(&cfg, &sz, &devs, &req).unwrap();
+        assert_eq!(p.ctx, 8192);
+        let s = &p.shards[0];
+        assert!(!s.kv_ram_cells.is_empty() && s.ram_layers.is_empty());
+        assert_eq!(s.kv_ram_cells[0], (3, 39));
+        assert_eq!(p.kv_ram_layers_of_slot(0), 0, "slot 0 keeps its cache: {:?}", s.kv_ram_cells);
+        assert!(p.kv_in_ram(39, 3) && !p.kv_in_ram(39, 0));
+        assert_eq!(s.kv_ram_bytes, s.kv_ram_cells.len() as u64 * cfg.kv_stage_bytes(8192));
+    }
+
     /// Weights that fit with a cache that does not: the cache of the last
     /// layers goes to RAM, the weights stay; --alloc gpu shrinks the context.
     #[test]
@@ -1438,17 +1540,17 @@ mod tests {
         assert_eq!(p.ctx, 40960);
         let s = &p.shards[0];
         assert!(s.ram_layers.is_empty(), "no weight leaves VRAM while a cache can");
-        assert!(!s.kv_ram_layers.is_empty() && s.kv_ram_layers.len() < 40);
+        assert!(!s.kv_ram_cells.is_empty() && s.kv_ram_cells.len() < 40);
         // The last layers, with one stage for all of them.
-        assert_eq!(*s.kv_ram_layers.last().unwrap(), 39);
+        assert_eq!(s.kv_ram_cells[0], (0, 39));
         assert_eq!(s.kv_stage_bytes, cfg.kv_stage_bytes(40960));
-        assert_eq!(s.kv_ram_bytes, s.kv_ram_layers.len() as u64 * cfg.kv_cells_bytes_per_layer(40960));
+        assert_eq!(s.kv_ram_bytes, s.kv_ram_cells.len() as u64 * cfg.kv_cells_bytes_per_layer(40960));
         assert!(s.total_bytes() <= s.budget_bytes);
-        assert!(p.kv_in_ram(39) && !p.kv_in_ram(0));
+        assert!(p.kv_in_ram(39, 0) && !p.kv_in_ram(0, 0));
 
         let gpu_only = PlacementRequest { ctx: 40960, alloc: AllocMode::Gpu, ..Default::default() };
         let p = plan(&cfg, &sz, &devs, &gpu_only).unwrap();
-        assert!(p.ctx < 40960 && p.shards[0].kv_ram_layers.is_empty(), "--alloc gpu shrinks the context instead");
+        assert!(p.ctx < 40960 && p.shards[0].kv_ram_cells.is_empty(), "--alloc gpu shrinks the context instead");
     }
 
     /// --disk-offload: of the layers in RAM, the first that fit the RAM budget

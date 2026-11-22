@@ -139,6 +139,16 @@ them at once. The ones it approves come for free.
    context no longer dropped to 131072. In a long conversation the copy grows:
    at position 65536, 18.9 tok/s, the same as before. `AIRUN_NO_KV_RAM=1` goes
    back to the old behavior.
+   With `--parallel N` the cache moves **one slot at a time**: slot N−1's
+   first, then the one before, and slot 0 (where a request alone runs) last.
+   While slot 0 keeps its cache, the layers are laid out as if every other
+   slot's cache were in RAM, so the fastest GPU takes more layers. Then each
+   GPU takes back the caches it still has room for. Requests go to the slots
+   whose cache is all in VRAM first. 27B NVFP4 on 5070 Ti + 5060 Ti,
+   `--parallel 4 -c 248144 --kv-type q4_0 --draft 4`, 128k prompt: decode
+   37.8 → 79.7 tok/s, prefill 2096 → 2279 t/s. `AIRUN_KV_RAM_FEWEST=1` moves
+   the fewest caches instead: more slots stay in VRAM, but fewer layers sit
+   on the fastest GPU.
 5. If not even with the whole cache in RAM the weights fit, the cache goes
    back to VRAM and the leftover layers stay in RAM. **During generation**
    (passes of up to 64 tokens), those layers' matmuls run **on the CPU**,
@@ -350,6 +360,10 @@ llama-server's slots:
   each).
 - A new request goes to the slot that already has the start of the
   conversation cached, so a chat's next turn does not reprocess the history.
+  When the cache of some slots is in RAM (a large `-c`, see step 4 of the
+  memory plan), a slot all in VRAM wins unless the other holds 8192 more
+  tokens of the prompt. Every slot gets the whole `-c`: llama-server divides
+  it among the slots instead.
 - **A request alone runs as without the flag:** with nobody generating or
   queued, it takes the same path as `--parallel 1` (MTP with `--draft`, greedy
   pick on the GPU, decode graphs, turn snapshot). When another arrives, it
@@ -694,7 +708,9 @@ can delay kernels by ~8%, and two separate sessions vary by ~15%.
 | `AIRUN_SCHED_TIMING=1` | One line per `serve --parallel` batched step: forward, sampling, delivery. Disturbs speed measurement. |
 | `AIRUN_HIDE_GPUS=<list>` | Like `--hide-gpu`, for every command: GPUs airun never touches. Does not combine with `CUDA_VISIBLE_DEVICES`. |
 | `AIRUN_NO_KV_RAM=1` | When the requested context does not fit, takes weights out of VRAM instead of the KV cache (the old behavior). |
+| `AIRUN_KV_RAM_FEWEST=1` | With `--parallel` and KV in RAM, lays the layers out with the fewest slot caches moved, instead of every slot's but slot 0's (then brought back where they fit). More slots stay in VRAM, fewer layers sit on the fastest GPU. |
 | `AIRUN_NO_SPLIT_VERIFY=1` | MTP verify attention (several tokens over one cache) goes back to the prefill kernel, which reads the whole context per block: 27B at 25k tokens, 52.8 → 34.2 tok/s. |
+| `AIRUN_NO_MMA_VERIFY=1` | MTP verify attention runs on FP32 math (one warp per token) instead of fp16 tensor cores. At long context it costs about one decode attention per verified token: 27B with `--draft 4`, q4_0 cache at 128k, 72.8 → 32.2 tok/s. |
 | `AIRUN_RAM_ON_GPU=1` | Layers that stay in RAM are always copied to VRAM before running, instead of multiplied on the CPU during generation. |
 | `AIRUN_CPU_THREADS=<n>` | Threads for CPU matmuls (default: one per logical core). On the 13700's DDR5, 8 already saturate the bandwidth. |
 | `AIRUN_CPU_SPIN_US=<n>` | How long CPU worker threads spin waiting for the next matmul (default 200 µs). Much longer starves the thread driving the GPU (5 ms: 3.0 → 0.9 tok/s). |

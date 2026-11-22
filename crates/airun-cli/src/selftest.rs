@@ -1491,7 +1491,9 @@ fn test_kv_in_ram(device: i32, stream: &Stream, report: &mut Report) -> Result<(
 /// 1000-cell cache in every KV type. Different reduction orders, so held to
 /// f32 rounding rather than bit equality.
 fn test_split_multi(device: i32, stream: &Stream, report: &mut Report) -> Result<()> {
-    let (heads, kvh, dim, ctx, n) = (24usize, 4usize, 256usize, 1024usize, 4usize);
+    // Five queries: the tensor-core verify pairs them per warp, so the last
+    // one runs alone.
+    let (heads, kvh, dim, ctx, n) = (24usize, 4usize, 256usize, 1024usize, 5usize);
     let mut rng = Rng::new(0x5B_17_0004);
     let q = DeviceBuffer::from_slice(device, &rng.floats(n * heads * dim), stream)?;
     let pos: Vec<i32> = (0..n as i32).map(|i| 990 + i).collect();
@@ -1500,6 +1502,7 @@ fn test_split_multi(device: i32, stream: &Stream, report: &mut Report) -> Result
     let partial = DeviceBuffer::<f32>::new(device, n * heads * splits * (dim + 2))?;
     let scale = 1.0 / (dim as f32).sqrt();
     let mut worst = 0f32;
+    let mut differs = Vec::new();
     for kv in [ops::KvType::F16, ops::KvType::Q8_0, ops::KvType::Q4_0] {
         let row = kv.row_bytes(dim);
         // Fill the caches through the cache writer, so every type holds valid blocks.
@@ -1521,9 +1524,21 @@ fn test_split_multi(device: i32, stream: &Stream, report: &mut Report) -> Result
         for (x, y) in a.iter().zip(&b) {
             worst = worst.max((x - y).abs() / x.abs().max(1e-2));
         }
+        // A token's result must not depend on how many tokens the verify
+        // has (a lone request verifies more drafts than a --parallel step).
+        for m in [2usize, 3] {
+            let c = DeviceBuffer::<f32>::new(device, m * heads * dim)?;
+            ops::attention_split_multi(c.as_mut_ptr(), partial.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), vc.as_ptr(),
+                d_pos.as_ptr(), heads, kvh, dim, ctx, scale, 0, splits, kv, m, stream)?;
+            if c.to_vec(stream)? != b[..m * heads * dim] {
+                differs.push(format!("{} with {m} queries", kv.name()));
+            }
+        }
     }
     report.case("verify attention split across the cache matches the prefill kernel",
         format!("max relative difference {worst:.2e} (f16, q8_0, q4_0)"), worst < 5e-3);
+    report.case("verify attention gives a token the same bits in a shorter verify",
+        if differs.is_empty() { "identical".to_string() } else { differs.join(", ") }, differs.is_empty());
     Ok(())
 }
 
@@ -2319,7 +2334,68 @@ fn test_attention(device: i32, stream: &Stream, report: &mut Report) -> Result<(
     test_argmax(device, stream, report)?;
     for kv in [ops::KvType::Q8_0, ops::KvType::Q4_0] {
         test_kv_quant(device, stream, report, kv)?;
+        test_kv_quant_prefill_raw(device, stream, report, kv)?;
     }
+    Ok(())
+}
+
+/// Prefill attention at head_dim 256 over a quantized cache, whose rows are
+/// whole 16-byte units, so the flash kernel stages them raw and decodes them
+/// in shared memory. Caches encoded on the CPU, reference decoded by
+/// dequant.rs; the visible keys end inside a tile, and both the fp32 and the
+/// per-tile fp16 P.V forms run.
+fn test_kv_quant_prefill_raw(device: i32, stream: &Stream, report: &mut Report, kv: ops::KvType) -> Result<()> {
+    const N_HEADS: usize = 8;
+    const N_KV: usize = 2;
+    const DIM: usize = 256;
+    const MAX_SEQ: usize = 300;
+    const CHUNK: usize = 40;
+    let ty = match kv { ops::KvType::Q8_0 => GgmlType::Q8_0, _ => GgmlType::Q4_0 };
+    let mut rng = Rng::new(0x4B56_0256 + kv.row_bytes(DIM) as u64);
+    let k_raw = rng.floats(N_KV * MAX_SEQ * DIM);
+    let v_raw = rng.floats(N_KV * MAX_SEQ * DIM);
+    let (mut kq, mut vq) = (Vec::new(), Vec::new());
+    airun_gguf::quantize(ty, &k_raw, DIM, &mut kq)?;
+    airun_gguf::quantize(ty, &v_raw, DIM, &mut vq)?;
+    let (mut k, mut v) = (vec![0f32; k_raw.len()], vec![0f32; v_raw.len()]);
+    dequant::dequantize(ty, &kq, k.len(), &mut k)?;
+    dequant::dequantize(ty, &vq, v.len(), &mut v)?;
+
+    let scale = 1.0 / (DIM as f32).sqrt();
+    let qc = rng.floats(CHUNK * N_HEADS * DIM);
+    let pos_c: Vec<i32> = (227..227 + CHUNK as i32).collect();
+    let mut want = vec![0f32; CHUNK * N_HEADS * DIM];
+    for (t, &p) in pos_c.iter().enumerate() {
+        for h in 0..N_HEADS {
+            let kvh = h / (N_HEADS / N_KV);
+            let qv = &qc[(t * N_HEADS + h) * DIM..][..DIM];
+            let scores: Vec<f32> = (0..=p as usize).map(|j| {
+                qv.iter().zip(&k[(kvh * MAX_SEQ + j) * DIM..][..DIM]).map(|(a, b)| a * b).sum::<f32>() * scale
+            }).collect();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (j, e) in exps.iter().enumerate() {
+                for d in 0..DIM {
+                    want[(t * N_HEADS + h) * DIM + d] += e / sum * v[(kvh * MAX_SEQ + j) * DIM + d];
+                }
+            }
+        }
+    }
+    let d_k = DeviceBuffer::from_slice(device, &kq, stream)?;
+    let d_v = DeviceBuffer::from_slice(device, &vq, stream)?;
+    let d_q = DeviceBuffer::from_slice(device, &qc, stream)?;
+    let d_p = DeviceBuffer::from_slice(device, &pos_c, stream)?;
+    let d_o = DeviceBuffer::<f32>::new(device, CHUNK * N_HEADS * DIM)?;
+    let mut worst = [0f32; 2];
+    // `keys` only picks the P.V form: 4096 takes the per-tile fp16 sums.
+    for (i, keys) in [MAX_SEQ, 4096].into_iter().enumerate() {
+        ops::attention_masked(d_o.as_mut_ptr(), d_q.as_ptr(), d_k.as_ptr(), d_v.as_ptr(), d_p.as_ptr(), CHUNK,
+            N_HEADS, N_KV, DIM, MAX_SEQ, scale, 0, kv, None, keys, stream)?;
+        worst[i] = compare(&want, &d_o.to_vec(stream)?).0;
+    }
+    report.case(&format!("{CHUNK}-token prefill attention, head_dim 256, over {} cache (raw tiles)", kv.name()),
+        format!("max_abs {:.3e}  fp16 P.V {:.3e}", worst[0], worst[1]), worst[0] <= 3e-3 && worst[1] <= 3e-3);
     Ok(())
 }
 
