@@ -164,6 +164,19 @@ prefill reaches the same logits as token by token.
 
 Every one of these has already produced a wrong conclusion here.
 
+- **"Faster than before" is not done; judge against the hardware.** Before
+  calling a speed task finished, profile the whole step (nsys,
+  `--cuda-graph-trace=node`) and write down, per phase and per kernel, its
+  time against what its bytes or FLOPs allow on that GPU (DRAM bandwidth,
+  tensor rate), plus the idle gaps between kernels and devices. Report what
+  remains and its estimated gain. A verify kernel once counted as fixed at
+  2.3x its old speed still ran at a third of the bandwidth; a speed target
+  met is a reason to report, not to stop looking.
+- **Measure MTP on chat replies too, not only on summaries of code.** The
+  summary prompt drafted at 65% acceptance while ordinary chat replies
+  drafted at 22%; a problem in the draft stayed hidden for several rounds
+  because the benchmark never showed it.
+
 - **Alternate the variants in the same session, two rounds at least.**
   Another program drawing on the GPU (a browser, the chat app) stretches
   kernels by ~8%, and two separate sessions vary by ~15%. The first
@@ -328,11 +341,18 @@ Every one of these has already produced a wrong conclusion here.
   batched one (`--parallel` text stays identical; the selftest checks the
   bits). `AIRUN_NO_SPLIT_VERIFY=1`. On sm_80+ with an f16 cache or rows of
   whole 16-byte units, `attention_verify_mma_kernel` runs it on fp16 tensor
-  cores: a warp takes two queries (MMA rows 0–7 and 8–15), and the block
-  shares `cp.async` K/V tiles. The scalar form (one warp per query,
-  `AIRUN_NO_MMA_VERIFY=1`) was FP32-bound. At 128k a 5-token verify cost
-  about five decode attentions, and MTP gained nothing there (27B q4_0:
-  32 → 73 tok/s).
+  cores. The (query, head) pairs are MMA rows `q * G + h`, 16 per warp
+  (5 queries of GQA-6: 2 warps, 30 of 32 rows), and the block shares
+  `cp.async` K/V tiles three ahead. A quantized cache decodes K's B
+  fragments straight from the raw rows (only V goes to an fp16 tile), so
+  four blocks fit an SM. It is bound by the fp16/fp32-accumulate tensor
+  rate (half rate on GeForce) and occupancy, not DRAM: one warp per two
+  queries took 3 warps and 576 µs a 128k q4_0 layer on the 5070 Ti, now
+  299. The scalar form (one warp per query, `AIRUN_NO_MMA_VERIFY=1`) was
+  FP32-bound: at 128k MTP gained nothing there.
+- The split-GPU delta-net commit after a verify replays as one graph per
+  device and accepted count (`commit_graphed`): launch by launch it was
+  ~2 ms of WDDM launches per step on the 27B over two GPUs.
 - Quantized KV cache (`--kv-type f16|q8_0|q4_0`): GGUF blocks per head row,
   decoded by the same `dequant`.
 - QSA sparse attention (qwen4exp, `kernels/qsa.cu`, `Runtime::qsa_select`):
@@ -544,9 +564,14 @@ Every one of these has already produced a wrong conclusion here.
 - The draft's argmax covers the first 65536 rows of the head
   (`DEFAULT_DRAFT_VOCAB` in spec.rs). On a 248k vocabulary every draft read
   the whole head, about a fifth of a 27B IQ2_M verify step. 64k rows kept the
-  acceptance on English code and Portuguese prose, where 16k–48k lost it on
-  Portuguese. `AIRUN_DRAFT_VOCAB=K` sets it, and 0 means the whole
-  vocabulary. A learned shortlist is the open lever.
+  acceptance on code, but on chat replies (22% against 34% with the whole
+  head) most missed drafts were tokens past the prefix. `DraftExtra` adds up
+  to 8192 rows (`AIRUN_DRAFT_EXTRA`, 0 off) for the tokens past it that the
+  server has seen in prompts and replies, scored after the prefix
+  (`argmax_map` renames the pick), and saves them with the profiles
+  (`<model>-<size>.draft`, `AIRUN_DRAFT_PROFILE=<path>|off`). Warm, chat
+  replies went 53 → 69 tok/s. `AIRUN_DRAFT_VOCAB=K` sets the prefix, and 0
+  means the whole vocabulary.
 
 ### `serve`
 

@@ -652,6 +652,8 @@ pub fn load(
             Err(e) => return Err(e),
         };
         model.expert_profile = profile.take().map(std::cell::RefCell::new);
+        model.draft_profile = crate::expert_profile::profile_path(gguf.path(), gguf.file_len(), "draft",
+            "AIRUN_DRAFT_PROFILE");
 
         progress("building tokenizer", 0, 1);
         let tokenizer = Tokenizer::from_gguf(&gguf)?;

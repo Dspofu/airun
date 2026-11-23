@@ -710,6 +710,7 @@ can delay kernels by ~8%, and two separate sessions vary by ~15%.
 | `AIRUN_NO_KV_RAM=1` | When the requested context does not fit, takes weights out of VRAM instead of the KV cache (the old behavior). |
 | `AIRUN_KV_RAM_FEWEST=1` | With `--parallel` and KV in RAM, lays the layers out with the fewest slot caches moved, instead of every slot's but slot 0's (then brought back where they fit). More slots stay in VRAM, fewer layers sit on the fastest GPU. |
 | `AIRUN_NO_SPLIT_VERIFY=1` | MTP verify attention (several tokens over one cache) goes back to the prefill kernel, which reads the whole context per block: 27B at 25k tokens, 52.8 → 34.2 tok/s. |
+| `AIRUN_DRAFT_EXTRA=<n>` | Head rows the MTP draft keeps for tokens past its 64k-row prefix that prompts and replies used (default 8192; 0 drafts from the prefix only). Learned while serving and saved next to the expert profiles as `<model>-<size>.draft`; `AIRUN_DRAFT_PROFILE=<path>` puts the file elsewhere, `off` neither reads nor writes it. |
 | `AIRUN_NO_MMA_VERIFY=1` | MTP verify attention runs on FP32 math (one warp per token) instead of fp16 tensor cores. At long context it costs about one decode attention per verified token: 27B with `--draft 4`, q4_0 cache at 128k, 72.8 → 32.2 tok/s. |
 | `AIRUN_RAM_ON_GPU=1` | Layers that stay in RAM are always copied to VRAM before running, instead of multiplied on the CPU during generation. |
 | `AIRUN_CPU_THREADS=<n>` | Threads for CPU matmuls (default: one per logical core). On the 13700's DDR5, 8 already saturate the bandwidth. |

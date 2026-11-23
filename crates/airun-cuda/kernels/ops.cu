@@ -132,9 +132,11 @@ __global__ __launch_bounds__(ARGMAX_THREADS) void argmax_partial_kernel(
 
 // `bump`, if set, is incremented by one: the chained decode graph advances its
 // position on the device (see Runtime::forward_decode_chained).
+// A non-null `map` renames picks at or past `base` to map[pick - base] (the
+// MTP draft's extra head rows, see Runtime::draft_extend).
 __global__ __launch_bounds__(ARGMAX_THREADS) void argmax_final_kernel(
     const float* __restrict__ scratch, const int n, int32_t* __restrict__ out,
-    int32_t* __restrict__ bump) {
+    int32_t* __restrict__ bump, const int32_t* __restrict__ map = nullptr, const int base = 0) {
     float best = -INFINITY;
     int idx = n;
     if (threadIdx.x < ARGMAX_BLOCKS) {
@@ -143,7 +145,8 @@ __global__ __launch_bounds__(ARGMAX_THREADS) void argmax_final_kernel(
     }
     argmax_block(best, idx, n);
     if (threadIdx.x == 0) {
-        *out = idx < n ? idx : 0;
+        idx = idx < n ? idx : 0;
+        *out = map && idx >= base ? map[idx - base] : idx;
         if (bump) *bump += 1;
     }
 }
@@ -352,6 +355,21 @@ __device__ __forceinline__ uint4 kv_piece(const uint8_t* row, int c) {
         wv[i] = *(const uint32_t*)&v;
     }
     return make_uint4(wv[0], wv[1], wv[2], wv[3]);
+}
+
+// Two codes of a q4_0 row (nibbles in bits 0..3 and 8..11 of x) or a q8_0
+// row (two int8 bytes of u) times the block's scale as a half2, rounded as
+// kv_piece rounds them.
+__device__ __forceinline__ uint32_t kv_codes_q4(uint32_t x, half2 d2) {
+    uint32_t w = (x & 0xFu) | ((x & 0xF00u) << 8) | 0x64006400u;
+    const half2 v = __hmul2(__hsub2(*(const half2*)&w, __half2half2(__ushort_as_half(0x6408))), d2);
+    return *(const uint32_t*)&v;
+}
+__device__ __forceinline__ uint32_t kv_codes_q8(uint32_t u, half2 d2) {
+    const uint32_t x = u ^ 0x8080u;
+    uint32_t w = (x & 0xFFu) | ((x & 0xFF00u) << 8) | 0x64006400u;
+    const half2 v = __hmul2(__hsub2(*(const half2*)&w, __half2half2(__ushort_as_half(0x6480))), d2);
+    return *(const uint32_t*)&v;
 }
 
 // One warp encodes one block; lane i holds element i.
@@ -1368,11 +1386,13 @@ __global__ __launch_bounds__(32, 1) void attention_decode_mma_kernel(
 // MMAs for nq queries over one cache. The scalar verify (one warp per query
 // in attention_decode_gqa_kernel) did every query's products on the FP32
 // pipes, so at 128k a 5-token verify cost about five decode attentions and
-// MTP gained nothing. Warp w takes queries 2w (MMA rows 0..7) and 2w+1 (rows
-// 8..15), the rows the decode kernel leaves zero; a row's sums do not depend
-// on its neighbour's. The block shares each K/V tile, copied by cp.async a
-// tile ahead (raw for quantized rows of whole 16-byte units, decoded in
-// shared memory). Splits have the verify's fixed boundaries
+// MTP gained nothing. The (query, head) pairs are MMA rows q * G + h, packed
+// 16 to a warp: 5 queries of a GQA-6 model take 2 warps (30 of 32 rows
+// used), where one warp per two queries took 3 (30 of 48) and the tensor
+// pipes, at half rate with fp32 accumulation on GeForce cards, were the
+// limit. A row's sums do not depend on its neighbours'. The block shares each
+// K/V tile, copied by cp.async a few tiles ahead (raw for quantized rows of
+// whole 16-byte units, decoded in shared memory). Splits have the verify's fixed boundaries
 // (verify_split_keys), so a token's numbers do not depend on how many
 // queries the verify has. AIRUN_NO_MMA_VERIFY=1 keeps the scalar kernel.
 // ---------------------------------------------------------------------------
@@ -1387,12 +1407,21 @@ __host__ __device__ constexpr size_t mma_verify_stage() {
     return KV == KV_F16 ? (size_t)MMA_VERIFY_TILE * GqaShape<D>::LD * 2
                         : (size_t)MMA_VERIFY_TILE * gqa_row_bytes<D, KV>();
 }
-// f16: K and V in two stages, read in place. Quantized: one fp16 K and V
-// tile, then two raw stages of each.
+// Stages of the cp.async pipeline. Two blocks fit an SM (the registers allow
+// no more), so one tile ahead left the cache waiting on DRAM latency. The raw
+// rows are small, so quantized caches keep more in flight.
+#ifndef MMA_VERIFY_QSTAGES
+#define MMA_VERIFY_QSTAGES 3
+#endif
+template <int D, int KV>
+__host__ __device__ constexpr int mma_verify_stages() { return KV == KV_F16 ? 2 : MMA_VERIFY_QSTAGES; }
+// f16: K stages, then V stages, read in place. Quantized: one fp16 V tile,
+// then the raw stages of K and of V.
 template <int D, int KV>
 __host__ __device__ constexpr size_t mma_verify_smem() {
-    return KV == KV_F16 ? 4 * mma_verify_stage<D, KV>()
-                        : 2 * (size_t)MMA_VERIFY_TILE * GqaShape<D>::LD * 2 + 4 * mma_verify_stage<D, KV>();
+    return KV == KV_F16 ? 2 * (size_t)mma_verify_stages<D, KV>() * mma_verify_stage<D, KV>()
+                        : (size_t)MMA_VERIFY_TILE * GqaShape<D>::LD * 2
+                              + 2 * (size_t)mma_verify_stages<D, KV>() * mma_verify_stage<D, KV>();
 }
 
 __device__ __forceinline__ void mma_cp16(void* smem, const void* gmem, bool valid) {
@@ -1426,11 +1455,12 @@ __global__ __launch_bounds__(32 * (GQA_MULTI_MAX / 2), 1) void attention_verify_
     constexpr int PIECES = D / 8;
     extern __shared__ __align__(16) unsigned char mv_smem[];
     constexpr size_t STAGE = mma_verify_stage<D, KV>();
-    // f16: K stages at 0 and STAGE, V stages at 2 STAGE and 3 STAGE.
-    // Quantized: fp16 K tile, fp16 V tile, raw K [2], raw V [2].
+    constexpr int NS = mma_verify_stages<D, KV>();
+    // f16: K stages [NS], then V stages [NS].
+    // Quantized: fp16 V tile, raw K [NS], raw V [NS].
     constexpr size_t T16 = (size_t)TK * LD * 2;
-    unsigned char* kstage = F16 ? mv_smem : mv_smem + 2 * T16;
-    unsigned char* vstage = kstage + 2 * STAGE;
+    unsigned char* kstage = F16 ? mv_smem : mv_smem + T16;
+    unsigned char* vstage = kstage + NS * STAGE;
 
     const int nthreads = blockDim.x;
     const int tid = threadIdx.x;
@@ -1445,18 +1475,21 @@ __global__ __launch_bounds__(32 * (GQA_MULTI_MAX / 2), 1) void attention_verify_
     const int begin = split * keys;
     const int end = min((split + 1) * keys, last + 1);
 
-    const int qa_i = 2 * warp, qb_i = 2 * warp + 1;
-    const bool has_b = qb_i < nq;
-    const int pos_a = positions[qa_i];
+    // This thread's two MMA rows, g and g + 8 of the warp's 16: row r of the
+    // block is query r / G, head r % G of this KV head.
+    const int ra = warp * 16 + g, rb = ra + 8;
+    const int qa_i = ra / G, ha = ra % G;
+    const int qb_i = rb / G, hb = rb % G;
+    const bool has_a = qa_i < nq, has_b = qb_i < nq;
+    const int pos_a = has_a ? positions[qa_i] : -1;
     const int pos_b = has_b ? positions[qb_i] : -1;
-    const bool head_ok = g < G;
 
-    // Q as A fragments: row g is query a's head g, row g + 8 query b's.
+    // Q as A fragments: fragment row g is row ra, row g + 8 is rb.
     uint32_t qf[KS][4];
     {
-        const float* qa = q + ((size_t)qa_i * n_heads + kvh * G + (head_ok ? g : 0)) * D;
-        const float* qb = q + ((size_t)(has_b ? qb_i : qa_i) * n_heads + kvh * G + (head_ok ? g : 0)) * D;
-        const bool ua = head_ok, ub = head_ok && has_b;
+        const float* qa = q + ((size_t)(has_a ? qa_i : 0) * n_heads + kvh * G + ha) * D;
+        const float* qb = q + ((size_t)(has_b ? qb_i : 0) * n_heads + kvh * G + hb) * D;
+        const bool ua = has_a, ub = has_b;
 #pragma unroll
         for (int ks = 0; ks < KS; ++ks) {
             const float2 a0 = ua ? *(const float2*)&qa[ks * 16 + 2 * t] : make_float2(0.f, 0.f);
@@ -1502,47 +1535,86 @@ __global__ __launch_bounds__(32 * (GQA_MULTI_MAX / 2), 1) void attention_verify_
 #pragma unroll
     for (int j = 0; j < NT; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
 
-    if (begin < end) stage(begin, 0);
+    // NS - 1 tiles ahead. A tile past the end commits an empty group, so the
+    // wait below always leaves exactly NS - 1 groups pending.
+#pragma unroll
+    for (int i = 0; i < NS - 1; ++i) {
+        if (begin + i * TK < end) stage(begin + i * TK, i);
+        else asm volatile("cp.async.commit_group;\n" ::);
+    }
     int st = 0;
-    for (int t0 = begin; t0 < end; t0 += TK, st ^= 1) {
-        if (t0 + TK < end) {
-            stage(t0 + TK, st ^ 1);
-            asm volatile("cp.async.wait_group 1;\n" ::);
-        } else {
-            asm volatile("cp.async.wait_group 0;\n" ::);
-        }
+    for (int t0 = begin; t0 < end; t0 += TK, st = st + 1 == NS ? 0 : st + 1) {
+        // The stage refilled here was read last iteration, before its closing barrier.
+        const int ahead = t0 + (NS - 1) * TK;
+        if (ahead < end) stage(ahead, st == 0 ? NS - 1 : st - 1);
+        else asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(NS - 1));
         __syncthreads();
-        const half* kt;
         const half* vt;
         if constexpr (F16) {
-            kt = (const half*)(kstage + st * STAGE);
             vt = (const half*)(vstage + st * STAGE);
         } else {
-            half* k16 = (half*)mv_smem;
-            half* v16 = (half*)(mv_smem + T16);
-            const uint8_t* kr = kstage + st * STAGE;
+            // Only V goes to fp16 here: ldmatrix.trans wants its rows. K's
+            // fragments are decoded from the raw rows below.
+            half* v16 = (half*)mv_smem;
             const uint8_t* vr = vstage + st * STAGE;
             for (int i = tid; i < TK * PIECES; i += nthreads) {
                 const int r = i / PIECES, c = i % PIECES;
-                *(uint4*)&k16[r * LD + 8 * c] = kv_piece<KV>(kr + r * RB, c);
                 *(uint4*)&v16[r * LD + 8 * c] = kv_piece<KV>(vr + r * RB, c);
             }
             __syncthreads();
-            kt = k16;
             vt = v16;
         }
 
         float s[TK / 8][4];
 #pragma unroll
         for (int j = 0; j < TK / 8; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+        if constexpr (F16) {
+            const half* kt = (const half*)(kstage + st * STAGE);
 #pragma unroll
-        for (int ks = 0; ks < KS; ++ks) {
+            for (int ks = 0; ks < KS; ++ks) {
 #pragma unroll
-            for (int j = 0; j < TK / 8; ++j) {
-                const half* kr = kt + (j * 8 + g) * LD + ks * 16 + 2 * t;
-                const uint32_t b0 = *(const uint32_t*)kr;
-                const uint32_t b1 = *(const uint32_t*)(kr + 8);
-                mma_16816(s[j][0], s[j][1], s[j][2], s[j][3], qf[ks][0], qf[ks][1], qf[ks][2], qf[ks][3], b0, b1);
+                for (int j = 0; j < TK / 8; ++j) {
+                    const half* kr = kt + (j * 8 + g) * LD + ks * 16 + 2 * t;
+                    const uint32_t b0 = *(const uint32_t*)kr;
+                    const uint32_t b1 = *(const uint32_t*)(kr + 8);
+                    mma_16816(s[j][0], s[j][1], s[j][2], s[j][3], qf[ks][0], qf[ks][1], qf[ks][2], qf[ks][3], b0, b1);
+                }
+            }
+        } else {
+            // B fragment of k-step ks for key j * 8 + g: elements ks * 16 + 2t,
+            // +1 and +8, +9 of its row, the halves kv_piece gives them. A
+            // 32-element block holds k-steps 2b and 2b + 1: in q4_0 the low
+            // and high nibbles of the same bytes, in q8_0 bytes 0..15 and
+            // 16..31. Without the fp16 K tile a block takes 8.4 KB less
+            // shared memory and four fit an SM instead of three.
+            const uint8_t* kraw = kstage + st * STAGE;
+            constexpr int BB = KV == KV_Q8_0 ? 34 : 18;
+#pragma unroll
+            for (int blk = 0; blk < D / 32; ++blk) {
+#pragma unroll
+                for (int j = 0; j < TK / 8; ++j) {
+                    const uint8_t* bb = kraw + (j * 8 + g) * RB + blk * BB;
+                    const half2 d2 = __half2half2(*(const half*)bb);
+                    uint32_t lo0, lo1, hi0, hi1;
+                    if constexpr (KV == KV_Q8_0) {
+                        lo0 = kv_codes_q8(*(const uint16_t*)(bb + 2 + 2 * t), d2);
+                        lo1 = kv_codes_q8(*(const uint16_t*)(bb + 2 + 2 * t + 8), d2);
+                        hi0 = kv_codes_q8(*(const uint16_t*)(bb + 2 + 16 + 2 * t), d2);
+                        hi1 = kv_codes_q8(*(const uint16_t*)(bb + 2 + 16 + 2 * t + 8), d2);
+                    } else {
+                        const uint32_t u0 = *(const uint16_t*)(bb + 2 + 2 * t);
+                        const uint32_t u1 = *(const uint16_t*)(bb + 2 + 2 * t + 8);
+                        lo0 = kv_codes_q4(u0 & 0x0F0Fu, d2);
+                        lo1 = kv_codes_q4(u1 & 0x0F0Fu, d2);
+                        hi0 = kv_codes_q4((u0 >> 4) & 0x0F0Fu, d2);
+                        hi1 = kv_codes_q4((u1 >> 4) & 0x0F0Fu, d2);
+                    }
+                    mma_16816(s[j][0], s[j][1], s[j][2], s[j][3], qf[2 * blk][0], qf[2 * blk][1],
+                              qf[2 * blk][2], qf[2 * blk][3], lo0, lo1);
+                    mma_16816(s[j][0], s[j][1], s[j][2], s[j][3], qf[2 * blk + 1][0], qf[2 * blk + 1][1],
+                              qf[2 * blk + 1][2], qf[2 * blk + 1][3], hi0, hi1);
+                }
             }
         }
 
@@ -1611,15 +1683,16 @@ __global__ __launch_bounds__(32 * (GQA_MULTI_MAX / 2), 1) void attention_verify_
         __syncthreads();   // the stage just read is refilled next iteration
     }
 
-    if (head_ok) {
+    {
         const size_t per_q = (size_t)n_heads * gridDim.y * (D + 2);
-        const size_t at = ((size_t)(kvh * G + g) * gridDim.y + split) * (D + 2);
-        float* out = partial + qa_i * per_q + at;
-        if (t == 0) { out[0] = ma; out[1] = la; }
+        float* out = partial + qa_i * per_q + ((size_t)(kvh * G + ha) * gridDim.y + split) * (D + 2);
+        if (has_a) {
+            if (t == 0) { out[0] = ma; out[1] = la; }
 #pragma unroll
-        for (int j = 0; j < NT; ++j) *(float2*)&out[2 + j * 8 + 2 * t] = make_float2(o[j][0], o[j][1]);
+            for (int j = 0; j < NT; ++j) *(float2*)&out[2 + j * 8 + 2 * t] = make_float2(o[j][0], o[j][1]);
+        }
         if (has_b) {
-            out = partial + qb_i * per_q + at;
+            out = partial + qb_i * per_q + ((size_t)(kvh * G + hb) * gridDim.y + split) * (D + 2);
             if (t == 0) { out[0] = mb; out[1] = lb; }
 #pragma unroll
             for (int j = 0; j < NT; ++j) *(float2*)&out[2 + j * 8 + 2 * t] = make_float2(o[j][2], o[j][3]);
@@ -1728,7 +1801,8 @@ static bool launch_verify_mma(int kv_type, float* partial, const float* q, const
                               const int32_t* pos, int nq, int heads, int kv_heads, int max_seq, float scale,
                               int splits, cudaStream_t stream, cudaError_t* e) {
     const dim3 grid(kv_heads, splits);
-    const int threads = 32 * ((nq + 1) / 2);
+    // 16 (query, head) rows a warp; G <= 8 keeps it within the launch bounds.
+    const int threads = 32 * ((nq * (heads / kv_heads) + 15) / 16);
 #define MV_LAUNCH(KVT)                                                                                   \
     do {                                                                                                 \
         if constexpr (mma_verify_ok<D, KVT>()) {                                                         \
@@ -2731,6 +2805,15 @@ airun_status airun_argmax(const void* x, int32_t n, void* out, void* scratch, vo
         (const float*)x, n, (float*)scratch);
     argmax_final_kernel<<<1, ARGMAX_THREADS, 0, stream>>>(
         (const float*)scratch, n, (int32_t*)out, (int32_t*)bump);
+    AIRUN_CHECK_LAUNCH();
+}
+airun_status airun_argmax_map(const void* x, int32_t n, void* out, void* scratch, const void* map,
+                              int32_t base, cudaStream_t stream) {
+    if (n <= 0 || !scratch || !map || base < 0 || base > n) return AIRUN_ERR_BAD_ARG;
+    argmax_partial_kernel<<<ARGMAX_BLOCKS, ARGMAX_THREADS, 0, stream>>>(
+        (const float*)x, n, (float*)scratch);
+    argmax_final_kernel<<<1, ARGMAX_THREADS, 0, stream>>>(
+        (const float*)scratch, n, (int32_t*)out, nullptr, (const int32_t*)map, base);
     AIRUN_CHECK_LAUNCH();
 }
 airun_status airun_rope(

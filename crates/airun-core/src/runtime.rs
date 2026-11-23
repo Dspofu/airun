@@ -2983,6 +2983,7 @@ impl Runtime {
             sp.vgraph = None;
             sp.vsgraph = None;
             sp.agraphs.clear();
+            sp.cgraphs.clear();
             sp.forget_head_graph();
         }
         self.set_rope_shift(shift)

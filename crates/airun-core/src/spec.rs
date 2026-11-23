@@ -50,6 +50,12 @@ pub(super) struct Spec {
     mgraph: Option<VerifyGraph>,
     /// [`Runtime::advance_graphed`]'s graphs, by accepted count - 1.
     pub(super) agraphs: Vec<Option<AdvanceGraph>>,
+    /// The delta-net commit of a model split across GPUs, one graph per
+    /// device and accepted count - 1 ([`Runtime::commit_graphed`]).
+    pub(super) cgraphs: Vec<Vec<Option<airun_cuda::Graph>>>,
+    /// The draft's extra head rows ([`Runtime::draft_extend`]), when the
+    /// draft vocabulary is a prefix of the head.
+    extra: Option<DraftExtra>,
     /// Batched steps (verify_rows / accept_rows / draft_rows): each row's
     /// head hidden for the next draft, the draft logits and the picks
     /// ([step][row] for drafts, [row][token] for a verify).
@@ -57,6 +63,49 @@ pub(super) struct Spec {
     rows_logits: DeviceBuffer<f32>,
     rows_picks: DeviceBuffer<i32>,
     rows_picks_host: airun_cuda::PinnedBuffer<i32>,
+}
+
+/// Output-head rows for tokens past the draft vocabulary's prefix that the
+/// server has seen (prompts and replies), copied into one buffer the draft
+/// scores after the prefix. Much of Qwen's vocabulary lies past the first 64k
+/// rows; on chat replies the prefix alone drafted at 22% acceptance where the
+/// whole head gave 34% (at four times the reads). The learned rows are saved
+/// with the model's profiles (draft_save) and loaded at the next start; warm,
+/// the same replies drafted at ~36% and ran 53 -> 69 tok/s.
+struct DraftExtra {
+    rows: DeviceBuffer<u8>,
+    /// Token of each row, on the device and on the host; free rows repeat
+    /// token 0's row and map to it.
+    map: DeviceBuffer<i32>,
+    tokens: Vec<i32>,
+    /// Whether a token has a row, by id.
+    has: Vec<bool>,
+    /// The row the next new token takes (oldest first once full).
+    next: usize,
+    /// Rows changed since the last save.
+    dirty: bool,
+}
+
+const DRAFT_MAGIC: &[u8; 8] = b"AIRUNDRF";
+
+/// The tokens a saved draft profile holds, oldest first, when it was written
+/// for a vocabulary of `vocab`.
+fn draft_load(path: &std::path::Path, vocab: usize) -> Vec<u32> {
+    let Ok(b) = std::fs::read(path) else { return Vec::new() };
+    if b.len() < 16 || &b[..8] != DRAFT_MAGIC
+        || u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize != vocab {
+        return Vec::new();
+    }
+    b[16..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+/// How many extra rows the draft keeps (AIRUN_DRAFT_EXTRA; 0 turns them
+/// off). 8192 rows of a 5120-wide Q5_K head are 29 MB, ~40 us a draft step.
+const DEFAULT_DRAFT_EXTRA: usize = 8192;
+fn draft_extra_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("AIRUN_DRAFT_EXTRA").ok()
+        .and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_DRAFT_EXTRA))
 }
 
 /// The MTP head state of a slot that is not the active one (the active
@@ -121,8 +170,9 @@ pub(super) struct ShardedVerifyGraph {
 /// Every draft is still checked by the full-vocabulary verify, so this trades
 /// acceptance for a cheaper head step, never the output. Default
 /// DEFAULT_DRAFT_VOCAB: on Qwen's 248k vocabulary each draft read the whole
-/// head, and the first 64k rows kept nearly all the acceptance on English code
-/// and Portuguese prose while the drafts' head reads fell by ~4x.
+/// head; the first 64k rows keep most of the acceptance on code while the
+/// drafts' head reads fall by ~4x, and DraftExtra adds the rows past them that
+/// the server's own text uses.
 /// AIRUN_DRAFT_VOCAB sets it; 0 or anything at least the vocabulary means all
 /// of it.
 const DEFAULT_DRAFT_VOCAB: usize = 65536;
@@ -283,6 +333,8 @@ impl Runtime {
             vsgraph: None,
             mgraph: None,
             agraphs: Vec::new(),
+            cgraphs: Vec::new(),
+            extra: None,
             rows_hsel: DeviceBuffer::new(dev, self.slots.len().max(1) * cfg.n_embd)?,
             rows_logits: DeviceBuffer::new(dev, self.slots.len().max(1) * draft_vocab(cfg.vocab_size))?,
             rows_picks: DeviceBuffer::new(dev, self.slots.len().max(1) * rows)?,
@@ -292,6 +344,123 @@ impl Runtime {
             self.slots[s].head = None;
         }
         self.ensure_heads()?;
+        self.draft_extra_init()?;
+        Ok(())
+    }
+
+    /// Allocates the draft's extra rows (see [`DraftExtra`]) when the draft
+    /// vocabulary leaves part of a VRAM head out, every row a copy of token
+    /// 0's. VRAM short of it leaves the draft on the prefix.
+    fn draft_extra_init(&mut self) -> Result<()> {
+        let vocab = self.model.config.vocab_size;
+        let base = draft_vocab(vocab);
+        let out_w = self.model.output_tensor();
+        let st = self.states.last().expect("a runtime has at least one device");
+        let n = draft_extra_rows().min(vocab - base);
+        if n == 0 || out_w.ram.is_some() || out_w.data.is_empty() || out_w.device != st.device {
+            return Ok(());
+        }
+        device::set_device(st.device)?;
+        let rb = out_w.row_bytes;
+        let (Ok(rows), Ok(map)) = (DeviceBuffer::<u8>::new(st.device, n * rb),
+                                   DeviceBuffer::<i32>::zeroed(st.device, n, &st.stream)) else {
+            return Ok(());
+        };
+        // Row 0 into the first slot, then doubling copies fill the rest.
+        ops::copy_2d(rows.as_mut_ptr(), rb, out_w.ptr(), rb, rb, 1, &st.stream)?;
+        let mut have = 1;
+        while have < n {
+            let c = have.min(n - have);
+            ops::copy_2d(rows.offset_ptr(have * rb), c * rb, rows.as_ptr(), c * rb, c * rb, 1, &st.stream)?;
+            have += c;
+        }
+        let sp = self.spec.as_mut().expect("set up by spec_init");
+        sp.extra = Some(DraftExtra { rows, map, tokens: vec![0; n], has: vec![false; vocab], next: 0, dirty: false });
+        if let Some(path) = self.model.draft_profile.clone() {
+            let saved = draft_load(&path, vocab);
+            self.draft_extend(&saved)?;
+            if let Some(x) = self.spec.as_mut().and_then(|sp| sp.extra.as_mut()) {
+                x.dirty = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the draft's extra rows' tokens, oldest first, when they changed
+    /// (through a temporary file, so an interrupted save leaves the old one).
+    /// A failure only costs the next start its warm rows.
+    pub(super) fn draft_save(&mut self) {
+        let vocab = self.model.config.vocab_size;
+        let Some(path) = self.model.draft_profile.clone() else { return };
+        let Some(x) = self.spec.as_mut().and_then(|sp| sp.extra.as_mut()) else { return };
+        if !x.dirty {
+            return;
+        }
+        let base = draft_vocab(vocab);
+        let n = x.tokens.len();
+        let mut out = Vec::with_capacity(16 + 4 * n);
+        out.extend_from_slice(DRAFT_MAGIC);
+        out.extend_from_slice(&(vocab as u32).to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for i in 0..n {
+            let t = x.tokens[(x.next + i) % n] as usize;
+            if t >= base {
+                out.extend_from_slice(&(t as u32).to_le_bytes());
+            }
+        }
+        let tmp = path.with_extension("draft.tmp");
+        let written = path.parent().map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&tmp, &out))
+            .and_then(|_| std::fs::rename(&tmp, &path));
+        if written.is_ok() {
+            x.dirty = false;
+        }
+    }
+
+    /// Gives every token of `toks` past the draft prefix a row in the
+    /// draft's extra rows, replacing the oldest once they are full. Queued on
+    /// the output device's stream, ahead of the next draft.
+    pub(super) fn draft_extend(&mut self, toks: &[u32]) -> Result<()> {
+        let vocab = self.model.config.vocab_size;
+        let base = draft_vocab(vocab);
+        let si = self.states.len() - 1;
+        let Some(sp) = self.spec.as_mut() else { return Ok(()) };
+        let Some(x) = sp.extra.as_mut() else { return Ok(()) };
+        let out_w = if self.model.config.tied_embeddings && self.model.output.data.is_empty() {
+            &self.model.token_embd
+        } else {
+            &self.model.output
+        };
+        let st = &self.states[si];
+        let rb = out_w.row_bytes;
+        let n = x.tokens.len();
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for &t in toks {
+            let t = t as usize;
+            if t < base || t >= vocab || x.has[t] {
+                continue;
+            }
+            if lo == usize::MAX {
+                device::set_device(st.device)?;
+            }
+            let r = x.next;
+            let old = x.tokens[r] as usize;
+            if old >= base {
+                x.has[old] = false;
+            }
+            x.tokens[r] = t as i32;
+            x.has[t] = true;
+            x.next = (r + 1) % n;
+            x.dirty = true;
+            // SAFETY of the offset: t < vocab rows of rb bytes.
+            let src = unsafe { (out_w.ptr() as *const u8).add(t * rb) } as *const std::ffi::c_void;
+            ops::copy_2d(x.rows.offset_ptr(r * rb), rb, src, rb, rb, 1, &st.stream)?;
+            lo = lo.min(r);
+            hi = hi.max(r + 1);
+        }
+        if lo < hi {
+            x.map.copy_from_host_at(lo, &x.tokens[lo..hi], &st.stream)?;
+        }
         Ok(())
     }
 
@@ -853,13 +1022,22 @@ impl Runtime {
         ops::rmsnorm(st.xb.as_mut_ptr(), st.x.as_ptr(), mtp.head_norm.as_ptr(), d, n, cfg.rms_eps, stream)?;
 
         // The draft picks among the first rows of the output head only (see
-        // draft_vocab); the verify still scores the whole vocabulary.
+        // draft_vocab) and the extra rows after them; the verify still scores
+        // the whole vocabulary.
         let out_w = self.model.output_tensor();
         let vocab = draft_vocab(cfg.vocab_size);
         ops::matvec(out_w.kernel_type(), out_w.ptr(), st.xb.offset_ptr((n - 1) * d),
             sp.logits.as_mut_ptr(), d, vocab, 1, out_w.row_bytes, stream)?;
-        ops::argmax(sp.logits.as_ptr(), vocab, sp.picks.offset_ptr(slot), sp.scratch.as_mut_ptr(),
-            std::ptr::null_mut(), stream)?;
+        if let Some(x) = sp.extra.as_ref() {
+            let e = x.tokens.len();
+            ops::matvec(out_w.kernel_type(), x.rows.as_ptr(), st.xb.offset_ptr((n - 1) * d),
+                sp.logits.offset_ptr(vocab), d, e, 1, out_w.row_bytes, stream)?;
+            ops::argmax_map(sp.logits.as_ptr(), vocab + e, sp.picks.offset_ptr(slot), sp.scratch.as_mut_ptr(),
+                x.map.as_ptr(), vocab, stream)?;
+        } else {
+            ops::argmax(sp.logits.as_ptr(), vocab, sp.picks.offset_ptr(slot), sp.scratch.as_mut_ptr(),
+                std::ptr::null_mut(), stream)?;
+        }
         Ok(())
     }
 
@@ -901,7 +1079,7 @@ impl Runtime {
         let si = self.states.len() - 1;
         let with_commit = si == 0;
         if !with_commit {
-            self.commit(m)?;
+            self.commit_graphed(m)?;
         }
         device::set_device(self.states[si].device)?;
         let built = if g.graph.is_none() {
@@ -991,9 +1169,61 @@ impl Runtime {
     /// Pushes the first `m` tokens of the last verify into every delta-net
     /// layer's convolution history and recurrent state.
     fn commit(&self, m: usize) -> Result<()> {
+        for si in 0..self.states.len() {
+            self.commit_device(si, m)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::commit`] split across GPUs, replayed as one graph per device:
+    /// issued launch by launch, its three small kernels per layer took ~2 ms
+    /// of host time per step on the 27B over two GPUs (WDDM launches), the
+    /// first GPU's before the second's. Queued without a wait: each stream
+    /// orders it before its next pass.
+    fn commit_graphed(&mut self, m: usize) -> Result<()> {
+        let shards = self.states.len();
+        {
+            let sp = self.spec.as_mut().expect("set up by spec_init");
+            if sp.cgraphs.len() < shards {
+                sp.cgraphs.resize_with(shards, Vec::new);
+            }
+        }
+        for si in 0..shards {
+            device::set_device(self.states[si].device)?;
+            let taken = {
+                let sp = self.spec.as_mut().expect("set up by spec_init");
+                if sp.cgraphs[si].len() < m {
+                    sp.cgraphs[si].resize_with(m, || None);
+                }
+                sp.cgraphs[si][m - 1].take()
+            };
+            let g = match taken {
+                Some(g) => g,
+                None => {
+                    // SAFETY of the capture: it reads the stash and writes the
+                    // active slot's delta-net states, whose addresses hold
+                    // until switch_slot drops these graphs.
+                    let stream = &self.states[si].stream;
+                    airun_cuda::Graph::begin_capture(stream)?;
+                    let queued = self.commit_device(si, m);
+                    let ended = airun_cuda::Graph::end_capture(stream);
+                    queued?;
+                    ended?
+                }
+            };
+            let launched = g.launch(&self.states[si].stream);
+            self.spec.as_mut().expect("set up by spec_init").cgraphs[si][m - 1] = Some(g);
+            launched?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::commit`] on shard `si` alone, on its stream.
+    fn commit_device(&self, si: usize, m: usize) -> Result<()> {
         let cfg = &self.model.config;
         let ssm = cfg.ssm.as_ref().expect("speculation runs on hybrids");
-        for st in &self.states {
+        {
+            let st = &self.states[si];
             device::set_device(st.device)?;
             let h = st.hybrid.as_ref().expect("hybrid scratch on a hybrid model");
             for (local, sh) in st.stash.iter().enumerate() {
@@ -1171,6 +1401,8 @@ impl Runtime {
         let mut hist: Vec<u32> = prompt.iter().copied().filter(|&t| !crate::runtime::is_image_token(t)).collect();
         let start = std::time::Instant::now();
         self.spec_init()?;
+        // The prompt's words are the ones a reply most likely repeats.
+        self.draft_extend(&hist)?;
         let k = self.draft;
 
         // The head's cache must cover every cached position; one a plain
@@ -1372,6 +1604,9 @@ impl Runtime {
                 }
 
                 let t1 = std::time::Instant::now();
+                if ended.is_none() {
+                    self.draft_extend(&[next])?;
+                }
                 let room = k.min(self.ctx.saturating_sub(p + committed + 1));
                 if ended.is_none() && room == k && k > 0 && !graphs_disabled() {
                     let mut toks = input[1..committed].to_vec();
@@ -1416,6 +1651,7 @@ impl Runtime {
         }
 
         drop(emit);
+        self.draft_save();
         if std::env::var("AIRUN_SPEC_TIMING").is_ok() && steps > 0 {
             let ms = |x: f64| 1000.0 * x / steps as f64;
             eprintln!("spec step: verify {:.2} ms, commit+absorb {:.2} ms, chain {:.2} ms ({steps} steps)",

@@ -16,6 +16,12 @@ Newest first. Move an entry between sections instead of duplicating it.
 
 ## Fixed
 
+[X] - commit `pending` | `Dspofu` - `Claude` | MTP drafts learn head rows past the 64k prefix from the server's own text (saved per model); chat replies drafted at 22%
+  - 27B `--draft 4`, chat replies: 53 to ~69 tok/s once warm. AIRUN_DRAFT_EXTRA=0 goes back.
+
+[X] - commit `pending` | `Dspofu` - `Claude` | Verify attention on tensor cores packed 16 (query, head) rows a warp, K decoded from raw rows, 3-stage cp.async; split-GPU delta-net commit graphed; NVFP4 5-6 token matvec width
+  - 27B q4_0 `--parallel 4 -c 248144 --draft 4`: 128k decode 69.4 to 83-87 tok/s, 2k 82.7 to 88-91. 128k verify layer on the 5070 Ti 576 to 299 us.
+
 [X] - commit `5abae8e` | `Dspofu` - `Claude` | `serve --parallel N` with KV in RAM put every slot's cache of whole layers there, slot 0 included; now one slot's cache at a time, slot 0 last
   - 27B q4_0, `--parallel 4 -c 248144 --draft 4`, 128k prompt: decode 37.8 to 79.7 tok/s, prefill 2096 to 2279. Each slot still gets the whole -c (llama-server divides it).
 

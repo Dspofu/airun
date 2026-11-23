@@ -100,17 +100,17 @@ fn prefill_attention_throughput() {
     }
 }
 
-/// A speculative verify's 4 queries over one long q4_0 cache: the split
-/// kernel (attention_split_multi) against the prefill kernel it replaced and
-/// four one-query decodes, per layer.
+/// A speculative verify's queries (`--draft 4`: 5) over one long q4_0 cache:
+/// the split kernel (attention_split_multi) against one-query decode, per
+/// layer, and the verify's cache read in GB/s.
 #[test]
 #[ignore]
 fn verify_attention_by_depth() {
     let dev: i32 = std::env::var("AIRUN_BENCH_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     device::set_device(dev).unwrap();
     let stream = Stream::new(dev).unwrap();
-    let n = 4usize;
-    let ctx = 32768usize;
+    let n: usize = std::env::var("AIRUN_BENCH_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let ctx = 131072usize;
     let kv = KvType::Q4_0;
     let row = kv.row_bytes(HEAD_DIM);
     let k = DeviceBuffer::<u8>::zeroed(dev, N_KV_HEADS * ctx * row, &stream).unwrap();
@@ -121,7 +121,7 @@ fn verify_attention_by_depth() {
     let splits = ops::attention_splits(ctx);
     let partial = DeviceBuffer::<f32>::new(dev, n * N_HEADS * splits * (HEAD_DIM + 2)).unwrap();
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    for &depth in &[512usize, 8192, 25000] {
+    for &depth in &[2048usize, 32768, 131000] {
         let pos: Vec<i32> = (0..n as i32).map(|i| depth as i32 - n as i32 + i).collect();
         let positions = DeviceBuffer::<i32>::from_slice(dev, &pos, &stream).unwrap();
         let time = |f: &dyn Fn()| {
@@ -136,11 +136,10 @@ fn verify_attention_by_depth() {
         };
         let split = time(&|| ops::attention_split_multi(out.as_mut_ptr(), partial.as_mut_ptr(), q.as_ptr(), k.as_ptr(),
             v.as_ptr(), positions.as_ptr(), N_HEADS, N_KV_HEADS, HEAD_DIM, ctx, scale, 0, splits, kv, n, &stream).unwrap());
-        let masked = time(&|| ops::attention_masked(out.as_mut_ptr(), q.as_ptr(), k.as_ptr(), v.as_ptr(),
-            positions.as_ptr(), n, N_HEADS, N_KV_HEADS, HEAD_DIM, ctx, scale, 0, kv, None, depth, &stream).unwrap());
         let one = time(&|| ops::attention_split(out.as_mut_ptr(), &partial, q.as_ptr(), k.as_ptr(), v.as_ptr(),
             positions.as_ptr(), N_HEADS, N_KV_HEADS, HEAD_DIM, ctx, scale, 0, splits, kv, &stream).unwrap());
-        println!("depth {depth:>6}: 4 queries split {split:8.1} us, prefill kernel {masked:8.1} us; 1 query {one:7.1} us");
+        let gbs = 2.0 * (N_KV_HEADS * depth * row) as f64 / split / 1e3;
+        println!("depth {depth:>6}: {n} queries {split:8.1} us ({gbs:5.0} GB/s); 1 query {one:7.1} us");
     }
 }
 

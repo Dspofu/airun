@@ -678,6 +678,8 @@ pub struct Model {
     /// Routing counts that chose the resident experts, updated as the
     /// runtime routes and saved when it is done (see expert_profile).
     pub expert_profile: Option<RefCell<crate::expert_profile::ExpertProfile>>,
+    /// Where the MTP draft's learned tokens are kept (see spec::DraftExtra).
+    pub draft_profile: Option<std::path::PathBuf>,
     /// The VRAM that layers kept in RAM are staged through, one per GPU that
     /// runs any (sized by the planner for the largest such layer).
     pub ram_staging: Vec<DeviceBuffer<u8>>,
@@ -1049,6 +1051,7 @@ impl Model {
             mtp,
             total_bytes,
             expert_profile: None,
+            draft_profile: None,
             ram_staging,
             ffn_staging,
             weight_arenas,

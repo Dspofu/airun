@@ -28,7 +28,9 @@ unsafe extern "C" {
         k: i32, n_rows: i32, n_tokens: i32, stream: ffi::Stream) -> Status;
     fn airun_nvfp4_sanitize(w: *mut c_void, n_blocks: i64, stream: ffi::Stream) -> Status;
     fn airun_argmax(x: *const c_void, n: i32, out: *mut c_void, scratch: *mut c_void,
-        bump: *mut c_void, stream: ffi::Stream) -> Status;    fn airun_add_rmsnorm(out: *mut c_void, x: *mut c_void, b: *const c_void, weight: *const c_void,
+        bump: *mut c_void, stream: ffi::Stream) -> Status;
+    fn airun_argmax_map(x: *const c_void, n: i32, out: *mut c_void, scratch: *mut c_void,
+        map: *const c_void, base: i32, stream: ffi::Stream) -> Status;    fn airun_add_rmsnorm(out: *mut c_void, x: *mut c_void, b: *const c_void, weight: *const c_void,
         n: i32, rows: i32, eps: f32, stream: ffi::Stream) -> Status;
     #[allow(clippy::too_many_arguments)]
     fn airun_qk_norm_rope_store(q: *mut c_void, k: *const c_void, v: *const c_void,
@@ -1072,6 +1074,24 @@ pub fn argmax(x: *const c_void, n: usize, out: *mut c_void, scratch: *mut c_void
     unsafe { ffi::check(airun_argmax(x, n as i32, out, scratch, bump, stream.raw())) }
     #[cfg(not(airun_cuda))]
     { let _ = (x, out, bump, stream); Err(CudaError::NotBuiltWithCuda) }
+}
+
+/// [`argmax`] whose pick, when at or past `base`, is replaced by
+/// `map[pick - base]` (an i32 array of `n - base` entries on the device).
+pub fn argmax_map(x: *const c_void, n: usize, out: *mut c_void, scratch: *mut c_void,
+                  map: *const c_void, base: usize, stream: &Stream) -> Result<()> {
+    if n == 0 || n > i32::MAX as usize || base > n {
+        return Err(bad_arg(format!("argmax over {n} values with {base} unmapped; this is a bug")));
+    }
+    if scratch.is_null() || map.is_null() {
+        return Err(bad_arg("argmax_map needs a scratch buffer and a map"));
+    }
+    #[cfg(airun_cuda)]
+    // SAFETY: x holds n floats, out one i32, scratch ARGMAX_SCRATCH 4-byte
+    // elements and map n - base i32s: device memory the caller owns.
+    unsafe { ffi::check(airun_argmax_map(x, n as i32, out, scratch, map, base as i32, stream.raw())) }
+    #[cfg(not(airun_cuda))]
+    { let _ = (x, out, map, stream); Err(CudaError::NotBuiltWithCuda) }
 }
 /// `x += b; out = rmsnorm(x) * weight`, per row of `n`: a residual add and the
 /// norm after it in one launch. Identical to [`add`] then [`rmsnorm`].

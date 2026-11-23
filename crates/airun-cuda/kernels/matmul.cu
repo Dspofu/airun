@@ -2739,8 +2739,14 @@ airun_status airun_matvec_q8(
             const int nt = min(8, n_tokens - t0);
             const block_q8a* xt = (const block_q8a*)xq + (size_t)t0 * groups;
             float* yt = (float*)y + (size_t)t0 * n_rows;
+            // 5-6 tokens (--draft 4 or 5) get their own width: in the 8-wide
+            // kernel the accumulators cost occupancy, 74 us where 4 tokens
+            // took 68 (17408 x 5120, 5070 Ti).
             if (nt <= 4) {
                 matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 4><<<blocks, WIDE_THREADS, 0, stream>>>(
+                    (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes);
+            } else if (nt <= 6) {
+                matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 6><<<blocks, WIDE_THREADS, 0, stream>>>(
                     (const uint8_t*)w, xt, yt, k, n_rows, nt, (size_t)row_bytes);
             } else {
                 matvec_q8_wide_multi_kernel<AIRUN_TYPE_NVFP4, R, 8><<<blocks, WIDE_THREADS, 0, stream>>>(

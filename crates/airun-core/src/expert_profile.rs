@@ -136,6 +136,19 @@ impl ExpertProfile {
     }
 }
 
+/// `<cache>/airun/profiles/<model stem>-<model_len>.<ext>`, or what `var`
+/// names (`off`: no file).
+pub(crate) fn profile_path(model: &Path, model_len: u64, ext: &str, var: &str) -> Option<PathBuf> {
+    match std::env::var(var) {
+        Ok(v) if v == "off" => None,
+        Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => {
+            let name = model.file_stem()?.to_string_lossy().to_string();
+            Some(cache_dir()?.join("airun").join("profiles").join(format!("{name}-{model_len}.{ext}")))
+        }
+    }
+}
+
 /// The per-user cache directory: %LOCALAPPDATA% on Windows, $XDG_CACHE_HOME
 /// or ~/.cache elsewhere.
 fn cache_dir() -> Option<PathBuf> {
